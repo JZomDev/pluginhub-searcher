@@ -50,7 +50,7 @@ async function list_directory(user, repo, directory, internalName) {
      const list = await fetch(url).then(res => res.json());
 	 const loopThis = list.tree.map(node => node.path);
 	 for (let i = 0; i < loopThis.length; i++) {
-		list_directory(user, repo, url + "/" + loopThis[i])
+		list_directory(user, repo, directory + "/" + loopThis[i])
 	}
   }
 }
