@@ -44,6 +44,8 @@ async function list_directory(user, repo, directory, internalName) {
 	fileContent.get(internalName).push(ret);
 	return;
   }
+  const url = `https://api.github.com/repos/${user}/${repo}/git/trees/master`;
+
   var directory2 = directory.split('/').filter(Boolean);
   const dir = await directory2.reduce(async (acc, dir) => {
       const { url } = await acc;
