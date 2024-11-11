@@ -26,9 +26,8 @@ async function readPluginApi(manifest) {
 
 	if (manifest.internalName.indexOf('zom') != -1)
 	{
-		const updateData = async () => {
-			await list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName, manifest.internalName);
-		};
+		let result = await list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName, manifest.internalName);
+		
 		for (let i = 0; i < fileContent.get(manifest.internalName).length; i++)
 		{
 			text.push(fileContent.get(manifest.internalName)[i].split("\n"));
