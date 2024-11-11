@@ -31,6 +31,7 @@ async function readPluginApi(manifest) {
 		{
 			text.push(fileContent.get(manifest.internalName)[i].split("\n"));
 		}
+		console.log('added text for: ' + manifest.internalName);
 	}
 	return text;
 }
