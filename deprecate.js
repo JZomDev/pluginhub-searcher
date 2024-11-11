@@ -44,13 +44,17 @@ async function list_directory(user, repo, directory, internalName) {
 	fileContent.get(internalName).push(ret);
 	return;
   }
-  const url = `https://api.github.com/repos/${user}/${repo}/git/trees/main/` + directory;
-  
-  if (url) {
-     const list = await fetch(url).then(res => res.json());
+  var directory2 = directory.split('/').filter(Boolean);
+  const dir = await directory2.reduce(async (acc, dir) => {
+      const { url } = await acc;
+      const list = await fetch(url).then(res => res.json());
+      return list.tree.find(node => node.path === dir);
+  }, { url });
+  if (dir) {
+     const list = await fetch(dir.url).then(res => res.json());
 	 const loopThis = list.tree.map(node => node.path);
 	 for (let i = 0; i < loopThis.length; i++) {
-		list_directory(user, repo, directory + "/" + loopThis[i])
+		list_directory(user, repo, directory + "/" + loopThis[i], internalName)
 	}
   }
 }
