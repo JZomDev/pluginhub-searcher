@@ -24,8 +24,8 @@ async function readPluginApi(manifest) {
 
 	let text = [];
 
-	if (manifest.internalName.indexOf('zom-afk-gotr') != -1)
-	{
+	//if (manifest.internalName.indexOf('zom-afk-gotr') != -1)
+	//{
 		let result = await list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName, manifest.internalName);
 		
 		for (let i = 0; i < fileContent.get(manifest.internalName).length; i++)
@@ -33,7 +33,7 @@ async function readPluginApi(manifest) {
 			text = text.concat(fileContent.get(manifest.internalName)[i].split("\n"));
 		}
 		console.log('added text for: ' + manifest.internalName);
-	}
+	//}
 	return text;
 }
 
