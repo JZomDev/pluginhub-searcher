@@ -22,11 +22,13 @@ let fileContent = [];
 
 async function readPluginApi(manifest) {
 	fileContent = [];
-	list_directory('JZomDev', 'pluginhub-searcher','plugins/${manifest.internalName}')
-	let req = await fetch(`${root}api/${manifest.internalName}_${manifest.jarHash}.api`);
-	let data = pako.inflate(new Uint8Array(await req.arrayBuffer()));
-	let text = new TextDecoder("utf-8").decode(data);
-	return text.split("\n");
+	list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName)
+	let text = [];
+	for (let i = 0; i < fileContent.length; i++)
+	{
+		text.push(fileContent[i].split("\n"));
+	}
+	return text;
 }
 
 async function list_directory(user, repo, directory) {
