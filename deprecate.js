@@ -26,7 +26,7 @@ async function readPluginApi(manifest) {
 
 	//if (manifest.internalName.indexOf('zom-afk-gotr') != -1)
 	//{
-		let result = await list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName, manifest.internalName);
+		let result = await getConent('JZomDev', 'pluginhub-searcher', manifest.internalName);
 		
 		for (let i = 0; i < fileContent.get(manifest.internalName).length; i++)
 		{
@@ -37,34 +37,15 @@ async function readPluginApi(manifest) {
 	return text;
 }
 
-async function list_directory(user, repo, directory, internalName) {
+async function getConent(user, repo, internalName) {
   if (directory.indexOf("\.") > 0) 
   {
-	console.log(directory);
-	let res = await fetch(`https://raw.githubusercontent.com/${user}/${repo}/refs/heads/main/` + directory),
+	let res = await fetch(`https://raw.githubusercontent.com/${user}/${repo}/refs/heads/main/plugins/` + internalName + '/content.txt'),
     		ret = await res.text(); 
 	fileContent.get(internalName).push(ret);
 	return true;
   }
-  const url = `https://api.github.com/repos/${user}/${repo}/git/trees/main`;
 
-	try {
-  var directory2 = directory.split('/').filter(Boolean);
-  const dir = await directory2.reduce(async (acc, dir) => {
-      const { url } = await acc;
-      const list = await fetch(url).then(res => res.json());
-      return list.tree.find(node => node.path === dir);
-  }, { url });
-  if (dir) {
-     const list = await fetch(dir.url).then(res => res.json());
-	 const loopThis = list.tree.map(node => node.path);
-	 for (let i = 0; i < loopThis.length; i++) {
-		const v = await list_directory(user, repo, directory + "/" + loopThis[i], internalName)
-	}
-  }
-  } catch (e) {
-					console.error(e);
-				} 
 }
 
 async function amap(limit, array, asyncMapper) {
