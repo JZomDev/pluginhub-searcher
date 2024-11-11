@@ -20,7 +20,7 @@ const installs = (async() => {
 })();
 let fileContent = new Map();
 async function readPluginApi(manifest) {
-	out.fileContent(manifest.internalName, [])
+	fileContent.set(manifest.internalName, [])
 
 	let text = [];
 
