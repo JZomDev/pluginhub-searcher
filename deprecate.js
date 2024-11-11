@@ -24,7 +24,7 @@ async function readPluginApi(manifest) {
 
 	let text = [];
 
-	if (manifest.internalName.indexOf('zom') != -1)
+	if (manifest.internalName.indexOf('zom-afk-gotr') != -1)
 	{
 		let result = await list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName, manifest.internalName);
 		
