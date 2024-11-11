@@ -1,0 +1,1274 @@
+package com.notificationpanel;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class NotificationPanelPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(NotificationPanelPlugin.class);
+		RuneLite.main(args);
+	}
+}
+
+package com.notificationpanel;
+
+import com.google.inject.Provides;
+import com.notificationpanel.ConditionalFormatting.ConditionalFormatParser;
+import com.notificationpanel.Formatting.Format;
+import com.notificationpanel.Formatting.FormatOptions.DurationOption;
+import com.notificationpanel.Formatting.FormatOptions.ShowTimeOption;
+import com.notificationpanel.Formatting.PartialFormat;
+import com.notificationpanel.NotificationPanelConfig.TimeUnit;
+import java.util.TimerTask;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneLiteConfig;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.NotificationFired;
+import net.runelite.client.events.OverlayMenuClicked;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientUI;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.OverlayMenuEntry;
+
+@Slf4j
+@PluginDescriptor(name = "Notification Panel")
+public class NotificationPanelPlugin extends Plugin
+{
+	static ConditionalFormatParser formatter;
+	@Inject
+	private NotificationPanelConfig config;
+	@Inject
+	private ClientUI clientUI;
+	@Inject
+	private RuneLiteConfig runeLiteConfig;
+	@Inject
+	private Client client;
+	@Inject
+	private NotificationPanelOverlay overlay;
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		updateFormatterAfterConfigChange();
+		overlayManager.add(overlay);
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		NotificationPanelOverlay.notificationQueue.clear();
+		overlayManager.remove(overlay);
+	}
+
+	@Subscribe
+	public void onOverlayMenuClicked(OverlayMenuClicked overlayMenuClicked)
+	{
+		OverlayMenuEntry overlayMenuEntry = overlayMenuClicked.getEntry();
+		if (overlayMenuEntry.getMenuAction() == MenuAction.RUNELITE_OVERLAY &&
+			overlayMenuClicked.getOverlay() == overlay)
+		{
+			final String option = overlayMenuClicked.getEntry().getOption();
+
+			if (option.equals(NotificationPanelOverlay.CLEAR_ALL))
+			{
+				NotificationPanelOverlay.notificationQueue.clear();
+			}
+		}
+	}
+
+	void updateFormatterAfterConfigChange()
+	{
+		formatter = new ConditionalFormatParser(config);
+	}
+
+	@Subscribe
+	public void onNotificationFired(NotificationFired event)
+	{
+		final String message = event.getMessage();
+		final PartialFormat options = formatter.getOptions(message);
+		final Format format = Format.getDefault(config).withOptions(options);
+
+		if (!format.getIsVisible())
+		{
+			return;
+		}
+
+		final Notification notification = new Notification(message, format, config);
+
+		NotificationPanelOverlay.notificationQueue.add(notification);
+		NotificationPanelOverlay.setShouldUpdateBoxes(true);
+
+		if (config.timeUnit() == TimeUnit.SECONDS)
+		{
+			java.util.Timer timer = new java.util.Timer();
+			TimerTask task = new TimerTask()
+			{
+				public void run()
+				{
+					notification.incrementElapsed();
+					notification.updateTimeString();
+
+					final int duration = notification.format.getDuration();
+					if (duration != 0 && notification.getElapsed() >= duration)
+					{
+						NotificationPanelOverlay.notificationQueue.poll();
+						timer.cancel();
+					}
+				}
+			};
+			notification.setTimer(timer);
+			timer.schedule(task, 1000L, 1000L);
+		}
+	}
+
+	private void formatAllNotifications()
+	{
+		for (Notification notification : NotificationPanelOverlay.notificationQueue)
+		{
+			PartialFormat options = formatter.getOptions(notification.getMessage());
+			notification.format = Format.getDefault(config).withOptions(options);
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (!event.getGroup().equals("notificationpanel"))
+		{
+			return;
+		}
+
+		removeOldNotifications();
+
+		switch (event.getKey())
+		{
+			case "showTime":
+				for (Notification notification : NotificationPanelOverlay.notificationQueue)
+				{
+					notification.format.setShowTime(new ShowTimeOption(config.showTime()));
+				}
+				break;
+			case "timeUnit":
+				NotificationPanelOverlay.notificationQueue.clear();
+				break;
+			case "expireTime":
+				NotificationPanelOverlay.notificationQueue.forEach(notification -> notification.format.setDuration(new DurationOption(config.expireTime())));
+				break;
+		}
+		updateFormatterAfterConfigChange();
+		formatAllNotifications();
+		NotificationPanelOverlay.shouldUpdateBoxes = true;
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		if (config.timeUnit() != TimeUnit.TICKS)
+		{
+			return;
+		}
+
+		ConcurrentLinkedQueue<Notification> queue = NotificationPanelOverlay.notificationQueue;
+		queue.forEach(notification -> {
+			notification.incrementElapsed();
+			notification.updateTimeString();
+			final int duration = notification.format.getDuration();
+			if (duration != 0 && notification.getElapsed() >= duration)
+			{
+				// prevent concurrent access errors by polling instead of removing a specific
+				// notification
+				queue.poll();
+			}
+		});
+	}
+
+	void removeOldNotifications()
+	{
+		NotificationPanelOverlay.notificationQueue.removeIf(Notification::isNotificationExpired);
+	}
+
+
+	@Provides
+	NotificationPanelConfig getConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(NotificationPanelConfig.class);
+	}
+
+}
+
+package com.notificationpanel;
+
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.Point;
+import java.awt.Rectangle;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import javax.inject.Inject;
+import lombok.Getter;
+import lombok.Setter;
+import static net.runelite.api.MenuAction.RUNELITE_OVERLAY;
+import net.runelite.client.ui.overlay.OverlayMenuEntry;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.components.ComponentOrientation;
+
+public class NotificationPanelOverlay extends OverlayPanel
+{
+	static final String CLEAR_ALL = "Clear";
+	static final int GAP = 6;
+	static final Color TRANSPARENT = new Color(0, 0, 0, 0);
+	static final private Dimension DEFAULT_SIZE = new Dimension(250, 60);
+	@Getter
+	@Setter
+	static ConcurrentLinkedQueue<Notification> notificationQueue =
+		new ConcurrentLinkedQueue<>();
+	@Setter
+	static boolean shouldUpdateBoxes;
+	static private Dimension preferredSize = DEFAULT_SIZE;
+	final private NotificationPanelConfig config;
+
+	@Inject
+	private NotificationPanelOverlay(NotificationPanelConfig config)
+	{
+		this.config = config;
+
+		setResizable(true);
+		setPosition(OverlayPosition.TOP_LEFT);
+		setPriority(OverlayPriority.LOW);
+		setClearChildren(false);
+
+		panelComponent.setWrap(false);
+		panelComponent.setBorder(new Rectangle(0, 0, 0, 0));
+		panelComponent.setOrientation(ComponentOrientation.VERTICAL);
+		panelComponent.setGap(new Point(0, GAP));
+		panelComponent.setBackgroundColor(TRANSPARENT);
+
+		getMenuEntries().add(new OverlayMenuEntry(RUNELITE_OVERLAY, CLEAR_ALL,
+			"Notification " + "panel"));
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (notificationQueue.isEmpty())
+		{
+			return null;
+		}
+
+		graphics.setFont(config.fontType().getFont());
+
+		final Dimension newPreferredSize = getPreferredSize();
+
+		if (newPreferredSize == null)
+		{
+			preferredSize = DEFAULT_SIZE;
+			setPreferredSize(preferredSize);
+			shouldUpdateBoxes = true;
+		}
+		// if we just compare the Dimension objects, they will always be different
+		// so just look at the widths. we can't manually control the height anyway, so ignore it.
+		else if (newPreferredSize.width != preferredSize.width)
+		{
+			preferredSize = newPreferredSize;
+			shouldUpdateBoxes = true;
+		}
+
+		// only rebuild the panel when necessary
+		if (shouldUpdateBoxes)
+		{
+			while (notificationQueue.size() > config.numToShow())
+			{
+				notificationQueue.poll();
+			}
+
+			notificationQueue.forEach(s -> s.makeBox(graphics, preferredSize));
+
+			panelComponent.getChildren().clear();
+			notificationQueue.forEach(s -> panelComponent.getChildren().add(s.getBox()));
+			updatePanelSize();
+
+			shouldUpdateBoxes = false;
+		}
+
+		return super.render(graphics);
+	}
+
+	void updatePanelSize()
+	{
+		int width = 2;
+		int minWidth = 500;
+		int height = 0;
+
+		for (Notification notification : notificationQueue)
+		{
+			width = Math.max(width, notification.getWidth());
+			minWidth = Math.min(minWidth, notification.getMaxWordWidth());
+			height = Math.max(height, notification.getHeight());
+		}
+
+		setPreferredSize(new Dimension(width, height));
+		setMinimumSize(minWidth);
+	}
+
+}
+
+package com.notificationpanel;
+
+import com.notificationpanel.Formatting.Format;
+import com.notificationpanel.Formatting.FormatOptions.DurationOption;
+import java.awt.Dimension;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.NoSuchElementException;
+import java.util.Timer;
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+public class Notification
+{
+	@Getter
+	private final String message;
+	private final String[] words;
+	@Getter
+	private final Instant time = Instant.now();
+	@Getter
+	private final PanelComponent box = new PanelComponent();
+	public Format format;
+	@Getter
+	private int elapsed = 0;
+	@Getter
+	private int width = 0;
+	@Getter
+	private int height = 0;
+	private int numLines = 0;
+	@Getter
+	private int maxWordWidth;
+	@Getter
+	@Setter
+	private Timer timer;
+
+	Notification(final String message, Format format, NotificationPanelConfig config)
+	{
+		this.message = message;
+		this.format = format;
+		// snapshot the time unit in case it changes
+		DurationOption.setTimeUnit(config.timeUnit());
+
+		box.setWrap(false);
+
+		final String[] splitMessage = splitMessage(message);
+		words = ellipsize(splitMessage);
+	}
+
+	/**
+	 * Fancy (TeX-like) word wrapping for minimal raggedness, based on
+	 * <a href="https://geeksforgeeks.org/word-wrap-problem-space-optimized-solution/">...</a>
+	 */
+	private static ArrayList<String> wrapString(String[] str, int[] arr, int k, int spaceWidth)
+	{
+		int i, j;
+		int n = str.length;
+		int currlen;
+		int cost;
+		int[] dp = new int[n];
+		int[] ans = new int[n];
+
+		dp[n - 1] = 0;
+		ans[n - 1] = n - 1;
+		for (i = n - 2;
+			 i >= 0;
+			 i--)
+		{
+			currlen = -1;
+			dp[i] = Integer.MAX_VALUE;
+			for (j = i;
+				 j < n;
+				 j++)
+			{
+				currlen += (arr[j] + spaceWidth);
+				if (currlen > k)
+				{
+					break;
+				}
+				if (j == n - 1)
+				{
+					cost = 0;
+				}
+				else
+				{
+					cost = (k - currlen) * (k - currlen) + dp[j + 1];
+				}
+				if (cost < dp[i])
+				{
+					dp[i] = cost;
+					ans[i] = j;
+				}
+			}
+		}
+
+		ArrayList<String> out = new ArrayList<>();
+		i = 0;
+
+		while (i < n)
+		{
+			StringBuilder sb = new StringBuilder();
+			for (j = i; j <= ans[i]; j++)
+			{
+				final String word = str[j];
+				sb.append(word);
+			}
+			out.add(sb.toString().trim());
+			i = ans[i] + 1;
+		}
+
+		return out;
+	}
+
+	/**
+	 * Split on spaces and slashes (to break up screenshot notifications)
+	 *
+	 * @param message, e.g. "hello world/there"
+	 * @return an array of words, ["hello", " ", "world", "/", "there"]
+	 */
+	private String[] splitMessage(String message)
+	{
+		return message.split("(?<=[ \\\\/])|(?=[ \\\\/])+", -1);
+
+	}
+
+	void makeBox(Graphics2D graphics, Dimension preferredSize)
+	{
+		if (!format.getIsVisible())
+		{
+			return;
+		}
+
+		box.getChildren().clear();
+		box.setBorder(new Rectangle(0, 0, 0, 0));
+		box.setBackgroundColor(format.getColorWithOpacity());
+
+		FontMetrics metrics = graphics.getFontMetrics();
+		final int[] wordWidths = Arrays
+			.stream(words)
+			.map(metrics::stringWidth)
+			.mapToInt(i -> i)
+			.toArray();
+		final int spaceWidth = metrics.charWidth(' ');
+
+		// compute width
+		maxWordWidth = maxOrZero(wordWidths);
+		width = Math.max(this.maxWordWidth + 4, preferredSize.width);
+
+		final ArrayList<String> wrappedLines = wrapString(words, wordWidths, width, spaceWidth);
+		numLines = wrappedLines.size();
+
+		//compute height, including age string + 1/2 line of vertical padding on top and bottom
+		final int lineHeight = metrics.getHeight();
+		height = (lineHeight * (numLines + (format.isShowTime() ? 1 : 0) + 1));
+
+		// Add ~1 total line of vertical padding to the notification box
+		final Rectangle border = new Rectangle(0, lineHeight / 2 - 1, 0, lineHeight / 2);
+		box.setBorder(border);
+
+		// we take advantage of the built-in centering and lack of
+		// wrapping of TitleComponent as opposed to LineComponent
+		for (String s : wrappedLines)
+		{
+			box.getChildren().add(TitleComponent.builder().text(s).build());
+		}
+
+		updateTimeString();
+	}
+
+	void updateTimeString()
+	{
+		removeTimeStringIfExists();
+		if (format.isShowTime())
+		{
+			addTimeString();
+		}
+	}
+
+	private void removeTimeStringIfExists()
+	{
+		final int timeStringIndex = this.numLines;
+		if (this.box.getChildren().size() > timeStringIndex)
+		{
+			this.box.getChildren().remove(timeStringIndex);
+		}
+	}
+
+	private void addTimeString()
+	{
+		final String timeString = getTimeString();
+		final TitleComponent timeStringComponent = TitleComponent.builder().text(timeString).build();
+		this.box.getChildren().add(timeStringComponent);
+	}
+
+	private int maxOrZero(int[] arr)
+	{
+		try
+		{
+			return Arrays.stream(arr).max().getAsInt();
+		}
+		catch (NoSuchElementException ex)
+		{
+			return 0;
+		}
+	}
+
+	private String[] ellipsize(String[] arr)
+	{
+		for (int i = 0; i < arr.length; i++)
+		{
+			if (arr[i].length() > 32)
+			{
+				arr[i] = arr[i].substring(0, 29) + "...";
+			}
+		}
+		return arr;
+	}
+
+	private String getTimeString()
+	{
+		int timeLeft = Math.abs(format.getDuration() - this.elapsed);
+		switch (DurationOption.getTimeUnit())
+		{
+			case TICKS:
+				return String.valueOf(Math.abs(timeLeft));
+			case SECONDS:
+				int minutes = ((timeLeft) % 3600) / 60;
+				int secs = (timeLeft) % 60;
+
+				StringBuilder sb = new StringBuilder();
+
+				if (minutes > 0)
+				{
+					sb.append(minutes).append("m");
+				}
+
+				if (minutes == 0 || secs > 0)
+				{
+					sb.append(secs).append("s");
+				}
+
+				if (format.getDuration() == 0)
+				{
+					sb.append(" ago");
+				}
+				return sb.toString();
+		}
+		return "";
+	}
+
+	public boolean isNotificationExpired()
+	{
+		final int duration = format.getDuration();
+		return duration != 0 && getElapsed() >= duration;
+	}
+
+	void incrementElapsed()
+	{
+		this.elapsed++;
+	}
+}
+
+package com.notificationpanel.Formatting;
+
+import java.util.List;
+import java.util.Optional;
+
+public abstract class FormatOption
+{
+	public String optionName;
+
+	public static Optional<? extends FormatOption> tryParseAsAny(String value, List<FormatOption> options)
+	{
+		for (FormatOption option : options)
+		{
+			Optional<? extends FormatOption> parsed = option.tryParseWord(value);
+			if (parsed.isPresent())
+			{
+				return parsed;
+			}
+		}
+		return Optional.empty();
+	}
+
+	public abstract Optional<? extends FormatOption> parseValue(String value) throws Exception;
+
+	public Optional<FormatOption> tryParseWord(String word)
+	{
+		final String[] split = word.split("=", 2);
+		final String key = split[0];
+
+		FormatOption option = null;
+
+		if (split.length == 1)
+		{
+			option = tryParseValue(key).orElse(null);
+		}
+		else if (key.equalsIgnoreCase(optionName))
+		{
+			final String value = split[1];
+			option = tryParseValue(value).orElse(null);
+		}
+
+		return Optional.ofNullable(option);
+	}
+
+
+	public Optional<? extends FormatOption> tryParseValue(String value)
+	{
+		try
+		{
+			return parseValue(value);
+		}
+		catch (Exception e)
+		{
+			return Optional.empty();
+		}
+	}
+
+
+}
+
+package com.notificationpanel.Formatting;
+
+import static com.notificationpanel.Formatting.FormatOption.tryParseAsAny;
+import com.notificationpanel.Formatting.FormatOptions.ColorOption;
+import com.notificationpanel.Formatting.FormatOptions.DurationOption;
+import com.notificationpanel.Formatting.FormatOptions.OpacityOption;
+import com.notificationpanel.Formatting.FormatOptions.ShowTimeOption;
+import com.notificationpanel.Formatting.FormatOptions.VisibilityOption;
+import com.notificationpanel.NotificationPanelConfig;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+
+
+public class PartialFormat
+{
+	private static final String REGEX_COMMA_OR_SPACES = "(,|\\s+)";
+
+	private final static List<FormatOption> possibleOptions = new ArrayList<>();
+
+	static
+	{
+		possibleOptions.add(new ColorOption());
+		possibleOptions.add(new OpacityOption());
+		possibleOptions.add(new VisibilityOption());
+		possibleOptions.add(new ShowTimeOption());
+		possibleOptions.add(new DurationOption());
+	}
+
+	public final List<FormatOption> options = new ArrayList<>();
+
+	public PartialFormat(List<FormatOption> options)
+	{
+		for (FormatOption option : options)
+		{
+			mergeOption(option);
+		}
+	}
+
+	public static PartialFormat parseLine(String line)
+	{
+		final List<FormatOption> options = new ArrayList<>();
+		final String[] words = line.split(REGEX_COMMA_OR_SPACES);
+		for (String word : words)
+		{
+			tryParseAsAny(word, possibleOptions).ifPresent(options::add);
+		}
+		return new PartialFormat(options);
+	}
+
+	/**
+	 * Combines the options in first and second, giving priority to the options in first.
+	 */
+	public static PartialFormat merge(PartialFormat first, PartialFormat second)
+	{
+		final PartialFormat merged = new PartialFormat(first.options);
+		for (FormatOption option : second.options)
+		{
+			merged.mergeOption(option);
+		}
+		return merged;
+	}
+
+	public static PartialFormat getDefaults(NotificationPanelConfig config)
+	{
+		final List<FormatOption> options = new ArrayList<>();
+		options.add(new ColorOption(config.bgColor()));
+		options.add(new OpacityOption(config.opacity()));
+		options.add(VisibilityOption.FromBoolean(config.visibility()));
+		options.add(new ShowTimeOption(config.showTime()));
+		options.add(new DurationOption(config.expireTime()));
+		return new PartialFormat(options);
+	}
+
+	private void mergeOption(FormatOption option)
+	{
+		if (!hasOptionOfSameTypeAs(option))
+		{
+			options.add(option);
+		}
+	}
+
+	private boolean hasOptionOfSameTypeAs(FormatOption option)
+	{
+		return options
+			.stream()
+			.anyMatch(o -> o.getClass().equals(option.getClass()));
+	}
+
+	public <T extends FormatOption> Optional<T> getOptionOfType(Class<T> type)
+	{
+		try
+		{
+			return options
+				.stream()
+				.filter(o -> o.getClass().equals(type))
+				.map(o -> (T) o)
+				.findFirst();
+		}
+		catch (ClassCastException e)
+		{
+			throw new RuntimeException("Tried to get option of type " + type.getSimpleName() + " but it was not of that type.", e);
+		}
+	}
+}
+
+package com.notificationpanel.Formatting;
+
+import com.notificationpanel.Formatting.FormatOptions.ColorOption;
+import com.notificationpanel.Formatting.FormatOptions.DurationOption;
+import com.notificationpanel.Formatting.FormatOptions.OpacityOption;
+import com.notificationpanel.Formatting.FormatOptions.ShowTimeOption;
+import com.notificationpanel.Formatting.FormatOptions.VisibilityOption;
+import com.notificationpanel.NotificationPanelConfig;
+import java.awt.Color;
+import lombok.Getter;
+
+public class Format
+{
+	@Getter
+	private Integer opacity;
+	@Getter
+	private Color color;
+	@Getter
+	private Boolean isVisible;
+	@Getter
+	private int duration;
+	@Getter
+	private boolean showTime;
+
+	public static Format getDefault(NotificationPanelConfig config)
+	{
+		return new Format().withOptions(PartialFormat.getDefaults(config));
+	}
+
+	public Format withOptions(PartialFormat options)
+	{
+
+		options.getOptionOfType(ColorOption.class).ifPresent(this::setColor);
+		options.getOptionOfType(OpacityOption.class).ifPresent(this::setOpacity);
+		options.getOptionOfType(VisibilityOption.class).ifPresent(this::setIsVisible);
+		options.getOptionOfType(DurationOption.class).ifPresent(this::setDuration);
+		options.getOptionOfType(ShowTimeOption.class).ifPresent(this::setShowTime);
+		return this;
+	}
+
+	private void setColor(ColorOption option)
+	{
+		this.color = option.getColor();
+	}
+
+	private void setIsVisible(VisibilityOption option)
+	{
+		this.isVisible = option.isVisible();
+	}
+
+	private void setOpacity(OpacityOption option)
+	{
+		this.opacity = option.getOpacity();
+	}
+
+	public void setDuration(DurationOption option)
+	{
+		this.duration = option.getDuration();
+	}
+
+	public void setShowTime(ShowTimeOption option)
+	{
+		this.showTime = option.isShowTime();
+	}
+
+
+	public Color getColorWithOpacity()
+	{
+		return new Color(color.getRed(), color.getGreen(), color.getBlue(), opacity);
+	}
+}
+
+package com.notificationpanel.Formatting.FormatOptions;
+
+import com.notificationpanel.Formatting.FormatOption;
+import java.text.ParseException;
+import java.util.Optional;
+import lombok.Getter;
+
+public class VisibilityOption extends FormatOption
+{
+	public static VisibilityOption Hidden = new VisibilityOption(false);
+	public static VisibilityOption Visible = new VisibilityOption(true);
+	@Getter
+	private boolean isVisible;
+
+	public VisibilityOption()
+	{
+		optionName = "visibility";
+	}
+
+
+	private VisibilityOption(boolean visible)
+	{
+		this.isVisible = visible;
+	}
+
+	public static VisibilityOption FromBoolean(boolean visible)
+	{
+		return visible ? Visible : Hidden;
+	}
+
+	public Optional<VisibilityOption> parseValue(String value) throws ParseException
+	{
+		switch (value.trim().toLowerCase())
+		{
+			case "hide":
+				return Optional.of(Hidden);
+			case "show":
+				return Optional.of(Visible);
+			default:
+				throw new ParseException("Invalid visibility value: " + value, 0);
+		}
+	}
+
+}
+
+package com.notificationpanel.Formatting.FormatOptions;
+
+import com.notificationpanel.Formatting.FormatOption;
+import com.notificationpanel.NotificationPanelConfig;
+import java.util.Optional;
+import lombok.Getter;
+import lombok.Setter;
+
+public class DurationOption extends FormatOption
+{
+	@Getter
+	@Setter
+	private static NotificationPanelConfig.TimeUnit timeUnit = NotificationPanelConfig.TimeUnit.SECONDS;
+	@Getter
+	private int duration;
+
+	public DurationOption()
+	{
+		optionName = "duration";
+	}
+
+	public DurationOption(int duration)
+	{
+		this.duration = duration;
+	}
+
+	public Optional<DurationOption> parseValue(String value)
+	{
+		int newDuration = Integer.parseInt(value);
+		DurationOption option = new DurationOption(newDuration);
+		return Optional.of(option);
+	}
+}
+
+
+package com.notificationpanel.Formatting.FormatOptions;
+
+import com.notificationpanel.Formatting.FormatOption;
+import java.util.Optional;
+import lombok.Getter;
+
+public class ShowTimeOption extends FormatOption
+{
+	@Getter
+	private boolean showTime;
+
+	public ShowTimeOption()
+	{
+		optionName = "showTime";
+	}
+
+	public ShowTimeOption(boolean showTime)
+	{
+		this.showTime = showTime;
+	}
+
+	public Optional<ShowTimeOption> parseValue(String value)
+	{
+		boolean showTime = Boolean.parseBoolean(value);
+		ShowTimeOption option = new ShowTimeOption(showTime);
+		return Optional.of(option);
+	}
+}
+
+package com.notificationpanel.Formatting.FormatOptions;
+
+import com.notificationpanel.Formatting.FormatOption;
+import java.awt.Color;
+import java.util.Optional;
+import lombok.Getter;
+
+public class ColorOption extends FormatOption
+{
+	@Getter
+	private Color color;
+
+	public ColorOption()
+	{
+		optionName = "color";
+	}
+
+	public ColorOption(Color color)
+	{
+		this.color = color;
+	}
+
+
+	public Optional<ColorOption> parseValue(String value) throws NumberFormatException
+	{
+		Color color = Color.decode(value);
+		ColorOption option = new ColorOption(color);
+		return Optional.of(option);
+	}
+
+}
+
+package com.notificationpanel.Formatting.FormatOptions;
+
+import com.notificationpanel.Formatting.FormatOption;
+import java.util.Optional;
+import lombok.Getter;
+
+public class OpacityOption extends FormatOption
+{
+	@Getter
+	private int opacity;
+
+	public OpacityOption()
+	{
+		optionName = "opacity";
+	}
+
+	public OpacityOption(int opacity)
+	{
+		this.opacity = opacity;
+	}
+
+	private static int rescaleAndClamp(int value)
+	{
+		if (value < 0)
+		{
+			return 0;
+		}
+
+		if (value > 100)
+		{
+			return 255;
+		}
+
+		return value * 255 / 100;
+	}
+
+	public Optional<OpacityOption> parseValue(String value)
+	{
+		try
+		{
+			int opacity = rescaleAndClamp(Integer.parseInt(value));
+			OpacityOption option = new OpacityOption(opacity);
+			return Optional.of(option);
+		}
+		catch (NumberFormatException e)
+		{
+			return Optional.empty();
+		}
+	}
+
+}
+
+package com.notificationpanel.ConditionalFormatting;
+
+import com.notificationpanel.Formatting.PartialFormat;
+import com.notificationpanel.NotificationPanelConfig;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
+import java.util.regex.Pattern;
+import static java.util.stream.Collectors.toList;
+import java.util.stream.Stream;
+
+public class ConditionalFormatParser
+{
+	private final List<ConditionalFormat> conditionalFormats;
+
+	private final NotificationPanelConfig config;
+
+	public ConditionalFormatParser(NotificationPanelConfig config)
+	{
+		this.config = config;
+
+		List<Pattern> patterns = parsePatterns(config.regexList());
+		List<PartialFormat> formats = parseFormats(config.colorList());
+		conditionalFormats = parseConditionalFormats(patterns, formats);
+	}
+
+	public static List<ConditionalFormat> parseConditionalFormats(List<Pattern> patterns, List<PartialFormat> optionsList)
+	{
+		List<ConditionalFormat> formats = new ArrayList<>();
+		final int numPairs = Math.min(patterns.size(), optionsList.size());
+		for (int i = 0; i < numPairs; i++)
+		{
+			final Pattern pattern = patterns.get(i);
+			final PartialFormat options = optionsList.get(i);
+			final ConditionalFormat format = new ConditionalFormat(pattern, options);
+			formats.add(format);
+		}
+
+		return formats;
+	}
+
+	private static List<Pattern> parsePatterns(String patternsConfig)
+	{
+		String[] lines = patternsConfig.split("\\n+");
+		List<Pattern> patterns = new ArrayList<>();
+		for (String line : lines)
+		{
+			Pattern pattern = Pattern.compile(line);
+			patterns.add(pattern);
+		}
+		return patterns;
+	}
+
+	private static List<PartialFormat> parseFormats(String formatsConfig)
+	{
+		String[] formatStrings = formatsConfig.split("\\n");
+
+		return Stream
+			.of(formatStrings)
+			.map(PartialFormat::parseLine)
+			.collect(toList());
+	}
+
+	public PartialFormat getOptions(String input)
+	{
+		PartialFormat defaults = PartialFormat.getDefaults(config);
+
+		return conditionalFormats
+			.stream()
+			.map(pf -> pf.getFormatIfMatches(input))
+			.filter(Optional::isPresent)
+			.map(Optional::get)
+			.reduce(PartialFormat::merge)
+			.orElse(defaults);
+	}
+}
+
+package com.notificationpanel.ConditionalFormatting;
+
+import com.notificationpanel.Formatting.PartialFormat;
+import java.util.Optional;
+import java.util.regex.Pattern;
+
+public class ConditionalFormat
+{
+
+	private final Pattern pattern;
+	private final PartialFormat options;
+
+	public ConditionalFormat(Pattern pattern, PartialFormat options)
+	{
+		this.pattern = pattern;
+		this.options = options;
+	}
+
+	private boolean isMatch(String input)
+	{
+		return pattern.matcher(input).matches();
+	}
+
+	public Optional<PartialFormat> getFormatIfMatches(String input)
+	{
+		if (isMatch(input))
+		{
+			return Optional.of(options);
+		}
+		return Optional.empty();
+	}
+}
+
+package com.notificationpanel;
+
+import java.awt.Color;
+import lombok.AllArgsConstructor;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.FontType;
+import net.runelite.client.config.Range;
+import net.runelite.client.config.Units;
+import static net.runelite.client.config.Units.PERCENT;
+
+@ConfigGroup("notificationpanel")
+public interface NotificationPanelConfig extends Config
+{
+
+	@ConfigItem(position = 1,
+		keyName = "expireTime",
+		name = "Duration",
+		description =
+			"The number of units to show each notification. Set to 0" +
+				" to never expire.")
+	@Range(min = 0)
+	default int expireTime()
+	{
+		return 3;
+	}
+
+	@ConfigItem(position = 2,
+		keyName = "timeUnit",
+		name = "Time Unit",
+		description = "The unit in which to measure the notification duration.")
+	default TimeUnit timeUnit()
+	{
+		return TimeUnit.SECONDS;
+	}
+
+	@ConfigItem(position = 3,
+		keyName = "numToShow",
+		name = "Number shown",
+		description = "The maximum number of notifications which should be displayed at " +
+			"once.")
+
+	@Range(min = 1, max = 5)
+	default int numToShow()
+	{
+		return 1;
+	}
+
+	@ConfigItem(position = 4,
+		keyName = "showTime",
+		name = "Show time",
+		description =
+			"Show the time remaining on the notification, or the age if it won't" +
+				" expire")
+	default boolean showTime()
+	{
+		return true;
+	}
+
+	@ConfigItem(position = 5,
+		keyName = "fontType",
+		name = "Font Style",
+		description = "The font style of the notification text.")
+	default FontType fontType()
+	{
+		return FontType.BOLD;
+	}
+
+	@ConfigItem(position = 6,
+		keyName = "bgColor",
+		name = "Default Color",
+		description = "The default background color of the notification window.")
+	default Color bgColor()
+	{
+		return new Color(0x181818);
+	}
+
+	@ConfigItem(position = 7,
+		keyName = "opacity",
+		name = "Opacity",
+		description = "The level of opacity/transparency of the notification background.")
+	@Units(PERCENT)
+	@Range(min = 0, max = 100)
+	default int opacity()
+	{
+		return 75;
+	}
+
+	@ConfigItem(position = 8,
+		keyName = "visibility",
+		name = "Visibility",
+		description = "Whether or not notifications are visible by default.")
+	default boolean visibility()
+	{
+		return true;
+	}
+
+	@ConfigItem(position = 9,
+		keyName = "regexList",
+		name = "Regex",
+		description =
+			"List of regular expressions, one per line."
+				+ " Matching notifications are formatted with the options in"
+				+ " the corresponding line below.")
+	default String regexList()
+	{
+		return "";
+	}
+
+	// keyName should be changed to "formatList," but this would break existing configs
+	@ConfigItem(position = 10,
+		keyName = "colorList",
+		name = "Options",
+		description = "List of format strings to apply to matching"
+			+ " notifications, one comma-separated list of options per line."
+			+ " Options can be a color (e.g. \"#bf616a\"), opacity"
+			+ "(\"opacity=n\" where n is an integer in [0, 100]), 'hide' or 'show'.")
+	default String colorList()
+	{
+		return "";
+	}
+
+	@AllArgsConstructor
+	enum TimeUnit
+	{
+		SECONDS("Seconds"), TICKS("Ticks");
+		private final String value;
+
+		@Override
+		public String toString()
+		{
+			return value;
+		}
+	}
+
+}
+

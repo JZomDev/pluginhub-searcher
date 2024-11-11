@@ -1,0 +1,1366 @@
+package com.github.elrol.run4lessplugin;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class Run4LessTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(Run4LessPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.github.elrol.run4lessplugin;
+
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import java.util.Timer;
+import java.util.TimerTask;
+
+public class TimedNotifier {
+    private static OverlayManager manager;
+    public static Timer timer;
+    public static int time;
+    public static String text;
+
+    public static void init(String txt, int seconds, OverlayManager m, RunnerNotificationOverlay overlay){
+        manager = m;
+        text = txt;
+        time = seconds;
+
+        if(overlay.isNew()) {
+            overlay.init(text, (time & 1) == 0);
+            manager.add(overlay);
+        } else {
+            overlay.flash((time & 1) == 0);
+        }
+
+        timer = new Timer();
+        timer.schedule(new NotifierTask(overlay), 1000);
+    }
+
+    private static class NotifierTask extends TimerTask {
+        RunnerNotificationOverlay overlay;
+        public NotifierTask(RunnerNotificationOverlay overlay){
+            this.overlay = overlay;
+        }
+
+        @Override
+        public void run() {
+            if(time > 0) {
+                time--;
+                init(text, time, manager, overlay);
+            } else {
+                manager.remove(overlay);
+                overlay.clearText();
+            }
+        }
+    }
+
+
+
+}
+
+package com.github.elrol.run4lessplugin;
+
+import com.google.common.collect.ArrayListMultimap;
+import com.google.gson.Gson;
+import com.google.inject.Inject;
+import com.google.inject.Provider;
+import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.menus.MenuManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.Text;
+import okhttp3.*;
+import okhttp3.internal.annotations.EverythingIsNonNull;
+
+import javax.imageio.ImageIO;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.List;
+
+@Slf4j
+@PluginDescriptor(
+        name = "Bone Running Plugin",
+        description = "A plugin made for Bone Running, commissioned by the Run4Less group and updated for Bone Dash",
+        tags = {"bone dash", "menu", "running", "bone"}
+)
+public class Run4LessPlugin extends Plugin {
+    protected static Run4LessPlugin INSTANCE;
+    @Inject
+    protected Gson gson;
+
+    @Inject
+    protected OkHttpClient httpClient;
+
+    @Inject
+    private Run4LessConfig config;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private Run4LessOverlay run4LessOverlay;
+
+    @Inject
+    private Run4LessCCOverlay run4LessCCOverlay;
+
+    @Inject
+    private RunnerNotificationOverlay notificationOverlay;
+
+    @Inject
+    private Run4LessHostOverlay run4LessHostOverlay;
+
+    @Inject
+    private ClientToolbar clientToolbar;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private Provider<MenuManager> menuManager;
+
+    @Inject
+    private ConfigManager configManager;
+
+    public static NavigationButton panel;
+
+    private boolean isRunner = false;
+    private boolean isHost = false;
+
+    private final ArrayListMultimap<String, Integer> indexes = ArrayListMultimap.create();
+    public static RunnerStats stats = RunnerStats.load();
+    public static HostData hostData = new HostData();
+    public static final String setClient = "Set as Client";
+    boolean shouldSpam = true;
+    public ArrayList<String> hosts = new ArrayList<>();
+    public ArrayList<String> hosting = new ArrayList<>();
+    public static BufferedImage logo;
+
+    @Override
+    protected void startUp() throws Exception {
+        INSTANCE = this;
+        hostData.load(config.hostJson());
+        run4LessHostOverlay.init(hosting);
+        if(client != null) menuManager.get().addPlayerMenuItem(setClient);
+        if(config.splitCCEnabled() && config.ccLines() > 0) overlayManager.add(run4LessCCOverlay);
+        logo = ImageUtil.loadImageResource(getClass(), "/OIG.png");
+        logo = resize(logo, config.logoScale());
+        panel = NavigationButton.builder()
+                .tooltip("Bone Calculator")
+                .icon(logo)
+                .priority(10)
+                .panel(new Run4LessPanel())
+                .build();
+        clientToolbar.addNavigation(panel);
+        updateLogo(getClass(), config.logoUrl());
+        super.startUp();
+    }
+
+    @Override
+    protected void shutDown() throws Exception {
+        overlayManager.remove(run4LessOverlay);
+        overlayManager.remove(run4LessCCOverlay);
+        overlayManager.remove(notificationOverlay);
+        overlayManager.remove(run4LessHostOverlay);
+        clientToolbar.removeNavigation(panel);
+        menuManager.get().removePlayerMenuItem(setClient);
+        configManager.setConfiguration("run4less", "clientName", "");
+        stats.updateRun("");
+        super.shutDown();
+    }
+
+    private boolean isRightClan() {
+        FriendsChatManager manager = client.getFriendsChatManager();
+        if(manager == null)  return false;
+        return Text.standardize(manager.getOwner()).equalsIgnoreCase(Text.standardize(config.ccName()));
+    }
+
+    @Subscribe(priority = -2)
+    public void onChatMessage(ChatMessage message) {
+        FriendsChatManager manager = client.getFriendsChatManager();
+        boolean ccEnabled = config.splitCCEnabled();
+        int ccLines = config.ccLines();
+
+        if (isRightClan() && message.getType().equals(ChatMessageType.FRIENDSCHAT)) {
+            if (ccEnabled && ccLines > 0) {
+                final Widget chat = client.getWidget(WidgetInfo.CHATBOX_TRANSPARENT_LINES);
+                if (chat != null && !chat.isHidden()) {
+                    run4LessCCOverlay.init(chat.getWidth(), message);
+                }
+            }
+            log.debug(message.getMessage());
+            if (message.getMessage().toLowerCase().contains("!bones ")) {
+                log.debug("Ran bones command");
+                String cmd = message.getMessage().toLowerCase().split("!bones ")[1];
+                String[] temp = cmd.replace("!bones", "").split(" ");
+                int rate = 0;
+                if (temp[0].equalsIgnoreCase("afk")) rate = 25000;
+                else if (temp[0].equalsIgnoreCase("tick")) rate = 15000;
+                else client.addChatMessage(message.getType(), message.getName(), "Invalid argument [" + temp[0] + "]. Options are [tick/afk]", message.getSender());
+
+                int qty = Integer.parseInt(temp[1]);
+                if (qty <= 0) {
+                    client.addChatMessage(message.getType(), message.getName(), "Invalid argument [" + temp[1] + "]. Options must be greater then 0", message.getSender());
+                    qty = 0;
+                }
+                DecimalFormat formatter = new DecimalFormat("#,###");
+                String price = formatter.format(Math.round(((float) qty / 26F) * rate));
+                client.addChatMessage(message.getType(), message.getName(), temp[0] + "ing " + temp[1] + " bones would be " + price, message.getSender());
+                log.debug(temp[0] + "ing " + temp[1] + " bones would be " + price);
+            }
+            String sender = message.getName();
+            if (!sender.isEmpty()) {
+                FriendsChatMember p = manager.findByName(sender);
+                if (p != null) {
+                    FriendsChatRank rank = p.getRank();
+                    String msg = message.getMessage();
+                    boolean runner = msg.equalsIgnoreCase("@runner");
+                    boolean ping = config.enablePing();
+                    if (rank != FriendsChatRank.UNRANKED && runner && isRunner && ping)
+                        TimedNotifier.init("Bone Runner Requested", 30, overlayManager, notificationOverlay);
+                    if(hosts.contains(p.getName()) && message.getMessage().contains("@host")){
+                        if(hosting.contains(p.getName())){
+                            hosting.remove(p.getName());
+                        } else {
+                            hosting.add(p.getName());
+                        }
+                        run4LessHostOverlay.init(hosting);
+                    }
+                }
+            }
+        }
+        if (message.getMessage().equalsIgnoreCase("accepted trade.") && config.enableStats()) {
+            Widget tradingWith = client.getWidget(334, 30);
+            if (tradingWith != null) {
+                String rsn = tradingWith.getText().replace("Trading with:<br>", "");
+                if (rsn.equalsIgnoreCase(config.clientName())) {
+                    Widget partnerTrades = client.getWidget(334, 29);
+                    Widget offeredTrades = client.getWidget(334, 28);
+
+                    if (partnerTrades != null && offeredTrades != null) {
+                        int i = 0;
+                        int coins = 0;
+                        int notes = 0;
+                        int qty = 0;
+                        String bones = "";
+                        String noted = "";
+                        for (Widget w : partnerTrades.getChildren()) {
+                            String text = w.getText();
+                            if (text.startsWith("Coins")) {
+                                if (text.contains("(")) text = text.split("[(]")[1];
+                                else text = text.split("<col=ffffff> x <col=ffff00>")[1];
+                                text = text.replace(",", "").replace(")", "");
+                                coins += Integer.parseInt(text);
+                            } else if (text.toLowerCase().contains("bones") && text.contains("<col=ffffff> x <col=ffff00>")) {
+                                String[] temp = text.split("<col=ffffff> x <col=ffff00>");
+                                noted = temp[0];
+                                notes = Integer.parseInt(temp[1]);
+                            } else if (text.toLowerCase().contains("bones")) {
+                                qty--;
+                            }
+                        }
+                        for (Widget w : offeredTrades.getChildren()) {
+                            if (w == null) continue;
+                            log.debug("[" + i++ + "]:" + w.getText());
+                            String s = w.getText().toLowerCase();
+                            if (s.contains("bones") && !s.contains("<col=ffffff> x <col=ffff00>")) {
+                                bones = w.getText();
+                                qty++;
+                            }
+                        }
+                        log.info("Adding Run");
+                        stats.addRun(rsn, bones, qty, coins, notes, noted);
+                    }
+                }
+            }
+        }
+        if (config.filterTradeEnabled() && message.getType().equals(ChatMessageType.TRADE)) {
+            removeMessage(message);
+        }
+        if (config.spamTrade() && message.getType().equals(ChatMessageType.TRADEREQ) && shouldSpam){
+            shouldSpam = false;
+            for (int i = 0; i < 7; i++) {
+                client.addChatMessage(message.getType(), message.getName(), message.getMessage(), message.getSender());
+            }
+            shouldSpam = true;
+        }
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event){
+        if(event.getGroup().equals("bone dash")){
+            if(config.splitCCEnabled()) {
+                final Widget chat = client.getWidget(WidgetInfo.CHATBOX_TRANSPARENT_LINES);
+                if(chat != null) run4LessCCOverlay.init(chat.getWidth());
+                overlayManager.add(run4LessCCOverlay);
+            } else {
+                overlayManager.remove(run4LessCCOverlay);
+            }
+            overlayManager.remove(run4LessOverlay);
+            updateLogo(getClass(), config.logoUrl());
+            stats.updateRun(config.clientName());
+        }
+    }
+
+    @Subscribe
+    public void onFriendsChatChanged(FriendsChatChanged event){
+        clientThread.invokeLater(() -> {
+            FriendsChatManager manager = client.getFriendsChatManager();
+            Player player = client.getLocalPlayer();
+            if(player != null && isRightClan()){
+                FriendsChatRank rank = manager.findByName(player.getName()).getRank();
+                if(rank.equals(FriendsChatRank.FRIEND)){
+                    isHost = true;
+                    updateLogo(getClass(), config.logoUrl());
+                    return;
+                } else if(!rank.equals(FriendsChatRank.UNRANKED)) {
+                    isRunner = true;
+                    updateLogo(getClass(), config.logoUrl());
+                    return;
+                } else {
+                    isRunner = false;
+                    isHost = false;
+                }
+                hosts.clear();
+                for(FriendsChatMember member : manager.getMembers()){
+                    if (isPlayerHost(member))
+                        hosts.add(member.getName());
+                    else
+                        hosting.remove(member.getName());
+                }
+                run4LessHostOverlay.init(hosting);
+            }
+            overlayManager.remove(run4LessOverlay);
+        });
+    }
+
+    private boolean isPlayerHost(FriendsChatMember member){
+        return (member.getRank().equals(FriendsChatRank.FRIEND) && !hosts.contains(member.getName()))
+                || (hostData.getUsers().contains(member.getName()) && !hosts.contains(member.getName()));
+    }
+    @Subscribe
+    public void onFriendsChatMemberJoined(FriendsChatMemberJoined event){
+        FriendsChatMember member = event.getMember();
+        if (isPlayerHost(member)) {
+            hosts.add(member.getName());
+        }
+    }
+
+    @Subscribe
+    public void onFriendsChatMemberLeft(FriendsChatMemberLeft event){
+        Player player = client.getLocalPlayer();
+        if(player != null) {
+            if (event.getMember().getName().equals(player.getName())) {
+                hosts.clear();
+                hosting.clear();
+            } else {
+                hosting.remove(event.getMember().getName());
+            }
+            run4LessHostOverlay.init(hosting);
+        }
+    }
+
+    @Subscribe
+    public void onClientTick(final ClientTick clientTick) {
+        if (client.getGameState() != GameState.LOGGED_IN || client.isMenuOpen()) return;
+        if(!panel.getIcon().equals(logo)) {
+            clientToolbar.removeNavigation(panel);
+            panel = NavigationButton.builder()
+                    .tooltip("Bone Calculator")
+                    .icon(logo)
+                    .priority(10)
+                    .panel(panel.getPanel())
+                    .build();
+            if (panel == null) log.info("Navigation was null");
+            if (clientToolbar == null) log.info("ClientToolbar was null");
+            clientToolbar.addNavigation(panel);
+        }
+        if (config.offerAllEnabled()) {
+                final MenuEntry[] menuEntries = client.getMenuEntries();
+            int index = 0;
+            indexes.clear();
+            for (MenuEntry entry : menuEntries) {
+                final String option = Text.removeTags(entry.getOption()).toLowerCase();
+                indexes.put(option, index++);
+            }
+
+            index = 0;
+            for (MenuEntry menuEntry : menuEntries) {
+                index++;
+                final String option = Text.removeTags(menuEntry.getOption()).toLowerCase();
+                final String target = Text.removeTags(menuEntry.getTarget()).toLowerCase();
+
+                if (option.equals("offer")) {
+                    final int i = index(indexes, menuEntries, index, option, target);
+                    final int id = index(indexes, menuEntries, i, "offer-all", target);
+
+                    if (i >= 0 && id >= 0) {
+                        final MenuEntry entry = menuEntries[id];
+                        menuEntries[id] = menuEntries[i];
+                        menuEntries[i] = entry;
+
+                        client.setMenuEntries(menuEntries);
+
+                        indexes.clear();
+                        int idx = 0;
+                        for (MenuEntry e : menuEntries) {
+                            final String o = Text.removeTags(e.getOption()).toLowerCase();
+                            indexes.put(o, idx++);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    public static int index(final ArrayListMultimap<String, Integer> optionIndexes, final MenuEntry[] entries, final int limit, final String option, final String target) {
+        List<Integer> indexes = optionIndexes.get(option);
+        for (int i = indexes.size() - 1; i >= 0; --i) {
+            final int idx = indexes.get(i);
+            MenuEntry entry = entries[idx];
+            String entryTarget = Text.removeTags(entry.getTarget()).toLowerCase();
+            if (idx <= limit && entryTarget.equals(target))
+                return idx;
+        }
+        return -1;
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked event){
+        if (event.getMenuOption().equals(setClient)){
+            String name = event.getMenuTarget().split(" {2}\\(level-")[0];
+            configManager.setConfiguration("run4less", "clientName", Text.removeTags(name));
+        }
+    }
+
+    private void removeMessage(ChatMessage msg){
+        ChatLineBuffer ccInfoBuffer = client.getChatLineMap().get(ChatMessageType.TRADE.getType());
+        if (ccInfoBuffer != null) {
+                ccInfoBuffer.removeMessageNode(msg.getMessageNode());
+        }
+    }
+
+    @Provides
+    Run4LessConfig getConfig(ConfigManager configManager){
+        return configManager.getConfig(Run4LessConfig.class);
+    }
+
+    private static BufferedImage resize(BufferedImage img, int s){
+        float scale = (float)s / 10.0f;
+        int size = Math.round(60.0f * scale);
+        Image tmp = img.getScaledInstance(size, size, Image.SCALE_SMOOTH);
+        BufferedImage image = new BufferedImage(size, size, BufferedImage.TYPE_INT_ARGB);
+
+        Graphics2D g2d = image.createGraphics();
+        g2d.drawImage(tmp, 0, 0, null);
+        g2d.dispose();
+        return image;
+    }
+
+    private void update(BufferedImage logo){
+        Run4LessPanel.init(logo);
+        logo = resize(logo, config.logoScale());
+        run4LessOverlay.setLogo(logo);
+        if ((isRunner || isHost) && !config.logoUrl().equalsIgnoreCase("none") ) overlayManager.add(run4LessOverlay);
+    }
+
+    private void updateLogo(Class<?> c, String url){
+        logo = ImageUtil.loadImageResource(c, "/OIG.png");
+        overlayManager.remove(run4LessOverlay);
+        if(!url.equals("") && !url.equalsIgnoreCase("none")) {
+            //OkHttpClient client = new OkHttpClient();
+
+            Request req = new Request.Builder().url(url).build();
+            httpClient.newCall(req).enqueue(new Callback() {
+                @Override
+                @EverythingIsNonNull
+                public void onFailure(Call call, IOException e) {
+                    update(logo);
+                    e.printStackTrace();
+                }
+
+                @Override
+                @EverythingIsNonNull
+                public void onResponse(Call call, Response response) throws IOException {
+                    try (ResponseBody responseBody = response.body()) {
+                        synchronized (ImageIO.class) {
+                            assert responseBody != null;
+                            BufferedImage temp = ImageIO.read(responseBody.byteStream());
+                            if(temp != null)
+                                logo = resize(temp, config.logoScale());
+                            update(logo);
+                        }
+                    }
+                }
+            });
+        } else {
+            update(logo);
+        }
+    }
+}
+
+package com.github.elrol.run4lessplugin;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.ui.PluginPanel;
+
+import javax.swing.border.EmptyBorder;
+import java.awt.image.BufferedImage;
+
+@Slf4j
+public class Run4LessPanel extends PluginPanel {
+    public static BufferedImage logo;
+
+    public static void init(BufferedImage image){
+        logo = image;
+    }
+
+    public Run4LessPanel(){
+        super();
+        setBorder(new EmptyBorder(10, 10, 10, 10));
+        add(new BoneCalcPanel());
+    }
+
+
+}
+
+package com.github.elrol.run4lessplugin;
+
+import com.google.gson.Gson;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+
+import java.io.*;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+public class RunnerStats {
+
+    private static final File dataLoc = new File(RuneLite.RUNELITE_DIR, "/bonerunning_logs/");
+    Map<String, RunnerData> runHistory = new HashMap<>();
+    Map<String, Integer> bonesRan = new HashMap<>();
+    int totalMade;
+    RunData current;
+
+    public RunnerStats(){
+        totalMade = 0;
+    }
+
+    public void addRun(String client, String bones, int count, int coins, int notes, String noted){
+        RunnerData data = runHistory.getOrDefault(client, new RunnerData(client));
+        if(!bones.isEmpty() && count > 0) {
+            int qty = data.items.getOrDefault(bones, 0);
+            data.items.put(bones, qty + count);
+            qty = bonesRan.getOrDefault(client, 0);
+            bonesRan.put(client, qty + count);
+            if(current != null) current.ran(bones, count);
+        }
+        if(coins > 0){
+            totalMade += coins;
+            data.price += coins;
+        }
+        if(notes > 0 && !noted.isEmpty()){
+            int notedQty = data.notes.getOrDefault(noted, 0);
+            data.notes.put(noted, notedQty + notes);
+            if (current == null) {
+                current = new RunData(client, noted, notes);
+                updateRun(client);
+            } else {
+                if (current.client.equalsIgnoreCase(client)) {
+                    current.add(noted, notes);
+                    updateRun(client);
+                } else {
+                    updateRun(client);
+                    current = new RunData(client, noted, notes);
+                }
+            }
+        }
+        runHistory.put(client, data);
+        log.debug("Client: " + client + ", Bones: " + bones + ", Count: " + count + ", Coins: " + coins + ", Notes: " + notes + ", Noted: " + noted);
+        save();
+    }
+
+    public void updateRun(String client){
+        log.info("updating run");
+        if(current == null) return;
+        if(!current.client.equalsIgnoreCase(client) || !current.check()){
+            double now = System.currentTimeMillis();
+            log.info(String.valueOf(current.start));
+            log.info(String.valueOf(now));
+            log.info(String.valueOf(now - (double)current.start));
+            long seconds = Math.round((double)(System.currentTimeMillis() - current.start) / 60000D);
+            RunnerData data = runHistory.getOrDefault(client, new RunnerData(client));
+            data.totalTime += seconds;
+            runHistory.put(client, data);
+            //TODO Database info send
+            //Send all the data to the server here
+            log.info("time for run was: " + seconds + " seconds");
+        }
+        if(!current.check()) current = null;
+        save();
+    }
+
+    public void save() {
+        if(!dataLoc.exists()) dataLoc.mkdirs();
+        log.debug("DataLoc: " + dataLoc.getAbsoluteFile());
+        try(FileWriter writer = new FileWriter(new File(dataLoc, "rundata.json"))) {
+            if(Run4LessPlugin.INSTANCE == null) return;
+            Gson gson = Run4LessPlugin.INSTANCE.gson;
+            if(gson != null)
+                gson.toJson(this, writer);
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    public static RunnerStats load() {
+        RunnerStats stats = new RunnerStats();
+        try {
+            if(Run4LessPlugin.INSTANCE == null) return stats;
+            Gson gson = Run4LessPlugin.INSTANCE.gson;
+            if(gson != null)
+                stats = gson.fromJson(new FileReader(new File(dataLoc, "rundata.json")), RunnerStats.class);
+        } catch (FileNotFoundException ignored) {}
+        return stats;
+    }
+
+    public int totalBones(){
+        int total = 0;
+        for(int i : bonesRan.values()){
+            total += i;
+        }
+        return total;
+    }
+
+    public static class RunnerData {
+        public String client;
+        public Map<String, Integer> items = new HashMap<>();
+        public Map<String, Integer> notes = new HashMap<>();
+        public int price;
+        public long totalTime;
+
+        public RunnerData(String client){
+            this.client = client;
+            price = 0;
+            totalTime = 0L;
+        }
+    }
+
+}
+
+package com.github.elrol.run4lessplugin;
+
+import com.google.inject.Inject;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.components.ComponentOrientation;
+import net.runelite.client.ui.overlay.components.ImageComponent;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.util.ImageUtil;
+
+import javax.imageio.ImageIO;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.net.URL;
+
+public class Run4LessOverlay extends Overlay {
+
+    private final PanelComponent panelComponent = new PanelComponent();
+    public String url = "";
+
+    public Run4LessOverlay(){
+        setPriority(OverlayPriority.HIGHEST);
+        setPosition(OverlayPosition.TOP_LEFT);
+        panelComponent.setOrientation(ComponentOrientation.HORIZONTAL);
+    }
+
+    public void setLogo(BufferedImage logo){
+        panelComponent.getChildren().clear();
+        panelComponent.getChildren().add(new ImageComponent(logo));
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        return panelComponent.render(graphics);
+    }
+
+}
+
+package com.github.elrol.run4lessplugin;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+import java.awt.*;
+
+@ConfigGroup("run4less")
+public interface Run4LessConfig extends Config {
+
+    //////////////////////////
+    //-------Settings-------//
+    //////////////////////////
+    @ConfigSection(
+            name = "General Settings",
+            description = "Settings for general features",
+            position = 0
+    )
+    String settings = "settings";
+
+        @ConfigItem(
+                position = 1,
+                keyName = "autoSS",
+                name = "Auto Screenshot Trades [NYI]",
+                description = "Automatically will take screenshots of trade windows.",
+                section = settings
+        )
+        default boolean autoSSEnabled() { return false; }
+
+        @ConfigItem(
+                position = 3,
+                keyName = "filterTrade",
+                name = "Filter Trade Messages",
+                description = "Will remove all trade messages, other then trade offers.",
+                section = settings
+        )
+        default boolean filterTradeEnabled() { return true; }
+
+        @ConfigItem(
+                position = 10,
+                keyName = "spamTrade",
+                name = "Trade Spam",
+                description = "Spams incoming trade requests to you.",
+                section = settings
+        )
+        default boolean spamTrade() { return true; }
+
+    //////////////////////////
+    //---------Clan---------//
+    //////////////////////////
+    @ConfigSection(
+            name = "Chat Settings",
+            description = "Settings for the clan chat",
+            position = 100
+    )
+    String clanchat = "clanchat";
+
+        @ConfigItem(
+                position = 101,
+                keyName = "ccName",
+                name = "ClanChat Owner",
+                description = "The owner of the group you are in.",
+                section = clanchat
+        )
+        default String ccName() { return "RunBones"; }
+
+        @ConfigItem(
+                position = 102,
+                keyName = "splitCC",
+                name = "Split Clan Messages",
+                description = "Will display clan chat messages above the chat window.",
+                section = clanchat
+        )
+        default boolean splitCCEnabled() { return true; }
+
+        @ConfigItem(
+                position = 103,
+                keyName = "ccLines",
+                name = "Lines of Clan Chat",
+                description = "How many line of clan chat should be displayed.",
+                section = clanchat
+        )
+        default int ccLines() { return 5; }
+
+        @ConfigItem(
+                position = 104,
+                keyName = "ccColor",
+                name = "Clan Chat Color",
+                description = "Default color for clan chat",
+                section = clanchat
+        )
+        default Color ccColor() { return Color.WHITE; }
+
+        @ConfigItem(
+                position = 105,
+                keyName = "ccRColor",
+                name = "Ranked Clan Chat Color",
+                description = "Color for ranked members in clan chat.",
+                section = clanchat
+        )
+        default Color ccRColor() { return Color.GREEN; }
+
+        @ConfigItem(
+                position = 106,
+                keyName = "ccSColor",
+                name = "Your Clan Chat Color",
+                description = "Color for your own messages in clan chat.",
+                section = clanchat
+        )
+        default Color ccSColor() { return Color.BLUE; }
+
+        @ConfigItem(
+                position = 107,
+                keyName = "ccClientColor",
+                name = "Clan Chat Client Color",
+                description = "Color for your clients messages in clan chat.",
+                section = clanchat
+        )
+        default Color ccClientColor() { return Color.YELLOW; }
+
+
+        @ConfigItem(
+                position = 108,
+                keyName = "ccHostColor",
+                name = "Clan Chat Host Color",
+                description = "Color for Hosts in clan chat.",
+                section = clanchat
+        )
+        default Color ccHostColor() { return Color.RED; }
+
+    //////////////////////////
+    //--------Runner--------//
+    //////////////////////////
+    @ConfigSection(
+            name = "Runner Settings",
+            description = "Settings related to Bone Runners",
+            position = 300
+    )
+    String runnerSettings = "runnerSettings";
+
+        @ConfigItem(
+                position = 301,
+                keyName = "offerAll",
+                name = "Offer All Items",
+                description = "Will offer all of the item clicked when trading.",
+                section = runnerSettings
+        )
+        default boolean offerAllEnabled() { return true; }
+
+        @ConfigItem(
+                position = 302,
+                keyName = "clientFilter",
+                name = "Client Filter",
+                description = "Filters different things using the Client Name.",
+                section = runnerSettings
+        )
+        default boolean clientFilterEnabled() { return false; }
+
+        @ConfigItem(
+                position = 304,
+                keyName = "clientName",
+                name = "Client's Name",
+                description = "Will filter other settings to make the client stand out.",
+                section = runnerSettings
+        )
+        default String clientName() { return ""; }
+
+        @ConfigItem(
+                position = 305,
+                keyName = "enableStats",
+                name = "Runner Stats",
+                description = "Logs the stats from trading.",
+                section = runnerSettings
+        )
+        default boolean enableStats() { return true; }
+
+        @ConfigItem(
+                position = 306,
+                keyName = "enablePing",
+                name = "Runner Ping",
+                description = "Pings you when a runner is requested.",
+                section = runnerSettings
+        )
+        default boolean enablePing() { return true; }
+
+        @ConfigItem(
+                position = 307,
+                keyName = "logoScale",
+                name = "Logo Scale",
+                description = "Will change the size of the Logo. (x/10)",
+                section = runnerSettings
+        )
+        default int logoScale() { return 10; }
+
+    /////////////////////////
+    //--------Hosts--------//
+    /////////////////////////
+    @ConfigSection(
+            name = "Host Settings",
+            description = "Settings related to hosts",
+            position = 400
+    )
+    String hostSettings = "hostSettings";
+
+        @ConfigItem(
+                position = 401,
+                keyName = "hostEnabled",
+                name = "Host Overlay [NYI]",
+                description = "Enables the host overlay.",
+                section = hostSettings
+        )
+        default boolean hostEnabled() { return false; }
+
+        @ConfigItem(
+                position = 402,
+                keyName = "hostColor",
+                name = "Host Color",
+                description = "The color of the host text.",
+                section = hostSettings
+        )
+        default Color hostColor() { return Color.CYAN; }
+
+        @ConfigItem(
+                position = 403,
+                keyName = "hostLimit",
+                name = "Host Limit",
+                description = "The number of hosts displayed.",
+                section = hostSettings
+        )
+        default int hostLimit() { return 10; }
+
+    /////////////////////////
+    //-----Connections-----//
+    /////////////////////////
+    @ConfigSection(
+            name = "Connection Settings",
+            description = "Settings related to external connections",
+            position = 500
+    )
+    String connectionSettings = "connectionSettings";
+
+        @ConfigItem(
+                position = 501,
+                keyName = "logoURL",
+                name = "Logo URL",
+                description = "The URL of the logo.",
+                section = connectionSettings
+        )
+        default String logoUrl() { return ""; }
+
+        @ConfigItem(
+                position = 502,
+                keyName = "hostJson",
+                name = "Host Json URL",
+                description = "The URL of the json file.",
+                section = connectionSettings
+        )
+        default String hostJson() { return ""; }
+}
+package com.github.elrol.run4lessplugin;
+
+import com.google.inject.Inject;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+import java.awt.*;
+
+public class RunnerNotificationOverlay extends Overlay {
+
+    @Inject
+    private Run4LessConfig config;
+
+    private final PanelComponent panelComponent = new PanelComponent();
+    private String text = "";
+
+    public void init(String text, boolean state){
+        this.text = text;
+        setPriority(OverlayPriority.HIGHEST);
+        setPosition(OverlayPosition.TOP_CENTER);
+        flash(state);
+    }
+
+    public void flash(boolean state){
+        Dimension dim = new Dimension(scale(300), scale(100));
+        panelComponent.setPreferredSize(dim);
+        panelComponent.getChildren().clear();
+        panelComponent.setWrap(false);
+        panelComponent.getChildren().add(TitleComponent.builder().text(text).color(state ? Color.white : Color.red).preferredSize(new Dimension(scale(100), scale(300))).build());
+    }
+
+    public void clearText(){ text = ""; }
+    public boolean isNew(){ return text.equals(""); }
+    public int scale(int base) {
+        float scale = 10.0f / 10.f;
+        return Math.round(scale * (float)base);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        return panelComponent.render(graphics);
+    }
+}
+
+package com.github.elrol.run4lessplugin;
+
+import com.google.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.components.*;
+
+import java.awt.*;
+import java.util.ArrayList;
+
+@Slf4j
+public class Run4LessCCOverlay extends Overlay {
+
+    @Inject
+    private Run4LessConfig config;
+
+    @Inject
+    private Client client;
+
+    private final ArrayList<ChatMessage> clanMessages = new ArrayList<>();
+    private final PanelComponent panelComponent = new PanelComponent();
+
+    public Run4LessCCOverlay(){
+        setPriority(OverlayPriority.HIGHEST);
+        setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
+    }
+
+    public void init(int width, ChatMessage message){
+        clanMessages.add(message);
+        init(width);
+    }
+
+    public void init(int width){
+        Player s = client.getLocalPlayer();
+        if(s == null) return;
+        panelComponent.setPreferredSize(new Dimension(width, 0));
+        panelComponent.getChildren().clear();
+        int last = clanMessages.size()-1;
+        ArrayList<ChatMessage> msgs = new ArrayList<>();
+        for(int i = last; i >= 0; i--){
+            if(msgs.size() >= config.ccLines()) break;
+            ChatMessage msg = clanMessages.get(i);
+            if(config.clientFilterEnabled()) {
+                if (!config.clientName().isEmpty() && (config.clientName().equalsIgnoreCase(msg.getName()) || msg.getName().equalsIgnoreCase(s.getName()))) {
+                    msgs.add(msg);
+                }
+            } else {
+                msgs.add(msg);
+            }
+        }
+        for(int i = msgs.size()-1; i >= 0; i--) {
+            panelComponent.getChildren().add(colorMessage(msgs.get(i), s.getName()));
+        }
+    }
+
+    private LineComponent colorMessage(ChatMessage msg, String name){
+        Color color = config.ccColor();
+        if(client.getFriendsChatManager() != null){
+            FriendsChatMember f = client.getFriendsChatManager().findByName(msg.getName());
+            if(f != null) {
+                FriendsChatRank rank = f.getRank();
+                if (rank != null) {
+                    if (rank != FriendsChatRank.UNRANKED) color = config.ccRColor();
+                    if (rank.equals(FriendsChatRank.FRIEND)) color = config.ccHostColor();
+                }
+            }
+            if(msg.getMessageNode().getName().equalsIgnoreCase(name))
+                color = config.ccSColor();
+        }
+        if(msg.getName().equalsIgnoreCase(config.clientName())) color = config.ccClientColor();
+        return LineComponent.builder()
+                .leftColor(color)
+                .left(msg.getMessageNode().getName() + ": " + msg.getMessage())
+                .build();
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        return panelComponent.render(graphics);
+    }
+}
+
+package com.github.elrol.run4lessplugin;
+
+import javax.swing.*;
+import java.awt.*;
+import java.text.DecimalFormat;
+
+public class BoneCalcPanel extends JPanel {
+
+    private final JTextField boneQty;
+    private final JTextField price;
+    private final JTextField totalCost;
+
+    public BoneCalcPanel(){
+        JButton reset;
+        JButton calc;
+
+        boneQty = new JTextField("0");
+        price = new JTextField("0");
+        totalCost = new JTextField("0");
+        totalCost.setEditable(false);
+        reset = new JButton("Reset");
+        reset.addActionListener(e -> {
+            boneQty.setText("0");
+            price.setText("0");
+            totalCost.setText("0");
+        });
+        calc = new JButton("Calculate");
+        calc.addActionListener(e -> {
+            int bones = parseString(boneQty.getText());
+            boneQty.setText("" + bones);
+            int p = parseString(price.getText());
+            price.setText("" + p);
+            double total = (Math.floor((((float)bones)) / 26.0F) * (float)p);
+            DecimalFormat formatter = new DecimalFormat("#,###");
+            totalCost.setText(formatter.format(total));
+        });
+        setLayout(new GridBagLayout());
+        GridBagConstraints c = new GridBagConstraints();
+        c.fill = GridBagConstraints.HORIZONTAL;
+        c.gridx = 0;
+        c.gridy = 0;
+        add(new JLabel("Bone Qty:"), c);
+        c.gridx++;
+        add(new JLabel("Price per Inv:"), c);
+        c.gridx = 0;
+        c.gridy++;
+        add(boneQty,c);
+        c.gridx++;
+        add(price, c);
+        c.gridx = 0;
+        c.gridy++;
+        add(reset, c);
+        c.gridx++;
+        add(calc, c);
+        c.gridwidth = 2;
+        c.gridx = 0;
+        c.gridy++;
+        add(new JLabel("Price for Run:"), c);
+        c.gridy++;
+        add(totalCost, c);
+    }
+
+    private int parseString(String s){
+        s = s.replace("b", "000000000");
+        s = s.replace("m", "000000");
+        s = s.replace("k", "000");
+        return Integer.parseInt(s);
+    }
+}
+
+package com.github.elrol.run4lessplugin;
+
+import lombok.extern.slf4j.Slf4j;
+
+import java.time.LocalDateTime;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+public class RunData {
+    String client = "";
+    transient long start;
+    Map<String, Integer> bones = new HashMap<>();
+
+    public RunData (String client, String type, int qty){
+        this.client = client;
+        start = System.currentTimeMillis();
+        log.info("Run Start: " + String.valueOf(start));
+        bones.put(type, qty);
+    }
+
+    public void ran(String type, int qty){
+        if(bones.containsKey(type)){
+            int q = bones.get(type) - qty;
+            if(q <= 0) bones.remove(type);
+            else bones.put(type, bones.get(type) - qty);
+        }
+    }
+
+    public void add(String type, int qty){
+        bones.put(type, bones.getOrDefault(type, 0) + qty);
+    }
+
+    public boolean check(){
+        return bones.isEmpty();
+    }
+}
+
+package com.github.elrol.run4lessplugin;
+
+import com.google.gson.Gson;
+import com.google.gson.annotations.SerializedName;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+import okhttp3.internal.annotations.EverythingIsNonNull;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+
+@Slf4j
+public class HostData {
+    @SerializedName(value = "OSRS Hosts")
+    public Host[] OSRS_Hosts;
+
+    public List<String> getUsers(){
+        List<String> users = new ArrayList<>();
+        if(OSRS_Hosts == null) return users;
+        for(Host host : OSRS_Hosts)
+            users.add(host.Username);
+        return users;
+    }
+
+    public void load(String hostJson){
+        if(hostJson == null || hostJson.isEmpty()) return;
+        //OkHttpClient client = new OkHttpClient();
+        Request req = new Request.Builder().url(hostJson).build();
+        if(Run4LessPlugin.INSTANCE == null) return;
+        OkHttpClient httpClient = Run4LessPlugin.INSTANCE.httpClient;
+        if(httpClient != null) {
+        httpClient.newCall(req).enqueue(new Callback() {
+                @Override
+                @EverythingIsNonNull
+                public void onFailure(Call call, IOException e) {
+                }
+
+                @Override
+                @EverythingIsNonNull
+                public void onResponse(Call call, Response response) throws IOException {
+                    assert response.body() != null;
+                    InputStreamReader reader = new InputStreamReader(response.body().byteStream(), StandardCharsets.UTF_8);
+
+                    if(Run4LessPlugin.INSTANCE == null) return;
+                    Gson gson = Run4LessPlugin.INSTANCE.gson;
+                    if(gson != null) {
+                        HostData data = gson.fromJson(reader, HostData.class);
+                        Run4LessPlugin.hostData.OSRS_Hosts = data.OSRS_Hosts;
+                    }
+                    reader.close();
+                }
+            });
+        }
+    }
+
+    @Override
+    public String toString() {
+        return "HostData{" +
+                "OSRS_Hosts=" + Arrays.toString(OSRS_Hosts) +
+                '}';
+    }
+
+    public static class Host {
+        String Username;
+        int World;
+        String loc;
+
+        public Host(String user, int w, String l){
+            Username = user;
+            World = w;
+            loc = l;
+        }
+
+        @Override
+        public String toString() {
+            return "Host{" +
+                    "Username='" + Username + '\'' +
+                    ", World=" + World +
+                    ", loc='" + loc + '\'' +
+                    '}';
+        }
+    }
+
+}
+
+package com.github.elrol.run4lessplugin;
+
+import com.google.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.FriendsChatManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+import java.awt.*;
+import java.util.ArrayList;
+
+@Slf4j
+public class Run4LessHostOverlay extends Overlay {
+
+    @Inject
+    private Run4LessConfig config;
+
+    @Inject
+    private Client client;
+
+    private PanelComponent panelComponent = new PanelComponent();
+
+    public Run4LessHostOverlay(){
+        setPriority(OverlayPriority.HIGHEST);
+        setPosition(OverlayPosition.TOP_LEFT);
+        panelComponent.setPreferredSize(new Dimension(200, 0));
+    }
+
+    public void init(ArrayList<String> list){
+        FriendsChatManager manager = client.getFriendsChatManager();
+        if(manager == null){
+            panelComponent.getChildren().clear();
+            return;
+        }
+        panelComponent.getChildren().clear();
+        panelComponent.getChildren().add(TitleComponent.builder().text("Active Hosts").color(config.hostColor()).build());
+        int i = 0;
+        for(String username : list){
+            if(i < config.hostLimit()) {
+                int world = manager.findByName(username).getWorld();
+                LineComponent line = LineComponent.builder()
+                        .leftColor(config.hostColor())
+                        .left(username + " : World " + world)
+                        .build();
+                panelComponent.getChildren().add(line);
+                i++;
+            }
+        }
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        return panelComponent.render(graphics);
+    }
+}
+

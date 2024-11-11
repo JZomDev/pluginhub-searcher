@@ -1,0 +1,1196 @@
+package com.sololegends.runelite;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class VarlamoreHouseThievingTest {
+	@SuppressWarnings("unchecked")
+	public static void main(String[] args) throws Exception {
+		ExternalPluginManager.loadBuiltin(VarlamoreHouseThievingPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.sololegends.runelite;
+
+import java.awt.geom.AffineTransform;
+import java.awt.image.AffineTransformOp;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.HashSet;
+
+import javax.imageio.ImageIO;
+
+import com.google.inject.Inject;
+import com.google.inject.Provides;
+import com.sololegends.panel.NextUpOverlayPanel;
+import com.sololegends.runelite.data.Houses;
+import com.sololegends.runelite.data.Houses.House;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.Notifier;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+@Slf4j
+@PluginDescriptor(name = "House Thieving Varlamore", description = "Highlights useful things when robbing houses in Varlamore", tags = {
+		"thieving", "houses", "varlamore" })
+public class VarlamoreHouseThievingPlugin extends Plugin {
+
+	public static final int LAVINIA_ID = 13312;
+	public static final int VICTOR_ID = 13313;
+	public static final int CAIUS_ID = 13314;
+	public static final String WEALTHY_CITIZEN_NAME = "Wealthy citizen";
+
+	public static final int LOCKED_DOOR_ID = 51998;
+	public static final int UNLOCKED_DOOR_ID = 51999;
+	public static final int ESCAPE_WINDOW_ID = 52998;
+
+	public static final int VALUABLE_VALUE = 55;
+	public static final int TIME_UNTIL_RETURN = 0;
+	public static final int TILE_WIDTH = 128;
+	public static final int DISTANCE_DOOR = 12 * TILE_WIDTH;
+	public static final int DISTANCE_DOOR_AWAY = 32 * TILE_WIDTH;
+	public static final int DISTANCE_OWNER = 5;
+
+	// Sound effects
+	// 2115 - Bonus Collected sound ID
+	// 3147 - Bonus Available sound ID
+	private static final int STATUE_SOUND_EFFECT = 2655;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private Notifier notifier;
+
+	@Inject
+	private VarlamoreHouseThievingOverlay thieving_overlay;
+
+	@Inject
+	private VarlamoreHouseThievingMinimapOverlay thieving_minimap_overlay;
+
+	@Inject
+	private VarlamoreHouseThievingConfig config;
+
+	@Inject
+	private OverlayManager overlay_manager;
+
+	@Inject
+	private NextUpOverlayPanel next_up_overlay;
+
+	@Override
+	protected void startUp() throws Exception {
+		log.info("Starting Varlamore House Thieving");
+		overlay_manager.add(thieving_overlay);
+		overlay_manager.add(thieving_minimap_overlay);
+		overlay_manager.add(next_up_overlay);
+	}
+
+	@Override
+	protected void shutDown() throws Exception {
+		log.info("Stopping Varlamore House Thieving!");
+		overlay_manager.remove(thieving_overlay);
+		overlay_manager.remove(thieving_minimap_overlay);
+		overlay_manager.remove(next_up_overlay);
+	}
+
+	public boolean playerInActivity() {
+		Player p = client.getLocalPlayer();
+		WorldPoint wl = p.getWorldLocation();
+		// Optimization to not run through renderings when not in the varlamore city
+		if (wl.getRegionID() == 6448 || wl.getRegionID() == 6704) {
+			return true;
+		}
+		return false;
+	}
+
+	private static final long NOTIFY_TIMEOUT = 10_000;
+	private HashSet<Integer> NOTIFIED = new HashSet<>();
+	private boolean distraction_alerted = false;
+	private long last_notify = -1;
+	private boolean done_stealing_notified = false;
+	private long flick_threshold = 450;
+	private long last_flick = 0;
+	private boolean flick = false;
+
+	private final void notify(String message) {
+		if (System.currentTimeMillis() - last_notify > NOTIFY_TIMEOUT) {
+			notifier.notify(message);
+			last_notify = System.currentTimeMillis();
+		}
+	}
+
+	public NPC[] getCachedNPCs() {
+		WorldView wv = client.getTopLevelWorldView();
+		return wv == null ? new NPC[0] : wv.npcs().getSparse();
+	}
+
+	public Scene getScene() {
+		WorldView wv = client.getTopLevelWorldView();
+		return wv == null ? null : wv.getScene();
+	}
+
+	public int getPlane() {
+		return client.getTopLevelWorldView().getPlane();
+	}
+
+	private BufferedImage ICON = null;
+
+	private void reloadIcon() {
+		int icon_width = config.debugIconSize();
+		ICON = new BufferedImage(icon_width, icon_width, BufferedImage.TYPE_INT_ARGB);
+		try (InputStream is = this.getClass().getClassLoader().getResourceAsStream("icon.png")) {
+			BufferedImage icon = ImageIO.read(is);
+			int w = icon.getWidth();
+			double scale_x = ((double) icon_width) / w;
+			int h = icon.getHeight();
+			double scale_y = ((double) icon_width) / h;
+			AffineTransform at = new AffineTransform();
+			at.scale(scale_x, scale_y);
+			AffineTransformOp scaleOp = new AffineTransformOp(at, AffineTransformOp.TYPE_BILINEAR);
+			ICON = scaleOp.filter(icon, ICON);
+		} catch (IOException e) {
+			System.err.println("Failed to load varlamore thieving icon:");
+			e.printStackTrace();
+		}
+	}
+
+	public BufferedImage icon() {
+		if (ICON == null) {
+			reloadIcon();
+		}
+		return ICON;
+	}
+
+	public boolean flick() {
+		return flick || config.disableIconFlashing();
+	}
+
+	@Subscribe
+	public void onClientTick(ClientTick event) {
+		if (System.currentTimeMillis() - last_flick > flick_threshold) {
+			last_flick = System.currentTimeMillis();
+			flick = !flick;
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event) {
+		// Optimization to not run through renderings when not in the varlamore city
+		if (client.getGameState() != GameState.LOGGED_IN || !playerInActivity()) {
+			return;
+		}
+		// ============================================
+		// NPC HANDLING
+		// ============================================
+		boolean in_house_distract = config.inHouseShowDistraction() && Houses.inLaviniaHouse(client.getLocalPlayer());
+		boolean in_house = Houses.inHouse(client.getLocalPlayer());
+		boolean found_distracted = false;
+		for (NPC npc : getCachedNPCs()) {
+			if (npc == null) {
+				continue;
+			}
+			if (npc.getId() == VarlamoreHouseThievingPlugin.LAVINIA_ID
+					|| npc.getId() == VarlamoreHouseThievingPlugin.CAIUS_ID
+					|| npc.getId() == VarlamoreHouseThievingPlugin.VICTOR_ID) {
+				// check position relative to the door
+				House house = Houses.getHouse(npc.getId());
+				if (house == null) {
+					continue;
+				}
+				int dist = npc.getWorldLocation().distanceTo2D(house.door.getWorldLocation());
+				if (config.notifyOnReturnHome() && config.enableReturnHomeOverlay()
+						&& house.door.isLocked()
+						&& house.contains(client.getLocalPlayer().getWorldLocation())
+						&& dist < VarlamoreHouseThievingPlugin.DISTANCE_OWNER) {
+					if (!NOTIFIED.contains(npc.getId())) {
+						notify("The owner is coming home! RUUUUUUNN!");
+						NOTIFIED.add(npc.getId());
+					}
+				} else {
+					NOTIFIED.remove(npc.getId());
+				}
+			}
+			if (npc.getName().equals(VarlamoreHouseThievingPlugin.WEALTHY_CITIZEN_NAME)) {
+				// If they are interacting with child
+				if (npc.isInteracting()) {
+					Actor a = npc.getInteracting();
+					if (a == null || a.getCombatLevel() != 0) {
+						continue;
+					}
+					found_distracted = true;
+					continue;
+				}
+			}
+		}
+		// If we found a distracted citizen alert if needed
+		if (found_distracted && !distraction_alerted) {
+			// If player not in a house
+			if (in_house_distract || !in_house) {
+				if ((config.enableDistractedOverlay() || config.notifyOnDistracted())) {
+					distraction_alerted = true;
+					if (config.enableDistractedOverlay()) {
+						NextUpOverlayPanel.trackDistraction();
+					}
+					if (config.notifyOnDistracted()) {
+						notify("A Wealthy citizen is being distracted!");
+					}
+				}
+			}
+		} else if (!found_distracted) {
+			distraction_alerted = false;
+		}
+		// ============================================
+		// Can't spot anything else check
+		// ============================================
+		if (config.notifyOnEmptyContainer()) {
+			// 15007745 = Full chatbox single text message widget ID
+			Widget widget = client.getWidget(15007745);
+			if (widget != null && widget.getText() != null
+					&& widget.getText().toLowerCase().startsWith("you can't spot anything else worth taking")) {
+				if (!done_stealing_notified) {
+					done_stealing_notified = true;
+					notify("You can't spot anything else worth stealing");
+				}
+			} else {
+				done_stealing_notified = false;
+			}
+		} else {
+			done_stealing_notified = false;
+		}
+
+		// ============================================
+		// Time threshold notifications
+		// ============================================
+		// Time since last distraction notification check
+		long time_since_last_distraction = NextUpOverlayPanel.sinceDistraction();
+
+		if (// If distraction overlay is enabled OR notifications on distracted is enabled
+		(config.enableDistractedOverlay() || config.notifyOnDistracted())
+				// If player configured to track distraction in house OR player is not in a
+				// house at all
+				&& (in_house_distract || !in_house)
+				// If threshold is configured and has been met
+				&& config.notifyOnTimeSinceDistraction() > 0
+				&& config.notifyOnTimeSinceDistraction() == time_since_last_distraction) {
+			String second_or_seconds = config.notifyOnTimeSinceDistraction() == 1 ? " second" : " seconds";
+			notify("It has been " + time_since_last_distraction + second_or_seconds + " since the last distraction");
+		}
+	}
+
+	@Subscribe
+	public void onSoundEffectPlayed(SoundEffectPlayed sound) {
+		int sound_id = sound.getSoundId();
+		if (config.disableStatueSoundEffect()
+				&& sound_id == VarlamoreHouseThievingPlugin.STATUE_SOUND_EFFECT) {
+			sound.consume();
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event) {
+		// Update whitelist when whitelist config changed
+		if (event.getKey().equals("debugging_icon_size")) {
+			reloadIcon();
+		}
+	}
+
+	@Provides
+	VarlamoreHouseThievingConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(VarlamoreHouseThievingConfig.class);
+	}
+}
+
+package com.sololegends.runelite;
+
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+
+import com.google.inject.Inject;
+import com.sololegends.panel.NextUpOverlayPanel;
+import com.sololegends.runelite.data.Houses;
+
+import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.client.ui.overlay.*;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
+
+public class VarlamoreHouseThievingMinimapOverlay extends Overlay {
+
+	private final Client client;
+	private final VarlamoreHouseThievingConfig config;
+	private VarlamoreHouseThievingPlugin plugin;
+
+	@Inject
+	private VarlamoreHouseThievingMinimapOverlay(Client client, VarlamoreHouseThievingPlugin plugin,
+			VarlamoreHouseThievingConfig config, TooltipManager tooltip_manager) {
+		super(plugin);
+		setPosition(OverlayPosition.DYNAMIC);
+		setLayer(OverlayLayer.ABOVE_WIDGETS);
+		this.client = client;
+		this.config = config;
+		this.plugin = plugin;
+	}
+
+	public static void renderMinimapIcon(Client client, Graphics2D graphics, BufferedImage icon, NPC npc) {
+		LocalPoint sw_tile = npc.getLocalLocation();
+		if (sw_tile != null) {
+			Point minimap_loc = npc.getMinimapLocation();
+			if (minimap_loc == null) {
+				return;
+			}
+			OverlayUtil.renderImageLocation(graphics,
+					new Point(minimap_loc.getX() - (icon.getWidth() / 2), minimap_loc.getY() - icon.getHeight()),
+					icon);
+
+		}
+	}
+
+	private void renderEntities(Graphics2D graphics) {
+		boolean found_citizen = false;
+		for (NPC npc : plugin.getCachedNPCs()) {
+			if (npc == null) {
+				continue;
+			}
+			if (npc.getName().equals(VarlamoreHouseThievingPlugin.WEALTHY_CITIZEN_NAME)) {
+				found_citizen = true;
+				// If they are interacting with child
+				if (config.highlightDistractedCitizens() && npc.isInteracting()) {
+					Actor a = npc.getInteracting();
+					if (a == null || a.getCombatLevel() != 0) {
+						continue;
+					}
+
+					// Render the Icon
+					if (plugin.flick() && (!Houses.inHouse(client.getLocalPlayer()) || config.inHouseDistractionFlashing())) {
+						renderMinimapIcon(client, graphics, plugin.icon(), npc);
+					}
+				}
+			}
+		}
+
+		if (!found_citizen) {
+			NextUpOverlayPanel.resetDistraction();
+		}
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics) {
+		if (client.getGameState() != GameState.LOGGED_IN) {
+			return null;
+		}
+		// Optimization to not run through renderings when not in the varlamore city
+		if (plugin.playerInActivity()) {
+			try {
+				renderEntities(graphics);
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+		return null;
+	}
+
+}
+
+package com.sololegends.runelite;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+
+import com.google.inject.Inject;
+import com.sololegends.panel.NextUpOverlayPanel;
+import com.sololegends.runelite.data.Houses;
+
+import net.runelite.api.*;
+import net.runelite.api.Menu;
+import net.runelite.api.Point;
+import net.runelite.api.coords.*;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.client.Notifier;
+import net.runelite.client.ui.overlay.*;
+import net.runelite.client.ui.overlay.tooltip.Tooltip;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
+
+public class VarlamoreHouseThievingOverlay extends Overlay {
+
+	private final Client client;
+	private final VarlamoreHouseThievingConfig config;
+	private WorldPoint tile_hint = null;
+	private boolean bonus_check_notified = false;
+	private final TooltipManager tooltip_manager;
+
+	private static final long NOTIFY_TIMEOUT = 30_000;
+	private long last_notify = -1;
+	@Inject
+	private Notifier notifier;
+
+	private VarlamoreHouseThievingPlugin plugin;
+
+	private final void notify(String message) {
+		if (System.currentTimeMillis() - last_notify > NOTIFY_TIMEOUT) {
+			notifier.notify(message);
+			last_notify = System.currentTimeMillis();
+		}
+	}
+
+	@Inject
+	private VarlamoreHouseThievingOverlay(Client client, VarlamoreHouseThievingPlugin plugin,
+			VarlamoreHouseThievingConfig config, TooltipManager tooltip_manager) {
+		super(plugin);
+		setPosition(OverlayPosition.DYNAMIC);
+		setLayer(OverlayLayer.ABOVE_SCENE);
+		this.client = client;
+		this.config = config;
+		this.plugin = plugin;
+		this.tooltip_manager = tooltip_manager;
+	}
+
+	public static void renderIcon(Client client, Graphics2D graphics, BufferedImage icon, NPC npc) {
+		LocalPoint sw_tile = npc.getLocalLocation();
+		if (sw_tile != null) {
+			Point icon_loc = npc.getCanvasTextLocation(graphics, "", npc.getLogicalHeight() + 25);
+			OverlayUtil.renderImageLocation(graphics,
+					new Point(icon_loc.getX() - (icon.getWidth() / 2), icon_loc.getY() - icon.getHeight()),
+					icon);
+		}
+	}
+
+	public static void renderEntity(Client client, Graphics2D graphics, Color color, NPC npc) {
+		LocalPoint sw_tile = npc.getLocalLocation();
+		NPCComposition npcComposition = npc.getTransformedComposition();
+		if (sw_tile != null) {
+			final int size = npcComposition.getSize();
+			final LocalPoint centerLp = new LocalPoint(
+					sw_tile.getX() + Perspective.LOCAL_TILE_SIZE * (size - 1) / 2,
+					sw_tile.getY() + Perspective.LOCAL_TILE_SIZE * (size - 1) / 2,
+					client.getTopLevelWorldView());
+			Polygon tilePoly = Perspective.getCanvasTileAreaPoly(client, centerLp, size);
+			if (tilePoly == null) {
+				return;
+			}
+			OverlayUtil.renderPolygon(graphics, tilePoly, color);
+		}
+	}
+
+	private void renderEntities(Graphics2D graphics) {
+		boolean found_citizen = false;
+		for (NPC npc : plugin.getCachedNPCs()) {
+			if (npc == null) {
+				continue;
+			}
+			if (config.highlightHomeOwners() && (npc.getId() == VarlamoreHouseThievingPlugin.LAVINIA_ID
+					|| npc.getId() == VarlamoreHouseThievingPlugin.CAIUS_ID
+					|| npc.getId() == VarlamoreHouseThievingPlugin.VICTOR_ID)) {
+				renderEntity(client, graphics, config.colorHomeOwners(), npc);
+			}
+			if (npc.getName().equals(VarlamoreHouseThievingPlugin.WEALTHY_CITIZEN_NAME)) {
+				found_citizen = true;
+				// If they are interacting with child
+				if (config.highlightDistractedCitizens() && npc.isInteracting()) {
+					Actor a = npc.getInteracting();
+					if (a == null || a.getCombatLevel() != 0) {
+						continue;
+					}
+					renderEntity(client, graphics, config.colorDistractedCitizens(), npc);
+
+					// Render the Icon If player not in a house OR has flashing enabled inside the
+					// house
+					if (plugin.flick() && (!Houses.inHouse(client.getLocalPlayer()) || config.inHouseDistractionFlashing())) {
+						renderIcon(client, graphics, plugin.icon(), npc);
+					}
+
+				} else if (config.highlightWealthyCitizens()) {
+					renderEntity(client, graphics, config.colorWealthyCitizens(), npc);
+				}
+			}
+		}
+
+		if (!found_citizen) {
+			NextUpOverlayPanel.resetDistraction();
+		}
+	}
+
+	private void renderTileObjects(Graphics2D graphics) {
+		Scene scene = plugin.getScene();
+		Tile[][][] tiles = scene.getTiles();
+		if (tile_hint != null) {
+			// Clear only if the door is the target
+			if (client.hasHintArrow() && client.getHintArrowType() == HintArrowType.COORDINATE
+					&& client.getHintArrowPoint().getX() == tile_hint.getX()
+					&& client.getHintArrowPoint().getY() == tile_hint.getY()) {
+				client.clearHintArrow();
+			}
+			tile_hint = null;
+		}
+		WorldPoint box_target = null;
+		if (client.getHintArrowType() == HintArrowType.COORDINATE) {
+			box_target = client.getHintArrowPoint();
+		}
+		if (box_target == null) {
+			bonus_check_notified = false;
+		}
+		int z = plugin.getPlane();
+		boolean has_locked_door = false;
+		for (int x = 0; x < Constants.SCENE_SIZE; ++x) {
+			for (int y = 0; y < Constants.SCENE_SIZE; ++y) {
+				Tile tile = tiles[z][x][y];
+
+				if (tile == null) {
+					continue;
+				}
+				WorldPoint tile_point = tile.getWorldLocation();
+				if ((config.highlightBonusChests() || config.notifyOnBonusChest())
+						&& tile_point.equals(box_target)) {
+					// Box targeted!
+					// Get and highlight object
+					GameObject[] objs = tile.getGameObjects();
+					if (objs != null) {
+						for (GameObject obj : objs) {
+							if (obj == null) {
+								continue;
+							}
+							// 52008 Box
+							// 52010 Wardrobe
+							// 52011 Jewellery Box
+							if ((obj.getId() == 52008 || obj.getId() == 52010 || obj.getId() == 52011)
+									&& obj.getConvexHull() != null) {
+								if (config.highlightBonusChests()) {
+									graphics.setColor(config.colorBonusChests());
+									graphics.draw(obj.getConvexHull());
+								}
+								if (!bonus_check_notified && config.notifyOnBonusChest()) {
+									notify("Bonus Loot opportunity!");
+									NextUpOverlayPanel.trackBonusChest();
+									bonus_check_notified = true;
+								}
+							}
+						}
+					}
+				}
+
+				// Check if door is out of update distance now
+				int dist = client.getLocalPlayer().getLocalLocation()
+						.distanceTo(tile.getLocalLocation());
+				if (dist > VarlamoreHouseThievingPlugin.DISTANCE_DOOR_AWAY) {
+					continue;
+				}
+				// Look for doors that need highlighting
+				WallObject wo = tile.getWallObject();
+				if (wo != null && wo.getId() == VarlamoreHouseThievingPlugin.LOCKED_DOOR_ID
+						&& wo.getConvexHull() != null) {
+					has_locked_door = true;
+					if (config.highlightLockedDoors()) {
+						graphics.setColor(config.colorLockedDoors());
+						graphics.draw(wo.getConvexHull());
+					}
+					// If door is not locked yet, this is first call
+					if (!Houses.isLocked(wo.getWorldLocation()) && config.enableReturnHomeOverlay()) {
+						NextUpOverlayPanel.trackOwnerLeft();
+					}
+					// Register door as locked
+					Houses.registerLocked(wo.getWorldLocation());
+					// Only if not close
+					if (!Houses.inHouse(client.getLocalPlayer()) && !client.hasHintArrow()
+							&& dist > VarlamoreHouseThievingPlugin.DISTANCE_DOOR) {
+						client.setHintArrow(tile.getLocalLocation());
+						tile_hint = tile.getWorldLocation();
+					}
+				}
+				if (wo != null && wo.getId() == VarlamoreHouseThievingPlugin.UNLOCKED_DOOR_ID
+						&& wo.getConvexHull() != null) {
+					Houses.registerUnlocked(wo.getWorldLocation());
+				}
+				if (config.highlightEscapeWindows() && wo != null && wo.getId() == VarlamoreHouseThievingPlugin.ESCAPE_WINDOW_ID
+						&& wo.getConvexHull() != null) {
+					graphics.setColor(config.colorEscapeWindows());
+					graphics.draw(wo.getConvexHull());
+				}
+			}
+		}
+		if (!has_locked_door) {
+			NextUpOverlayPanel.resetOwnerLeft();
+		}
+	}
+
+	private void renderInventory(Graphics2D graphics) {
+		Menu menu = client.getMenu();
+		MenuEntry[] menuEntries = menu.getMenuEntries();
+
+		if (menuEntries.length < 1) {
+			return;
+		}
+
+		MenuEntry menuEntry = menuEntries[menuEntries.length - 1];
+		int widgetId = menuEntry.getParam1();
+
+		if (widgetId != ComponentID.INVENTORY_CONTAINER) {
+			return;
+		}
+
+		ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
+		Item item = inventory.getItem(menuEntry.getParam0());
+		if (item == null || item.getId() != 29332) {
+			return;
+		}
+		tooltip_manager.add(new Tooltip("Value: " + item.getQuantity() * VarlamoreHouseThievingPlugin.VALUABLE_VALUE));
+		return;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics) {
+		if (client.getGameState() != GameState.LOGGED_IN) {
+			return null;
+		}
+		// Optimization to not run through renderings when not in the varlamore city
+		if (plugin.playerInActivity()) {
+			try {
+				renderEntities(graphics);
+				renderTileObjects(graphics);
+				renderInventory(graphics);
+			} catch (Exception e) {
+				e.printStackTrace();
+			}
+		}
+		return null;
+	}
+
+	public Direction getNearestDirection(int angle) {
+		int round = angle >>> 9;
+		int up = angle & 256;
+		if (up != 0) {
+			// round up
+			++round;
+		}
+		switch (round & 3) {
+			case 0:
+				return Direction.SOUTH;
+			case 1:
+				return Direction.WEST;
+			case 2:
+				return Direction.NORTH;
+			case 3:
+				return Direction.EAST;
+			default:
+				throw new IllegalStateException();
+		}
+	}
+}
+
+package com.sololegends.runelite.data;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import com.sololegends.runelite.VarlamoreHouseThievingPlugin;
+
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldPoint;
+
+public class Houses {
+
+	private static List<House> HOUSES = new ArrayList<>() {
+		{
+			// Lavinia
+			add(
+					new House(VarlamoreHouseThievingPlugin.LAVINIA_ID,
+							1666, 3080, 1676, 3094,
+							new Door(1668, 3094),
+							new Escape(1670, 3088)));
+			// Victor
+			add(
+					new House(VarlamoreHouseThievingPlugin.VICTOR_ID,
+							1632, 3093, 1640, 3103,
+							new Door(1636, 3103),
+							new Escape(1637, 3090)));
+			// Cauis
+			add(
+					new House(VarlamoreHouseThievingPlugin.CAIUS_ID,
+							1631, 3117, 1640, 3124,
+							new Door(1631, 3121),
+							new Escape(1638, 3124)));
+		}
+	};
+
+	public static boolean inLaviniaHouse(Player player) {
+		for (House house : HOUSES) {
+			if (house.id == VarlamoreHouseThievingPlugin.LAVINIA_ID
+					&& house.contains(player.getWorldLocation())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static boolean inHouse(Player player) {
+		for (House house : HOUSES) {
+			if (house.contains(player.getWorldLocation())) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public static House getHouse(Player player) {
+		for (House house : HOUSES) {
+			if (house.contains(player.getWorldLocation())) {
+				return house;
+			}
+		}
+		return null;
+	}
+
+	public static House getHouse(int owner) {
+		for (House house : HOUSES) {
+			if (house.id == owner) {
+				return house;
+			}
+		}
+		return null;
+	}
+
+	public static void registerLocked(WorldPoint door) {
+		for (House house : HOUSES) {
+			if (house.door.is(door)) {
+				house.door.setLocked();
+			}
+		}
+	}
+
+	public static boolean isLocked(WorldPoint door) {
+		for (House house : HOUSES) {
+			if (house.door.is(door)) {
+				return house.door.isLocked();
+			}
+		}
+		return false;
+	}
+
+	public static void registerUnlocked(WorldPoint door) {
+		for (House house : HOUSES) {
+			if (house.door.is(door)) {
+				house.door.setUnlocked();
+			}
+		}
+	}
+
+	public static class House {
+		public final int x1, y1, x2, y2;
+		public final int id;
+		public final Door door;
+		public final Escape escape;
+
+		public House(int id, int x1, int y1, int x2, int y2, Door door, Escape escape) {
+			this.id = id;
+			this.x1 = x1;
+			this.y1 = y1;
+			this.x2 = x2;
+			this.y2 = y2;
+			this.door = door;
+			this.escape = escape;
+		}
+
+		public boolean contains(WorldPoint point) {
+			return point.getX() >= x1 && point.getX() <= x2
+					&& point.getY() >= y1 && point.getY() <= y2;
+		}
+
+		@Override
+		public int hashCode() {
+			return x1 + x2 + y1 + y2;
+		}
+
+		@Override
+		public boolean equals(Object obj) {
+			if (obj instanceof House) {
+				House tm = (House) obj;
+				return tm.x1 == x1 && tm.y1 == y1 && tm.x2 == x2 && tm.y2 == y2;
+			}
+			return false;
+		}
+	}
+
+	public static class Door {
+		public final int x, y;
+		private boolean locked = false;
+
+		public Door(int x, int y) {
+			this.x = x;
+			this.y = y;
+		}
+
+		public WorldPoint getWorldLocation() {
+			return new WorldPoint(x, y, 0);
+		}
+
+		public boolean isLocked() {
+			return locked;
+		}
+
+		public void setLocked() {
+			locked = true;
+		}
+
+		public void setUnlocked() {
+			locked = false;
+		}
+
+		public boolean is(WorldPoint point) {
+			return point.getX() == x && point.getY() == y;
+		}
+
+		@Override
+		public int hashCode() {
+			return x + y;
+		}
+
+		@Override
+		public boolean equals(Object obj) {
+			if (obj instanceof Door) {
+				Door tm = (Door) obj;
+				return tm.x == x && tm.y == y;
+			}
+			return false;
+		}
+	}
+
+	public static class Escape extends Door {
+		public Escape(int x, int y) {
+			super(x, y);
+		}
+	}
+}
+package com.sololegends.runelite;
+
+import java.awt.Color;
+
+import net.runelite.client.config.*;
+
+@ConfigGroup("Varlamore House Thieving")
+public interface VarlamoreHouseThievingConfig extends Config {
+
+	@ConfigSection(name = "Features", description = "turn on and off features", position = 0)
+
+	String feature_section = "features";
+
+	@ConfigItem(position = 1, section = feature_section, keyName = "enable_distracted_overlay", name = "When Distracted Overlay", description = "Enable Overlay counting up since the last distracted citizen")
+	default boolean enableDistractedOverlay() {
+		return true;
+	}
+
+	@ConfigItem(position = 2, section = feature_section, keyName = "enable_return_home_overlay", name = "Owner Returning Overlay", description = "Enable Overlay counting up from home owner leaving")
+	default boolean enableReturnHomeOverlay() {
+		return true;
+	}
+
+	@ConfigItem(position = 3, section = feature_section, keyName = "enable_bonus_chest_overlay", name = "Bonus chest Overlay", description = "Enable Overlay counting up since the last bonus chest")
+	default boolean enableBonusChestOverlay() {
+		return true;
+	}
+
+	@ConfigItem(position = 4, section = feature_section, keyName = "disable_blessed_statue_sound", name = "Disable Bonus Item Sounds", description = "Disables the sound effect when you receive a blessed statue or jewelry")
+	default boolean disableStatueSoundEffect() {
+		return false;
+	}
+
+	@ConfigItem(position = 5, section = feature_section, keyName = "disable_flashing_distraction_icon", name = "Disable Distracted Icon Flashing", description = "Disables the flashing of the distracted icon, icon will still show")
+	default boolean disableIconFlashing() {
+		return false;
+	}
+
+	@ConfigSection(name = "Notifications", description = "turn on and off notification", position = 10)
+	String notifications_section = "notification";
+
+	@ConfigItem(position = 11, section = notifications_section, keyName = "notify_on_distracted", name = "When Distracted", description = "Trigger a notification when a Wealthy Citizen is being distracted")
+	default boolean notifyOnDistracted() {
+		return true;
+	}
+
+	@ConfigItem(position = 12, section = notifications_section, keyName = "notify_on_time_since_distraction", name = "Time Since Distraction", description = "Trigger a notification when the time since a distraction reaches a certain value. 0 turns it off")
+	default int notifyOnTimeSinceDistraction() {
+		return 0;
+	}
+
+	@ConfigItem(position = 13, section = notifications_section, keyName = "notify_on_bonus", name = "Bonus Chest", description = "Trigger a notification when a bonus chest appears")
+	default boolean notifyOnBonusChest() {
+		return true;
+	}
+
+	@ConfigItem(position = 14, section = notifications_section, keyName = "notify_on_return_home", name = "Owner Returning", description = "Trigger a notification when the house owner is returning")
+	default boolean notifyOnReturnHome() {
+		return true;
+	}
+
+	@ConfigItem(position = 15, section = notifications_section, keyName = "notify_on_empty_container", name = "Empty Container", description = "Trigger a notification when the container you're stealing from is empty")
+	default boolean notifyOnEmptyContainer() {
+		return true;
+	}
+
+	@ConfigSection(name = "Highlight Options", description = "turn on and off highlights", position = 20)
+	String highlights_section = "highlights";
+
+	@ConfigItem(position = 20, section = highlights_section, keyName = "highlight_doors", name = "Locked Doors", description = "Highlight door of a house ready to be robbed")
+	default boolean highlightLockedDoors() {
+		return true;
+	}
+
+	@ConfigItem(position = 21, section = highlights_section, keyName = "highlight_escape", name = "Escape Window", description = "Highlights escape windows")
+	default boolean highlightEscapeWindows() {
+		return true;
+	}
+
+	@ConfigItem(position = 22, section = highlights_section, keyName = "highlight_wealthy_citizen", name = "Wealthy Citizens", description = "Highlights Wealthy citizens")
+	default boolean highlightWealthyCitizens() {
+		return true;
+	}
+
+	@ConfigItem(position = 23, section = highlights_section, keyName = "highlight_distracted", name = "Distracted Citizens", description = "Highlights distracted citizens")
+	default boolean highlightDistractedCitizens() {
+		return true;
+	}
+
+	@ConfigItem(position = 24, section = highlights_section, keyName = "highlight_homeowner", name = "Home Owners", description = "Highlights home owners")
+	default boolean highlightHomeOwners() {
+		return true;
+	}
+
+	@ConfigItem(position = 25, section = highlights_section, keyName = "highlight_bonus_chest", name = "Bonus Chests", description = "Highlights bonus chests")
+	default boolean highlightBonusChests() {
+		return true;
+	}
+
+	@ConfigSection(name = "Styling", description = "Stylize it!", position = 30)
+	String styling_section = "styling";
+
+	@Alpha
+	@ConfigItem(position = 30, section = styling_section, keyName = "color_doors", name = "Locked Doors", description = "Highlight color for door of a house ready to be robbed")
+	default Color colorLockedDoors() {
+		return Color.GREEN;
+	}
+
+	@Alpha
+	@ConfigItem(position = 31, section = styling_section, keyName = "color_escape", name = "Escape Window", description = "Highlight color for escape windows")
+	default Color colorEscapeWindows() {
+		return Color.RED;
+	}
+
+	@Alpha
+	@ConfigItem(position = 32, section = styling_section, keyName = "color_wealthy_citizen", name = "Wealthy Citizens", description = "Highlight color for Wealthy citizens")
+	default Color colorWealthyCitizens() {
+		return Color.CYAN;
+	}
+
+	@Alpha
+	@ConfigItem(position = 33, section = styling_section, keyName = "color_distracted", name = "Distracted Citizens", description = "Highlight color for distracted citizens")
+	default Color colorDistractedCitizens() {
+		return Color.GREEN;
+	}
+
+	@Alpha
+	@ConfigItem(position = 34, section = styling_section, keyName = "color_homeowner", name = "Home Owners", description = "Highlight color for home owners")
+	default Color colorHomeOwners() {
+		return Color.RED;
+	}
+
+	@Alpha
+	@ConfigItem(position = 35, section = styling_section, keyName = "color_bonus_chest", name = "Bonus Chests", description = "Highlight color for bonus chests")
+	default Color colorBonusChests() {
+		return Color.GREEN;
+	}
+
+	@ConfigSection(name = "Inside House", description = "Configure behaviour whilst you're in a house", position = 40)
+	String in_house_section = "in_house";
+
+	@ConfigItem(position = 40, section = in_house_section, keyName = "in_house_distraction_overlay", name = "Distracted Counter in House", description = "Show the distracted citizen counter while you're in Lavinia's house")
+	default boolean inHouseShowDistraction() {
+		return false;
+	}
+
+	@ConfigItem(position = 41, section = in_house_section, keyName = "in_house_distraction_icon", name = "Distracted Icon in House", description = "Show the distracted citizen icon while you're in Lavinia's house")
+	default boolean inHouseDistractionFlashing() {
+		return false;
+	}
+
+	@ConfigSection(name = "Debugging", description = "Debugging options", position = 60)
+	String debugging_section = "debugging";
+
+	@ConfigItem(position = 60, section = debugging_section, keyName = "debugging_icon_size", name = "Icon Size", description = "Set the distracted Icon size")
+	default int debugIconSize() {
+		return 25;
+	}
+
+}
+
+package com.sololegends.panel;
+
+import java.awt.*;
+
+import javax.inject.Inject;
+
+import com.sololegends.runelite.VarlamoreHouseThievingConfig;
+import com.sololegends.runelite.VarlamoreHouseThievingPlugin;
+import com.sololegends.runelite.data.Houses;
+
+import net.runelite.api.Client;
+import net.runelite.client.ui.overlay.*;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.LineComponent.LineComponentBuilder;
+
+public class NextUpOverlayPanel extends OverlayPanel {
+
+  public static final int WARN_THRESHOLD_DISTRACTED = 70;
+  public static final int NOW_THRESHOLD_DISTRACTED = 90;
+  public static final int WARN_THRESHOLD_OWNER_RET = 150;
+  public static final int NOW_THRESHOLD_OWNER_RET = 160;
+  public static final int WARN_THRESHOLD_BONUS_CHEST = 30;
+  public static final int NOW_THRESHOLD_BONUS_CHEST = 60;
+
+  // system time in milliseconds
+  private static long last_distraction = -1;
+  private static long owner_left = -1;
+  private static long bonus_chest = -1;
+  private VarlamoreHouseThievingPlugin plugin;
+  private VarlamoreHouseThievingConfig config;
+
+  @Inject
+  private Client client;
+
+  @Inject
+  private NextUpOverlayPanel(VarlamoreHouseThievingPlugin plugin, VarlamoreHouseThievingConfig config) {
+    super(plugin);
+    this.plugin = plugin;
+    this.config = config;
+    setPosition(OverlayPosition.TOP_CENTER);
+    setPriority(Overlay.PRIORITY_LOW);
+  }
+
+  public static void trackDistraction() {
+    last_distraction = System.currentTimeMillis();
+  }
+
+  public static void resetDistraction() {
+    last_distraction = -1;
+  }
+
+  public static void trackOwnerLeft() {
+    owner_left = System.currentTimeMillis();
+  }
+
+  public static void resetOwnerLeft() {
+    owner_left = -1;
+  }
+
+  public static void trackBonusChest() {
+    bonus_chest = System.currentTimeMillis();
+  }
+
+  public static void resetBonusChest() {
+    bonus_chest = -1;
+  }
+
+  public static long now() {
+    return System.currentTimeMillis();
+  }
+
+  public static long sinceOwnerLeft() {
+    return (System.currentTimeMillis() - owner_left) / 1000;
+  }
+
+  public static long sinceBonusChest() {
+    return (System.currentTimeMillis() - bonus_chest) / 1000;
+  }
+
+  public static long sinceDistraction() {
+    return (System.currentTimeMillis() - last_distraction) / 1000;
+  }
+
+  // 98, 132, 176
+  @Override
+  public Dimension render(Graphics2D graphics) {
+    boolean in_house = Houses.inHouse(client.getLocalPlayer());
+    // Reset counters on not in market
+    if (!plugin.playerInActivity()) {
+      resetOwnerLeft();
+      resetDistraction();
+      resetBonusChest();
+    }
+    // Reset owner counter if feature turned off
+    if (!config.enableReturnHomeOverlay()) {
+      resetOwnerLeft();
+    }
+    // Reset distraction counter if feature turned off
+    if (!config.enableDistractedOverlay()) {
+      resetDistraction();
+    }
+    // Reset bonus chest counter if feature turned off, or player not in house
+    if (!config.enableBonusChestOverlay() || !in_house) {
+      resetBonusChest();
+    }
+
+    if (plugin.playerInActivity()
+        && ((config.inHouseShowDistraction() && Houses.inLaviniaHouse(client.getLocalPlayer()))
+            || !in_house)
+        && last_distraction != -1) {
+      // If player in the market and not in the house
+      long since = sinceDistraction();
+      LineComponentBuilder builder = LineComponent.builder()
+          .left("Time since distraction:")
+          .right(since + "s");
+
+      if (since > NOW_THRESHOLD_DISTRACTED) {
+        builder.rightColor(Color.RED);
+      } else if (since > WARN_THRESHOLD_DISTRACTED) {
+        builder.rightColor(Color.ORANGE);
+      }
+
+      panelComponent.getChildren().add(builder.build());
+    }
+
+    // Return now if player NOT in a house
+    // Everything after here required being in a house
+    if (!in_house) {
+      return super.render(graphics);
+    }
+    if (owner_left != -1) {
+      // If player in a house
+      long since = sinceOwnerLeft();
+      LineComponentBuilder builder = LineComponent.builder()
+          .left("Time since Owner left:")
+          .right(since + "s");
+
+      if (since > NOW_THRESHOLD_OWNER_RET) {
+        builder.rightColor(Color.RED);
+      } else if (since > WARN_THRESHOLD_OWNER_RET) {
+        builder.rightColor(Color.ORANGE);
+      }
+
+      panelComponent.getChildren().add(builder.build());
+    }
+    if (bonus_chest != -1) {
+      // If player in a house
+      long since = sinceBonusChest();
+      LineComponentBuilder builder = LineComponent.builder()
+          .left("Time since Bonus Chest:")
+          .right(since + "s");
+
+      if (since > NOW_THRESHOLD_BONUS_CHEST) {
+        builder.rightColor(Color.RED);
+      } else if (since > WARN_THRESHOLD_BONUS_CHEST) {
+        builder.rightColor(Color.ORANGE);
+      }
+
+      panelComponent.getChildren().add(builder.build());
+    }
+    return super.render(graphics);
+  }
+}
+

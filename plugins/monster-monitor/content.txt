@@ -1,0 +1,2053 @@
+package com.example;
+
+import com.monstermonitor.MonsterMonitorPlugin;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ExamplePluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(MonsterMonitorPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.monstermonitor;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+/**
+ * The MonsterMonitorConfig interface defines the configuration options for Monster Monitor.
+ * It allows users to toggle settings such as displaying the overlay, receiving notifications
+ * when kill limits are reached, and customizing the notification messages.
+ */
+@ConfigGroup("monster monitor")
+public interface MonsterMonitorConfig extends Config {
+
+    /**
+     * Configures whether the Monster Monitor overlay should be displayed.
+     *
+     * @return true if the overlay should be shown, false otherwise
+     */
+    @ConfigItem(
+            keyName = "showOverlay",
+            name = "Show Overlay",
+            description = "Toggle to display or hide the Monster Monitor overlay"
+    )
+    default boolean showOverlay() {
+        return true; // Default to showing the overlay
+    }
+
+    /**
+     * Configures whether a notification should be sent when a kill limit is reached.
+     *
+     * @return true if notifications should be sent when the kill limit is reached, false otherwise
+     */
+    @ConfigItem(
+            keyName = "notifyOnLimit",
+            name = "Notify on Kill Limit",
+            description = "Send a notification when the kill limit is reached"
+    )
+    default boolean notifyOnLimit() {
+        return true;  // Default to notifying when the kill limit is reached
+    }
+
+    /**
+     * Configures whether chat notifications should be shown when kill limits are reached.
+     *
+     * @return true if chat notifications should be shown, false otherwise
+     */
+    @ConfigItem(
+            keyName = "showChatNotifications",
+            name = "Show Chat Notifications",
+            description = "Show notifications about reaching kill limits in the chat window."
+    )
+    default boolean showChatNotifications() {
+        return true; // Default to showing chat notifications
+    }
+
+    /**
+     * Configures the custom notification message displayed when a kill limit is reached.
+     *
+     * @return the custom notification message
+     */
+    @ConfigItem(
+            keyName = "customNotificationMessage",
+            name = "Custom Notification Message",
+            description = "Lets you personalize the message displayed when a kill limit is reached. add {npc} for npc name"
+    )
+    default String customNotificationMessage() {
+        return "Kill limit reached for {npc}"; // Default message
+    }
+
+    /**
+     * Configures whether sound alerts should be enabled for notifications.
+     *
+     * @return true if sound alerts should be enabled, false otherwise
+     */
+    @ConfigItem(
+            keyName = "enableSoundAlerts",
+            name = "Enable Sound Alerts",
+            description = "Enable sound alerts for notifications."
+    )
+    default boolean enableSoundAlerts() {
+        return true; // Default to enabling sound alerts
+    }
+
+    /**
+     * Configures whether right-click menu entries should be displayed.
+     *
+     * @return true if the right-click menu entries should be shown, false otherwise
+     */
+    @ConfigItem(
+            keyName = "showRightClickMenuEntries",
+            name = "Show Right-Click Menu Entries",
+            description = "Toggle to show or hide the right-click menu entries for NPCs."
+    )
+    default boolean showRightClickMenuEntries() {
+        return true; // Default to showing right-click menu entries
+    }
+
+    @ConfigItem(
+            keyName = "showTitle",
+            name = "Show Overlay Title",
+            description = "Toggle the display of the overlay title"
+    )
+    default boolean showTitle() {
+        return true;
+    }
+}
+
+package com.monstermonitor;
+
+import net.runelite.api.Client;
+import net.runelite.api.Hitsplat;
+import net.runelite.api.NPC;
+import net.runelite.api.Actor;
+import net.runelite.api.events.*;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.callback.ClientThread;
+
+import javax.inject.Inject;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Tracks and manages NPC deaths and interactions for Monster Monitor.
+ * This class handles tracking of kills and ensures that ignored NPCs are not logged.
+ */
+public class DeathTracker {
+    private final Client client;
+    private final MonsterMonitorPlugin plugin;
+    private final MonsterMonitorLogger logger;
+    private final MonsterMonitorPanel panel;
+    private final ClientThread clientThread;
+
+    // Tracks NPCs with recent player interactions
+    private final Map<Integer, String> lastKnownNpcName = new ConcurrentHashMap<>();
+    private final Map<Integer, Integer> lastInteractionTicks = new ConcurrentHashMap<>();
+    private final Map<Integer, Boolean> wasNpcEngaged = new ConcurrentHashMap<>();
+
+    private static final int INTERACTION_TIMEOUT_TICKS = 7;
+
+    private static final Map<String, Set<Integer>> FINAL_PHASE_IDS = Map.ofEntries(
+            Map.entry("Kalphite Queen", Set.of(965)),
+            Map.entry("The Nightmare", Set.of(378)),
+            Map.entry("Phosani's Nightmare", Set.of(377)),
+            Map.entry("Alchemical Hydra", Set.of(8622)),
+            Map.entry("Hydra", Set.of(8609)),
+            Map.entry("Phantom Muspah", Set.of(12082)),
+            Map.entry("The Hueycoatl", Set.of(14013)),
+            Map.entry("Dusk", Set.of(7889)),
+            Map.entry("Abyssal Sire", Set.of(5891)),
+            Map.entry("Kephri", Set.of(11722)),
+            Map.entry("Verzik Vitur", Set.of(10832, 8371, 10849))
+    );
+
+    private static final Set<String> EXCLUDED_NPC_NAMES = Set.of(
+            "Hueycoatl Tail",
+            "Hueycoatl Tail Broken",
+            "Hueycoatl Body",
+            "Dawn",
+            "Cracked Ice"
+    );
+
+    @Inject
+    public DeathTracker(Client client, MonsterMonitorPlugin plugin, MonsterMonitorLogger logger, MonsterMonitorPanel panel, ClientThread clientThread) {
+        this.client = client;
+        this.plugin = plugin;
+        this.logger = logger;
+        this.panel = panel;
+        this.clientThread = clientThread;
+    }
+
+    @Subscribe
+    public void onInteractingChanged(InteractingChanged event) {
+        Actor source = event.getSource();
+        Actor target = event.getTarget();
+
+        if (source == client.getLocalPlayer() && target instanceof NPC) {
+            NPC npc = (NPC) target;
+            int npcIndex = npc.getIndex();
+            String npcName = Optional.ofNullable(npc.getName()).orElse("Unnamed NPC");
+
+            lastKnownNpcName.put(npcIndex, npcName);
+            lastInteractionTicks.put(npcIndex, client.getTickCount());
+            wasNpcEngaged.put(npcIndex, false);
+        }
+    }
+
+    @Subscribe
+    public void onHitsplatApplied(HitsplatApplied event) {
+        Actor target = event.getActor();
+        Hitsplat hitsplat = event.getHitsplat();
+
+        if (target instanceof NPC && hitsplat.isMine()) {
+            NPC npc = (NPC) target;
+            int npcIndex = npc.getIndex();
+            String npcName = Optional.ofNullable(npc.getName()).orElse(lastKnownNpcName.getOrDefault(npcIndex, "Unnamed NPC"));
+
+            lastKnownNpcName.put(npcIndex, npcName);
+            lastInteractionTicks.put(npcIndex, client.getTickCount());
+            wasNpcEngaged.put(npcIndex, true);
+        }
+    }
+
+    @Subscribe
+    public void onActorDeath(ActorDeath event) {
+        Actor actor = event.getActor();
+
+        if (actor instanceof NPC) {
+            NPC npc = (NPC) actor;
+            int npcIndex = npc.getIndex();
+            int npcId = npc.getId();
+            String npcName = lastKnownNpcName.getOrDefault(npcIndex, "Unnamed NPC");
+
+            // Skip logging if the NPC is in the exclusion list
+            if (EXCLUDED_NPC_NAMES.contains(npcName)) {
+                return;
+            }
+
+            // Check if this NPC is a multi-phase boss with intermediate phases
+            if (FINAL_PHASE_IDS.containsKey(npcName)) {
+                Set<Integer> finalIds = FINAL_PHASE_IDS.get(npcName);
+                // Only log if the NPC ID is one of the final phase IDs for this multi-phase boss
+                if (!finalIds.contains(npcId)) {
+                    return; // Skip logging for intermediate phases
+                }
+            }
+
+            // Log death only if the player was recently engaged with the NPC and it's in the final phase or a regular NPC
+            if (wasNpcEngaged.getOrDefault(npcIndex, false) && isInteractionValid(npcIndex)) {
+                clientThread.invoke(() -> plugin.logDeath(npcName));
+                cleanupAfterLogging(npcIndex);
+            }
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick event) {
+        int currentTick = client.getTickCount();
+
+        // Clean up entries where interaction has timed out
+        lastInteractionTicks.keySet().removeIf(npcIndex ->
+                (currentTick - lastInteractionTicks.get(npcIndex)) > INTERACTION_TIMEOUT_TICKS
+        );
+    }
+
+    /**
+     * Checks if the interaction with an NPC is valid based on the last interaction time.
+     *
+     * @param npcIndex The index of the NPC to check.
+     * @return true if the interaction is within the allowed time window, false otherwise.
+     */
+    private boolean isInteractionValid(int npcIndex) {
+        Integer lastTick = lastInteractionTicks.get(npcIndex);
+        return lastTick != null && (client.getTickCount() - lastTick) <= INTERACTION_TIMEOUT_TICKS;
+    }
+
+    /**
+     * Cleans up tracking information after an NPC's interaction has been logged or expired.
+     *
+     * @param npcIndex The index of the NPC to clean up.
+     */
+    private void cleanupAfterLogging(int npcIndex) {
+        lastKnownNpcName.remove(npcIndex);
+        lastInteractionTicks.remove(npcIndex);
+        wasNpcEngaged.remove(npcIndex);
+    }
+}
+
+package com.monstermonitor;
+
+import com.google.inject.Provides;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.eventbus.EventBus;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@PluginDescriptor(
+        name = "Monster Monitor",
+        description = "Tracks NPC kills and allows setting kill limits",
+        tags = {"npc", "kill", "limit"}
+)
+public class MonsterMonitorPlugin extends Plugin
+{
+    @Inject
+    MonsterMonitorConfig config;
+
+    @Inject
+    private EventBus eventBus;
+
+    @Inject
+    MonsterMonitorLogger logger;
+
+    @Inject
+    MonsterMonitorOverlay overlay;
+
+    @Inject
+    MonsterMonitorPanel panel;
+
+    @Inject
+    OverlayManager overlayManager;
+
+    @Inject
+    ClientToolbar clientToolbar;
+
+    @Inject
+    Client client;
+
+    @Inject
+    ClientThread clientThread;
+
+    @Inject
+    DeathTracker deathTracker;
+
+    @Inject
+    MonsterMonitorMenuHandler menuHandler;
+
+    private NavigationButton navButton;
+    private boolean initialized = false;
+
+    @Provides
+    MonsterMonitorConfig provideConfig(ConfigManager configManager)
+    {
+        return configManager.getConfig(MonsterMonitorConfig.class);
+    }
+
+    /**
+     * Initializes the plugin, setting up UI components and registering events.
+     */
+    @Override
+    protected void startUp() throws Exception
+    {
+        // Ensure the logger is initialized once the player is loaded.
+        clientThread.invoke(() -> {
+            if (client.getLocalPlayer() != null)
+            {
+                logger.initialize();
+            }
+        });
+
+        // Load the plugin icon and create a navigation button.
+        final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/net/runelite/client/plugins/MonsterMonitor/icon.png");
+        navButton = NavigationButton.builder()
+                .tooltip("Monster Monitor")
+                .icon(icon)
+                .panel(panel)
+                .build();
+        clientToolbar.addNavigation(navButton);
+        updateOverlayVisibility();
+
+        // Register DeathTracker and menu handler for event handling.
+        eventBus.register(deathTracker);
+        eventBus.register(menuHandler);
+    }
+
+    /**
+     * Handles plugin shutdown, including saving logs and removing UI elements.
+     */
+    @Override
+    protected void shutDown() throws Exception
+    {
+        overlayManager.remove(overlay);
+        clientToolbar.removeNavigation(navButton);
+
+        // Unregister DeathTracker and menu handler to stop event handling.
+        eventBus.unregister(deathTracker);
+        eventBus.unregister(menuHandler);
+
+        // Save the current log state if the logger was initialized.
+        if (logger != null && initialized)
+        {
+            logger.saveLog();
+        }
+        initialized = false;
+    }
+
+    /**
+     * Handles the game tick event to initialize components if needed.
+     */
+    @Subscribe
+    public void onGameTick(GameTick event)
+    {
+        // Initialize logger and UI elements if not yet initialized.
+        if (!initialized && client.getLocalPlayer() != null)
+        {
+            logger.initialize();
+            logger.loadLog();
+            updateOverlay();
+            updateOverlayVisibility();
+            panel.updatePanel();
+            initialized = true;
+        }
+    }
+
+    /**
+     * Logs a death for a specific NPC and updates the UI accordingly.
+     *
+     * @param npcName The name of the NPC to log the death for.
+     */
+    public void logDeath(String npcName)
+    {
+        if (initialized)
+        {
+            logger.logDeath(npcName);
+            updateUI();
+            checkKillLimit(npcName);
+        }
+    }
+
+    /**
+     * Updates the UI elements, including the overlay and panel.
+     */
+    public void updateUI()
+    {
+        if (initialized)
+        {
+            clientThread.invoke(() -> {
+                updateOverlay();
+                panel.updatePanel();
+            });
+        }
+    }
+
+    /**
+     * Checks if a kill limit has been reached for a specific NPC and sends notifications.
+     *
+     * @param npcName The name of the NPC to check the kill limit for.
+     */
+    private void checkKillLimit(String npcName)
+    {
+        if (!initialized)
+        {
+            return;
+        }
+
+        NpcData npcData = logger.getNpcLog().get(npcName);
+        if (npcData == null)
+        {
+            return;
+        }
+
+        int killLimit = npcData.getKillLimit();
+        int killCountForLimit = npcData.getKillCountForLimit();
+
+        // If the kill limit is reached, notify the player.
+        if (killLimit > 0 && killCountForLimit >= killLimit && npcData.isNotifyOnLimit())
+        {
+            if (config.notifyOnLimit())
+            {
+                // Play a sound if enabled.
+                if (config.enableSoundAlerts())
+                {
+                    Toolkit.getDefaultToolkit().beep();
+                }
+                // Display a chat message if enabled.
+                if (config.showChatNotifications())
+                {
+                    String message = "<col=ff0000>" + config.customNotificationMessage().replace("{npc}", npcName) + "</col>";
+                    client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, null);
+                }
+            }
+        }
+    }
+
+    /**
+     * Retrieves the list of tracked NPCs.
+     *
+     * @return A list of tracked NPC data.
+     */
+    public List<NpcData> getTrackedNpcs()
+    {
+        return logger.getNpcLog().values().stream().collect(Collectors.toList());
+    }
+
+    /**
+     * Updates the overlay with the current list of tracked NPCs.
+     * Only displays NPCs that have a set kill limit.
+     */
+    public void updateOverlay() {
+        List<NpcData> filteredNpcs = getTrackedNpcs().stream()
+                .filter(npcData -> npcData.isLimitSet() && !npcData.isIgnored())
+                .collect(Collectors.toList());
+
+        overlay.updateOverlayData(filteredNpcs);
+    }
+
+    /**
+     * Updates the visibility of the overlay based on user settings and tracked NPCs.
+     */
+    public void updateOverlayVisibility() {
+        // Check if there are any tracked NPCs with a set kill limit.
+        boolean hasKillLimitSet = logger.getNpcLog().values().stream()
+                .anyMatch(npcData -> npcData.isLimitSet() && !npcData.isIgnored());
+
+        // Only show the overlay if enabled in the config and at least one kill limit is set.
+        if (hasKillLimitSet && config.showOverlay()) {
+            overlayManager.add(overlay);
+        } else {
+            overlayManager.remove(overlay);
+        }
+
+        updateOverlay(); // Refresh the overlay with the current data
+    }
+
+    /**
+     * Sets the specified NPC to be monitored with a given kill limit.
+     * If the limit is zero, it is considered as having no limit.
+     *
+     * @param npcName The name of the NPC to monitor.
+     * @param killLimit The kill limit to set.
+     */
+    public void setNpcToMonitor(String npcName, int killLimit) {
+        NpcData npcData = logger.getNpcLog().computeIfAbsent(npcName, NpcData::new);
+
+        npcData.setKillLimit(killLimit);
+        npcData.setLimitSet(true); // Ensure the limit is set
+        npcData.setIgnored(false); // Ensure the NPC is not ignored
+        npcData.resetKillCountForLimit(); // Reset progress towards the limit if changed
+
+        // Update the logger with the new NPC data and refresh the UI.
+        logger.updateNpcData(npcData);
+        panel.updatePanel(); // Update the panel to reflect the checkbox state
+
+        // Force the UI elements to reflect the updated state
+        SwingUtilities.invokeLater(() -> panel.updatePanel());
+        updateOverlayVisibility();
+    }
+
+    /**
+     * Sets the specified NPC to be ignored, preventing it from being tracked.
+     *
+     * @param npcName The name of the NPC to ignore.
+     */
+    public void setNpcToIgnore(String npcName) {
+        NpcData npcData = logger.getNpcLog().computeIfAbsent(npcName, NpcData::new);
+
+        npcData.setIgnored(true);
+        npcData.setLimitSet(false);
+        npcData.setKillLimit(0);
+        npcData.resetKillCountForLimit();
+
+        // Update the logger with the new NPC data and refresh the UI.
+        logger.updateNpcData(npcData);
+        updateUI();
+        updateOverlayVisibility();
+    }
+
+    /**
+     * Handles changes in the plugin's configuration settings.
+     *
+     * @param event The configuration change event.
+     */
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event)
+    {
+        // Ensure the config change is related to the "monster monitor" plugin.
+        if (!event.getGroup().equals("monster monitor")) {
+            return;
+        }
+
+        // Respond to specific configuration changes.
+        switch (event.getKey()) {
+            case "showOverlay":
+            case "showTitle":
+            case "showRightClickMenuEntries":
+                updateOverlayVisibility();
+                break;
+            case "notifyOnLimit":
+            case "showChatNotifications":
+            case "customNotificationMessage":
+            case "enableSoundAlerts":
+                updateUI();
+                break;
+        }
+    }
+}
+
+package com.monstermonitor;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.NoArgsConstructor;
+import lombok.AllArgsConstructor;
+
+/**
+ * Represents the data associated with an NPC being tracked by Monster Monitor.
+ * This class holds information such as the NPC's name, kill counts, kill limits,
+ * whether the NPC is ignored (not logged), and whether notifications should be sent when a kill limit is reached.
+ */
+@Getter
+@Setter
+@NoArgsConstructor
+@AllArgsConstructor
+public class NpcData
+{
+    private String npcName; // Name of the NPC
+    private int totalKillCount; // Total kills of this NPC
+    private int killCountForLimit; // Progress towards the kill limit
+    private int killLimit; // The set kill limit for this NPC
+    private boolean limitSet; // Flag to track if the limit is set
+    private boolean notifyOnLimit; // Flag to determine if notifications should be sent when the kill limit is reached
+    private boolean ignored; // Flag to indicate if the NPC is ignored (true = ignored, false = tracked)
+
+    /**
+     * Constructor to create an NpcData object with just the NPC name.
+     * Initializes other fields to default values.
+     *
+     * @param npcName the name of the NPC
+     */
+    public NpcData(String npcName)
+    {
+        this.npcName = npcName;
+        this.totalKillCount = 0;
+        this.killCountForLimit = 0;
+        this.killLimit = 0; // No limit by default
+        this.limitSet = false; // Default to not set
+        this.notifyOnLimit = false; // Default to not notify
+        this.ignored = false; // Default to not ignored (tracked)
+    }
+
+    /**
+     * Increment the total kill count and the kill count towards the limit.
+     * This method is typically called when the player kills the tracked NPC.
+     * Ignores incrementing counts if the NPC is marked as ignored.
+     */
+    public void incrementKillCount()
+    {
+        if (!ignored) {
+            this.totalKillCount++;
+            this.killCountForLimit++;
+        }
+    }
+
+    /**
+     * Reset the total kill count and progress towards the limit.
+     * This method is used to reset the tracking data for the NPC, typically when the player
+     * wants to restart the tracking from zero.
+     */
+    public void resetKillCount()
+    {
+        this.totalKillCount = 0;
+        this.killCountForLimit = 0;
+    }
+
+    /**
+     * Reset only the progress towards the limit.
+     * This method resets the kill count related to the limit while retaining the total kills.
+     * Useful when the player wants to set a new limit but retain overall kill history.
+     */
+    public void resetKillCountForLimit()
+    {
+        this.killCountForLimit = 0;
+    }
+
+    /**
+     * Checks if the NPC should be tracked in the overlay based on its ignored state.
+     * This is useful for ensuring ignored NPCs don't appear in the monitoring section.
+     *
+     * @return true if the NPC should be tracked, false if it is ignored.
+     */
+    public boolean isTrackable()
+    {
+        return !ignored;
+    }
+}
+
+package com.monstermonitor;
+
+import net.runelite.client.ui.PluginPanel;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import javax.swing.plaf.basic.BasicScrollBarUI;
+import java.awt.*;
+import java.awt.event.*;
+import java.util.*;
+import java.util.List;
+
+/**
+ * Represents the main panel of Monster Monitor.
+ * This panel displays a list of NPCs that the player has been tracking, including their kill counts and
+ * various options for managing the tracked data, including ignore/monitor status.
+ * The panel also includes a title, total kill count display, and scrollable list of NPCs.
+ */
+public class MonsterMonitorPanel extends PluginPanel {
+    private final MonsterMonitorPlugin plugin;
+    private final JPanel npcListPanel;
+    private final JPanel ignoredNpcListPanel;
+    private final JPanel fillerBox; // The filler box at the bottom
+    private JLabel totalKillCountLabel;
+    private final Map<NpcData, Boolean> dropdownStates = new HashMap<>(); // Stores the state of dropdowns
+
+    @Inject
+    public MonsterMonitorPanel(MonsterMonitorPlugin plugin) {
+        this.plugin = plugin;
+
+        // Set layout using BorderLayout for the main panel
+        setLayout(new BorderLayout());
+
+        // Define colors for the UI components
+        Color backgroundColor = new Color(45, 45, 45); // Unified background color
+        Color textColor = new Color(200, 200, 200); // Light gray color for text
+
+        // Set the panel's background color
+        setBackground(backgroundColor);
+
+        // Initialize and configure the panel title
+        JPanel titlePanel = new JPanel(new BorderLayout());
+        titlePanel.setBackground(backgroundColor);
+
+        // Title label, now centered in the middle of the panel
+        JLabel titleLabel = new JLabel("Monster Monitor", SwingConstants.CENTER);
+        titleLabel.setFont(new Font("Arial", Font.BOLD, 14));
+        titleLabel.setForeground(new Color(200, 150, 0)); // Orange color for the title text
+        titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
+
+        ImageIcon icon = new ImageIcon(getClass().getResource("/net/runelite/client/plugins/MonsterMonitor/icon.png"));
+        titleLabel.setIcon(icon);
+
+        // Initialize and configure the total kill count label
+        totalKillCountLabel = new JLabel("Total kills: 0");
+        totalKillCountLabel.setFont(new Font("Arial", Font.BOLD, 12)); // Bold text
+        totalKillCountLabel.setForeground(textColor); // Light gray for the total kills text
+        totalKillCountLabel.setHorizontalAlignment(SwingConstants.CENTER);
+
+        // Add the title and total kill count to the title panel
+        titlePanel.add(titleLabel, BorderLayout.NORTH); // Place title at the top
+        titlePanel.add(totalKillCountLabel, BorderLayout.SOUTH); // Below the title
+
+        // Add the title panel to the top of the main panel (fixed)
+        add(titlePanel, BorderLayout.NORTH);
+
+
+        // Initialize the NPC List Panels using GridBagLayout
+        this.npcListPanel = new JPanel(new GridBagLayout());
+        this.npcListPanel.setBackground(backgroundColor);
+        this.npcListPanel.setBorder(BorderFactory.createEmptyBorder());
+        this.ignoredNpcListPanel = new JPanel(new GridBagLayout());
+        this.ignoredNpcListPanel.setBackground(backgroundColor);
+        add(npcListPanel, BorderLayout.CENTER);
+
+        // Customize scroll bar appearance
+        SwingUtilities.invokeLater(() -> {
+            Component parent = this.getParent();
+            while (parent != null && !(parent instanceof JScrollPane)) {
+                parent = parent.getParent();
+            }
+            if (parent instanceof JScrollPane) {
+                JScrollPane scrollPane = (JScrollPane) parent;
+                scrollPane.getVerticalScrollBar().setUI(new CustomScrollBarUI(new Color(200, 150, 0)));
+                scrollPane.getVerticalScrollBar().setPreferredSize(new Dimension(2, 0));
+                scrollPane.getVerticalScrollBar().setUnitIncrement(6);
+            }
+        });
+
+        // Initialize the dynamic filler box that adjusts based on NPC count
+        this.fillerBox = new JPanel();
+        fillerBox.setBackground(backgroundColor); // Same background as the panel (invisible)
+        fillerBox.setPreferredSize(new Dimension(0, 200)); // Initial height is large
+    }
+
+    /**
+     * Captures the current dropdown state for all NPC panels before refreshing.
+     */
+    private void captureDropdownStates() {
+        Component[] components = npcListPanel.getComponents();
+        for (Component component : components) {
+            if (component instanceof MonsterMonitorBox) {
+                MonsterMonitorBox box = (MonsterMonitorBox) component;
+                NpcData npcData = box.getNpcData();
+                dropdownStates.put(npcData, box.isDropdownVisible());
+            }
+        }
+    }
+
+    /**
+     * Restores the dropdown states after the panel is refreshed.
+     */
+    private void restoreDropdownStates() {
+        Component[] components = npcListPanel.getComponents();
+        for (Component component : components) {
+            if (component instanceof MonsterMonitorBox) {
+                MonsterMonitorBox box = (MonsterMonitorBox) component;
+                NpcData npcData = box.getNpcData();
+                box.setDropdownVisible(dropdownStates.getOrDefault(npcData, false));
+            }
+        }
+    }
+
+    /**
+     * Updates the panel by refreshing the list of tracked and ignored NPCs.
+     */
+    public void updatePanel() {
+        SwingUtilities.invokeLater(() -> {
+            captureDropdownStates();
+
+            npcListPanel.removeAll();
+            ignoredNpcListPanel.removeAll();
+
+            List<NpcData> trackedNpcs = new ArrayList<>(plugin.getTrackedNpcs());
+            List<NpcData> ignoredNpcs = new ArrayList<>();
+
+            // Separate tracked and ignored NPCs for different displays
+            for (NpcData npcData : trackedNpcs) {
+                if (npcData.isIgnored()) {
+                    ignoredNpcs.add(npcData);
+                }
+            }
+
+            Collections.reverse(trackedNpcs);
+            Collections.reverse(ignoredNpcs);
+
+            int totalKills = 0;
+            GridBagConstraints gbc = new GridBagConstraints();
+            gbc.gridx = 0;
+            gbc.gridy = 0;
+            gbc.weightx = 1.0;
+            gbc.fill = GridBagConstraints.HORIZONTAL;
+            gbc.insets = new Insets(5, 0, 5, 0);
+
+            // Add tracked NPCs
+            for (NpcData npcData : trackedNpcs) {
+                if (!npcData.isIgnored()) {
+                    MonsterMonitorBox npcPanel = new MonsterMonitorBox(plugin, npcData, dropdownStates.getOrDefault(npcData, false));
+                    totalKills += npcData.getTotalKillCount();
+                    npcListPanel.add(npcPanel, gbc);
+                    addContextMenuToNpcPanel(npcPanel, npcData);
+                    gbc.gridy++;
+                }
+            }
+
+            // Add ignored NPCs section
+            if (!ignoredNpcs.isEmpty()) {
+                JLabel ignoredLabel = new JLabel("Ignored NPCs", SwingConstants.CENTER);
+                ignoredLabel.setForeground(new Color(180, 180, 180));
+                ignoredLabel.setFont(new Font("Arial", Font.BOLD, 12));
+                npcListPanel.add(ignoredLabel, gbc);
+                gbc.gridy++;
+
+                for (NpcData npcData : ignoredNpcs) {
+                    MonsterMonitorBox npcPanel = new MonsterMonitorBox(plugin, npcData, dropdownStates.getOrDefault(npcData, false));
+                    npcPanel.setBackground(new Color(50, 50, 50)); // Solid grey background for ignored NPCs
+                    npcListPanel.add(npcPanel, gbc);
+                    addContextMenuToNpcPanel(npcPanel, npcData);
+                    gbc.gridy++;
+                }
+            }
+
+            adjustFillerBox(trackedNpcs.size() + ignoredNpcs.size());
+            npcListPanel.add(fillerBox, gbc);
+
+            totalKillCountLabel.setText("Total kills: " + totalKills);
+            npcListPanel.revalidate();
+            npcListPanel.repaint();
+
+            restoreDropdownStates();
+        });
+    }
+
+    /**
+     * Adds a context menu to the given NPC panel.
+     */
+    private void addContextMenuToNpcPanel(MonsterMonitorBox npcPanel, NpcData npcData) {
+        JPopupMenu contextMenu = createContextMenu(npcData);
+        npcPanel.setComponentPopupMenu(contextMenu);
+        npcPanel.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (e.isPopupTrigger()) {
+                    contextMenu.show(npcPanel, e.getX(), e.getY());
+                }
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                if (e.isPopupTrigger()) {
+                    contextMenu.show(npcPanel, e.getX(), e.getY());
+                }
+            }
+        });
+    }
+
+    private void adjustFillerBox(int npcCount) {
+        int minHeight = 100;
+        int maxHeight = 400;
+
+        if (npcCount > 15) {
+            fillerBox.setPreferredSize(new Dimension(0, 0));
+        } else {
+            int dynamicHeight = maxHeight - (npcCount * 15);
+            dynamicHeight = Math.max(minHeight, dynamicHeight);
+            fillerBox.setPreferredSize(new Dimension(0, dynamicHeight));
+        }
+
+        fillerBox.revalidate();
+        fillerBox.repaint();
+    }
+
+    private JPopupMenu createContextMenu(NpcData npcData) {
+        JPopupMenu contextMenu = new JPopupMenu();
+
+        if (!npcData.isIgnored()) {
+            JMenuItem ignoreMenuItem = new JMenuItem("Ignore NPC");
+            ignoreMenuItem.addActionListener(ev -> {
+                npcData.setIgnored(true);
+                plugin.logger.updateNpcData(npcData);
+                plugin.updateOverlay();
+                updatePanel();
+            });
+            contextMenu.add(ignoreMenuItem);
+        }
+
+        JMenu monitorMenu = new JMenu("Monitor");
+        String[] presets = {"1", "10", "100", "1000"};
+        for (String preset : presets) {
+            JMenuItem presetItem = new JMenuItem(preset);
+            presetItem.addActionListener(ev -> {
+                npcData.setKillLimit(Integer.parseInt(preset));
+                npcData.setLimitSet(true); // Ensure the Set Limit checkbox is checked
+                npcData.setIgnored(false);
+                plugin.logger.updateNpcData(npcData);
+                plugin.updateOverlay();
+                updatePanel();
+            });
+            monitorMenu.add(presetItem);
+        }
+
+        // Add custom limit option
+        JMenuItem customMonitorItem = new JMenuItem("Custom...");
+        customMonitorItem.addActionListener(ev -> {
+            String input = JOptionPane.showInputDialog("Enter custom kill limit:");
+            try {
+                int customLimit = Integer.parseInt(input);
+                npcData.setKillLimit(customLimit);
+                npcData.setLimitSet(true); // Ensure the Set Limit checkbox is checked
+                npcData.setIgnored(false);
+                plugin.logger.updateNpcData(npcData);
+                plugin.updateOverlay();
+                updatePanel();
+            } catch (NumberFormatException ignored) {
+                // Handle invalid input silently
+            }
+        });
+        monitorMenu.add(customMonitorItem);
+        contextMenu.add(monitorMenu);
+
+        JMenuItem resetMenuItem = new JMenuItem("Clear NPC Data");
+        resetMenuItem.addActionListener(ev -> {
+            plugin.logger.removeNpcFromLog(npcData.getNpcName());
+            plugin.logger.saveLog();
+            plugin.updateOverlay();
+            updatePanel();
+        });
+
+        JMenuItem resetKillLimitMenuItem = new JMenuItem("Reset Kill Limit");
+        resetKillLimitMenuItem.addActionListener(ev -> {
+            npcData.setKillLimit(0);
+            npcData.setLimitSet(false);
+            npcData.resetKillCountForLimit();
+            plugin.logger.updateNpcData(npcData);
+            plugin.updateOverlay();
+            updatePanel();
+        });
+
+        contextMenu.add(resetMenuItem);
+        contextMenu.add(resetKillLimitMenuItem);
+
+        // "Edit NPC Data" option to edit NPC Data from log
+        JMenuItem editNpcDataMenuItem = new JMenuItem("Edit NPC Data");
+        editNpcDataMenuItem.addActionListener(ev -> showEditNpcDataDialog(npcData));
+        contextMenu.add(editNpcDataMenuItem);
+
+        // Add Expand All and Collapse All
+        JMenuItem collapseAllItem = new JMenuItem("Collapse All");
+        collapseAllItem.addActionListener(this::collapseAllDropdowns);
+
+        JMenuItem expandAllItem = new JMenuItem("Expand All");
+        expandAllItem.addActionListener(this::expandAllDropdowns);
+
+        contextMenu.addSeparator();
+        contextMenu.add(collapseAllItem);
+        contextMenu.add(expandAllItem);
+
+        return contextMenu;
+    }
+
+    private void showEditNpcDataDialog(NpcData npcData) {
+        JPanel panel = new JPanel(new GridLayout(4, 2));
+
+        // Create input fields with current values prefilled
+        JLabel npcNameField = new JLabel(String.valueOf(npcData.getNpcName()));
+        JTextField totalKillsField = new JTextField(String.valueOf(npcData.getTotalKillCount()));
+        JTextField killLimitField = new JTextField(String.valueOf(npcData.getKillLimit()));
+        JTextField killsForLimitField = new JTextField(String.valueOf(npcData.getKillCountForLimit()));
+
+        // Add labels and fields to the panel
+        panel.add(new JLabel(getName()));
+        panel.add(npcNameField);
+        panel.add(new JLabel("Total Kills:"));
+        panel.add(totalKillsField);
+        panel.add(new JLabel("Kill Limit:"));
+        panel.add(killLimitField);
+        panel.add(new JLabel("Kills For Limit:"));
+        panel.add(killsForLimitField);
+
+        int result = JOptionPane.showConfirmDialog(null, panel, "Edit NPC Data", JOptionPane.OK_CANCEL_OPTION, JOptionPane.PLAIN_MESSAGE);
+
+        if (result == JOptionPane.OK_OPTION) {
+            try {
+                // Parse and set new values if valid
+                int totalKills = Integer.parseInt(totalKillsField.getText());
+                int killLimit = Integer.parseInt(killLimitField.getText());
+                int killsForLimit = Integer.parseInt(killsForLimitField.getText());
+
+                npcData.setTotalKillCount(totalKills);
+                npcData.setKillLimit(killLimit);
+                npcData.setKillCountForLimit(killsForLimit);
+
+                plugin.logger.updateNpcData(npcData);
+                plugin.updateOverlay();
+                updatePanel();  // Refresh the panel to show updated values
+
+            } catch (NumberFormatException e) {
+                JOptionPane.showMessageDialog(null, "Please enter valid numbers.", "Invalid Input", JOptionPane.ERROR_MESSAGE);
+            }
+        }
+    }
+
+    private void collapseAllDropdowns(ActionEvent e) {
+        for (Component component : npcListPanel.getComponents()) {
+            if (component instanceof MonsterMonitorBox) {
+                MonsterMonitorBox box = (MonsterMonitorBox) component;
+                box.setDropdownVisible(false);
+            }
+        }
+        npcListPanel.revalidate();
+        npcListPanel.repaint();
+    }
+
+    private void expandAllDropdowns(ActionEvent e) {
+        for (Component component : npcListPanel.getComponents()) {
+            if (component instanceof MonsterMonitorBox) {
+                MonsterMonitorBox box = (MonsterMonitorBox) component;
+                box.setDropdownVisible(true);
+            }
+        }
+        npcListPanel.revalidate();
+        npcListPanel.repaint();
+    }
+
+    public static class CustomScrollBarUI extends BasicScrollBarUI {
+        private final Color arrowColor;
+
+        public CustomScrollBarUI(Color arrowColor) {
+            this.arrowColor = arrowColor;
+        }
+
+        @Override
+        protected void configureScrollBarColors() {
+            this.thumbColor = new Color(200, 150, 0);
+            this.trackColor = new Color(30, 30, 30);
+        }
+
+        @Override
+        protected JButton createDecreaseButton(int orientation) {
+            return createZeroButton();
+        }
+
+        @Override
+        protected JButton createIncreaseButton(int orientation) {
+            return createZeroButton();
+        }
+
+        private JButton createZeroButton() {
+            JButton button = new JButton();
+            button.setPreferredSize(new Dimension(0, 0));
+            return button;
+        }
+    }
+}
+
+package com.monstermonitor;
+
+import javax.swing.*;
+import java.awt.*;
+
+/**
+ * Represents a UI component (box) in Monster Monitor that displays information
+ * about a specific NPC. The box shows the NPC's name, kill count, and provides options to
+ * set kill limits, enable notifications, and other related settings.
+ * This component also supports expanding and collapsing additional options via a dropdown.
+ */
+public class MonsterMonitorBox extends JPanel
+{
+    private final MonsterMonitorPlugin plugin;
+    private final NpcData npcData;
+    private boolean optionsVisible; // Tracks whether the dropdown is open
+    private final JPanel optionsPanel;
+    private JButton toggleButton;
+    private JCheckBox setLimitCheckbox;
+    private JSpinner limitSpinner;
+    private JCheckBox notifyCheckbox;
+
+    /**
+     * Constructs the MonsterMonitorBox component and initializes its UI elements.
+     *
+     * @param plugin The MonsterMonitorPlugin instance that this box is part of.
+     * @param npcData The NpcData associated with the NPC displayed in this box.
+     * @param initialDropdownState The initial state of the dropdown (expanded or collapsed).
+     */
+    public MonsterMonitorBox(MonsterMonitorPlugin plugin, NpcData npcData, boolean initialDropdownState)
+    {
+        this.plugin = plugin;
+        this.npcData = npcData;
+        this.optionsVisible = initialDropdownState;
+
+        setLayout(new BorderLayout());
+        setBackground(new Color(60, 60, 60));
+        setBorder(BorderFactory.createLineBorder(Color.GRAY));
+
+        add(createNpcNameLabel(), BorderLayout.WEST);
+        add(createToggleButton(), BorderLayout.EAST);
+
+        // Create the options panel
+        optionsPanel = createOptionsPanel();
+        if (optionsVisible) {
+            add(optionsPanel, BorderLayout.SOUTH);
+        }
+
+        // Set the initial state of the checkbox and other UI elements
+        refreshUI();
+        updateOptionStateBasedOnIgnored();
+    }
+
+    /**
+     * Creates the NPC name label displaying the NPC's name and kill count.
+     *
+     * @return The JLabel for the NPC's name.
+     */
+    private JLabel createNpcNameLabel()
+    {
+        JLabel npcNameLabel = new JLabel(npcData.getNpcName() + " x " + npcData.getTotalKillCount());
+        npcNameLabel.setForeground(new Color(200, 200, 200));
+        npcNameLabel.setFont(new Font("Arial", Font.BOLD, 12));
+        npcNameLabel.setHorizontalAlignment(SwingConstants.LEFT);
+        npcNameLabel.setBorder(BorderFactory.createEmptyBorder(2, 5, 2, 5));
+        return npcNameLabel;
+    }
+
+    /**
+     * Creates the toggle button for expanding or collapsing the options panel.
+     *
+     * @return The JButton used to toggle the dropdown visibility.
+     */
+    private JButton createToggleButton()
+    {
+        toggleButton = new JButton(optionsVisible ? "▲" : "▼");
+        toggleButton.setPreferredSize(new Dimension(16, 16));
+        toggleButton.setBorder(BorderFactory.createEmptyBorder());
+        toggleButton.setContentAreaFilled(false);
+        toggleButton.setFocusPainted(false);
+        toggleButton.setForeground(new Color(200, 150, 0));
+
+        toggleButton.addActionListener(e -> toggleOptionsVisibility());
+        return toggleButton;
+    }
+
+    /**
+     * Toggles the visibility of the options panel (dropdown) in the NPC box.
+     * Expands or collapses the options panel and updates the toggle button text.
+     */
+    private void toggleOptionsVisibility() {
+        SwingUtilities.invokeLater(() -> {
+            if (optionsVisible) {
+                remove(optionsPanel);
+                toggleButton.setText("▼");
+            } else {
+                add(optionsPanel, BorderLayout.SOUTH);
+                toggleButton.setText("▲");
+            }
+            optionsVisible = !optionsVisible;
+            revalidate();
+            getParent().revalidate();
+            getParent().repaint();
+        });
+    }
+
+    /**
+     * Creates the options panel that allows users to set a kill limit, enable notifications,
+     * and interact with other related settings for the NPC.
+     *
+     * @return A JPanel containing the options controls.
+     */
+    private JPanel createOptionsPanel()
+    {
+        JPanel panel = new JPanel(new GridBagLayout());
+        panel.setBackground(new Color(60, 60, 60));
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.insets = new Insets(2, 2, 2, 2);
+
+        setLimitCheckbox = createSetLimitCheckbox();
+        limitSpinner = createLimitSpinner();
+        notifyCheckbox = createNotifyCheckbox();
+
+        gbc.gridx = 0;
+        gbc.weightx = 0.1;
+        panel.add(setLimitCheckbox, gbc);
+
+        gbc.gridx = 1;
+        gbc.weightx = 0.3;
+        panel.add(limitSpinner, gbc);
+
+        gbc.gridx = 2;
+        gbc.weightx = 0.1;
+        panel.add(notifyCheckbox, gbc);
+
+        return panel;
+    }
+
+    /**
+     * Creates the checkbox to set a kill limit.
+     *
+     * @return A JCheckBox to enable or disable kill limit.
+     */
+    private JCheckBox createSetLimitCheckbox()
+    {
+        JCheckBox checkBox = new JCheckBox("Set Limit");
+        checkBox.setForeground(Color.LIGHT_GRAY);
+        checkBox.setBackground(new Color(60, 60, 60));
+        checkBox.setFont(new Font("SansSerif", Font.BOLD, 11));
+        checkBox.setSelected(npcData.isLimitSet());
+        checkBox.addActionListener(e -> handleSetLimitCheckbox());
+        return checkBox;
+    }
+
+    /**
+     * Creates the spinner to adjust the kill limit.
+     *
+     * @return A JSpinner for selecting the kill limit.
+     */
+    private JSpinner createLimitSpinner()
+    {
+        JSpinner spinner = new JSpinner(new SpinnerNumberModel(npcData.getKillLimit(), 0, 9999999, 1)) {
+            @Override
+            public Dimension getPreferredSize() {
+                return new Dimension(70, 20);
+            }
+
+            @Override
+            public Dimension getMaximumSize() {
+                return new Dimension(90, 20);
+            }
+        };
+        spinner.setEnabled(npcData.isLimitSet());
+        spinner.setFont(new Font("SansSerif", Font.BOLD, 11));
+        spinner.addChangeListener(e -> {
+            int limit = (Integer) spinner.getValue();
+            npcData.setKillLimit(limit);
+            plugin.logger.updateNpcData(npcData);
+            plugin.updateOverlay();
+        });
+        return spinner;
+    }
+
+    /**
+     * Creates the checkbox to enable notifications for reaching the kill limit.
+     *
+     * @return A JCheckBox to enable or disable notifications.
+     */
+    private JCheckBox createNotifyCheckbox()
+    {
+        JCheckBox checkBox = new JCheckBox("Notify");
+        checkBox.setForeground(Color.LIGHT_GRAY);
+        checkBox.setBackground(new Color(60, 60, 60));
+        checkBox.setFont(new Font("SansSerif", Font.BOLD, 11));
+        checkBox.setSelected(npcData.isNotifyOnLimit());
+        checkBox.setEnabled(npcData.isLimitSet());
+        checkBox.addActionListener(e -> {
+            npcData.setNotifyOnLimit(checkBox.isSelected());
+            plugin.logger.updateNpcData(npcData);
+        });
+        return checkBox;
+    }
+
+    /**
+     * Handles the action when the set limit checkbox is toggled.
+     */
+    private void handleSetLimitCheckbox()
+    {
+        boolean isChecked = setLimitCheckbox.isSelected();
+        npcData.setLimitSet(isChecked);
+        limitSpinner.setEnabled(isChecked);
+        notifyCheckbox.setEnabled(isChecked);
+
+        if (!isChecked) {
+            npcData.setKillLimit(0); // Clear the limit when unchecked
+            limitSpinner.setValue(0); // Reset the spinner to 0
+            notifyCheckbox.setSelected(false); // Uncheck notify
+            npcData.setNotifyOnLimit(false); // Update npcData to reflect unchecked state
+            plugin.updateOverlay();
+        } else {
+            npcData.setKillLimit((Integer) limitSpinner.getValue());
+        }
+
+        plugin.logger.updateNpcData(npcData);
+        updatePanelDirectly();
+    }
+
+    /**
+     * Refreshes the UI elements based on the current state of the npcData.
+     */
+    private void refreshUI()
+    {
+        setLimitCheckbox.setSelected(npcData.isLimitSet());
+        limitSpinner.setEnabled(npcData.isLimitSet());
+        notifyCheckbox.setEnabled(npcData.isLimitSet());
+        revalidate();
+        repaint();
+    }
+
+    /**
+     * Disables or enables option controls based on whether the NPC is ignored.
+     */
+    private void updateOptionStateBasedOnIgnored() {
+        SwingUtilities.invokeLater(() -> {
+            boolean isIgnored = npcData.isIgnored();
+            setLimitCheckbox.setEnabled(!isIgnored);
+            limitSpinner.setEnabled(!isIgnored && npcData.isLimitSet());
+            notifyCheckbox.setEnabled(!isIgnored && npcData.isLimitSet());
+
+            setBackground(isIgnored ? new Color(50, 50, 50) : new Color(60, 60, 60));
+            toggleButton.setBackground(isIgnored ? new Color(50, 50, 50) : new Color(60, 60, 60));
+            toggleButton.setForeground(isIgnored ? Color.GRAY : new Color(200, 150, 0));
+
+            revalidate();
+            repaint();
+        });
+    }
+
+    /**
+     * Updates the parent panel directly to reflect any changes made in this component.
+     */
+    private void updatePanelDirectly()
+    {
+        Container parent = getParent();
+        if (parent instanceof MonsterMonitorPanel) {
+            ((MonsterMonitorPanel) parent).updatePanel();
+        }
+    }
+
+    /**
+     * Returns the NpcData associated with this box.
+     *
+     * @return The NpcData object.
+     */
+    public NpcData getNpcData()
+    {
+        return npcData;
+    }
+
+    /**
+     * Checks if the dropdown options panel is currently visible.
+     *
+     * @return True if the dropdown is visible, otherwise false.
+     */
+    public boolean isDropdownVisible()
+    {
+        return optionsVisible;
+    }
+
+    /**
+     * Sets the visibility of the dropdown options panel to the specified state.
+     *
+     * @param visible True to make the dropdown visible, false to hide it.
+     */
+    public void setDropdownVisible(boolean visible)
+    {
+        if (visible != optionsVisible)
+        {
+            toggleOptionsVisibility();
+        }
+    }
+}
+
+package com.monstermonitor;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import net.runelite.api.Client;
+import net.runelite.api.Player;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import javax.inject.Inject;
+import java.io.*;
+import java.lang.reflect.Type;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+/**
+ * The MonsterMonitorLogger class is responsible for logging and managing data related to NPC kills.
+ * It handles reading from and writing to log files specific to each player,
+ * maintains the current state of the tracked NPCs, and handles NPC ignore/monitor states.
+ */
+public class MonsterMonitorLogger {
+    private static final Logger logger = LoggerFactory.getLogger(MonsterMonitorLogger.class);
+    private static final String BASE_LOG_DIR = System.getProperty("user.home") + "/.runelite/monstermonitor";
+    private final Map<String, NpcData> npcLog = new LinkedHashMap<>(); // Use LinkedHashMap to maintain insertion order
+    private String playerLogDir; // Directory to store logs specific to the player
+    private String logFilePath; // Path to the main log file
+    private final MonsterMonitorPlugin plugin;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private Gson gson;
+
+    @Inject
+    public MonsterMonitorLogger(MonsterMonitorPlugin plugin) {
+        this.plugin = plugin;
+    }
+
+    /**
+     * Initializes the logger with directories based on the player's name.
+     * Creates necessary directories and files if they don't exist, and loads existing log data.
+     */
+    public void initialize() {
+        Player localPlayer = client.getLocalPlayer();
+        if (localPlayer == null) {
+            return; // Exit early if the player is not yet initialized
+        }
+
+        String playerName = localPlayer.getName();
+        playerLogDir = BASE_LOG_DIR + "/" + playerName;
+        logFilePath = playerLogDir + "/monster_monitor_log.json";
+
+        File directory = new File(playerLogDir);
+        if (!directory.exists()) {
+            directory.mkdirs(); // Create the directory if it doesn't exist
+        }
+
+        createEmptyFileIfNotExists(logFilePath);
+        loadLog(); // Load existing data
+    }
+
+    /**
+     * Helper method to create an empty file if it doesn't exist.
+     *
+     * @param filePath the path to the file that needs to be checked/created
+     */
+    private void createEmptyFileIfNotExists(String filePath) {
+        File file = new File(filePath);
+        if (!file.exists()) {
+            try {
+                file.createNewFile();
+            } catch (IOException e) {
+                logger.error("Failed to create new log file at {}", filePath, e);
+            }
+        }
+    }
+
+    /**
+     * Loads the NPC log from the file, or creates a new file if it doesn't exist.
+     * This method ensures that the NPC log is populated with data from previous sessions
+     * and updates any missing fields to ensure compatibility.
+     */
+    public void loadLog() {
+        if (logFilePath == null) {
+            return;
+        }
+
+        File logFile = new File(logFilePath);
+        if (!logFile.exists()) {
+            try {
+                logFile.createNewFile();
+                saveLogAsync();  // Save the log (with initial empty data)
+            } catch (IOException e) {
+                logger.error("Failed to create new log file during load at {}", logFilePath, e);
+            }
+        }
+
+        try (BufferedReader reader = new BufferedReader(new FileReader(logFile))) {
+            Type type = new TypeToken<Map<String, NpcData>>() {}.getType();
+            Map<String, NpcData> loadedLog = gson.fromJson(reader, type);
+            if (loadedLog != null) {
+                // Iterate over loaded entries and ensure they have all required fields
+                loadedLog.forEach((npcName, npcData) -> {
+                    // Ensure default values for missing fields
+                    if (npcData.getKillLimit() == 0) {
+                        npcData.setKillLimit(10); // Default kill limit (could be 0 if not set)
+                    }
+                    if (npcData.getKillCountForLimit() == 0) {
+                        npcData.resetKillCountForLimit();
+                    }
+                    if (!npcData.isLimitSet()) {
+                        npcData.setLimitSet(false);
+                    }
+                    if (!npcData.isIgnored()) {
+                        npcData.setIgnored(false);
+                    }
+                    if (!npcData.isNotifyOnLimit()) {
+                        npcData.setNotifyOnLimit(false);
+                    }
+
+                    // Update the in-memory log with the corrected data
+                    npcLog.put(npcName, npcData);
+                });
+
+                // Save back the updated log to ensure that the new fields are persisted
+                saveLogAsync();
+            }
+        } catch (IOException e) {
+            logger.error("Failed to load log data from {}", logFilePath, e);
+        }
+
+        // Ensure the overlay is updated after loading data
+        plugin.updateOverlayVisibility();
+    }
+
+    /**
+     * Logs the death of an NPC by updating its kill count and saving the log.
+     * Also reorders the log to ensure the last killed NPC is at the top.
+     *
+     * @param npcName the name of the NPC
+     */
+    public void logDeath(String npcName) {
+        NpcData npcData = npcLog.getOrDefault(npcName, new NpcData(npcName));
+
+        // Do not log kills for NPCs that are set to be ignored
+        if (npcData.isIgnored()) {
+            return;
+        }
+
+        npcData.incrementKillCount();
+        npcLog.remove(npcName); // Remove the NPC if it exists to reinsert it at the top
+        npcLog.put(npcName, npcData); // Insert it at the top
+
+        saveLogAsync(); // Save the reordered log asynchronously
+    }
+
+    /**
+     * Saves the current NPC log to the file asynchronously.
+     * This method is called whenever NPC data is updated to ensure persistence.
+     */
+    public void saveLogAsync() {
+        new Thread(this::saveLog).start();
+    }
+
+    /**
+     * Synchronously saves the current NPC log to the file.
+     * This method is intended to be run on a background thread.
+     */
+    public void saveLog() {
+        if (logFilePath == null) {
+            return;
+        }
+
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(new File(logFilePath)))) {
+            gson.toJson(npcLog, writer);
+        } catch (IOException e) {
+            logger.error("Failed to save log data to {}", logFilePath, e);
+        }
+    }
+
+    /**
+     * Retrieves the current NPC log.
+     *
+     * @return a map containing the NPC log data
+     */
+    public synchronized Map<String, NpcData> getNpcLog() {
+        return new LinkedHashMap<>(npcLog); // Return a copy to avoid exposing internal state
+    }
+
+    /**
+     * Removes an NPC from the log by name.
+     *
+     * @param npcName the name of the NPC to remove
+     * @return true if the NPC was removed, false if not found
+     */
+    public synchronized void removeNpcFromLog(String npcName) {
+        npcLog.remove(npcName);
+    }
+
+    /**
+     * Updates the data for a specific NPC in the log and saves the log asynchronously.
+     * If the NPC is ignored, it will not be tracked further.
+     *
+     * @param npcData the updated data for the NPC
+     */
+    public synchronized void updateNpcData(NpcData npcData) {
+        npcLog.put(npcData.getNpcName(), npcData);
+        saveLogAsync();
+        plugin.updateOverlayVisibility();
+    }
+}
+
+package com.monstermonitor;
+
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.NPC;
+import net.runelite.api.events.MenuOpened;
+import net.runelite.client.eventbus.Subscribe;
+
+import javax.inject.Inject;
+
+/**
+ * Handles adding custom menu entries for Monster Monitor.
+ * Manages the creation of "Monitor" and "Ignore" options.
+ */
+public class MonsterMonitorMenuHandler {
+    private static final String MONITOR_OPTION = "Monitor";
+    private static final String IGNORE_OPTION = "Ignore";
+    private final MonsterMonitorPlugin plugin;
+    private final MonsterMonitorLogger logger;
+    private final MonsterMonitorPanel panel;
+    private final MonsterMonitorConfig config;
+    private final Client client;
+
+    @Inject
+    public MonsterMonitorMenuHandler(MonsterMonitorPlugin plugin, MonsterMonitorLogger logger, Client client, MonsterMonitorPanel panel, MonsterMonitorConfig config) {
+        this.plugin = plugin;
+        this.logger = logger;
+        this.panel = panel;
+        this.config = config;
+        this.client = client;
+    }
+
+    /**
+     * Inserts custom options when the target is an NPC.
+     *
+     * @param event The event triggered when the menu is opened.
+     */
+    @Subscribe
+    public void onMenuOpened(MenuOpened event) {
+        if (!config.showRightClickMenuEntries()) {
+            return; // Exit early if the user has disabled the right-click menu entries
+        }
+
+        MenuEntry[] menuEntries = event.getMenuEntries();
+        NPC targetNpc = findTargetNpc(menuEntries);
+
+        if (targetNpc != null) {
+            addCustomMenuOptions(targetNpc);
+        }
+    }
+
+    /**
+     * Finds the target NPC from the menu entries.
+     *
+     * @param menuEntries The array of menu entries.
+     * @return The target NPC if found, otherwise null.
+     */
+    private NPC findTargetNpc(MenuEntry[] menuEntries) {
+        for (MenuEntry menuEntry : menuEntries) {
+            MenuAction menuType = menuEntry.getType();
+            NPC target = menuEntry.getNpc();
+
+            if (target != null && isValidMenuType(menuType, menuEntry.getOption(), target.getCombatLevel())) {
+                return target;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Checks if a menu type and option are valid for adding custom entries.
+     *
+     * @param menuType The type of the menu.
+     * @param optionText The option text from the menu.
+     * @param combatLevel The combat level of the NPC.
+     * @return True if the menu type and option are valid for adding entries, otherwise false.
+     */
+    private boolean isValidMenuType(MenuAction menuType, String optionText, int combatLevel) {
+        return (menuType == MenuAction.EXAMINE_NPC || menuType == MenuAction.NPC_SECOND_OPTION || menuType == MenuAction.NPC_FIFTH_OPTION)
+                && optionText.equals("Attack")
+                && combatLevel > 0;
+    }
+
+    /**
+     * Adds custom "Monitor" and "Ignore" menu options for the specified NPC.
+     *
+     * @param npc The NPC to add the options for.
+     */
+    private void addCustomMenuOptions(NPC npc) {
+        String npcName = npc.getName();
+        int combatLevel = npc.getCombatLevel();
+
+        if (npcName == null) {
+            return;
+        }
+
+        NpcData npcData = logger.getNpcLog().get(npcName);
+
+        if (shouldAddMonitorOption(npcData)) {
+            addMonitorMenuOption(npcName, combatLevel);
+        }
+
+        if (shouldAddIgnoreOption(npcData)) {
+            addIgnoreMenuOption(npcName, combatLevel);
+        }
+    }
+
+    /**
+     * Determines if the "Monitor" option should be added for the NPC.
+     *
+     * @param npcData The data of the NPC.
+     * @return True if the "Monitor" option should be added, otherwise false.
+     */
+    private boolean shouldAddMonitorOption(NpcData npcData) {
+        return npcData == null || (!npcData.isLimitSet() && !npcData.isIgnored());
+    }
+
+    /**
+     * Adds the "Monitor" option to the menu.
+     *
+     * @param npcName The name of the NPC.
+     * @param combatLevel The combat level of the NPC.
+     */
+    private void addMonitorMenuOption(String npcName, int combatLevel) {
+        client.getMenu()
+                .createMenuEntry(1)
+                .setOption(MONITOR_OPTION)
+                .setTarget(npcName + " (level-" + combatLevel + ")")
+                .setType(MenuAction.RUNELITE_HIGH_PRIORITY)
+                .onClick(e -> handleMonitorAction(npcName));
+    }
+
+    /**
+     * Determines if the "Ignore" option should be added for the NPC.
+     *
+     * @param npcData The data of the NPC.
+     * @return True if the "Ignore" option should be added, otherwise false.
+     */
+    private boolean shouldAddIgnoreOption(NpcData npcData) {
+        return npcData == null || (!npcData.isIgnored() && !npcData.isLimitSet());
+    }
+
+    /**
+     * Adds the "Ignore" option to the menu.
+     *
+     * @param npcName The name of the NPC.
+     * @param combatLevel The combat level of the NPC.
+     */
+    private void addIgnoreMenuOption(String npcName, int combatLevel) {
+        client.getMenu()
+                .createMenuEntry(1)
+                .setOption(IGNORE_OPTION)
+                .setTarget(npcName + " (level-" + combatLevel + ")")
+                .setType(MenuAction.RUNELITE_HIGH_PRIORITY)
+                .onClick(e -> handleIgnoreAction(npcName));
+    }
+
+    /**
+     * Handles the "Monitor" action from the menu.
+     *
+     * @param npcName The name of the NPC to monitor.
+     */
+    private void handleMonitorAction(String npcName) {
+        plugin.setNpcToMonitor(npcName, 10); // Default to a kill limit of 10 when monitoring
+        NpcData npcData = logger.getNpcLog().get(npcName);
+        if (npcData != null) {
+            npcData.setLimitSet(true); // Make sure the checkbox is checked
+            logger.updateNpcData(npcData);
+            plugin.updateOverlay();
+            panel.updatePanel();
+        }
+    }
+
+    /**
+     * Handles the "Ignore" action from the menu.
+     *
+     * @param npcName The name of the NPC to ignore.
+     */
+    private void handleIgnoreAction(String npcName) {
+        plugin.setNpcToIgnore(npcName);
+    }
+}
+
+package com.monstermonitor;
+
+import lombok.Getter;
+import net.runelite.api.Client;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
+
+/**
+ * Represents the overlay used in Monster Monitor.
+ * This overlay displays information about tracked NPCs, such as their names and the number of kills
+ * towards a specified kill limit, along with a dynamic progress bar.
+ */
+public class MonsterMonitorOverlay extends Overlay {
+
+    private static final int NAME_CHARACTER_LIMIT = 16;  // Define a character limit for truncation
+    private final AtomicReference<List<NpcData>> trackedNpcs = new AtomicReference<>(Collections.emptyList()); // Thread-safe list of tracked NPCs
+
+    @Getter
+    private final Client client;
+    private final MonsterMonitorPlugin plugin;
+    private final PanelComponent panelComponent = new PanelComponent();
+
+    @Inject
+    private ClientThread clientThread;
+
+    /**
+     * Constructs the MonsterMonitorOverlay and initializes the overlay's properties.
+     *
+     * @param client The RuneLite client instance.
+     * @param plugin The MonsterMonitorPlugin instance that this overlay is part of.
+     */
+    @Inject
+    public MonsterMonitorOverlay(Client client, MonsterMonitorPlugin plugin) {
+        this.client = client;
+        this.plugin = plugin;
+        setPosition(OverlayPosition.TOP_CENTER);
+        setLayer(OverlayLayer.ABOVE_SCENE); // Layer the overlay above widgets
+        setResizable(true); // Allow users to resize the overlay
+        setMovable(true); // Allow users to move the overlay
+        setPriority(55); // Increase priority slightly for better visibility
+
+        // Configure the panelComponent for the overlay
+        panelComponent.setBackgroundColor(new Color(45, 45, 45, 200)); // Dark gray with semi-transparency
+        panelComponent.setPreferredSize(new Dimension(160, 0)); // Set preferred width for the overlay
+        panelComponent.setBorder(new Rectangle(5, 5, 5, 5)); // Adds padding around the content
+    }
+
+    /**
+     * Updates the list of tracked NPCs to be displayed on the overlay.
+     * Filters out any NPCs that are currently ignored before updating.
+     *
+     * @param trackedNpcs The list of NPCs to be tracked and displayed.
+     */
+    public void updateOverlayData(List<NpcData> trackedNpcs) {
+        clientThread.invokeLater(() -> {
+            List<NpcData> filteredNpcs = trackedNpcs.stream()
+                    .filter(npcData -> !npcData.isIgnored())
+                    .collect(Collectors.toList());
+
+            Collections.reverse(filteredNpcs); // Reverse the order to display the most recent NPCs first
+            this.trackedNpcs.set(filteredNpcs); // Atomically update the tracked NPCs
+        });
+    }
+
+    /**
+     * Renders the overlay on the game screen, displaying tracked NPCs and their kill counts.
+     *
+     * @param graphics The Graphics2D object used for drawing the overlay.
+     * @return The dimension of the rendered overlay.
+     */
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        panelComponent.getChildren().clear(); // Clear previous overlay components
+
+        List<NpcData> currentNpcs = trackedNpcs.get(); // Get the current NPC list atomically
+
+        if (currentNpcs == null || currentNpcs.isEmpty()) {
+            return null; // Return early if there are no tracked NPCs to display
+        }
+
+        int overlayWidth = 160;
+        int yOffset = 0;
+        int totalHeight = 0;
+
+        // Check if title should be displayed, and add it if necessary
+        if (plugin.config.showTitle()) {
+            graphics.setFont(new Font("Arial", Font.BOLD, 14));
+            FontMetrics metrics = graphics.getFontMetrics();
+            int titleX = (overlayWidth - metrics.stringWidth("Monster Monitor")) / 2;
+            int titleY = yOffset + metrics.getAscent();
+
+            // Draw the title with a shadow for visibility
+            graphics.setColor(Color.BLACK);
+            graphics.drawString("Monster Monitor", titleX + 1, titleY + 1);
+            graphics.setColor(new Color(200, 150, 0));
+            graphics.drawString("Monster Monitor", titleX, titleY);
+
+            yOffset += 20;
+            totalHeight += 20;
+        } else {
+            panelComponent.getChildren().add(LineComponent.builder().left("").build());
+            yOffset += 10;
+            totalHeight += 10;
+        }
+
+        // Display each tracked NPC with a progress bar
+        for (NpcData npcData : currentNpcs) {
+            if (npcData.getKillLimit() > 0) {
+                drawProgressBar(graphics, npcData, overlayWidth, 14, yOffset);
+                yOffset += 18;
+                totalHeight += 18;
+            }
+        }
+
+        panelComponent.setPreferredSize(new Dimension(overlayWidth, totalHeight));
+        return new Dimension(overlayWidth, totalHeight);
+    }
+
+    /**
+     * Draws a progress bar for a specific NPC's kill progress toward the limit.
+     *
+     * @param graphics     The Graphics2D object used for drawing.
+     * @param npcData      The NPC data containing kill information.
+     * @param overlayWidth The width of the overlay.
+     * @param barHeight    The height of the progress bar.
+     * @param yOffset      The vertical offset for drawing the bar.
+     */
+    private void drawProgressBar(Graphics2D graphics, NpcData npcData, int overlayWidth, int barHeight, int yOffset) {
+        int limit = npcData.getKillLimit();
+        int killsTowardLimit = npcData.getKillCountForLimit();
+
+        // Calculate progress percentage and cap it at 100%
+        double progressPercentage = Math.min(killsTowardLimit / (double) limit, 1.0);
+        Color barColor = getBarColor(progressPercentage);
+
+        int barWidth = overlayWidth - 10;
+        int startX = (overlayWidth - barWidth) / 2;
+
+        // Draw the progress bar background (gray)
+        graphics.setColor(new Color(60, 60, 60));
+        graphics.fillRect(startX, yOffset, barWidth, barHeight);
+
+        // Draw the filled portion of the progress bar
+        int filledWidth = (int) (progressPercentage * barWidth);
+        graphics.setColor(barColor);
+        graphics.fillRect(startX, yOffset, filledWidth, barHeight);
+
+        // Draw a border around the progress bar
+        graphics.setColor(Color.BLACK);
+        graphics.drawRect(startX, yOffset, barWidth, barHeight);
+
+        // Draw NPC name and progress text
+        drawText(graphics, npcData, killsTowardLimit, limit, overlayWidth, startX, yOffset, barHeight, barWidth);
+    }
+
+    /**
+     * Determines the color of the progress bar based on the progress percentage.
+     *
+     * @param progressPercentage The progress percentage of the kill count toward the limit.
+     * @return A color representing the progress stage.
+     */
+    private Color getBarColor(double progressPercentage) {
+        if (progressPercentage >= 0.75) return Color.GREEN.darker();
+        if (progressPercentage >= 0.5) return Color.ORANGE.darker();
+        return Color.RED.darker();
+    }
+
+    /**
+     * Draws the NPC name and progress count on top of the progress bar.
+     *
+     * @param graphics         The Graphics2D object used for drawing.
+     * @param npcData          The NPC data containing kill information.
+     * @param killsTowardLimit The current kill count.
+     * @param limit            The kill limit.
+     * @param overlayWidth     The width of the overlay.
+     * @param startX           The starting X position for the text.
+     * @param yOffset          The vertical offset for drawing the text.
+     * @param barHeight        The height of the progress bar.
+     * @param barWidth         The width of the progress bar.
+     */
+    private void drawText(Graphics2D graphics, NpcData npcData, int killsTowardLimit, int limit, int overlayWidth, int startX, int yOffset, int barHeight, int barWidth) {
+        graphics.setFont(new Font("Arial", Font.BOLD, 11));
+        FontMetrics metrics = graphics.getFontMetrics();
+        int textY = yOffset + ((barHeight + metrics.getAscent() - metrics.getDescent()) / 2) + 1;
+
+        // Draw the truncated NPC name on the left
+        String npcName = truncateName(npcData.getNpcName());
+        graphics.setColor(Color.BLACK);
+        graphics.drawString(npcName, startX + 4, textY + 1); // Shadow
+        graphics.setColor(Color.LIGHT_GRAY);
+        graphics.drawString(npcName, startX + 3, textY);
+
+        // Draw the progress text on the right
+        String progressText = formatNumber(killsTowardLimit) + "/" + formatNumber(limit);
+        int textWidth = metrics.stringWidth(progressText);
+        int textX = startX + barWidth - textWidth - 4;
+        graphics.setColor(Color.BLACK);
+        graphics.drawString(progressText, textX + 1, textY + 1); // Shadow
+        graphics.setColor(Color.LIGHT_GRAY);
+        graphics.drawString(progressText, textX, textY);
+    }
+
+    /**
+     * Truncates the NPC name if it exceeds the specified character limit, appending an ellipsis if truncated.
+     *
+     * @param name The original NPC name.
+     * @return A truncated name with ellipsis if it exceeds the limit, or the original name otherwise.
+     */
+    private String truncateName(String name) {
+        return name.length() <= NAME_CHARACTER_LIMIT ? name : name.substring(0, NAME_CHARACTER_LIMIT - 3) + "...";
+    }
+
+    /**
+     * Formats the given number to a more readable string, such as 1k for 1000, without rounding up.
+     *
+     * @param number The number to format.
+     * @return A formatted string representing the number.
+     */
+    private String formatNumber(int number) {
+        if (number >= 1_000_000) {
+            return String.format("%.1fm", number / 1_000_000.0);
+        } else if (number >= 1_000) {
+            return String.format("%.1fk", number / 1_000.0);
+        } else {
+            return Integer.toString(number);
+        }
+    }
+}

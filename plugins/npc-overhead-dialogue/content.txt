@@ -1,0 +1,890 @@
+package com.NPCOverheadDialogue;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class NPCOverheadDialogue
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(NPCOverheadDialoguePlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.NPCOverheadDialogue;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("NPCOverheadCDialogue")
+public interface NPCOverheadDialogueConfig extends Config
+{
+	@ConfigItem(
+		keyName = "dialogBoxText",
+		name = "Display Dialog Box Text Overhead",
+		description = "Displays dialog in the dialog box above the corresponding NPC"
+	)
+	default boolean showDialogBoxText()
+	{
+		return false;
+	}
+	@ConfigItem(
+			keyName = "ambientDialog",
+			name = "Display Ambient Dialog Overhead",
+			description = "Displays ambient dialog above NPCs"
+	)
+	default boolean showAmbientDialog()
+	{
+		return false;
+	}
+	@ConfigItem(
+			keyName = "damageDialog",
+			name = "Display Damage Dialog Overhead",
+			description = "Displays damage dialog above NPCs"
+	)
+	default boolean showDamageDialog()
+	{
+		return false;
+	}
+	@ConfigItem(
+			keyName = "deathDialog",
+			name = "Display Death Dialog Overhead",
+			description = "Displays death dialog above NPCs"
+	)
+	default boolean showDeathDialog()
+	{
+		return false;
+	}
+	@ConfigItem(
+			keyName = "walkingDialog",
+			name = "Display Walking Dialog Overhead",
+			description = "Displays walking dialog above NPCs"
+	)
+	default boolean showWalkingDialog()
+	{
+		return false;
+	}
+	@ConfigItem(
+			keyName = "chatDialog",
+			name = "Display Overhead Dialog in Chat",
+			description = "Displays all enabled dialog in the chat"
+	)
+	default boolean enableChatDialog() { return false; }
+}
+
+package com.NPCOverheadDialogue;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import net.runelite.api.Actor;
+
+@Data
+@AllArgsConstructor
+class ActorDialogState
+{
+    private Actor actor;
+    private String name;
+    private String dialog;
+    private int dialogChangeTick;
+    private int lastXCoordinate;
+    private int lastYCoordinate;
+    private int ticksWithoutMoving;
+    private boolean inCombat;
+}
+package com.NPCOverheadDialogue;
+
+import com.NPCOverheadDialogue.dialog.DialogNpc;
+import com.google.common.base.MoreObjects;
+import com.google.inject.Provides;
+
+import java.awt.*;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Random;
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.NPC;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.AnimationChanged;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.HitsplatApplied;
+import net.runelite.api.events.InteractingChanged;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetID;
+import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.NPCManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.util.Text;
+
+@Slf4j
+@PluginDescriptor(
+        name = "NPC Overhead Dialog"
+)
+public class NPCOverheadDialoguePlugin extends Plugin
+{
+    private static final int FAST_TICK_TIMEOUT = 2;
+    private static final int SLOW_TICK_TIMEOUT = 5;
+    private static final int MOVING_TICK_DELAY = 2;
+    private static final int AMBIENT_TICK_TIMEOUT = 15; // 9 seconds
+    private static final Random RANDOM = new Random();
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private NPCOverheadDialogueConfig config;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private NPCManager npcManager;
+
+    @Inject
+    private ChatMessageManager chatMessageManager;
+
+    private final Map<Actor, ActorDialogState> dialogStateMap = new HashMap<>();
+    private Actor actor = null;
+    private String lastNPCText = "";
+    private int actorTextTick = 0;
+    private String lastPlayerText = "";
+    private int playerTextTick = 0;
+
+    @Provides
+    NPCOverheadDialogueConfig provideConfig(ConfigManager configManager){
+        return configManager.getConfig(NPCOverheadDialogueConfig.class);
+    }
+
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged c)
+    {
+        if (!c.getGameState().equals(GameState.LOADING))
+        {
+            return;
+        }
+
+        actor = null;
+        lastNPCText = "";
+        lastPlayerText = "";
+        dialogStateMap.clear();
+    }
+
+    @Subscribe
+    public void onInteractingChanged(InteractingChanged event)
+    {
+        if (event.getTarget() == null || event.getSource() != client.getLocalPlayer())
+        {
+            return;
+        }
+        if(config.showDialogBoxText() && event.getSource() != actor && actor != null){
+            actor.setOverheadText(null);
+        }
+        lastNPCText = "";
+        lastPlayerText = "";
+        actor = event.getTarget();
+    }
+
+    @Subscribe
+    public void onAnimationChanged(AnimationChanged animationChanged)
+    {
+        //log.info("animation changed for: " + animationChanged.getActor().getName());
+        if (!(animationChanged.getActor() instanceof NPC))
+        {
+            return;
+        }
+
+        final NPC npc = (NPC) animationChanged.getActor();
+        if (config.showDeathDialog() && npc.isDead() && npc.getName() != null)
+        {
+            //for death text, best option for slayer item killed monsters
+            //final DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(npc.getName()));
+            DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcID(npc.getId());
+
+            if (dialogNpc == null)
+            {
+                dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(MoreObjects.firstNonNull(npc.getName(), "")));
+            }
+            if (dialogNpc == null)
+            {
+                return;
+            }
+
+            final ActorDialogState state = getOrCreateActorDialogState(npc);
+            if (state == null)
+            {
+                return;
+            }
+
+            final String[] dialogues = dialogNpc.getDeathDialogs();
+            if (dialogues == null)
+            {
+                return;
+            }
+
+            setOverheadText(dialogues[RANDOM.nextInt(dialogues.length)], npc, state);
+        }
+    }
+
+    @Subscribe
+    public void onHitsplatApplied(HitsplatApplied event)
+    {
+        if (event.getActor().getName() == null || !(event.getActor() instanceof NPC))
+        {
+            return;
+        }
+
+        //final DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(event.getActor().getName()));
+        DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcID(((NPC) event.getActor()).getId());
+
+        if (dialogNpc == null)
+        {
+            dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(MoreObjects.firstNonNull(event.getActor().getName(), "")));
+        }
+        if (dialogNpc == null)
+        {
+            return;
+        }
+
+        final NPC npc = (NPC) event.getActor();
+        final ActorDialogState state = getOrCreateActorDialogState(npc);
+        // If state is null that means we aren't tracking this npc
+        if (state == null)
+        {
+            return;
+        }
+
+        if (config.showDeathDialog() && npc.isDead())
+        {
+            final String[] dialogues = dialogNpc.getDeathDialogs();
+            if (dialogues != null)
+            {
+                setOverheadText(dialogues[RANDOM.nextInt(dialogues.length)], npc, state);
+                state.setInCombat(true);
+                // return here so damage text doesn't get applied since death dialog exists
+                return;
+            }
+        }
+
+        if (config.showDamageDialog() && event.getHitsplat().getAmount() > 0)
+        {
+            final String[] dialogues = dialogNpc.getDamageDialogs();
+            if (dialogues == null)
+            {
+                return;
+            }
+
+            setOverheadText(dialogues[RANDOM.nextInt(dialogues.length)], npc, state);
+            state.setInCombat(true);
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick event)
+    {
+        if (actor != null)
+        {
+            if(config.showDialogBoxText()) {
+                checkWidgetDialogs();
+            }
+            if (actorTextTick > 0 && client.getTickCount() - actorTextTick > SLOW_TICK_TIMEOUT)
+            {
+                actor.setOverheadText(null);
+                actorTextTick = 0;
+            }
+        }
+
+        if (client.getLocalPlayer() != null && playerTextTick > 0 && client.getTickCount() - playerTextTick > SLOW_TICK_TIMEOUT)
+        {
+            client.getLocalPlayer().setOverheadText(null);
+            playerTextTick = 0;
+        }
+
+        npcTextInvoker();
+
+        final int currentTick = client.getTickCount();
+        for (final Map.Entry<Actor, ActorDialogState> entry : dialogStateMap.entrySet())
+        {
+            final Actor actor = entry.getKey();
+            final ActorDialogState state = entry.getValue();
+
+            final int activeTicks = state.getDialogChangeTick() > 0 ? currentTick - state.getDialogChangeTick() : -1;
+            if (state.getDialog() == null
+                    || (state.isInCombat() && activeTicks > FAST_TICK_TIMEOUT)
+                    || (!state.isInCombat() && activeTicks > SLOW_TICK_TIMEOUT))
+            {
+                if (!Objects.equals(state.getDialog(), actor.getOverheadText()))
+                {
+                    state.setDialogChangeTick(client.getTickCount());
+                }
+                actor.setOverheadText(null);
+                state.setDialog(null);
+                state.setInCombat(false);
+            }
+            else
+            {
+                setOverheadText(state.getDialog(), actor, state);
+            }
+        }
+    }
+
+    // checks all local NPCs movement/idle timeout and applies an overhead message if necessary, Uses Ambient dialogues
+    private void npcTextInvoker()
+    {
+        for (final NPC npc : client.getNpcs())
+        {
+            //final DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcName(MoreObjects.firstNonNull(npc.getName(), ""));
+            DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcID(npc.getId());
+
+            if (dialogNpc == null)
+            {
+                dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(MoreObjects.firstNonNull(npc.getName(), "")));
+            }
+            if (dialogNpc == null)
+            {
+                continue;
+            }
+
+            final ActorDialogState state = getOrCreateActorDialogState(npc);
+            // If state is null that means we aren't tracking this npc
+            if (state == null)
+            {
+                continue;
+            }
+
+            if(config.showWalkingDialog()) {
+                checkWalkingDialog(npc, state);
+            }
+            if(config.showAmbientDialog()) {
+                checkAmbientDialog(npc, state);
+            }
+        }
+    }
+
+    private void checkWalkingDialog(final NPC npc, final ActorDialogState state)
+    {
+        DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcID(npc.getId());
+
+        if (dialogNpc == null)
+        {
+            dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(MoreObjects.firstNonNull(npc.getName(), "")));
+        }
+        if (dialogNpc == null)
+        {
+            return;
+        }
+
+        if (hasNpcMoved(npc))
+        {
+            //log.info(npc + " has moved");
+
+
+            final String[] dialogues = dialogNpc.getWalkingDialogs();
+            if (dialogues == null)
+            {
+                return;
+            }
+
+            final String dialogue = dialogues[RANDOM.nextInt(dialogues.length)];
+            //log.info(state.getTicksWithoutMoving() + " ticks without moving, and " + MOVING_TICK_DELAY + " is the delay");
+            if (state.getTicksWithoutMoving() > MOVING_TICK_DELAY)
+            {
+                setOverheadText(dialogue, npc, state);
+                state.setTicksWithoutMoving(0);
+                log.info("set " + npc + " overhead text");
+            }
+        }
+        else
+        {
+            state.setTicksWithoutMoving(state.getTicksWithoutMoving() + 1);
+            //log.info("state's ticks without moving has been incremented to " + state.getTicksWithoutMoving());
+        }
+    }
+
+    private void checkAmbientDialog(final NPC npc, final ActorDialogState state)
+    {
+        //DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(MoreObjects.firstNonNull(npc.getName(), "")));
+        DialogNpc dialogNpc = DialogNpc.getDialogNpcsByNpcID(npc.getId());
+
+        if (dialogNpc == null)
+        {
+            dialogNpc = DialogNpc.getDialogNpcsByNpcName(Text.escapeJagex(MoreObjects.firstNonNull(npc.getName(), "")));
+        }
+        if (dialogNpc == null)
+        {
+            return;
+        }
+        log.info("NPC being checked is: " + dialogNpc.getNpcName() + " with an npcID of: " + dialogNpc.getNpcID());
+
+        final String[] dialogues = dialogNpc.getAmbientDialogs();
+        if (dialogues == null)
+        {
+            return;
+        }
+
+        if ((client.getTickCount() - state.getDialogChangeTick()) >= AMBIENT_TICK_TIMEOUT
+                && (RANDOM.nextInt(100) + 1) <= 1)
+        {
+            final String dialogue = dialogues[RANDOM.nextInt(dialogues.length)];
+            setOverheadText(dialogue, npc, state);
+            log.info(npc.getName() + " said: " + dialogue);
+        }
+    }
+
+
+    private void checkWidgetDialogs()
+    {
+        //final String npcDialogText = getWidgetTextSafely();
+        //final String playerDialogText = getWidgetTextSafely(WidgetID.DIALOG_PLAYER_GROUP_ID, 5);
+        Widget playerTextWidget = client.getWidget(WidgetInfo.DIALOG_PLAYER_TEXT);
+        String playerDialogText = (playerTextWidget != null) ? playerTextWidget.getText() : null;
+        Widget npcTextWidget = client.getWidget(WidgetInfo.DIALOG_NPC_TEXT);
+        String npcDialogText = (npcTextWidget != null) ? npcTextWidget.getText() : null;
+
+        // For when the NPC has dialog
+        if (npcDialogText != null && !lastNPCText.equals(npcDialogText))
+        {
+            lastNPCText = npcDialogText;
+            actor.setOverheadText(npcDialogText);
+            if(config.enableChatDialog()) {
+                final ChatMessageBuilder message = new ChatMessageBuilder()
+                        .append(Color.RED, actor.getName())
+                        .append(": ")
+                        .append(Color.BLUE, npcDialogText);
+
+                chatMessageManager.queue(QueuedMessage.builder()
+                        .type(ChatMessageType.GAMEMESSAGE)
+                        .runeLiteFormattedMessage(message.build())
+                        .build());
+            }
+
+            actorTextTick = client.getTickCount();
+        }
+
+        //For when your player has dialogue
+        if (playerDialogText != null && !lastPlayerText.equals(playerDialogText))
+        {
+            lastPlayerText = playerDialogText;
+            if (client.getLocalPlayer() != null)
+            {
+                client.getLocalPlayer().setOverheadText(playerDialogText);
+
+                if(config.enableChatDialog()) {
+                    final ChatMessageBuilder message = new ChatMessageBuilder()
+                            .append(Color.RED, client.getLocalPlayer().getName())
+                            .append(": ")
+                            .append(Color.BLUE, playerDialogText);
+
+                    chatMessageManager.queue(QueuedMessage.builder()
+                            .type(ChatMessageType.GAMEMESSAGE)
+                            .runeLiteFormattedMessage(message.build())
+                            .build());
+                }
+
+                playerTextTick = client.getTickCount();
+            }
+        }
+    }
+
+    private boolean hasNpcMoved(NPC npc)
+    {
+        final ActorDialogState state = getOrCreateActorDialogState(npc);
+        // If state is null that means we aren't tracking this npc
+        if (state == null)
+        {
+            return false;
+        }
+
+        final WorldPoint npcPos = npc.getWorldLocation();
+        final WorldPoint lastNpcPos = new WorldPoint(state.getLastXCoordinate(), state.getLastYCoordinate(), -1);
+        //log.info("npc has moved? : " + (npcPos.distanceTo2D(lastNpcPos) > 0) + " : " + npcPos.distanceTo2D(lastNpcPos));
+        state.setLastXCoordinate(npc.getWorldLocation().getX());
+        state.setLastYCoordinate(npc.getWorldLocation().getY());
+        return npcPos.distanceTo2D(lastNpcPos) > 0;
+    }
+
+    @Nullable
+    private ActorDialogState getOrCreateActorDialogState(final  NPC npc)
+    {
+        if (npc.getName() == null || !DialogNpc.isDialogNpc(Text.escapeJagex(npc.getName())))
+        {
+            return null;
+        }
+
+        ActorDialogState result = dialogStateMap.get(npc);
+        if (result == null)
+        {
+            result = new ActorDialogState(
+                    npc, Text.escapeJagex(npc.getName()), npc.getOverheadText(),
+                    npc.getOverheadText() == null ? 0 : client.getTickCount(),
+                    npc.getWorldLocation().getX(), npc.getWorldLocation().getY(),
+                    2, false);
+            dialogStateMap.put(npc, result);
+        }
+
+        return result;
+    }
+
+    private void setOverheadText(final String dialogue, final Actor actor, final ActorDialogState state)
+    {
+        if (state.getDialogChangeTick() <= 0 || !Objects.equals(state.getDialog(), dialogue))
+        {
+            state.setDialogChangeTick(client.getTickCount());
+        }
+        state.setDialog(dialogue);
+        actor.setOverheadText(dialogue);
+
+        if(config.enableChatDialog()) {
+            final ChatMessageBuilder message = new ChatMessageBuilder()
+                    .append(Color.RED, actor.getName())
+                    .append(": ")
+                    .append(Color.BLUE, dialogue);
+
+            chatMessageManager.queue(QueuedMessage.builder()
+                    .type(ChatMessageType.GAMEMESSAGE)
+                    .runeLiteFormattedMessage(message.build())
+                    .build());
+        }
+    }
+
+    //deprecated, old functions used for grabbing player and NPC dialog from the dialog box
+    /*
+    //for when NPCs have dialog
+    private String getWidgetTextSafely()
+    {
+        return getWidgetTextSafely(WidgetInfo.DIALOG_NPC_TEXT.getGroupId(), WidgetInfo.DIALOG_NPC_TEXT.getChildId());
+    }
+
+    //for when your player has dialog
+    private String getWidgetTextSafely(final int group, final int child)
+    {
+        return client.getWidget(group, child) == null ? null : Text.sanitizeMultilineText(Objects.requireNonNull(client.getWidget(group, child)).getText());
+    }
+     */
+}
+package com.NPCOverheadDialogue.dialog;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+@AllArgsConstructor
+@Getter
+public enum DialogCategories
+{
+    CLEANER(
+            null,
+            null,
+            null,
+            new String[] {"*sweep* *sweep*", "Time for a break!", "I just swept there!", "*whistles*"}),
+    DUCKS(
+            new String[]{"Quack!", "Quack! Quack!"},
+            null,
+            null,
+            null),
+    DRAGONS(
+            new String[]{"*snarl*", "Roar!", "*stomp* *stomp*"},
+            null,
+            new String[]{"Roar!"},
+            null),
+    FISHING_SPOT(
+            new String[]{"*blub* *blub*", "*splash*"},
+            null,
+            null,
+            null),
+    HONKING_BIRDS(
+            new String[]{"Honk!", "Honk! Honk!"},
+            null,
+            null,
+            null),
+    LENNY(
+            new String[]{"I sure love the rabbits!", "Gotta tend the rabbits!"},
+            null,
+            null,
+            null),
+    LIBRARIAN(
+            new String[]{"I am a librarian", "shhhhhh", "I have always imagined that paradise will be a kind of Library"},
+            null,
+            null,
+            new String[]{"I am a walking librarian"}),
+    MID_SIZED_RODENTS(
+            new String[]{"*nibble* *nibble*"},
+            new String[]{"squeak!"},
+            new String[]{"squeeaak..."},
+            null),
+    PIGS(
+            new String[]{"Oink!"},
+            null,
+            null,
+            null),
+    RATS(
+            new String[]{"*scamper* *scamper*"},
+            new String[]{"hiss"},
+            new String[]{"hissssssssssssss"},
+            null),
+    SEAGULLS(
+            new String[]{"Squawk!"},
+            null,
+            null,
+            null),
+    SKELETONS(
+            null,
+            null,
+            new String[]{"*crumbles*"},
+            null),
+    STORE_CLERK(
+            new String[]{"Come check out my wares!", "I have the best prices around", "Buying all junk", "Bank sale"},
+            null,
+            null,
+            null)
+    ;
+
+    private final String[] ambientDialogs;
+    private final String[] damageDialogs;
+    private final String[] deathDialogs;
+    private final String[] walkingDialogs;
+}
+package com.NPCOverheadDialogue.dialog;
+
+import com.google.common.collect.ImmutableMap;
+import java.util.Map;
+import javax.annotation.Nullable;
+import lombok.Getter;
+import org.apache.commons.lang3.ArrayUtils;
+
+@Getter
+public enum DialogNpc
+{
+    CLEANER("Cleaner", -1 ,DialogCategories.CLEANER),
+
+    DRAKE("Drake", 2004, DialogCategories.DUCKS),
+    DUCK("Duck", -1, DialogCategories.DUCKS),
+    DUCKLING("Duckling", -1, DialogCategories.DUCKS),
+
+    ADAMANT_DRAGON("Adamant dragon", -1, DialogCategories.DRAGONS),
+    BABY_BLACK_DRAGON("Baby black dragon", -1, DialogCategories.DRAGONS),
+    BABY_BLUE_DRAGON("Baby blue dragon", -1, DialogCategories.DRAGONS),
+    BABY_GREEN_DRAGON("Baby green dragon", -1, DialogCategories.DRAGONS),
+    BABY_RED_DRAGON("Baby red dragon", -1, DialogCategories.DRAGONS),
+    BLACK_DRAGON("Black dragon", -1, DialogCategories.DRAGONS),
+    BLUE_DRAGON("Blue dragon", -1, DialogCategories.DRAGONS),
+    BRONZE_DRAGON("Bronze dragon", -1, DialogCategories.DRAGONS),
+    BRUTAL_BLACK_DRAGON("Brutal black dragon", -1, DialogCategories.DRAGONS),
+    BRUTAL_BLUE_DRAGON("Brutal blue dragon", -1, DialogCategories.DRAGONS),
+    BRUTAL_GREEN_DRAGON("Brutal green dragon", -1, DialogCategories.DRAGONS),
+    BRUTAL_RED_DRAGON("Brutal red dragon", -1, DialogCategories.DRAGONS),
+    CORRUPTED_DRAGON("Corrupted dragon", -1, DialogCategories.DRAGONS),
+    CRYSTALLINE_DRAGON("Crystalline dragon", -1, DialogCategories.DRAGONS),
+    DRAKE_DRAGON("Drake", -1, DialogCategories.DRAGONS),
+    GREEN_DRAGON("Green dragon", -1, DialogCategories.DRAGONS),
+    IRON_DRAGON("Iron dragon", -1, DialogCategories.DRAGONS),
+    LAVA_DRAGON("Lava dragon", -1, DialogCategories.DRAGONS),
+    MITHRIL_DRAGON("Mithril dragon", -1, DialogCategories.DRAGONS),
+    REANIMATED_DRAGON("Reanimated dragon", -1, DialogCategories.DRAGONS),
+    RED_DRAGON("Red dragon", -1, DialogCategories.DRAGONS),
+    RUNE_DRAGON("Rune dragon", -1, DialogCategories.DRAGONS),
+    STEEL_DRAGON("Steel dragon", -1, DialogCategories.DRAGONS),
+
+    FISHING_SPOT("Fishing spot", -1, DialogCategories.FISHING_SPOT),
+    ROD_FISHING_SPOT("Rod Fishing spot", -1, DialogCategories.FISHING_SPOT),
+
+    BLACK_SWAN("Black swan", -1, DialogCategories.HONKING_BIRDS),
+    CORMORANT("Cormorant", -1, DialogCategories.HONKING_BIRDS),
+    GOOSE("Goose", -1, DialogCategories.HONKING_BIRDS),
+    SWAN("Swan", -1, DialogCategories.HONKING_BIRDS),
+
+    RELDO("Reldo", -1, DialogCategories.LIBRARIAN),
+
+    LENNY("Lenny", -1, DialogCategories.LENNY),
+
+    BABY_MOLE("Baby Mole", -1, DialogCategories.MID_SIZED_RODENTS),
+    RABBIT("Rabbit", -1, DialogCategories.MID_SIZED_RODENTS),
+    RED_PANDA("Red Panda", -1, DialogCategories.MID_SIZED_RODENTS),
+    SQUIRREL("Squirrel", -1, DialogCategories.MID_SIZED_RODENTS),
+
+    PIG("Pig", -1, DialogCategories.PIGS),
+    PIGLET("Piglet", -1, DialogCategories.PIGS),
+
+    GIANT_RAT("Giant rat", -1, DialogCategories.RATS),
+    RAT("Rat", -1, DialogCategories.RATS),
+
+    GULLS("Gull", -1, DialogCategories.SEAGULLS),
+    PELICAN("Pelican", -1, DialogCategories.SEAGULLS),
+    SEAGULL("Seagull", -1, DialogCategories.SEAGULLS),
+
+    GARGOYLE("Gargoyle", -1, DialogCategories.SKELETONS),
+    SKELETON("Skeleton", -1, DialogCategories.SKELETONS)
+
+    ;
+
+    private final String npcName;
+    private final int npcID;
+    private final DialogCategories[] dialogCategories;
+
+    DialogNpc(final String npcName, final int npcID, DialogCategories... dialogCategories)
+    {
+        this.npcName = npcName;
+        this.npcID = npcID;
+        this.dialogCategories = dialogCategories;
+    }
+
+    private static final Map<String, DialogNpc> NAME_MAP;
+    static
+    {
+        ImmutableMap.Builder<String, DialogNpc> builder = new ImmutableMap.Builder<>();
+        for (final DialogNpc n : values())
+        {
+            String d;
+            if(n.getNpcID() != -1){
+                d = Integer.toString(n.getNpcID());
+            }
+            else{
+                d = n.getNpcName().toUpperCase();
+            }
+            builder.put(d, n);
+        }
+        NAME_MAP = builder.build();
+    }
+
+    public static boolean isDialogNpc(final String npcName)
+    {
+        return NAME_MAP.containsKey(npcName.toUpperCase());
+    }
+
+    @Nullable
+    public static DialogNpc getDialogNpcsByNpcName(final String npcName)
+    {
+        return NAME_MAP.get(npcName.toUpperCase());
+    }
+
+    @Nullable
+    public static DialogNpc getDialogNpcsByNpcID(final int npcID) {
+        //log.info("ID being checked is " + npcID);
+        return NAME_MAP.get(Integer.toString(npcID));
+    }
+
+    @Nullable
+    public String[] getAmbientDialogs()
+    {
+        String[] dialogs = new String[0];
+        for (final DialogCategories category : dialogCategories)
+        {
+            if (category.getAmbientDialogs() != null)
+            {
+                dialogs = ArrayUtils.addAll(dialogs, category.getAmbientDialogs());
+            }
+        }
+
+        return dialogs.length > 0 ? dialogs : null;
+    }
+
+    @Nullable
+    public static String[] getAmbientDialogsByNpcName(final String npcName)
+    {
+        final DialogNpc v = NAME_MAP.get(npcName.toUpperCase());
+
+        if (v == null)
+        {
+            return null;
+        }
+
+        return v.getAmbientDialogs();
+    }
+
+    @Nullable
+    public String[] getDamageDialogs()
+    {
+        String[] dialogs = new String[0];
+        for (final DialogCategories category : dialogCategories)
+        {
+            if (category.getDamageDialogs() != null)
+            {
+                dialogs = ArrayUtils.addAll(dialogs, category.getDamageDialogs());
+            }
+        }
+
+        return dialogs.length > 0 ? dialogs : null;
+    }
+
+    @Nullable
+    public static String[] getDamageDialogsByNpcName(final String npcName)
+    {
+        final DialogNpc v = NAME_MAP.get(npcName.toUpperCase());
+
+        if (v == null)
+        {
+            return null;
+        }
+
+        return v.getDamageDialogs();
+    }
+
+    @Nullable
+    public String[] getDeathDialogs()
+    {
+        String[] dialogs = new String[0];
+        for (final DialogCategories category : dialogCategories)
+        {
+            if (category.getDeathDialogs() != null)
+            {
+                dialogs = ArrayUtils.addAll(dialogs, category.getDeathDialogs());
+            }
+        }
+
+        return dialogs.length > 0 ? dialogs : null;
+    }
+
+    @Nullable
+    public static String[] getDeathDialogsByNpcName(final String npcName)
+    {
+        final DialogNpc v = NAME_MAP.get(npcName.toUpperCase());
+
+        if (v == null)
+        {
+            return null;
+        }
+
+        return v.getDeathDialogs();
+    }
+
+    @Nullable
+    public String[] getWalkingDialogs()
+    {
+        String[] dialogs = new String[0];
+        for (final DialogCategories category : dialogCategories)
+        {
+            if (category.getWalkingDialogs() != null)
+            {
+                dialogs = ArrayUtils.addAll(dialogs, category.getWalkingDialogs());
+            }
+        }
+
+        return dialogs.length > 0 ? dialogs : null;
+    }
+
+    @Nullable
+    public static String[] getWalkingDialogsByNpcName(final String npcName)
+    {
+        final DialogNpc v = NAME_MAP.get(npcName.toUpperCase());
+
+        if (v == null)
+        {
+            return null;
+        }
+
+        return v.getWalkingDialogs();
+    }
+}

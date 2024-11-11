@@ -1,0 +1,528 @@
+package com.roftracker;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ROFTrackerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ROFTrackerPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.roftracker;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.inject.Inject;
+import lombok.Getter;
+import net.runelite.api.ItemID;
+import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.api.widgets.WidgetItem;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.overlay.WidgetItemOverlay;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.util.concurrent.TimeUnit;
+
+public class BankItemHighlight extends WidgetItemOverlay
+{
+    private Rectangle bounds = null;
+
+    private final ROFTrackerPlugin plugin;
+
+    private final ROFTrackerConfig config;
+    private final ItemManager itemManager;
+
+    @Getter
+    private final Cache<Integer, BufferedImage> heatmapImages = CacheBuilder.newBuilder()
+            .maximumSize(160)
+            .expireAfterWrite(2, TimeUnit.MINUTES)
+            .build();
+
+    @Inject
+    BankItemHighlight(ROFTrackerPlugin plugin, ROFTrackerConfig config, ItemManager itemManager)
+    {
+        this.plugin = plugin;
+        this.config = config;
+        this.itemManager = itemManager;
+        showOnBank();
+    }
+
+    @Override
+    public void renderItemOverlay(Graphics2D graphics, int itemId, WidgetItem itemWidget)
+    {
+        if (itemWidget.getWidget().getParentId() != WidgetInfo.BANK_ITEM_CONTAINER.getId())
+        {
+            return;
+        }
+
+        if (itemWidget.getId() == ItemID.IRON_ORE && plugin.isPlayerWearingROF() ||
+            itemWidget.getId() == ItemID.RING_OF_FORGING && !plugin.isPlayerWearingROF())
+        {
+            if (bounds == null)
+            {
+                bounds = itemWidget.getCanvasBounds();
+                bounds.y -= 3;
+                bounds.height += 3;
+                bounds.x -= 3;
+                bounds.width += 3;
+            }
+
+            graphics.setColor(config.colorBankOutline());
+            graphics.drawRect(bounds.x,  bounds.y, bounds.width, bounds.height);
+            Color fill = config.colorBankOutline();
+            graphics.setColor(new Color(fill.getRed(), fill.getGreen(), fill.getBlue(), 20));
+            graphics.fillRect(bounds.x, bounds.y, bounds.width, bounds.height);
+
+            //final BufferedImage image = itemManager.getImage(itemWidget.getId(), 1, false);
+            //graphics.drawImage(image, bounds.x, bounds.y, null);
+        }
+
+    }
+
+}
+
+package com.roftracker;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import java.awt.*;
+
+@ConfigGroup("roftracker")
+public interface ROFTrackerConfig extends Config
+{
+
+    @ConfigItem(keyName = "meltNotify", name = "ROF Melt Notification" , description = "Notifies the player when the ring of forging melts", position = 1)
+    default boolean cbMeltNotify()
+    {
+        return false;
+    }
+
+    @ConfigItem(keyName = "smeltNotify", name = "Smelting Notification", description = "Notifies the player every time they smelt iron without wearing the Ring of Forging", position = 2)
+    default boolean cbNotifyOnSmeltWithoutRing() { return true; }
+
+    @ConfigItem(keyName = "warningBox", name = "Display warning box", description = "Displays a big red warning box when not wearing the Ring of Forging", position = 3)
+    default boolean cbWarningBox()
+    {
+        return true;
+    }
+
+    @ConfigItem(keyName = "bankIcons", name = "Bank outlines", description = "Displays an outline around the the bank item to use", position = 4)
+    default boolean cbBankOutline()
+    {
+        return true;
+    }
+
+    @ConfigItem(keyName = "bankIconColor", name = "Bank outline color", description = "Sets the color of the bank outlines", position = 5)
+    default Color colorBankOutline() { return Color.YELLOW; }
+}
+
+package com.roftracker;
+
+import com.google.inject.Provides;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.client.Notifier;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+
+@PluginDescriptor(
+		name = "Ring of Forging Helper",
+		description = "Shows remaining ROF charges and warns the player when ROF not equipped",
+		tags = {"ring","forging","smithing", "smelting", "iron", "equipment"}
+)
+public class ROFTrackerPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private ROFTrackerConfig config;
+
+	@Inject
+	private InfoBoxManager infoBoxManager;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private ConfigManager configManager;
+
+	@Inject
+	private Notifier notifier;
+
+	private ROFChargeCounter counterBox = null;
+
+	private BankItemHighlight bankItemOverlayROF = null;
+
+	private WarningOverlay warningOverlay = null;
+
+	private boolean playerWearingROF = false;
+
+	@Provides
+	ROFTrackerConfig getConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(ROFTrackerConfig.class);
+	}
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		clientThread.invokeLater(() ->
+		{
+			final ItemContainer container = client.getItemContainer(InventoryID.EQUIPMENT);
+			if (container != null)
+			{
+				checkInventory(container.getItems());
+			}
+			if (!isPlayerWearingROF())
+			{
+				updateMissingROF();
+			}
+		});
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		infoBoxManager.removeInfoBox(counterBox);
+		overlayManager.remove(warningOverlay);
+		overlayManager.remove(bankItemOverlayROF);
+		counterBox = null;
+		warningOverlay = null;
+		bankItemOverlayROF = null;
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged event)
+	{
+		if (event.getItemContainer() != client.getItemContainer(InventoryID.EQUIPMENT))
+		{
+			return;
+		}
+		checkInventory(event.getItemContainer().getItems());
+		redrawBankOverlay();
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+		if (event.getMessage().equals("You retrieve a bar of iron."))
+		{
+			// Smelting iron without wearing ROF
+			if (counterBox == null)
+			{
+				if (config.cbNotifyOnSmeltWithoutRing())
+				{
+					notifier.notify("WARNING: Smelting without Ring of Forging.", TrayIcon.MessageType.ERROR);
+				}
+			}
+			// Player is wearing ROF, update the charge count
+			else
+			{
+				updateInfoBox();
+				// TODO: duplicated code to update count during smelting, should refactor
+				int chargeCount = getRingCharge();
+				if (counterBox != null)
+				{
+					counterBox.setCount(chargeCount);
+				}
+			}
+		}
+		else if (event.getMessage().equals("Your Ring of Forging has melted."))
+		{
+			if (config.cbMeltNotify())
+			{
+				notifier.notify("Your Ring of Forging has melted!", TrayIcon.MessageType.ERROR);
+			}
+			updateMissingROF();
+		}
+		// Smelting iron without wearing ROF
+		else if (event.getMessage().equals("The ore is too impure and you fail to refine it."))
+		{
+			if (config.cbNotifyOnSmeltWithoutRing())
+			{
+				notifier.notify("WARNING: Smelting without Ring of Forging.", TrayIcon.MessageType.ERROR);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onWidgetLoaded(WidgetLoaded widgetLoaded)
+	{
+		if (isBankVisible())
+		{
+			removeBankOverlay();
+			addBankIconOverlay(null);
+		}
+	}
+
+	@Subscribe
+	public void onWidgetClosed(WidgetClosed widgetClosed)
+	{
+		if (!isBankVisible())
+		{
+			removeBankOverlay();
+		}
+	}
+	@Subscribe
+	public void onClientTick(ClientTick event)
+	{
+		if (isBankVisible())
+		{
+			redrawBankOverlay();
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged)
+	{
+		if (config.cbWarningBox() && !playerWearingROF)
+		{
+			addWarningOverlay();
+		}
+		else if (!config.cbWarningBox() || playerWearingROF)
+		{
+			removeWarningOverlay();
+		}
+	}
+
+	private void checkInventory(final Item[] items)
+	{
+		if (items.length >= EquipmentInventorySlot.RING.getSlotIdx())
+		{
+			final Item ring = items[EquipmentInventorySlot.RING.getSlotIdx()];
+
+			if (ring != null && ring.getId() == ItemID.RING_OF_FORGING)
+			{
+				final ItemComposition ringComp = itemManager.getItemComposition(ring.getId());
+				updateInfobox(ring, ringComp);
+				removeWarningOverlay();
+				playerWearingROF = true;
+			}
+			else
+			{
+				updateMissingROF();
+				playerWearingROF = false;
+			}
+		}
+		else {
+			updateMissingROF();
+			playerWearingROF = false;
+		}
+	}
+
+	private void updateInfobox(final Item item, final ItemComposition comp)
+	{
+		// TODO: should refactor this and overloaded func (params unnecessary, could use better func name)
+		int chargeCount = getRingCharge();
+		if (counterBox != null && counterBox.getItemID() == item.getId())
+		{
+			counterBox.setCount(chargeCount);
+			return;
+		}
+		updateInfoBox();
+	}
+
+	private void updateInfoBox()
+	{
+		if (counterBox == null)
+		{
+			createInfobox();
+		}
+		redrawBankOverlay();
+	}
+
+	private void removeInfobox()
+	{
+		infoBoxManager.removeInfoBox(counterBox);
+		counterBox = null;
+	}
+
+	private void createInfobox()
+	{
+		removeInfobox();
+		int chargeCount = getRingCharge();
+		final BufferedImage image = itemManager.getImage(ItemID.RING_OF_FORGING, 1, false);
+		counterBox = new ROFChargeCounter(this, ItemID.RING_OF_FORGING, chargeCount, image);
+		infoBoxManager.addInfoBox(counterBox);
+	}
+
+
+	private void addBankIconOverlay(final Rectangle rect)
+	{
+		redrawBankOverlay();
+	}
+
+	private void removeBankOverlay()
+	{
+		overlayManager.remove(bankItemOverlayROF);
+	}
+
+	private void redrawBankOverlay() {
+		overlayManager.remove(bankItemOverlayROF);
+		if (config.cbBankOutline())
+		{
+			bankItemOverlayROF = new BankItemHighlight(this, config, itemManager);
+			overlayManager.add(bankItemOverlayROF);
+		}
+	}
+
+	private void addWarningOverlay()
+	{
+		overlayManager.remove(warningOverlay);
+		warningOverlay = new WarningOverlay(this);
+		warningOverlay.setPreferredColor(Color.RED);
+		warningOverlay.setBounds(new Rectangle(100,100));
+		overlayManager.add(warningOverlay);
+	}
+
+	private void removeWarningOverlay()
+	{
+		overlayManager.remove(warningOverlay);
+		warningOverlay = null;
+	}
+
+	private void updateMissingROF()
+	{
+		int chargeCount = getRingCharge();
+		removeInfobox();
+		if (config.cbWarningBox() && warningOverlay == null)
+		{
+			addWarningOverlay();
+		}
+	}
+
+	private int getRingCharge()
+	{
+		return getItemCharges("ringOfForging");
+	}
+
+	// From Item Charges plugin
+	int getItemCharges(String key)
+	{
+		final String groupName = "itemCharge";
+		Integer i = configManager.getConfiguration(groupName, key, Integer.class);
+		if (i != null)
+		{
+			configManager.unsetConfiguration(groupName, key);
+			configManager.setRSProfileConfiguration(groupName, key, i);
+			return i;
+		}
+
+		i = configManager.getRSProfileConfiguration(groupName, key, Integer.class);
+		return i == null ? -1 : i;
+	}
+
+	boolean isBankVisible()
+	{
+		Widget bank = client.getWidget(WidgetInfo.BANK_CONTAINER);
+		return bank != null && !bank.isHidden();
+	}
+
+	public boolean isPlayerWearingROF()
+	{
+		return playerWearingROF;
+	}
+
+}
+
+
+package com.roftracker;
+
+import lombok.Getter;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.ui.overlay.infobox.Counter;
+import net.runelite.client.util.QuantityFormatter;
+
+import java.awt.image.BufferedImage;
+
+class ROFChargeCounter extends Counter
+{
+	@Getter
+	private final int itemID;
+
+	ROFChargeCounter(Plugin plugin, int itemID, int count, BufferedImage image)
+	{
+		super(image, plugin, count);
+		this.itemID = itemID;
+	}
+
+	@Override
+	public String getText()
+	{
+		return QuantityFormatter.quantityToRSDecimalStack(getCount());
+	}
+
+	@Override
+	public String getTooltip()
+	{
+		return "ROF Charges";
+	}
+}
+
+package com.roftracker;
+
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+import static net.runelite.api.MenuAction.RUNELITE_OVERLAY_CONFIG;
+import static net.runelite.client.ui.overlay.OverlayManager.OPTION_CONFIGURE;
+
+public class WarningOverlay extends OverlayPanel
+{
+    private final ROFTrackerPlugin plugin;
+
+    @Inject
+    public WarningOverlay(ROFTrackerPlugin plugin)
+    {
+        super(plugin);
+        setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
+        this.plugin = plugin;
+        addMenuEntry(RUNELITE_OVERLAY_CONFIG, OPTION_CONFIGURE, "ROF Overlay");
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        final String warningString = "WARNING: NOT WEARING RING OF FORGING";
+
+        panelComponent.getChildren().add(TitleComponent.builder()
+                .text(warningString)
+                .color(Color.RED)
+                .build());
+
+        panelComponent.setPreferredSize(new Dimension(
+                graphics.getFontMetrics().stringWidth(warningString) + 500,
+                300));
+
+        return super.render(graphics);
+    }
+}
+

@@ -1,0 +1,449 @@
+package alexsuperfly.forcerecolor;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ForceRecolorPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ForceRecolorPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package alexsuperfly.forcerecolor;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.MessageNode;
+import net.runelite.api.Varbits;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.Text;
+import org.apache.commons.lang3.StringUtils;
+
+import java.awt.Color;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Force Recolor"
+)
+public class ForceRecolorPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private ForceRecolorConfig config;
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
+	@Inject
+	private ConfigManager configManager;
+
+	@Provides
+	ForceRecolorConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(ForceRecolorConfig.class);
+	}
+
+	private static final Pattern TAG_REGEXP_SANS_LT_GT = Pattern.compile("<(?!lt>|gt>)[^>]*>");
+
+	private int transparencyVarbit = -1;
+	private final Map<Integer, String> textGroupStrings = new HashMap<>();
+	private final Map<Integer, Pattern> matchGroupPatterns = new HashMap<>();
+	private final Map<Integer, String> colorGroupStrings = new HashMap<>();
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		updateMatchingText();
+		updateRecolorColor();
+	}
+
+	private void updateMatchingText()
+	{
+		textGroupStrings.clear();
+		matchGroupPatterns.clear();
+
+		if (!config.matchedTextString().trim().equals(""))
+		{
+			List<String> items = Text.fromCSV(config.matchedTextString());
+			for (String val : items)
+			{
+				String[] segments = val.split("::");
+				int group = 0;
+				if (segments.length == 2)
+				{
+					group = StringUtils.isNumeric(segments[1]) ? Integer.parseInt(segments[1]) : 0;
+					if (group > 9 || group < 0)
+					{
+						group = 0;
+					}
+				}
+				String matchText = Pattern.quote(Text.escapeJagex(segments[0]));
+				String currentText = textGroupStrings.get(group);
+				String combinedMatchText = currentText != null ? currentText + "|" + matchText : matchText;
+				textGroupStrings.put(group, combinedMatchText);
+			}
+
+			textGroupStrings.forEach((group, text)
+					-> matchGroupPatterns.put(group, Pattern.compile("(?:\\b|(?<=\\s)|\\A)(?:" + text + ")(?:\\b|(?=\\s)|\\z)", Pattern.CASE_INSENSITIVE)));
+		}
+	}
+
+	private void updateRecolorColor()
+	{
+		log.debug("updateRecolorColor");
+		boolean transparent = client.isResized() && transparencyVarbit != 0;
+		String defaultColorString = "";
+
+		colorGroupStrings.clear();
+
+		switch (config.recolorStyle())
+		{
+			case CHAT_COLOR_CONFIG:
+			{
+				Color chatColorConfigColor = configManager.getConfiguration("textrecolor", transparent ? "transparentGameMessage" : "opaqueGameMessage", Color.class);
+				if (chatColorConfigColor != null)
+				{
+					defaultColorString = "<col=" + ColorUtil.toHexColor(chatColorConfigColor).substring(1) + ">";
+				}
+				break;
+			}
+			case THIS_CONFIG:
+			{
+				Color thisConfigColor = transparent ? config.transparentRecolor() : config.opaqueRecolor();
+				if (thisConfigColor != null)
+				{
+					defaultColorString = "<col=" + ColorUtil.toHexColor(thisConfigColor).substring(1) + ">";
+				}
+				break;
+			}
+		}
+		colorGroupStrings.put(0, defaultColorString);
+
+		for (int i = 1; i < 10; i++)
+		{
+			Color color = configManager.getConfiguration("forcerecolor", transparent ? "transparentRecolorGroup" + String.valueOf(i) : "opaqueRecolorGroup" + String.valueOf(i), Color.class);
+			colorGroupStrings.put(i, color != null ? "<col=" + ColorUtil.toHexColor(color).substring(1) + ">" : "");
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (event.getGroup().equals("forcerecolor"))
+		{
+			updateMatchingText();
+			updateRecolorColor();
+		}
+
+		if (event.getGroup().equals("textrecolor"))
+		{
+			updateRecolorColor();
+		}
+	}
+
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged event)
+	{
+		int setting = client.getVarbitValue(Varbits.TRANSPARENT_CHATBOX);
+
+		if (transparencyVarbit != setting)
+		{
+			transparencyVarbit = setting;
+			updateRecolorColor();
+		}
+	}
+
+	// Run after ChatMessageManager and the Chat Filter plugin
+	// in case they change something/remove the message
+	@Subscribe(priority = -3)
+	public void onChatMessage(ChatMessage chatMessage)
+	{
+		ChatMessageType chatType = chatMessage.getType();
+		if (!config.allMessageTypes() && chatType != ChatMessageType.GAMEMESSAGE && chatType != ChatMessageType.SPAM && chatType != ChatMessageType.ENGINE)
+		{
+			return;
+		}
+
+		MessageNode messageNode = chatMessage.getMessageNode();
+		String nodeValue = removeMostTags(messageNode.getValue());
+
+		for (int group : matchGroupPatterns.keySet())
+		{
+			Matcher matcher = matchGroupPatterns.get(group).matcher(nodeValue);
+
+			if (matcher.find())
+			{
+				// When the Notifier makes a new message onChatMessage gets fired
+				// before it refreshes its content and so changes would be overridden
+				// unless I set them after it finally does
+				clientThread.invokeLater(() ->
+				{
+					messageNode.setValue(colorGroupStrings.get(group) + nodeValue);
+					messageNode.setRuneLiteFormatMessage(messageNode.getValue());
+					client.refreshChat();
+				});
+				break;
+			}
+		}
+	}
+
+	public static String removeMostTags(String str)
+	{
+		return TAG_REGEXP_SANS_LT_GT.matcher(str).replaceAll("").replace('\u00A0', ' ');
+	}
+}
+
+package alexsuperfly.forcerecolor;
+
+public enum RecolorStyle
+{
+    NONE,
+    THIS_CONFIG,
+    CHAT_COLOR_CONFIG
+}
+
+package alexsuperfly.forcerecolor;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+import java.awt.Color;
+
+@ConfigGroup("forcerecolor")
+public interface ForceRecolorConfig extends Config
+{
+	@ConfigSection(
+			name = "Opaque group colors",
+			description = "Color groups for the opaque chatbox",
+			position = 20,
+			closedByDefault = true
+	)
+	String opaqueGroups = "opaqueGroups";
+
+	@ConfigSection(
+			name = "Transparent group colors",
+			description = "Color groups for the transparent chatbox",
+			position = 21,
+			closedByDefault = true
+	)
+	String transparentGroups = "transparentGroups";
+
+	@ConfigItem(
+		position = 1,
+		keyName = "matchedTextString",
+		name = "Matched text",
+		description = "Comma separated list of text to find, force recoloring containing game messages.  Append a ::# to the string to denote what color group it should be colored as, blank or invalid numbers will be evaluated to the default color."
+	)
+	default String matchedTextString()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+			keyName = "allMessageTypes",
+			name = "Match all message types",
+			description = "Matches against all message types, when disabled only matches game messages."
+	)
+	default boolean allMessageTypes()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		position = 2,
+		keyName = "recolorStyle",
+		name = "Recolor Style",
+		description = "What should be used to recolor the matched message."
+	)
+	default RecolorStyle recolorStyle()
+	{
+		return RecolorStyle.CHAT_COLOR_CONFIG;
+	}
+
+	@ConfigItem(
+		position = 3,
+		keyName = "opaqueRecolor",
+		name = "Opaque Recolor",
+		description = "The default recolor color for the opaque chatbox."
+	)
+	Color opaqueRecolor();
+
+	@ConfigItem(
+		position = 4,
+		keyName = "transparentRecolor",
+		name = "Transparent Recolor",
+		description = "The default recolor color for the transparent chatbox."
+	)
+	Color transparentRecolor();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup1",
+			name = "Opaque Group 1",
+			description = "The recolor color of group 1 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup1();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup2",
+			name = "Opaque Group 2",
+			description = "The recolor color of group 2 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup2();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup3",
+			name = "Opaque Group 3",
+			description = "The recolor color of group 3 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup3();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup4",
+			name = "Opaque Group 4",
+			description = "The recolor color of group 4 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup4();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup5",
+			name = "Opaque Group 5",
+			description = "The recolor color of group 5 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup5();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup6",
+			name = "Opaque Group 6",
+			description = "The recolor color of group 6 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup6();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup7",
+			name = "Opaque Group 7",
+			description = "The recolor color of group 7 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup7();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup8",
+			name = "Opaque Group 8",
+			description = "The recolor color of group 8 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup8();
+
+	@ConfigItem(
+			keyName = "opaqueRecolorGroup9",
+			name = "Opaque Group 9",
+			description = "The recolor color of group 9 for the opaque chatbox.",
+			section = opaqueGroups
+	)
+	Color opaqueRecolorGroup9();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup1",
+			name = "Transparent Group 1",
+			description = "The recolor color of group 1 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup1();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup2",
+			name = "Transparent Group 2",
+			description = "The recolor color of group 2 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup2();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup3",
+			name = "Transparent Group 3",
+			description = "The recolor color of group 3 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup3();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup4",
+			name = "Transparent Group 4",
+			description = "The recolor color of group 4 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup4();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup5",
+			name = "Transparent Group 5",
+			description = "The recolor color of group 5 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup5();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup6",
+			name = "Transparent Group 6",
+			description = "The recolor color of group 6 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup6();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup7",
+			name = "Transparent Group 7",
+			description = "The recolor color of group 7 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup7();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup8",
+			name = "Transparent Group 8",
+			description = "The recolor color of group 8 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup8();
+
+	@ConfigItem(
+			keyName = "transparentRecolorGroup9",
+			name = "Transparent Group 9",
+			description = "The recolor color of group 9 for the transparent chatbox.",
+			section = transparentGroups
+	)
+	Color transparentRecolorGroup9();
+}
+

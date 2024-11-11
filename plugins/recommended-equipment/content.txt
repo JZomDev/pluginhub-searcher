@@ -1,0 +1,3027 @@
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class RecommendedEquipmentPluginLauncher
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(RecommendedEquipmentPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import net.runelite.client.util.ImageUtil;
+
+import javax.swing.*;
+import java.awt.image.BufferedImage;
+
+public final class Icons {
+    public static final BufferedImage ICON_IMG = ImageUtil.loadImageResource(Icons.class, "icon.png");
+    public static final ImageIcon CHEVRON_UP = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "chevron-up.png"));
+    public static final ImageIcon CHEVRON_DOWN = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "chevron-down.png"));
+    public static final ImageIcon CHEVRON_LEFT = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "chevron-left.png"));
+    public static final ImageIcon FUNNEL = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "funnel.png"));
+    public static final ImageIcon ICON = new ImageIcon(ICON_IMG);
+    public static final ImageIcon LINK = new ImageIcon(ImageUtil.resizeImage(ImageUtil.loadImageResource(Icons.class, "link.png"), 16, 16));
+    public static final ImageIcon MAGNIFYING_GLASS = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "magnifying-glass.png"));
+
+    private Icons() {
+        throw new AssertionError();
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.Getter;
+import net.runelite.client.ui.MultiplexingPluginPanel;
+
+@Getter
+public class ActivityListItem extends ClickableListItem {
+    private final Activity activity;
+
+    public ActivityListItem(Activity activity, RecommendedEquipmentPlugin plugin, ActivityManager activityManager, MultiplexingPluginPanel muxer) {
+        super(activity.getName(),
+            activity.getCategory(),
+            activity.isFavorite(),
+            () -> {
+                activity.setFavorite(!activity.isFavorite());
+                activityManager.saveFavorite(activity);
+            }
+        );
+        this.activity = activity;
+        this.setToolTipText(activity.getName());
+        this.setOnClick(() -> muxer.pushState(new ActivityPanel(activity, plugin, activityManager, muxer)));
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import okhttp3.*;
+
+import javax.annotation.Nonnull;
+import javax.inject.Inject;
+import java.io.IOException;
+import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.TimeUnit;
+
+public class RecEquipClient {
+    private final OkHttpClient cachingClient;
+    private final Gson gson;
+    private static final HttpUrl GITHUB = Objects.requireNonNull(HttpUrl.parse("https://raw.githubusercontent.com/adamk33n3r/recgear-wiki-scraper"));
+
+    @Inject
+    public RecEquipClient(OkHttpClient cachingClient, Gson gson) {
+        this.cachingClient = cachingClient.newBuilder()
+            .addInterceptor(new CacheInterceptor(15))
+            .build();
+        this.gson = gson.newBuilder()
+            .registerTypeAdapter(ActivitySlotTier.class, new ActivitySlotTierDeserializer())
+            .create();
+    }
+
+    public List<Activity> downloadActivities(boolean forceDownload) throws IOException {
+        HttpUrl allActivities = GITHUB.newBuilder()
+            .addPathSegment("master")
+            .addPathSegment("recs")
+            .addPathSegment("all.min.json")
+            .build();
+        Request.Builder reqBuilder = new Request.Builder().url(allActivities);
+        if (forceDownload) {
+            reqBuilder.cacheControl(CacheControl.FORCE_NETWORK);
+        }
+        try (Response res  = this.cachingClient.newCall(reqBuilder.build()).execute()) {
+            if (res.code() != 200) {
+                throw new IOException("Non-OK response code: " + res.code());
+            }
+
+            return this.gson.fromJson(Objects.requireNonNull(res.body()).string(), new TypeToken<List<Activity>>() {}.getType());
+        }
+    }
+
+    static class CacheInterceptor implements Interceptor {
+        private final int minutes;
+        public CacheInterceptor(int minutes) {
+            this.minutes = minutes;
+        }
+
+        @Override
+        @Nonnull
+        public Response intercept(Chain chain) throws IOException {
+            Response response = chain.proceed(chain.request());
+
+            CacheControl cacheControl = new CacheControl.Builder()
+                .maxAge(this.minutes, TimeUnit.MINUTES)
+                .build();
+
+            return response.newBuilder()
+                .removeHeader("Pragma")
+                .removeHeader("Cache-Control")
+                .header("Cache-Control", cacheControl.toString())
+                .build();
+        }
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import com.adamk33n3r.runelite.recommendedequipment.banktab.BankTab;
+
+import com.google.inject.Binder;
+import com.google.inject.Provides;
+import javax.inject.Inject;
+
+import com.google.inject.name.Names;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
+
+import java.awt.image.BufferedImage;
+import java.util.*;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Recommended Equipment",
+	description = "Recommended Equipment is a plugin that will suggest the best gear for the boss you are fighting or activity you are participating in.",
+	tags = { "equipment", "gear", "boss", "pvm", "pvp", "activity" }
+)
+public class RecommendedEquipmentPlugin extends Plugin {
+	public static final int ICON_SPRITE_ID = 0x74386F72;
+
+	@Inject
+	private Client client;
+	@Inject
+	private EventBus eventBus;
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	@Getter
+	private BankTab bankTab;
+
+	@Getter
+	private ActivityEquipmentStyle activityEquipmentStyle;
+
+	private NavigationButton navButton;
+
+	@Override
+	public void configure(Binder binder) {
+		Properties properties = RecommendedEquipmentProperties.getProperties();
+		Names.bindProperties(binder, properties);
+	}
+
+	@Override
+	protected void startUp() throws Exception {
+		this.eventBus.register(this.bankTab);
+		this.bankTab.startUp();
+		PanelWrapper panel = this.injector.getInstance(PanelWrapper.class);
+		this.navButton = NavigationButton.builder()
+			.tooltip("Recommended Equipment")
+			.icon((BufferedImage) Icons.ICON.getImage())
+			.priority(5)
+			.panel(panel)
+			.build();
+		this.clientToolbar.addNavigation(this.navButton);
+
+		this.client.getSpriteOverrides().put(ICON_SPRITE_ID, ImageUtil.getImageSpritePixels(Icons.ICON_IMG, this.client));
+	}
+
+	@Override
+	protected void shutDown() throws Exception {
+		this.eventBus.unregister(this.bankTab);
+		this.bankTab.shutDown();
+		this.clientToolbar.removeNavigation(this.navButton);
+		this.client.getSpriteOverrides().remove(ICON_SPRITE_ID);
+	}
+
+	public void setActivityEquipmentStyle(ActivityEquipmentStyle activityEquipmentStyle) {
+		this.activityEquipmentStyle = activityEquipmentStyle;
+
+		if (this.activityEquipmentStyle != null) {
+			if (!this.bankTab.isInitialized()) {
+				this.bankTab.startUp();
+			}
+			if (this.bankTab.isActive()) {
+				this.bankTab.resetTab();
+			}
+		} else {
+			this.bankTab.shutDown();
+		}
+	}
+
+	@Provides
+	RecommendedEquipmentConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(RecommendedEquipmentConfig.class);
+	}
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.Getter;
+import net.runelite.client.ui.ColorScheme;
+
+import javax.swing.*;
+import javax.swing.border.Border;
+
+public class EquipmentStyleListItem extends ClickableListItem {
+    @Getter
+    private final ActivityEquipmentStyle style;
+    @Getter
+    private boolean selected;
+    private final RecommendedEquipmentPlugin plugin;
+
+    private final Border selectedBorder;
+    private final Border unselectedBorder;
+
+    public EquipmentStyleListItem(Activity activity, ActivityEquipmentStyle style, ActivityPanel parent, RecommendedEquipmentPlugin plugin, ActivityManager activityManager) {
+        super(style.getName(), null, style.isFavorite(), () -> {
+            style.setFavorite(!style.isFavorite());
+            activityManager.saveFavorite(activity);
+        });
+        this.plugin = plugin;
+        this.style = style;
+
+        this.setOnClick(() -> parent.selectLoadout(this));
+        Border emptyBorder = BorderFactory.createEmptyBorder(3, 5, 3, 5);
+        this.selectedBorder = BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(ColorScheme.TEXT_COLOR, 1), emptyBorder);
+        this.unselectedBorder = BorderFactory.createCompoundBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR, 1), emptyBorder);
+        this.setBorder(this.unselectedBorder);
+    }
+
+    public void select() {
+        this.selected = true;
+        this.setBackground(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        this.setBorder(this.selectedBorder);
+        this.plugin.setActivityEquipmentStyle(this.style);
+    }
+
+    public void deselect(boolean setStyle) {
+        this.selected = false;
+        this.setBackground(ColorScheme.DARKER_GRAY_HOVER_COLOR);
+        this.setBorder(this.unselectedBorder);
+        if (setStyle && this.plugin.getActivityEquipmentStyle() == this.style) {
+            this.plugin.setActivityEquipmentStyle(null);
+        }
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+
+public class PluginTitle extends JPanel {
+    @Inject
+    public PluginTitle(@Named("recequip.pluginVersion") String pluginVersion) {
+        this.setLayout(new BorderLayout());
+        JLabel icon = new JLabel(Icons.ICON);
+        icon.setBorder(new EmptyBorder(0, 0, 4, 2));
+        this.add(icon, BorderLayout.WEST);
+        JLabel titleLabel = new JLabel("Recommended Equipment");
+        this.add(titleLabel, BorderLayout.CENTER);
+        JLabel version = new JLabel("v" + pluginVersion);
+        version.setFont(version.getFont().deriveFont(Font.BOLD, 10f));
+        version.setBorder(new EmptyBorder(5, 0, 0, 0));
+        this.add(version, BorderLayout.EAST);
+    }
+}
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.Data;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Data
+public class ActivitySlotTier {
+    private List<ActivityItem> items = new ArrayList<>();
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.Getter;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.util.Properties;
+
+public class RecommendedEquipmentProperties {
+    @Getter()
+    private static final Properties properties = new Properties();
+
+    static {
+//        try (InputStream in = RecommendedEquipmentProperties.class.getResourceAsStream("recequip.properties")) {
+//            properties.load(in);
+//        } catch (IOException ex) {
+//            throw new RuntimeException(ex);
+//        }
+
+        try (InputStream in = RecommendedEquipmentProperties.class.getResourceAsStream("version.properties")) {
+            properties.load(in);
+            String pluginVersion = String.format(
+                "%s.%s.%s",
+                properties.getProperty("VERSION_MAJOR"),
+                properties.getProperty("VERSION_MINOR"),
+                properties.getProperty("VERSION_PATCH"));
+            properties.put("recequip.pluginVersion", pluginVersion);
+            String phase = properties.getProperty("VERSION_PHASE");
+            String build = properties.getProperty("VERSION_BUILD");
+            String pluginVersionFull = String.format("%s-%s+%s", pluginVersion, phase, build);
+            properties.put("recequip.pluginVersionFull", pluginVersionFull);
+        } catch (IOException ex) {
+            throw new RuntimeException(ex);
+        }
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import javax.swing.*;
+import javax.swing.border.Border;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.util.Arrays;
+
+public class Accordion extends ScrollablePanel {
+    private static final Border VIEWPORT_BORDER = new EmptyBorder(0, 0, 0, 5);
+    public Accordion() {
+        this.setLayout(new StretchedStackedLayout(5));
+    }
+
+    public void addSection(String title, JPanel content) {
+        AccordionSection section = new AccordionSection(title, content, this::onSectionToggle);
+        this.add(section);
+    }
+
+    public void onSectionToggle(AccordionSection section) {
+        // A little glitchy, but it works
+        SwingUtilities.invokeLater(() -> {
+            Container scrollPaneContainer = SwingUtilities.getAncestorOfClass(JScrollPane.class, this);
+            if (scrollPaneContainer == null) {
+                return;
+            }
+
+            JScrollPane scrollPane = (JScrollPane) scrollPaneContainer;
+            if (scrollPane.getVerticalScrollBar().isVisible()) {
+                scrollPane.setViewportBorder(VIEWPORT_BORDER);
+            } else {
+                scrollPane.setViewportBorder(null);
+            }
+            this.revalidate();
+
+            // Revalidate all sections since scrollbar changed
+            SwingUtilities.invokeLater(() -> {
+                Arrays.stream(this.getComponents())
+                    .forEach(Component::revalidate);
+            });
+        });
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.Data;
+
+import java.util.List;
+
+@Data
+public class ActivityItem {
+    private String name;
+    private List<Integer> itemIDs;
+}
+
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import net.runelite.client.plugins.config.ConfigPlugin;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.SwingUtil;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+
+public class ClickableListItem extends ClickablePanel {
+    protected static final ImageIcon ON_STAR;
+    protected static final ImageIcon OFF_STAR;
+
+    static {
+        BufferedImage onStar = ImageUtil.loadImageResource(ConfigPlugin.class, "star_on.png");
+        ON_STAR = new ImageIcon(onStar);
+
+        BufferedImage offStar = ImageUtil.luminanceScale(
+            ImageUtil.grayscaleImage(onStar),
+            0.77f
+        );
+        OFF_STAR = new ImageIcon(offStar);
+    }
+
+    private final String text;
+    private final String subtext;
+    private final boolean isFavorite;
+    private final Runnable onFavorite;
+
+    public ClickableListItem(String text, String subtext, boolean isFavorite, Runnable onFavorite) {
+        super(ColorScheme.DARKER_GRAY_HOVER_COLOR, ColorScheme.MEDIUM_GRAY_COLOR, ColorScheme.DARK_GRAY_COLOR);
+        this.text = text;
+        this.subtext = subtext;
+        this.isFavorite = isFavorite;
+        this.onFavorite = onFavorite;
+        this.rebuild();
+        this.setBorder(new EmptyBorder(3, 5, 3, 5));
+        Theme.applyStyle(this, Theme.PanelType.CLICKABLE);
+    }
+
+    public void rebuild() {
+        this.removeAll();
+        JLabel name = new JLabel(this.text);
+        name.setHorizontalAlignment(SwingConstants.LEFT);
+        name.setAlignmentX(LEFT_ALIGNMENT);
+
+        JLabel category = new JLabel(this.subtext);
+        if (this.subtext == null) {
+            category.setText("\u00A0");
+        }
+        JToggleButton favoriteBtn = new JToggleButton(OFF_STAR);
+        favoriteBtn.setSelected(this.isFavorite);
+        favoriteBtn.setSelectedIcon(ON_STAR);
+        SwingUtil.removeButtonDecorations(favoriteBtn);
+        SwingUtil.addModalTooltip(favoriteBtn, "Unfavorite", "Favorite");
+        favoriteBtn.setPreferredSize(new Dimension(21, 21));
+        favoriteBtn.addActionListener(e -> this.onFavorite.run());
+
+        GroupLayout layout = new GroupLayout(this);
+        this.setLayout(layout);
+        layout.setHorizontalGroup(
+            layout.createParallelGroup()
+                .addGroup(layout.createSequentialGroup()
+                    .addContainerGap()
+                    .addComponent(name, 0, GroupLayout.DEFAULT_SIZE, Short.MAX_VALUE)
+                    .addPreferredGap(LayoutStyle.ComponentPlacement.RELATED, GroupLayout.PREFERRED_SIZE, Short.MAX_VALUE)
+                    .addComponent(category)
+                    .addPreferredGap(LayoutStyle.ComponentPlacement.RELATED, GroupLayout.PREFERRED_SIZE, GroupLayout.PREFERRED_SIZE)
+                    .addComponent(favoriteBtn, 21, 21, 21))
+        );
+        layout.setVerticalGroup(
+            layout.createParallelGroup()
+                .addGroup(layout.createSequentialGroup()
+                    .addContainerGap()
+                    .addGroup(layout.createParallelGroup(GroupLayout.Alignment.CENTER)
+                        .addComponent(name, 16, 16, 16)
+                        .addComponent(favoriteBtn, 16, 16, 16)
+                        .addComponent(category))
+                    .addContainerGap())
+        );
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment.banktab;
+
+import net.runelite.api.Point;
+import net.runelite.api.widgets.Widget;
+
+public class BankWidget {
+    public Widget itemWidget;
+
+    public BankWidget(Widget itemWidget) {
+        this.itemWidget = itemWidget;
+    }
+
+    public boolean isPointOverWidget(Point point)
+    {
+        return itemWidget.contains(point);
+    }
+
+    public int getItemID() {
+        return itemWidget.getItemId();
+    }
+
+    public int getItemQuantity() {
+        return itemWidget.getItemQuantity();
+    }
+
+    public void swap(BankWidget otherWidget) {
+        int otherXItem = otherWidget.itemWidget.getOriginalX();
+        int otherYItem = otherWidget.itemWidget.getOriginalY();
+
+        otherWidget.swapPosition(otherWidget.itemWidget, itemWidget);
+        swapPosition(itemWidget, otherXItem, otherYItem);
+    }
+
+    private void swapPosition(Widget thisWidget, Widget otherWidget) {
+        thisWidget.setOriginalX(otherWidget.getOriginalX());
+        thisWidget.setOriginalY(otherWidget.getOriginalY());
+        thisWidget.revalidate();
+    }
+
+    private void swapPosition(Widget thisWidget, int x, int y) {
+        thisWidget.setOriginalX(x);
+        thisWidget.setOriginalY(y);
+        thisWidget.revalidate();
+    }
+}
+
+
+package com.adamk33n3r.runelite.recommendedequipment.banktab;
+
+import com.adamk33n3r.runelite.recommendedequipment.Icons;
+import com.adamk33n3r.runelite.recommendedequipment.RecommendedEquipmentPlugin;
+import lombok.Getter;
+import net.runelite.api.*;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.JavaScriptCallback;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetType;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.plugins.bank.BankSearch;
+import net.runelite.client.util.ImageUtil;
+
+import javax.inject.Inject;
+import java.awt.image.BufferedImage;
+
+public class BankFilterButton {
+    private static final String BUTTON_NAME = "Recommended\u00a0Equipment";
+    private static final int REC_BUTTON_SIZE = 25;
+    private static final int REC_BUTTON_X = 408;
+    private static final int REC_BUTTON_Y = 5;
+
+    @Getter
+    private boolean tabActive = false;
+    private final Client client;
+    private final ClientThread clientThread;
+    private final BankSearch bankSearch;
+    private Widget parent;
+    private Widget backgroundWidget;
+    private Widget iconWidget;
+
+    @Inject
+    public BankFilterButton(Client client, ClientThread clientThread, BankSearch bankSearch) {
+        this.client = client;
+        this.clientThread = clientThread;
+        // Used for resetting the search
+        this.bankSearch = bankSearch;
+    }
+
+    public void init() {
+        if (this.isHidden()) {
+            return;
+        }
+
+        this.parent = this.client.getWidget(ComponentID.BANK_CONTAINER);
+        assert this.parent != null;
+
+        this.backgroundWidget = this.createGraphic(this.parent, BUTTON_NAME, SpriteID.UNKNOWN_BUTTON_SQUARE_SMALL, REC_BUTTON_SIZE, REC_BUTTON_SIZE, REC_BUTTON_X, REC_BUTTON_Y);
+        this.backgroundWidget.setAction(1, "View tab");
+        this.backgroundWidget.setOnOpListener((JavaScriptCallback) this::handleTagTab);
+
+        this.iconWidget = this.createGraphic(this.parent, "", RecommendedEquipmentPlugin.ICON_SPRITE_ID, REC_BUTTON_SIZE - 6, REC_BUTTON_SIZE - 6, REC_BUTTON_X + 3, REC_BUTTON_Y + 3);
+
+        if (tabActive) {
+            tabActive = false;
+            this.clientThread.invokeLater(this::activateTab);
+        }
+    }
+
+    public void destroy() {
+        if (this.tabActive) {
+            this.closeTab();
+            this.bankSearch.reset(true);
+        }
+
+        this.parent = null;
+
+        if (this.iconWidget != null) {
+            iconWidget.setHidden(true);
+        }
+
+        if (this.backgroundWidget != null) {
+            this.backgroundWidget.setHidden(true);
+        }
+
+        this.tabActive = false;
+    }
+
+    private void activateTab() {
+        if (this.tabActive) {
+            return;
+        }
+
+        this.backgroundWidget.setSpriteId(SpriteID.UNKNOWN_BUTTON_SQUARE_SMALL_SELECTED);
+        this.backgroundWidget.revalidate();
+        this.tabActive = true;
+
+        this.bankSearch.reset(true); // clear search dialog & re-layout bank for new tab
+    }
+
+    public void updateLocation() {
+        if (this.parent == null) {
+            return;
+        }
+
+        boolean found = false;
+        for (Widget child : this.parent.getDynamicChildren()) {
+            if (child.isHidden() || child.getName().isBlank()) {
+                continue;
+            }
+            if ("quest-helper".equals(child.getName())) {
+                found = true;
+                this.backgroundWidget.setOriginalX(REC_BUTTON_X - 25 - 4);
+                this.iconWidget.setOriginalX(REC_BUTTON_X + 3 - 25 - 4);
+                break;
+            }
+        }
+
+        if (!found) {
+            this.backgroundWidget.setOriginalX(REC_BUTTON_X);
+            this.iconWidget.setOriginalX(REC_BUTTON_X + 3);
+        }
+
+        this.backgroundWidget.revalidate();
+        this.iconWidget.revalidate();
+    }
+
+    private void handleTagTab(ScriptEvent scriptEvent) {
+        if (scriptEvent.getOp() == 2) {
+            this.client.setVarbit(Varbits.CURRENT_BANK_TAB, 0);
+
+            if (this.tabActive) {
+                this.closeTab();
+                this.bankSearch.reset(true);
+            } else {
+                this.activateTab();
+            }
+
+            this.client.playSoundEffect(SoundEffectID.UI_BOOP);
+        }
+    }
+
+
+    public void handleClick(MenuOptionClicked event) {
+        if (isHidden()) {
+            return;
+        }
+        String menuOption = event.getMenuOption();
+
+        // If click a base tab, close
+        boolean clickedTabTag = menuOption.startsWith("View tab") && !event.getMenuTarget().equals(BUTTON_NAME);
+        boolean clickedOtherTab = menuOption.equals("View all items") || menuOption.startsWith("View tag tab");
+        // NOTE: Without clickedTabTag, this closes the tab first, and then handleTagTab is called which reopens it
+        if (this.tabActive && (clickedTabTag || clickedOtherTab)) {
+            closeTab();
+        }
+    }
+
+    public void handleSearch()
+    {
+        if (tabActive)
+        {
+            closeTab();
+            // This ensures that when clicking Search when tab is selected, the search input is opened rather
+            // than client trying to close it first
+            client.setVarcStrValue(VarClientStr.INPUT_TEXT, "");
+            client.setVarcIntValue(VarClientInt.INPUT_TYPE, 0);
+        }
+    }
+
+    public void closeTab() {
+        this.tabActive = false;
+        if (this.backgroundWidget != null)
+        {
+            this.backgroundWidget.setSpriteId(SpriteID.UNKNOWN_BUTTON_SQUARE_SMALL);
+            this.backgroundWidget.revalidate();
+        }
+    }
+
+    public void refreshTab() {
+        if (!this.tabActive) {
+            return;
+        }
+
+        client.setVarbit(Varbits.CURRENT_BANK_TAB, 0);
+
+        bankSearch.reset(true); // clear search dialog & relayout bank for new tab.
+    }
+
+    private Widget createGraphic(Widget container, String name, int sprite, int width, int height, int x, int y) {
+        Widget widget = container.createChild(-1, WidgetType.GRAPHIC);
+        widget.setOriginalWidth(width);
+        widget.setOriginalHeight(height);
+        widget.setOriginalX(x);
+        widget.setOriginalY(y);
+        widget.setSpriteId(sprite);
+        widget.setOnOpListener(ScriptID.NULL);
+        widget.setHasListener(true);
+        widget.setName(name);
+        widget.revalidate();
+        return widget;
+    }
+
+    public boolean isHidden() {
+        Widget widget = this.client.getWidget(ComponentID.BANK_CONTAINER);
+        return widget == null || widget.isHidden();
+    }
+
+    public boolean isInitialized() {
+        return this.parent != null;
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment.banktab;
+
+import com.adamk33n3r.runelite.recommendedequipment.*;
+
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.api.widgets.*;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.util.Text;
+import org.apache.commons.lang3.tuple.Pair;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.awt.Point;
+import java.util.*;
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class BankTab {
+    private static final int ITEMS_PER_ROW = 8;
+    private static final int ITEM_VERTICAL_SPACING = 36;
+    private static final int ITEM_HORIZONTAL_SPACING = 48;
+    private static final int ITEM_ROW_START = 51;
+    private static final int LINE_VERTICAL_SPACING = 5;
+    private static final int LINE_HEIGHT = 2;
+    private static final int TEXT_HEIGHT = 15;
+    private static final int ITEM_HEIGHT = 32;
+    private static final int ITEM_WIDTH = 36;
+    private static final int ITEM_HORIZONTAL_GAP = ITEM_HORIZONTAL_SPACING - ITEM_WIDTH;
+    private static final int EMPTY_BANK_SLOT_ID = 6512;
+
+    @Inject
+    private Client client;
+    @Inject
+    private ClientThread clientThread;
+    @Inject
+    private BankFilterButton bankFilterButton;
+    @Inject
+    private ChatMessageManager chatMessageManager;
+    @Inject
+    private RecommendedEquipmentPlugin recommendedEquipmentPlugin;
+
+    private final List<Widget> addedWidgets = new ArrayList<>();
+    private final Map<Widget, ActivityItem> widgetItems = new HashMap<>();
+    private final Map<BankWidget, BankWidget> fakeToRealItem = new HashMap<>();
+
+    public void startUp() {
+        if (this.recommendedEquipmentPlugin.getActivityEquipmentStyle() != null) {
+            this.clientThread.invokeLater(this.bankFilterButton::init);
+        }
+    }
+
+    public void shutDown() {
+        this.clientThread.invokeLater(this.bankFilterButton::destroy);
+        if (!this.addedWidgets.isEmpty()) {
+            for (Widget addedWidget : this.addedWidgets) {
+                addedWidget.setHidden(true);
+            }
+            this.addedWidgets.clear();
+        }
+    }
+
+    public boolean isActive() {
+        return this.bankFilterButton.isTabActive();
+    }
+
+    public boolean isInitialized() {
+        return this.bankFilterButton.isInitialized();
+    }
+
+    public void resetTab() {
+        this.clientThread.invokeLater(this.bankFilterButton::refreshTab);
+    }
+
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded event) {
+        if (event.getGroupId() == InterfaceID.BANK && this.recommendedEquipmentPlugin.getActivityEquipmentStyle() != null) {
+            this.bankFilterButton.init();
+        }
+    }
+
+    @Subscribe
+    public void onClientTick(ClientTick clientTick) {
+        if (this.bankFilterButton.isHidden()) return;
+
+        bankFilterButton.updateLocation();
+
+        if (!bankFilterButton.isTabActive()) return;
+
+        net.runelite.api.Point mousePoint = client.getMouseCanvasPosition();
+        if (fakeToRealItem.isEmpty()) {
+            return;
+        }
+
+        for (BankWidget bankWidget : fakeToRealItem.keySet())
+        {
+            if (bankWidget.isPointOverWidget(mousePoint))
+            {
+                bankWidget.swap(fakeToRealItem.get(bankWidget));
+                return;
+            }
+        }
+    }
+
+    @Subscribe
+    public void onScriptCallbackEvent(ScriptCallbackEvent event) {
+        String eventName = event.getEventName();
+
+        int[] intStack = client.getIntStack();
+        int intStackSize = client.getIntStackSize();
+
+        if ("getSearchingTagTab".equals(eventName)) {
+            intStack[intStackSize - 1] = this.bankFilterButton.isTabActive() ? 1 : 0;
+        }
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked event) {
+        bankFilterButton.handleClick(event);
+    }
+
+    @Subscribe
+    public void onScriptPreFired(ScriptPreFired event) {
+        int scriptId = event.getScriptId();
+
+        if (scriptId == ScriptID.BANKMAIN_FINISHBUILDING) {
+            if (this.bankFilterButton.isTabActive()) {
+                Widget bankTitle = this.client.getWidget(ComponentID.BANK_TITLE_BAR);
+                if (bankTitle != null) {
+                    bankTitle.setText(this.recommendedEquipmentPlugin.getActivityEquipmentStyle().getName());
+                }
+            }
+        } else if (scriptId == ScriptID.BANKMAIN_SEARCH_TOGGLE) {
+            this.bankFilterButton.handleSearch();
+        }
+    }
+
+    @Subscribe
+    public void onScriptPostFired(ScriptPostFired event) {
+        if (event.getScriptId() == ScriptID.BANKMAIN_SEARCHING) {
+            // The return value of bankmain_searching is on the stack. If we have a tag tab active
+            // make it return true to put the bank in a searching state.
+            if (bankFilterButton.isTabActive()) {
+                client.getIntStack()[client.getIntStackSize() - 1] = 1; // true
+            }
+            if (!addedWidgets.isEmpty()) {
+                for (Widget addedWidget : addedWidgets) {
+                    addedWidget.setHidden(true);
+                }
+                addedWidgets.clear();
+            }
+            fakeToRealItem.clear();
+
+            return;
+        }
+
+        if (event.getScriptId() != ScriptID.BANKMAIN_FINISHBUILDING) {
+            return;
+        }
+
+        if (!this.bankFilterButton.isTabActive()) {
+            return;
+        }
+
+        Widget itemContainer = this.client.getWidget(ComponentID.BANK_ITEM_CONTAINER);
+        if (itemContainer == null) {
+            return;
+        }
+
+        if (!this.addedWidgets.isEmpty()) {
+            for (Widget addedWidget : this.addedWidgets) {
+                addedWidget.setHidden(true);
+            }
+            this.addedWidgets.clear();
+        }
+
+        fakeToRealItem.clear();
+
+        Widget[] containerChildren = itemContainer.getDynamicChildren();
+        this.clientThread.invokeAtTickEnd(() -> {
+            ActivityEquipmentStyle equipmentStyle = recommendedEquipmentPlugin.getActivityEquipmentStyle();
+            if (equipmentStyle != null) {
+                sortBankTabItems(itemContainer, containerChildren, equipmentStyle);
+            }
+        });
+    }
+
+    private void sortBankTabItems(Widget itemContainer, Widget[] containerChildren, ActivityEquipmentStyle newLayout)
+    {
+        int totalSectionsHeight = 0;
+
+        List<Integer> itemList = new ArrayList<>();
+        for (Widget itemWidget : containerChildren)
+        {
+            if (itemWidget.getSpriteId() == SpriteID.RESIZEABLE_MODE_SIDE_PANEL_BACKGROUND
+                || itemWidget.getText().contains("Tab"))
+            {
+                itemWidget.setHidden(true);
+            }
+            else if (!itemWidget.isHidden() &&
+                itemWidget.getItemId() != -1 &&
+                !itemList.contains(itemWidget.getItemId()) &&
+                itemWidget.getItemId() != EMPTY_BANK_SLOT_ID)
+            {
+                itemList.add(itemWidget.getItemId());
+            }
+        }
+
+        List<String> bankItemTexts = new ArrayList<>();
+        HashMap<Integer, BankWidget> itemIDsAdded = new HashMap<>();
+
+        for (Pair<String, List<ActivitySlotTier>> bankTabItems : newLayout.getSlots())
+        {
+            totalSectionsHeight = addSlotTabSection(itemContainer, bankTabItems.getKey(), bankTabItems.getValue(), itemList, totalSectionsHeight, bankItemTexts, itemIDsAdded);
+        }
+
+        // We add item texts after all items are added so they always overlay
+//        for (BankText bankText : bankItemTexts)
+//        {
+//            Widget realItemQuantityText = createText(itemContainer,
+//                bankText.text,
+//                Color.WHITE.getRGB(),
+//                ITEM_HORIZONTAL_SPACING,
+//                TEXT_HEIGHT - 3,
+//                bankText.x,
+//                bankText.y);
+//
+//            addedWidgets.add(realItemQuantityText);
+//
+//            if (bankText.spriteID != -1)
+//            {
+//                Widget realItemInInventorySprite = createIcon(itemContainer,
+//                    bankText.spriteID,
+//                    10,
+//                    10,
+//                    bankText.spriteX,
+//                    bankText.spriteY
+//                );
+//                addedWidgets.add(realItemInInventorySprite);
+//            }
+//
+//        }
+
+        totalSectionsHeight = addGeneralSection(itemContainer, itemList, totalSectionsHeight);
+
+        final Widget bankItemContainer = client.getWidget(ComponentID.BANK_ITEM_CONTAINER);
+        if (bankItemContainer == null) return;
+        int itemContainerHeight = bankItemContainer.getHeight();
+
+        bankItemContainer.setScrollHeight(Math.max(totalSectionsHeight, itemContainerHeight));
+
+        final int itemContainerScroll = bankItemContainer.getScrollY();
+        clientThread.invokeLater(() ->
+            client.runScript(ScriptID.UPDATE_SCROLLBAR,
+                ComponentID.BANK_SCROLLBAR,
+                ComponentID.BANK_ITEM_CONTAINER,
+                itemContainerScroll));
+    }
+
+    private int addGeneralSection(Widget itemContainer, List<Integer> items, int totalSectionsHeight) {
+        int totalItemsAdded = 0;
+
+        if (items.isEmpty())
+        {
+            return totalSectionsHeight;
+        }
+
+        for (Integer itemID : items)
+        {
+            for (Widget widget : itemContainer.getDynamicChildren())
+            {
+                if (!widget.isHidden() && widget.getOpacity() != 150 && widget.getItemId() == itemID)
+                {
+                    if (totalItemsAdded == 0)
+                    {
+                        totalSectionsHeight = addSectionHeader(itemContainer, "General", totalSectionsHeight);
+                    }
+
+                    placeItem(widget, totalItemsAdded, totalSectionsHeight);
+                    totalItemsAdded++;
+                }
+            }
+        }
+        int newHeight = totalSectionsHeight + (totalItemsAdded / ITEMS_PER_ROW) * ITEM_VERTICAL_SPACING;
+        newHeight = totalItemsAdded % ITEMS_PER_ROW != 0 ? newHeight + ITEM_VERTICAL_SPACING : newHeight;
+
+        return newHeight;
+    }
+
+    private int addSectionHeader(Widget itemContainer, String title, int totalSectionsHeight) {
+        addedWidgets.add(createGraphic(itemContainer, SpriteID.RESIZEABLE_MODE_SIDE_PANEL_BACKGROUND, ITEMS_PER_ROW * ITEM_HORIZONTAL_SPACING, LINE_HEIGHT, ITEM_ROW_START, totalSectionsHeight));
+        addedWidgets.add(createText(itemContainer, title, new Color(228, 216, 162).getRGB(), (ITEMS_PER_ROW * ITEM_HORIZONTAL_SPACING) + ITEM_ROW_START
+            , TEXT_HEIGHT, ITEM_ROW_START, totalSectionsHeight + LINE_VERTICAL_SPACING));
+
+        return totalSectionsHeight + LINE_VERTICAL_SPACING + TEXT_HEIGHT;
+    }
+
+    private int addTierDivider(Widget itemContainer, int totalItemsAdded, int totalSectionsHeight) {
+        int adjXOffset = ((totalItemsAdded) % (ITEMS_PER_ROW+1)) * ITEM_HORIZONTAL_SPACING + ITEM_ROW_START - ITEM_HORIZONTAL_GAP;
+        int adjYOffset = totalSectionsHeight + ((totalItemsAdded - 1) / ITEMS_PER_ROW) * ITEM_VERTICAL_SPACING;
+        addedWidgets.add(createGraphic(itemContainer, SpriteID.RESIZEABLE_MODE_SIDE_PANEL_BACKGROUND, 2, ITEM_VERTICAL_SPACING - 6, adjXOffset, adjYOffset));
+        return totalSectionsHeight;
+    }
+
+    private int addSlotTabSection(Widget itemContainer,
+                                  String slotName,
+                                  List<ActivitySlotTier> items,
+                                  List<Integer> ownedItemIDs,
+                                  int totalSectionsHeight,
+                                  List<String> bankItemTexts,
+                                  Map<Integer, BankWidget> itemIDsAdded) {
+        int newHeight = totalSectionsHeight;
+
+         if (items.isEmpty()) {
+             return newHeight;
+         }
+
+         // Presume there'll be some content as we have fake items now
+         newHeight = addSectionHeader(itemContainer, slotName, newHeight);
+         newHeight = createPartialSection(itemContainer, items, ownedItemIDs, newHeight, itemIDsAdded);
+
+         return newHeight;
+    }
+
+    private int createPartialSection(Widget itemContainer,
+                                     List<ActivitySlotTier> items,
+                                     List<Integer> ownedItemIDs,
+                                     int totalSectionsHeight,
+                                     Map<Integer, BankWidget> itemIDsAdded) {
+        int totalItemsAdded = 0;
+        // Iterate over each tier
+        int i = 0;
+        for (ActivitySlotTier slotTier : items) {
+            boolean foundItem = false;
+
+            // Iterate over each item in the tier
+            for (ActivityItem item : slotTier.getItems()) {
+                // If owns one of the items
+                if (!Collections.disjoint(ownedItemIDs, item.getItemIDs())) {
+                    // Loop through bank to find item
+                    for (Widget widget : itemContainer.getDynamicChildren()) {
+                        if (!widget.isHidden() && widget.getOpacity() != 150 && (item.getItemIDs().contains(widget.getItemId()))) {
+                            foundItem = true;
+
+                            Point point = placeItem(widget, totalItemsAdded, totalSectionsHeight);
+                            widget.setItemQuantityMode(1);
+
+                            totalItemsAdded++;
+                            ownedItemIDs.removeAll(Collections.singletonList(widget.getItemId()));
+                            itemIDsAdded.put(widget.getItemId(), new BankWidget(widget));
+
+                            break;
+                        }
+                    }
+                }
+
+                if (!foundItem) {
+                    // calculate correct item position as if this was a normal tab
+                    int adjXOffset = (totalItemsAdded % ITEMS_PER_ROW) * ITEM_HORIZONTAL_SPACING + ITEM_ROW_START;
+                    int adjYOffset = totalSectionsHeight + (totalItemsAdded / ITEMS_PER_ROW) * ITEM_VERTICAL_SPACING;
+
+                    Widget fakeItemWidget;
+                    // Have list of all real items + text. Do check to see if any of those items
+                    // Match the ItemIDs
+                    if (Collections.disjoint(itemIDsAdded.keySet(), item.getItemIDs()))
+                    {
+                        fakeItemWidget = createMissingItem(itemContainer, item, adjXOffset, adjYOffset);
+                        ownedItemIDs.removeAll(item.getItemIDs());
+                    }
+                    else
+                    {
+                        List<Integer> result = item.getItemIDs().stream()
+                            .distinct()
+                            .filter(itemIDsAdded.keySet()::contains)
+                            .collect(Collectors.toList());
+
+                        BankWidget realItemWidget = itemIDsAdded.get((result.get(0)));
+
+                        fakeItemWidget = createDuplicateItem(itemContainer, item,
+                            realItemWidget.getItemQuantity(), adjXOffset, adjYOffset);
+
+                        fakeToRealItem.put(new BankWidget(fakeItemWidget), realItemWidget);
+                    }
+
+//                    if (bankTabItem.getQuantity() > 0)
+//                    {
+//                        makeBankText(fakeItemWidget.getItemQuantity(), bankTabItem.getQuantity(), adjXOffset, adjYOffset, bankTabItem.getItemRequirement(), bankItemTexts);
+//                    }
+
+                    widgetItems.put(fakeItemWidget, item);
+                    addedWidgets.add(fakeItemWidget);
+
+                    totalItemsAdded++;
+                }
+            }
+
+            if (i < items.size() - 1) {
+                addTierDivider(itemContainer, totalItemsAdded, totalSectionsHeight);
+            }
+
+
+            i++;
+        }
+
+        int newHeight = totalSectionsHeight + (totalItemsAdded / ITEMS_PER_ROW) * ITEM_VERTICAL_SPACING;
+        newHeight = totalItemsAdded % ITEMS_PER_ROW == 0 ? newHeight : newHeight + ITEM_VERTICAL_SPACING;
+        return newHeight;
+    }
+
+    private Point placeItem(Widget widget, int totalItemsAdded, int totalSectionsHeight) {
+        int adjYOffset = totalSectionsHeight + (totalItemsAdded / ITEMS_PER_ROW) * ITEM_VERTICAL_SPACING;
+        int adjXOffset = (totalItemsAdded % ITEMS_PER_ROW) * ITEM_HORIZONTAL_SPACING + ITEM_ROW_START;
+
+        if (widget.getOriginalY() != adjYOffset) {
+            widget.setOriginalY(adjYOffset);
+            widget.revalidate();
+        }
+
+        if (widget.getOriginalX() != adjXOffset) {
+            widget.setOriginalX(adjXOffset);
+            widget.revalidate();
+        }
+
+        return new Point(adjXOffset, adjYOffset);
+    }
+
+    private Widget createMissingItem(Widget container, ActivityItem activityItem, int x, int y)
+    {
+        Widget widget = container.createChild(-1, WidgetType.GRAPHIC);
+        widget.setItemQuantityMode(1); // quantity of 1 still shows number
+        widget.setOriginalWidth(ITEM_WIDTH);
+        widget.setOriginalHeight(ITEM_HEIGHT);
+        widget.setOriginalX(x);
+        widget.setOriginalY(y);
+
+        List<Integer> itemIDs = activityItem.getItemIDs();
+//        if (activityItem.getItemRequirement().getDisplayItemId() != null)
+//        {
+//            itemIDs = Collections.singletonList(activityItem.getItemRequirement().getDisplayItemId());
+//        }
+
+        if (itemIDs.isEmpty())
+        {
+            itemIDs.add(ItemID.CAKE_OF_GUIDANCE);
+        }
+
+        widget.setItemId(itemIDs.get(0));
+        widget.setName("<col=ff9040>" + activityItem.getName() + "</col>");
+//        if (activityItem.getDetails() != null) {
+            widget.setText("Test tooltip: Missing");
+//        }
+        widget.setItemQuantity(0);
+        widget.setOpacity(150);
+        widget.setOnOpListener(ScriptID.NULL);
+        widget.setHasListener(true);
+
+        addTabActions(widget);
+
+        widget.revalidate();
+
+        return widget;
+    }
+
+    private Widget createDuplicateItem(Widget container, ActivityItem activityItem, int quantity, int x, int y) {
+        Widget widget = container.createChild(-1, WidgetType.GRAPHIC);
+        widget.setItemQuantityMode(1); // quantity of 1 still shows number
+        widget.setOriginalWidth(ITEM_WIDTH);
+        widget.setOriginalHeight(ITEM_HEIGHT);
+        widget.setOriginalX(x);
+        widget.setOriginalY(y);
+        widget.setBorderType(1);
+
+        List<Integer> itemIDs = activityItem.getItemIDs();
+//        if (activityItem.getDisplayID() != null) {
+//            itemIDs = Collections.singletonList(activityItem.getDisplayID());
+//        }
+
+        widget.setItemId(itemIDs.get(0));
+        widget.setName("<col=ff9040>" + activityItem.getName() + "</col>");
+//        if (activityItem.getDetails() != null) {
+            widget.setText("This is a test tooltip: Duplicate");
+//        }
+        widget.setItemQuantity(quantity);
+        widget.setOnOpListener(ScriptID.NULL);
+        widget.setHasListener(true);
+
+        widget.revalidate();
+
+        return widget;
+    }
+
+    private void addTabActions(Widget w) {
+        w.setAction(1, "Details");
+
+        w.setOnOpListener((JavaScriptCallback) this::handleFakeItemClick);
+    }
+
+    private void handleFakeItemClick(ScriptEvent event) {
+        Widget widget = event.getSource();
+        if (widget.getItemId() != -1)
+        {
+            String name = widget.getName();
+//            ActivityItem item = widgetItems.get(widget);
+
+//            String quantity = QuantityFormatter.formatNumber(item.getQuantity()) + " x ";
+//            if (item.getQuantity() == -1)
+//            {
+//                quantity = "some ";
+//            }
+            final ChatMessageBuilder message = new ChatMessageBuilder()
+                .append("You need ")
+                .append(ChatColorType.HIGHLIGHT)
+                .append("a ")
+                .append(Text.removeTags(name))
+                .append(".");
+
+            if (!widget.getText().isEmpty())
+            {
+                message.append(ChatColorType.NORMAL)
+                    .append(" " + widget.getText() + ".");
+            }
+
+            this.chatMessageManager.queue(QueuedMessage.builder()
+                .type(ChatMessageType.ITEM_EXAMINE)
+                .runeLiteFormattedMessage(message.build())
+                .build());
+        }
+    }
+
+    private Widget createText(Widget container, String text, int color, int width, int height, int x, int y) {
+        Widget widget = container.createChild(-1, WidgetType.TEXT);
+        widget.setOriginalWidth(width);
+        widget.setOriginalHeight(height);
+        widget.setOriginalX(x);
+        widget.setOriginalY(y);
+
+        widget.setText(text);
+        widget.setFontId(FontID.PLAIN_11);
+        widget.setTextColor(color);
+        widget.setTextShadowed(true);
+
+        widget.revalidate();
+
+        return widget;
+    }
+
+    private Widget createGraphic(Widget container, int spriteId, int width, int height, int x, int y) {
+        Widget widget = container.createChild(-1, WidgetType.GRAPHIC);
+        widget.setOriginalWidth(width);
+        widget.setOriginalHeight(height);
+        widget.setOriginalX(x);
+        widget.setOriginalY(y);
+
+        widget.setSpriteId(spriteId);
+
+        widget.revalidate();
+
+        return widget;
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.function.Consumer;
+
+public class AccordionSection extends JPanel {
+    private final JPanel contentPanel;
+    private final JLabel titleLabel;
+    private final JLabel arrowLabel;
+    private boolean collapsed = true;
+
+    public AccordionSection(String title, JPanel contentPanel, Consumer<AccordionSection> onToggle) {
+        this.contentPanel = contentPanel;
+        this.titleLabel = new JLabel(title);
+        this.arrowLabel = new JLabel(Icons.CHEVRON_DOWN);
+
+        MouseAdapter mouseAdapter = new MouseAdapter() {
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                toggle();
+                onToggle.accept(AccordionSection.this);
+            }
+        };
+        this.titleLabel.addMouseListener(mouseAdapter);
+        this.arrowLabel.addMouseListener(mouseAdapter);
+
+        JPanel top = new JPanel(new BorderLayout(5, 5));
+        top.add(this.arrowLabel, BorderLayout.EAST);
+        top.add(this.titleLabel, BorderLayout.CENTER);
+        top.setBorder(new HorizontalRuleBorder(5, HorizontalRuleBorder.BOTTOM));
+
+        this.setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+        this.add(top);
+        this.add(this.contentPanel);
+        this.contentPanel.setVisible(false);
+        this.contentPanel.setBorder(new HorizontalRuleBorder(5, HorizontalRuleBorder.BOTTOM));
+    }
+
+    public void toggle() {
+        this.collapsed = !this.collapsed;
+        this.contentPanel.setVisible(!this.collapsed);
+        this.arrowLabel.setIcon(this.collapsed ? Icons.CHEVRON_DOWN : Icons.CHEVRON_UP);
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import com.google.gson.*;
+import com.google.gson.reflect.TypeToken;
+
+import java.lang.reflect.Type;
+import java.util.List;
+
+public class ActivitySlotTierDeserializer implements JsonDeserializer<ActivitySlotTier> {
+    @Override
+    public ActivitySlotTier deserialize(JsonElement jsonElement, Type type, JsonDeserializationContext context) throws JsonParseException {
+        ActivitySlotTier activitySlotTier = new ActivitySlotTier();
+        jsonElement.getAsJsonObject().entrySet().forEach(entry -> {
+            String key = entry.getKey();
+            JsonElement value = entry.getValue();
+            ActivityItem activityItem = new ActivityItem();
+            activityItem.setName(key);
+            activityItem.setItemIDs(context.deserialize(value, new TypeToken<List<Integer>>() {}.getType()));
+            activitySlotTier.getItems().add(activityItem);
+        });
+        return activitySlotTier;
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import com.google.gson.annotations.SerializedName;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Data
+@NoArgsConstructor
+public class Activity {
+    private String name;
+    private String url;
+    private String category;
+    private transient boolean favorite;
+
+    @SerializedName("styles")
+    private List<ActivityEquipmentStyle> equipmentStyles = new ArrayList<>();
+
+    public Activity(String name, String url, String category, boolean favorite) {
+        this.name = name;
+        this.url = url;
+        this.category = category;
+        this.favorite = favorite;
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.LinkBrowser;
+
+import javax.swing.*;
+import javax.swing.border.CompoundBorder;
+
+public class FooterPanel extends JPanel {
+    public FooterPanel() {
+        super();
+        this.setLayout(new StretchedStackedLayout(2));
+
+        JPanel secondaryPanel = new JPanel(new StretchedStackedLayout(8));
+        secondaryPanel.setBorder(new HorizontalRuleBorder(8, HorizontalRuleBorder.BOTTOM));
+
+        JButton howToUseButton = new JButton("How to use this plugin");
+        Theme.applyStyle(howToUseButton, Theme.ButtonType.SECONDARY);
+        howToUseButton.addActionListener(e -> LinkBrowser.browse("https://github.com/adamk33n3r/runelite-recommended-equipment/blob/master/README.md"));
+        secondaryPanel.add(howToUseButton);
+        JButton donateButton = new JButton("Donate");
+        Theme.applyStyle(donateButton, Theme.ButtonType.SECONDARY);
+        donateButton.addActionListener(e -> LinkBrowser.browse("https://donate.stripe.com/9AQcNxadm1pL7Hq9AA"));
+        secondaryPanel.add(donateButton);
+        this.add(secondaryPanel);
+
+        JButton submitRequestButton = new JButton("Submit a request");
+        Theme.applyStyle(submitRequestButton, Theme.ButtonType.HIGHLIGHT);
+        submitRequestButton.setBackground(ColorScheme.DARKER_GRAY_HOVER_COLOR);
+        submitRequestButton.addActionListener(e -> LinkBrowser.browse("https://github.com/adamk33n3r/runelite-recommended-equipment/issues/new"));
+        this.add(submitRequestButton);
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.*;
+
+import java.util.ArrayList;
+import java.util.List;
+
+@Data
+@EqualsAndHashCode(onlyExplicitlyIncluded = true)
+public class Favorite {
+    @EqualsAndHashCode.Include
+    public final String activity;
+    public boolean favorite;
+    public List<String> loadouts = new ArrayList<>();
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.Setter;
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+
+public class ClickablePanel extends JPanel {
+    private Color background;
+    @Setter
+    private Color hover;
+    @Setter
+    private Color pressed;
+
+    @Setter
+    private Runnable onClick;
+
+    private boolean isEntered;
+    private boolean isPressed;
+
+    public ClickablePanel(Color background, Color hover, Color pressed) {
+        this.background = background;
+        this.hover = hover;
+        this.pressed = pressed;
+        super.setBackground(this.background);
+        this.addMouseListener(new MouseAdapter() {
+            public void mouseEntered(MouseEvent evt) {
+                if (!isPressed) {
+                    ClickablePanel.super.setBackground(ClickablePanel.this.hover);
+                }
+                isEntered = true;
+            }
+            public void mouseExited(MouseEvent evt) {
+                if (!isPressed) {
+                    ClickablePanel.super.setBackground(ClickablePanel.this.background);
+                }
+                isEntered = false;
+            }
+            public void mousePressed(MouseEvent evt) {
+                ClickablePanel.super.setBackground(ClickablePanel.this.pressed);
+                isPressed = true;
+            }
+            public void mouseReleased(MouseEvent evt) {
+                if (isEntered) {
+                    ClickablePanel.super.setBackground(ClickablePanel.this.hover);
+                } else {
+                    ClickablePanel.super.setBackground(ClickablePanel.this.background);
+                }
+                isPressed = false;
+                if (isEntered && ClickablePanel.this.onClick != null) {
+                    ClickablePanel.this.onClick.run();
+                }
+            }
+        });
+    }
+
+    public void setBackground(Color bg) {
+        super.setBackground(bg);
+        this.background = bg;
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.Data;
+import org.apache.commons.lang3.tuple.Pair;
+
+import java.util.List;
+
+@Data
+public class ActivityEquipmentStyle {
+    private String name;
+    private List<ActivitySlotTier> head;
+    private List<ActivitySlotTier> neck;
+    private List<ActivitySlotTier> cape;
+    private List<ActivitySlotTier> body;
+    private List<ActivitySlotTier> legs;
+    private List<ActivitySlotTier> weapon;
+    private List<ActivitySlotTier> shield;
+    private List<ActivitySlotTier> ammo;
+    /*
+    1st tier = rada 4
+    2nd tier = god blessing OR rada 3
+    "ammo": [
+      {
+        "Rada's blessing 4": [
+          "22947"
+        ]
+      },
+      {
+        "God blessing": [
+          "20220",
+          "20223",
+          "20226",
+          "20229",
+          "20232",
+          "20235"
+        ],
+        "Rada's blessing 3": [
+          "22945"
+        ]
+      }
+    ],
+     */
+    private List<ActivitySlotTier> hands;
+    private List<ActivitySlotTier> feet;
+    /*
+    "feet": [
+      {
+        "Pegasian boots": [
+          "13237"
+        ]
+      },
+      {
+        "Blessed boots": [
+          "19921",
+          "19930",
+          "19924",
+          "19927",
+          "19933",
+          "19936"
+        ]
+      }
+    ],
+     */
+    private List<ActivitySlotTier> ring;
+    private List<ActivitySlotTier> special;
+
+    private transient boolean favorite;
+
+    public List<Pair<String, List<ActivitySlotTier>>> getSlots() {
+        // TODO: should probably be a scraper data change
+        return List.of(
+            Pair.of("Head", head),
+            Pair.of("Neck", neck),
+            Pair.of("Cape", cape),
+            Pair.of("Body", body),
+            Pair.of("Legs", legs),
+            Pair.of("Weapon", weapon),
+            Pair.of("Shield", shield),
+            Pair.of("Ammo", ammo),
+            Pair.of("Hands", hands),
+            Pair.of("Feet", feet),
+            Pair.of("Ring", ring),
+            Pair.of("Special", special)
+        );
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.laf.RuneLiteLAF;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+
+@Singleton
+public class PanelWrapper extends PluginPanel {
+    private final RecommendedEquipmentPanel recommendedEquipmentPanel;
+    @Inject
+    public PanelWrapper(RecommendedEquipmentPanel recommendedEquipmentPanel, PluginTitle pluginTitle) {
+        super(false);
+        this.recommendedEquipmentPanel = recommendedEquipmentPanel;
+        this.setLayout(new BorderLayout());
+        this.setBorder(new EmptyBorder(10, 10, 10, 10));
+        this.add(pluginTitle, BorderLayout.NORTH);
+        pluginTitle.setBorder(new EmptyBorder(0, 0, 10, 0));
+        this.add(this.recommendedEquipmentPanel.getMuxer(), BorderLayout.CENTER);
+        FooterPanel footerPanel = new FooterPanel();
+        this.add(footerPanel, BorderLayout.SOUTH);
+    }
+
+    @Override
+    public void onActivate() {
+        this.recommendedEquipmentPanel.getMuxer().onActivate();
+    }
+
+    @Override
+    public void onDeactivate() {
+        this.recommendedEquipmentPanel.getMuxer().onDeactivate();
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
+
+@ConfigGroup(RecommendedEquipmentConfig.CONFIG_GROUP)
+public interface RecommendedEquipmentConfig extends Config {
+    String CONFIG_GROUP = "recommended-equipment";
+
+    @ConfigItem(
+        keyName = "favorites",
+        name = "Favorites",
+        description = "The serialized list of favorite activities and equipment styles.",
+        hidden = true
+    )
+    default Set<Favorite> favorites() {
+        return new HashSet<>();
+    }
+
+    // Setter
+    @ConfigItem(
+        keyName = "favorites",
+        name = "Favorites",
+        description = "The serialized list of favorite activities and equipment styles.",
+        hidden = true
+    )
+    void favorites(Set<Favorite> favorites);
+}
+
+/*
+ * MIT License
+ *
+ * Copyright (c) 2023 Rob Camick
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ */
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import java.awt.*;
+import javax.swing.JScrollPane;
+import javax.swing.SwingUtilities;
+
+/**
+ *  FlowLayout subclass that fully supports wrapping of components.
+ */
+public class WrapLayout extends FlowLayout
+{
+    private Dimension preferredLayoutSize;
+
+    /**
+     * Constructs a new <code>WrapLayout</code> with a left
+     * alignment and a default 5-unit horizontal and vertical gap.
+     */
+    public WrapLayout()
+    {
+        super();
+    }
+
+    /**
+     * Constructs a new <code>FlowLayout</code> with the specified
+     * alignment and a default 5-unit horizontal and vertical gap.
+     * The value of the alignment argument must be one of
+     * <code>WrapLayout</code>, <code>WrapLayout</code>,
+     * or <code>WrapLayout</code>.
+     * @param align the alignment value
+     */
+    public WrapLayout(int align)
+    {
+        super(align);
+    }
+
+    /**
+     * Creates a new flow layout manager with the indicated alignment
+     * and the indicated horizontal and vertical gaps.
+     * <p>
+     * The value of the alignment argument must be one of
+     * <code>WrapLayout</code>, <code>WrapLayout</code>,
+     * or <code>WrapLayout</code>.
+     * @param align the alignment value
+     * @param hgap the horizontal gap between components
+     * @param vgap the vertical gap between components
+     */
+    public WrapLayout(int align, int hgap, int vgap)
+    {
+        super(align, hgap, vgap);
+    }
+
+    /**
+     * Returns the preferred dimensions for this layout given the
+     * <i>visible</i> components in the specified target container.
+     * @param target the component which needs to be laid out
+     * @return the preferred dimensions to lay out the
+     * subcomponents of the specified container
+     */
+    @Override
+    public Dimension preferredLayoutSize(Container target)
+    {
+        return layoutSize(target, true);
+    }
+
+    /**
+     * Returns the minimum dimensions needed to layout the <i>visible</i>
+     * components contained in the specified target container.
+     * @param target the component which needs to be laid out
+     * @return the minimum dimensions to lay out the
+     * subcomponents of the specified container
+     */
+    @Override
+    public Dimension minimumLayoutSize(Container target)
+    {
+        Dimension minimum = layoutSize(target, false);
+        minimum.width -= (getHgap() + 1);
+        return minimum;
+    }
+
+    /**
+     * Returns the minimum or preferred dimension needed to layout the target
+     * container.
+     *
+     * @param target target to get layout size for
+     * @param preferred should preferred size be calculated
+     * @return the dimension to layout the target container
+     */
+    private Dimension layoutSize(Container target, boolean preferred)
+    {
+        synchronized (target.getTreeLock())
+        {
+            //  Each row must fit with the width allocated to the containter.
+            //  When the container width = 0, the preferred width of the container
+            //  has not yet been calculated so lets ask for the maximum.
+
+            int targetWidth = target.getSize().width;
+            Container container = target;
+
+            while (container.getSize().width == 0 && container.getParent() != null)
+            {
+                container = container.getParent();
+            }
+
+            targetWidth = container.getSize().width;
+
+            if (targetWidth == 0)
+                targetWidth = Integer.MAX_VALUE;
+
+            int hgap = getHgap();
+            int vgap = getVgap();
+            Insets insets = target.getInsets();
+            int horizontalInsetsAndGap = insets.left + insets.right + (hgap * 2);
+            int maxWidth = targetWidth - horizontalInsetsAndGap;
+
+            //  Fit components into the allowed width
+
+            Dimension dim = new Dimension(0, 0);
+            int rowWidth = 0;
+            int rowHeight = 0;
+
+            int nmembers = target.getComponentCount();
+
+            for (int i = 0; i < nmembers; i++)
+            {
+                Component m = target.getComponent(i);
+
+                if (m.isVisible())
+                {
+                    Dimension d = preferred ? m.getPreferredSize() : m.getMinimumSize();
+
+                    //  Can't add the component to current row. Start a new row.
+
+                    if (rowWidth + d.width > maxWidth)
+                    {
+                        addRow(dim, rowWidth, rowHeight);
+                        rowWidth = 0;
+                        rowHeight = 0;
+                    }
+
+                    //  Add a horizontal gap for all components after the first
+
+                    if (rowWidth != 0)
+                    {
+                        rowWidth += hgap;
+                    }
+
+                    rowWidth += d.width;
+                    rowHeight = Math.max(rowHeight, d.height);
+                }
+            }
+
+            addRow(dim, rowWidth, rowHeight);
+
+            dim.width += horizontalInsetsAndGap;
+            dim.height += insets.top + insets.bottom + vgap * 2;
+
+            //	When using a scroll pane or the DecoratedLookAndFeel we need to
+            //  make sure the preferred size is less than the size of the
+            //  target containter so shrinking the container size works
+            //  correctly. Removing the horizontal gap is an easy way to do this.
+
+            Container scrollPane = SwingUtilities.getAncestorOfClass(JScrollPane.class, target);
+
+            if (scrollPane != null && target.isValid())
+            {
+                dim.width -= (hgap + 1);
+            }
+
+            return dim;
+        }
+    }
+
+    /*
+     *  A new row has been completed. Use the dimensions of this row
+     *  to update the preferred size for the container.
+     *
+     *  @param dim update the width and height when appropriate
+     *  @param rowWidth the width of the row to add
+     *  @param rowHeight the height of the row to add
+     */
+    private void addRow(Dimension dim, int rowWidth, int rowHeight)
+    {
+        dim.width = Math.max(dim.width, rowWidth);
+
+        if (dim.height > 0)
+        {
+            dim.height += getVgap();
+        }
+
+        dim.height += rowHeight;
+    }
+}
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import com.formdev.flatlaf.ui.FlatToggleButtonUI;
+import com.google.common.base.Splitter;
+import com.google.common.collect.Lists;
+import lombok.Getter;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.DynamicGridLayout;
+import net.runelite.client.ui.MultiplexingPluginPanel;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.IconTextField;
+import net.runelite.client.ui.laf.RuneLiteLAF;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import java.awt.*;
+import java.io.IOException;
+import java.util.*;
+import java.util.List;
+
+@Singleton
+public class RecommendedEquipmentPanel extends PluginPanel {
+    @Inject
+    private ActivityManager activityManager;
+    @Inject
+    private RecommendedEquipmentPlugin plugin;
+
+    @Getter
+    private final MultiplexingPluginPanel muxer = new MultiplexingPluginPanel(this);
+
+    private static final EmptyBorder VIEWPORT_BORDER = new EmptyBorder(0, 0, 0, 5);
+    private final List<ActivityListItem> allActivityListItems = new ArrayList<>();
+    private JPanel mainPanel;
+    private IconTextField search;
+    private JScrollPane scrollPane;
+
+    private static final Splitter SPLITTER = Splitter.on(" ").trimResults().omitEmptyStrings();
+    private JPanel filterList;
+    private final Set<String> selectedCategories = new HashSet<>();
+    private List<Activity> activities;
+
+    public RecommendedEquipmentPanel() {
+        super(false);
+        this.setLayout(new BorderLayout());
+        this.setBackground(ColorScheme.DARK_GRAY_COLOR);
+    }
+
+    public void rebuild() {
+        this.removeAll();
+
+        JPanel topPanel = new JPanel();
+        topPanel.setLayout(new BorderLayout(0, BORDER_OFFSET));
+        this.add(topPanel, BorderLayout.NORTH);
+
+        JPanel filterArea = new JPanel(new DynamicGridLayout(2, 1, 5, 5));
+        topPanel.add(filterArea, BorderLayout.CENTER);
+
+        this.search = new IconTextField();
+        this.search.setIcon(IconTextField.Icon.SEARCH);
+        this.search.setPreferredSize(new Dimension(PluginPanel.PANEL_WIDTH - 20, 30));
+        this.search.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        this.search.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        this.search.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                onSearchBarChanged(search.getText());
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                onSearchBarChanged(search.getText());
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                onSearchBarChanged(search.getText());
+            }
+        });
+//        CATEGORY_TAGS.forEach(searchBar.getSuggestionListModel()::addElement);
+        filterArea.add(this.search);
+
+        this.filterList = new JPanel();
+        this.filterList.setLayout(new WrapLayout(FlowLayout.LEFT, 2, 2));
+        this.filterList.setBorder(new EmptyBorder(4, 4, 4, 4));
+        this.filterList.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        this.filterList.add(new JLabel("Filter list", Icons.FUNNEL, SwingConstants.LEFT));
+        filterArea.add(this.filterList);
+
+        this.mainPanel = new JPanel();
+        this.mainPanel.setLayout(new StretchedStackedLayout(5));
+        this.mainPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        ScrollablePanel scrollablePanel = new ScrollablePanel(new BorderLayout());
+        scrollablePanel.setScrollableWidth(ScrollablePanel.ScrollableSizeHint.FIT);
+        scrollablePanel.setScrollableHeight(ScrollablePanel.ScrollableSizeHint.STRETCH);
+        scrollablePanel.setScrollableBlockIncrement(SwingConstants.VERTICAL, ScrollablePanel.IncrementType.PERCENT, 10);
+        scrollablePanel.setScrollableUnitIncrement(SwingConstants.VERTICAL, ScrollablePanel.IncrementType.PERCENT, 10);
+        scrollablePanel.add(this.mainPanel, BorderLayout.NORTH);
+
+        this.scrollPane = new JScrollPane(scrollablePanel, JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        // For the scrollbar gap
+        this.scrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        ClickableListPanel activityList = new ClickableListPanel("Choose activity", this.scrollPane);
+        activityList.setBorder(new HorizontalRuleBorder(10, HorizontalRuleBorder.BOTH));
+        this.add(activityList, BorderLayout.CENTER);
+
+        this.reloadList(true);
+    }
+
+    private void reloadList(boolean fetch) {
+        this.reloadList(fetch, false);
+    }
+
+    private void reloadList(boolean fetch, boolean forceDownload) {
+        try {
+            this.allActivityListItems.clear();
+            if (fetch) {
+                this.activities = this.activityManager.getActivities(forceDownload);
+            }
+            this.filterList.removeAll();
+            this.filterList.add(new JLabel("Filter list", Icons.FUNNEL, SwingConstants.LEFT));
+            this.filterList.add(this.makeFilterButton("Favorite"));
+            activities.stream().map(Activity::getCategory).distinct().map(this::makeFilterButton).forEach(this.filterList::add);
+            activities.stream()
+                .sorted(Comparator.comparing(Activity::getName))
+                .filter((activity) -> {
+                    return this.selectedCategories.isEmpty() || Arrays.stream(this.filterList.getComponents())
+                        .filter(c -> c instanceof JToggleButton)
+                        .map(c -> (JToggleButton) c)
+                        .anyMatch(c -> c.isSelected() && (c.getText().equals("Favorite") ? activity.isFavorite() : c.getText().equals(activity.getCategory())));
+                })
+                .map((activity) -> new ActivityListItem(activity, this.plugin, this.activityManager, this.muxer))
+                .forEach(this.allActivityListItems::add);
+            this.onSearchBarChanged(this.search.getText());
+        } catch (IOException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private JToggleButton makeFilterButton(String label) {
+        JToggleButton jToggleButton = new JToggleButton(label);
+        jToggleButton.setFont(jToggleButton.getFont().deriveFont(12f));
+        jToggleButton.setSelected(this.selectedCategories.contains(label));
+        jToggleButton.addActionListener((ev) -> {
+            if (jToggleButton.isSelected()) {
+                this.selectedCategories.add(label);
+            } else {
+                this.selectedCategories.remove(label);
+            }
+            this.reloadList(false);
+        });
+        jToggleButton.putClientProperty("JButton.buttonType", "toolBarButton");
+//        jToggleButton.setBorder(BorderFactory.createLineBorder(ColorScheme.TEXT_COLOR, 1));
+        Theme.applyStyle(jToggleButton, Theme.ButtonType.SECONDARY, Theme.ButtonSize.SMALL);
+        if (label.equals("Favorite")) {
+            jToggleButton.setForeground(ColorScheme.BRAND_ORANGE);
+        }
+        return jToggleButton;
+    }
+
+    private void onSearchBarChanged(String text) {
+        this.mainPanel.removeAll();
+        this.allActivityListItems.stream()
+            .filter(item -> Text.matchesSearchTerms(SPLITTER.split(text.toLowerCase()), Lists.newArrayList(SPLITTER.split(item.getActivity().getName().toLowerCase()))))
+            .forEach(this.mainPanel::add);
+        this.revalidate();
+        SwingUtilities.invokeLater(() -> {
+            if (this.scrollPane.getVerticalScrollBar().isVisible()) {
+                this.scrollPane.setViewportBorder(VIEWPORT_BORDER);
+            } else {
+                this.scrollPane.setViewportBorder(null);
+            }
+        });
+    }
+
+    @Override
+    public void onActivate() {
+        this.rebuild();
+    }
+
+    @Override
+    public void onDeactivate() {
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.BorderLayout;
+
+public class ClickableListPanel extends JPanel {
+    public ClickableListPanel(String title, JScrollPane scrollPane) {
+        super();
+        this.setLayout(new BorderLayout(5, 5));
+        JPanel header = new JPanel(new BorderLayout());
+        header.setBorder(new EmptyBorder(0, 12, 0, 5));
+        header.add(new JLabel(title), BorderLayout.WEST);
+//        JLabel sortLabel = new JLabel("Sort A-Z", Icons.CHEVRON_DOWN, SwingConstants.RIGHT);
+//        sortLabel.setHorizontalTextPosition(SwingConstants.LEFT);
+//        header.add(sortLabel, BorderLayout.EAST);
+        this.add(header, BorderLayout.NORTH);
+        this.add(scrollPane, BorderLayout.CENTER);
+    }
+
+    public void setClickableList(JScrollPane scrollPane) {
+        this.add(scrollPane, BorderLayout.CENTER);
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import com.google.common.base.Charsets;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.MultiplexingPluginPanel;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.laf.RuneLiteLAF;
+import net.runelite.client.util.LinkBrowser;
+
+import javax.swing.*;
+import javax.swing.border.CompoundBorder;
+import javax.swing.border.EmptyBorder;
+import javax.swing.border.LineBorder;
+import java.awt.*;
+import java.net.URLEncoder;
+import java.util.Arrays;
+import java.util.List;
+
+public class ActivityPanel extends PluginPanel {
+    private final Activity activity;
+    private final ActivityManager activityManager;
+    private final MultiplexingPluginPanel muxer;
+    private final RecommendedEquipmentPlugin plugin;
+
+    private JPanel styles;
+    private JScrollPane scrollPane;
+    private Accordion selectedLoadout;
+
+    public ActivityPanel(Activity activity, RecommendedEquipmentPlugin plugin, ActivityManager activityManager, MultiplexingPluginPanel muxer) {
+        super(false);
+        this.activity = activity;
+        this.activityManager = activityManager;
+        this.plugin = plugin;
+        this.muxer = muxer;
+
+        this.setLayout(new BorderLayout());
+    }
+
+    public void deselectAll(EquipmentStyleListItem except, boolean setActiveToNull) {
+        Arrays.stream(this.styles.getComponents())
+            .filter(c -> c instanceof EquipmentStyleListItem)
+            .map(c -> (EquipmentStyleListItem) c)
+            .filter(item -> item != except)
+            .forEach(item -> item.deselect(setActiveToNull));
+    }
+
+    public void rebuild() {
+        this.removeAll();
+
+        JPanel topPanel = new JPanel();
+        topPanel.setLayout(new BorderLayout(0, 10));
+        this.add(topPanel, BorderLayout.NORTH);
+        JButton directWikiLink = new JButton("Direct wiki link", Icons.LINK);
+        directWikiLink.addActionListener(e -> LinkBrowser.browse(this.activity.getUrl()));
+        directWikiLink.setHorizontalTextPosition(SwingConstants.LEFT);
+        Theme.applyStyle(directWikiLink, Theme.ButtonType.PRIMARY, Theme.ButtonSize.SMALL);
+
+        JPanel wikiWrapper = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        wikiWrapper.add(directWikiLink);
+        topPanel.add(wikiWrapper, BorderLayout.SOUTH);
+        JButton back = new JButton(this.activity.getName(), Icons.CHEVRON_LEFT);
+        Theme.applyStyle(back, Theme.ButtonType.PRIMARY);
+        back.setHorizontalAlignment(SwingConstants.LEFT);
+
+        back.addActionListener(e -> {
+            this.plugin.setActivityEquipmentStyle(null);
+            this.muxer.popState();
+        });
+        topPanel.add(back, BorderLayout.CENTER);
+
+        this.styles = new JPanel(new StretchedStackedLayout(5));
+
+        ActivityEquipmentStyle selectedStyle = this.plugin.getActivityEquipmentStyle();
+        this.activity.getEquipmentStyles().stream()
+            .map(style -> new EquipmentStyleListItem(this.activity, style, this, this.plugin, this.activityManager))
+            .forEach(item -> {
+                this.styles.add(item);
+                if (selectedStyle != null && item.getStyle() == selectedStyle) {
+                    item.select();
+                }
+            });
+
+        this.selectedLoadout = new Accordion();
+        this.selectedLoadout.setBorder(new EmptyBorder(5, 0, 0, 0));
+
+        ScrollablePanel wrapper = new ScrollablePanel(new StretchedStackedLayout(5));
+        wrapper.setScrollableWidth(ScrollablePanel.ScrollableSizeHint.FIT);
+        wrapper.setScrollableHeight(ScrollablePanel.ScrollableSizeHint.STRETCH);
+        wrapper.setScrollableBlockIncrement(SwingConstants.VERTICAL, ScrollablePanel.IncrementType.PERCENT, 10);
+        wrapper.setScrollableUnitIncrement(SwingConstants.VERTICAL, ScrollablePanel.IncrementType.PERCENT, 10);
+        wrapper.add(this.styles);
+        wrapper.add(this.selectedLoadout);
+
+        this.scrollPane = new JScrollPane(wrapper, JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED, JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        // For the scrollbar gap
+        this.scrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        ClickableListPanel chooseLoadout = new ClickableListPanel("Choose loadout", this.scrollPane);
+        chooseLoadout.setBorder(new HorizontalRuleBorder(10, HorizontalRuleBorder.BOTH));
+        this.add(chooseLoadout, BorderLayout.CENTER);
+        this.rebuildSelectedLoadout();
+    }
+
+    public void selectLoadout(EquipmentStyleListItem item) {
+        if (item.isSelected()) {
+            item.deselect(true);
+        } else {
+            this.deselectAll(item, false);
+            item.select();
+        }
+        this.rebuildSelectedLoadout();
+    }
+
+    private void rebuildSelectedLoadout() {
+        this.selectedLoadout.removeAll();
+        if (this.plugin.getActivityEquipmentStyle() != null) {
+            this.selectedLoadout.removeAll();
+            this.plugin.getActivityEquipmentStyle().getSlots().forEach((slot) -> {
+                if (slot.getValue().isEmpty()) {
+                    return;
+                }
+                JPanel section = this.makeSlotSection(slot.getValue());
+                this.selectedLoadout.addSection(slot.getKey(), section);
+            });
+        }
+
+        this.selectedLoadout.revalidate();
+        this.selectedLoadout.repaint();
+
+        SwingUtilities.invokeLater(() -> {
+            if (this.scrollPane.getVerticalScrollBar().isVisible()) {
+                this.scrollPane.setViewportBorder(new EmptyBorder(0, 0, 0, 5));
+            } else {
+                this.scrollPane.setViewportBorder(null);
+            }
+        });
+    }
+
+    private JPanel makeSlotSection(List<ActivitySlotTier> slotTiers) {
+        JPanel content = new JPanel();
+        content.setLayout(new WrapLayout(WrapLayout.LEFT));
+        slotTiers.forEach(slotTier -> {
+            slotTier.getItems().forEach((item) -> {
+                JButton tierItem = new JButton(item.getName());
+                tierItem.addActionListener((ev) -> {
+                    LinkBrowser.browse("https://oldschool.runescape.wiki/?title=Special%3ASearch&go=Go&search=" + URLEncoder.encode(item.getName(), Charsets.UTF_8));
+                });
+                Theme.applyStyle(tierItem, Theme.ButtonType.PRIMARY);
+                content.add(tierItem);
+            });
+        });
+        return content;
+    }
+
+    @Override
+    public void onActivate() {
+        this.rebuild();
+    }
+
+    @Override
+    public void onDeactivate() {
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import java.awt.*;
+import java.util.function.Function;
+
+/**
+ * Modified DynamicGridLayout to not resize components vertically.
+ */
+public class StretchedStackedLayout extends GridLayout
+{
+    public StretchedStackedLayout(int vgap)
+    {
+        super(0, 1, 0, vgap);
+    }
+
+    @Override
+    public Dimension preferredLayoutSize(Container parent)
+    {
+        synchronized (parent.getTreeLock())
+        {
+            return calculateSize(parent, Component::getPreferredSize);
+        }
+    }
+
+    @Override
+    public Dimension minimumLayoutSize(Container parent)
+    {
+        synchronized (parent.getTreeLock())
+        {
+            return calculateSize(parent, Component::getMinimumSize);
+        }
+    }
+
+    @Override
+    public void layoutContainer(Container parent)
+    {
+        synchronized (parent.getTreeLock())
+        {
+            final Insets insets = parent.getInsets();
+            final int ncomponents = parent.getComponentCount();
+            int nrows = getRows();
+            int ncols = getColumns();
+
+            if (ncomponents == 0)
+            {
+                return;
+            }
+
+            if (nrows > 0)
+            {
+                ncols = (ncomponents + nrows - 1) / nrows;
+            }
+            else
+            {
+                nrows = (ncomponents + ncols - 1) / ncols;
+            }
+
+            final int hgap = getHgap();
+            final int vgap = getVgap();
+
+            // scaling factors
+            final Dimension pd = preferredLayoutSize(parent);
+            final Insets parentInsets = parent.getInsets();
+            int wborder = parentInsets.left + parentInsets.right;
+//            int hborder = parentInsets.top + parentInsets.bottom;
+            final double sw = (1.0 * parent.getWidth() - wborder) / (pd.width - wborder);
+//            final double sh = (1.0 * parent.getHeight() - hborder) / (pd.height - hborder);
+
+            final int[] w = new int[ncols];
+            final int[] h = new int[nrows];
+
+            // calculate dimensions for all components + apply scaling
+            for (int i = 0; i < ncomponents; i++)
+            {
+                final int r = i / ncols;
+                final int c = i % ncols;
+                final Component comp = parent.getComponent(i);
+                final Dimension d = comp.getPreferredSize();
+                d.width = (int) (sw * d.width);
+//                d.height = (int) (sh * d.height);
+
+                if (w[c] < d.width)
+                {
+                    w[c] = d.width;
+                }
+
+                if (h[r] < d.height)
+                {
+                    h[r] = d.height;
+                }
+            }
+
+            // Apply new bounds to all child components
+            for (int c = 0, x = insets.left; c < ncols; c++)
+            {
+                for (int r = 0, y = insets.top; r < nrows; r++)
+                {
+                    int i = r * ncols + c;
+
+                    if (i < ncomponents)
+                    {
+                        parent.getComponent(i).setBounds(x, y, w[c], h[r]);
+                    }
+
+                    y += h[r] + vgap;
+                }
+
+                x += w[c] + hgap;
+            }
+        }
+    }
+
+    /**
+     * Calculate outer size of the layout based on it's children and sizer
+     * @param parent parent component
+     * @param sizer functioning returning dimension of the child component
+     * @return outer size
+     */
+    private Dimension calculateSize(final Container parent, final Function<Component, Dimension> sizer)
+    {
+        final int ncomponents = parent.getComponentCount();
+        int nrows = getRows();
+        int ncols = getColumns();
+
+        if (nrows > 0)
+        {
+            ncols = (ncomponents + nrows - 1) / nrows;
+        }
+        else
+        {
+            nrows = (ncomponents + ncols - 1) / ncols;
+        }
+
+        final int[] w = new int[ncols];
+        final int[] h = new int[nrows];
+
+        // Calculate dimensions for all components
+        for (int i = 0; i < ncomponents; i++)
+        {
+            final int r = i / ncols;
+            final int c = i % ncols;
+            final Component comp = parent.getComponent(i);
+            final Dimension d = sizer.apply(comp);
+
+            if (w[c] < d.width)
+            {
+                w[c] = d.width;
+            }
+
+            if (h[r] < d.height)
+            {
+                h[r] = d.height;
+            }
+        }
+
+        // Calculate total width and height of the layout
+        int nw = 0;
+
+        for (int j = 0; j < ncols; j++)
+        {
+            nw += w[j];
+        }
+
+        int nh = 0;
+
+        for (int i = 0; i < nrows; i++)
+        {
+            nh += h[i];
+        }
+
+        final Insets insets = parent.getInsets();
+
+        // Apply insets and horizontal and vertical gap to layout
+        return new Dimension(
+            insets.left + insets.right + nw + (ncols - 1) * getHgap(),
+            insets.top + insets.bottom + nh + (nrows - 1) * getVgap());
+    }
+}
+
+/**
+ *  A panel that implements the Scrollable interface. This class allows you
+ *  to customize the scrollable features by using newly provided setter methods
+ *  so you don't have to extend this class every time.
+ *
+ *  Scrollable amounts can be specifed as a percentage of the viewport size or
+ *  as an actual pixel value. The amount can be changed for both unit and block
+ *  scrolling for both horizontal and vertical scrollbars.
+ *
+ *  The Scrollable interface only provides a boolean value for determining whether
+ *  or not the viewport size (width or height) should be used by the scrollpane
+ *  when determining if scrollbars should be made visible. This class supports the
+ *  concept of dynamically changing this value based on the size of the viewport.
+ *  In this case the viewport size will only be used when it is larger than the
+ *  panels size. This has the effect of ensuring the viewport is always full as
+ *  components added to the panel will be size to fill the area available,
+ *  based on the rules of the applicable layout manager of course.
+ */
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import javax.swing.JPanel;
+import javax.swing.JViewport;
+import javax.swing.Scrollable;
+import javax.swing.SwingConstants;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.LayoutManager;
+import java.awt.Rectangle;
+
+public class ScrollablePanel extends JPanel
+    implements Scrollable, SwingConstants
+{
+    public enum ScrollableSizeHint
+    {
+        NONE,
+        FIT,
+        STRETCH;
+    }
+
+    public enum IncrementType
+    {
+        PERCENT,
+        PIXELS;
+    }
+
+    private ScrollableSizeHint scrollableHeight = ScrollableSizeHint.NONE;
+    private ScrollableSizeHint scrollableWidth  = ScrollableSizeHint.NONE;
+
+    private IncrementInfo horizontalBlock;
+    private IncrementInfo horizontalUnit;
+    private IncrementInfo verticalBlock;
+    private IncrementInfo verticalUnit;
+
+    /**
+     *  Default constructor that uses a FlowLayout
+     */
+    public ScrollablePanel()
+    {
+        this( new FlowLayout() );
+    }
+
+    /**
+     *  Constuctor for specifying the LayoutManager of the panel.
+     *
+     *  @param layout the LayountManger for the panel
+     */
+    public ScrollablePanel(LayoutManager layout)
+    {
+        super( layout );
+
+        IncrementInfo block = new IncrementInfo(IncrementType.PERCENT, 100);
+        IncrementInfo unit = new IncrementInfo(IncrementType.PERCENT, 10);
+
+        setScrollableBlockIncrement(HORIZONTAL, block);
+        setScrollableBlockIncrement(VERTICAL, block);
+        setScrollableUnitIncrement(HORIZONTAL, unit);
+        setScrollableUnitIncrement(VERTICAL, unit);
+    }
+
+    /**
+     *  Get the height ScrollableSizeHint enum
+     *
+     *  @return the ScrollableSizeHint enum for the height
+     */
+    public ScrollableSizeHint getScrollableHeight()
+    {
+        return scrollableHeight;
+    }
+
+    /**
+     *  Set the ScrollableSizeHint enum for the height. The enum is used to
+     *  determine the boolean value that is returned by the
+     *  getScrollableTracksViewportHeight() method. The valid values are:
+     *
+     *  ScrollableSizeHint.NONE - return "false", which causes the height
+     *      of the panel to be used when laying out the children
+     *  ScrollableSizeHint.FIT - return "true", which causes the height of
+     *      the viewport to be used when laying out the children
+     *  ScrollableSizeHint.STRETCH - return "true" when the viewport height
+     *      is greater than the height of the panel, "false" otherwise.
+     *
+     *  @param scrollableHeight as represented by the ScrollableSizeHint enum.
+     */
+    public void setScrollableHeight(ScrollableSizeHint scrollableHeight)
+    {
+        this.scrollableHeight = scrollableHeight;
+        revalidate();
+    }
+
+    /**
+     *  Get the width ScrollableSizeHint enum
+     *
+     *  @return the ScrollableSizeHint enum for the width
+     */
+    public ScrollableSizeHint getScrollableWidth()
+    {
+        return scrollableWidth;
+    }
+
+    /**
+     *  Set the ScrollableSizeHint enum for the width. The enum is used to
+     *  determine the boolean value that is returned by the
+     *  getScrollableTracksViewportWidth() method. The valid values are:
+     *
+     *  ScrollableSizeHint.NONE - return "false", which causes the width
+     *      of the panel to be used when laying out the children
+     *  ScrollableSizeHint.FIT - return "true", which causes the width of
+     *      the viewport to be used when laying out the children
+     *  ScrollableSizeHint.STRETCH - return "true" when the viewport width
+     *      is greater than the width of the panel, "false" otherwise.
+     *
+     *  @param scrollableWidth as represented by the ScrollableSizeHint enum.
+     */
+    public void setScrollableWidth(ScrollableSizeHint scrollableWidth)
+    {
+        this.scrollableWidth = scrollableWidth;
+        revalidate();
+    }
+
+    /**
+     *  Get the block IncrementInfo for the specified orientation
+     *
+     *  @return the block IncrementInfo for the specified orientation
+     */
+    public IncrementInfo getScrollableBlockIncrement(int orientation)
+    {
+        return orientation == SwingConstants.HORIZONTAL ? horizontalBlock : verticalBlock;
+    }
+
+    /**
+     *  Specify the information needed to do block scrolling.
+     *
+     *  @param orientation  specify the scrolling orientation. Must be either:
+     *      SwingContants.HORIZONTAL or SwingContants.VERTICAL.
+     *  @paran type  specify how the amount parameter in the calculation of
+     *      the scrollable amount. Valid values are:
+     *		IncrementType.PERCENT - treat the amount as a % of the viewport size
+     *      IncrementType.PIXEL - treat the amount as the scrollable amount
+     *  @param amount  a value used with the IncrementType to determine the
+     *      scrollable amount
+     */
+    public void setScrollableBlockIncrement(int orientation, IncrementType type, int amount)
+    {
+        IncrementInfo info = new IncrementInfo(type, amount);
+        setScrollableBlockIncrement(orientation, info);
+    }
+
+    /**
+     *  Specify the information needed to do block scrolling.
+     *
+     *  @param orientation  specify the scrolling orientation. Must be either:
+     *      SwingContants.HORIZONTAL or SwingContants.VERTICAL.
+     *  @param info  An IncrementInfo object containing information of how to
+     *      calculate the scrollable amount.
+     */
+    public void setScrollableBlockIncrement(int orientation, IncrementInfo info)
+    {
+        switch(orientation)
+        {
+            case SwingConstants.HORIZONTAL:
+                horizontalBlock = info;
+                break;
+            case SwingConstants.VERTICAL:
+                verticalBlock = info;
+                break;
+            default:
+                throw new IllegalArgumentException("Invalid orientation: " + orientation);
+        }
+    }
+
+    /**
+     *  Get the unit IncrementInfo for the specified orientation
+     *
+     *  @return the unit IncrementInfo for the specified orientation
+     */
+    public IncrementInfo getScrollableUnitIncrement(int orientation)
+    {
+        return orientation == SwingConstants.HORIZONTAL ? horizontalUnit : verticalUnit;
+    }
+
+    /**
+     *  Specify the information needed to do unit scrolling.
+     *
+     *  @param orientation  specify the scrolling orientation. Must be either:
+     *      SwingContants.HORIZONTAL or SwingContants.VERTICAL.
+     *  @paran type  specify how the amount parameter in the calculation of
+     *               the scrollable amount. Valid values are:
+     *				 IncrementType.PERCENT - treat the amount as a % of the viewport size
+     *               IncrementType.PIXEL - treat the amount as the scrollable amount
+     *  @param amount  a value used with the IncrementType to determine the
+     *                 scrollable amount
+     */
+    public void setScrollableUnitIncrement(int orientation, IncrementType type, int amount)
+    {
+        IncrementInfo info = new IncrementInfo(type, amount);
+        setScrollableUnitIncrement(orientation, info);
+    }
+
+    /**
+     *  Specify the information needed to do unit scrolling.
+     *
+     *  @param orientation  specify the scrolling orientation. Must be either:
+     *      SwingContants.HORIZONTAL or SwingContants.VERTICAL.
+     *  @param info  An IncrementInfo object containing information of how to
+     *               calculate the scrollable amount.
+     */
+    public void setScrollableUnitIncrement(int orientation, IncrementInfo info)
+    {
+        switch(orientation)
+        {
+            case SwingConstants.HORIZONTAL:
+                horizontalUnit = info;
+                break;
+            case SwingConstants.VERTICAL:
+                verticalUnit = info;
+                break;
+            default:
+                throw new IllegalArgumentException("Invalid orientation: " + orientation);
+        }
+    }
+
+//  Implement Scrollable interface
+
+    public Dimension getPreferredScrollableViewportSize()
+    {
+        return getPreferredSize();
+    }
+
+    public int getScrollableUnitIncrement(
+        Rectangle visible, int orientation, int direction)
+    {
+        switch(orientation)
+        {
+            case SwingConstants.HORIZONTAL:
+                return getScrollableIncrement(horizontalUnit, visible.width);
+            case SwingConstants.VERTICAL:
+                return getScrollableIncrement(verticalUnit, visible.height);
+            default:
+                throw new IllegalArgumentException("Invalid orientation: " + orientation);
+        }
+    }
+
+    public int getScrollableBlockIncrement(
+        Rectangle visible, int orientation, int direction)
+    {
+        switch(orientation)
+        {
+            case SwingConstants.HORIZONTAL:
+                return getScrollableIncrement(horizontalBlock, visible.width);
+            case SwingConstants.VERTICAL:
+                return getScrollableIncrement(verticalBlock, visible.height);
+            default:
+                throw new IllegalArgumentException("Invalid orientation: " + orientation);
+        }
+    }
+
+    protected int getScrollableIncrement(IncrementInfo info, int distance)
+    {
+        if (info.getIncrement() == IncrementType.PIXELS)
+            return info.getAmount();
+        else
+            return distance * info.getAmount() / 100;
+    }
+
+    public boolean getScrollableTracksViewportWidth()
+    {
+        if (scrollableWidth == ScrollableSizeHint.NONE)
+            return false;
+
+        if (scrollableWidth == ScrollableSizeHint.FIT)
+            return true;
+
+        //  STRETCH sizing, use the greater of the panel or viewport width
+
+        if (getParent() instanceof JViewport)
+        {
+            return (((JViewport)getParent()).getWidth() > getPreferredSize().width);
+        }
+
+        return false;
+    }
+
+    public boolean getScrollableTracksViewportHeight()
+    {
+        if (scrollableHeight == ScrollableSizeHint.NONE)
+            return false;
+
+        if (scrollableHeight == ScrollableSizeHint.FIT)
+            return true;
+
+        //  STRETCH sizing, use the greater of the panel or viewport height
+
+
+        if (getParent() instanceof JViewport)
+        {
+            return (((JViewport)getParent()).getHeight() > getPreferredSize().height);
+        }
+
+        return false;
+    }
+
+    /**
+     *  Helper class to hold the information required to calculate the scroll amount.
+     */
+    static class IncrementInfo
+    {
+        private IncrementType type;
+        private int amount;
+
+        public IncrementInfo(IncrementType type, int amount)
+        {
+            this.type = type;
+            this.amount = amount;
+        }
+
+        public IncrementType getIncrement()
+        {
+            return type;
+        }
+
+        public int getAmount()
+        {
+            return amount;
+        }
+
+        public String toString()
+        {
+            return
+                "ScrollablePanel[" +
+                    type + ", " +
+                    amount + "]";
+        }
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import lombok.AllArgsConstructor;
+import net.runelite.client.ui.ColorScheme;
+
+import javax.swing.*;
+import javax.swing.border.Border;
+import java.awt.*;
+
+public class Theme {
+    public static final Border PRIMARY_BORDER = BorderFactory.createLineBorder(ColorScheme.TEXT_COLOR, 1);
+    public static final Border SECONDARY_BORDER = BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR, 1);
+
+    public static final Border NORMAL_PADDING = BorderFactory.createEmptyBorder(4, 8, 4, 8);
+    public static final Border SMALL_PADDING = BorderFactory.createEmptyBorder(2, 4, 2, 4);
+    public static final Border PANEL_PADDING = BorderFactory.createEmptyBorder(3, 5, 3, 5);
+
+    @AllArgsConstructor
+    public enum ButtonType {
+        PRIMARY(ColorScheme.TEXT_COLOR, ColorScheme.DARK_GRAY_HOVER_COLOR, PRIMARY_BORDER),
+        SECONDARY(ColorScheme.TEXT_COLOR, ColorScheme.DARK_GRAY_COLOR, SECONDARY_BORDER),
+        HIGHLIGHT(ColorScheme.TEXT_COLOR, ColorScheme.DARKER_GRAY_HOVER_COLOR, PRIMARY_BORDER),
+        ;
+
+        private final Color foreground;
+        private final Color background;
+        private final Border border;
+    }
+
+    public enum ButtonSize {
+        NORMAL,
+        SMALL,
+    }
+
+    @AllArgsConstructor
+    public enum PanelType {
+        CLICKABLE(ColorScheme.DARKER_GRAY_HOVER_COLOR, BorderFactory.createCompoundBorder(SECONDARY_BORDER, PANEL_PADDING)),
+        ;
+
+        private final Color background;
+        private final Border border;
+    }
+
+    public static void applyStyle(AbstractButton button, ButtonType type) {
+        applyStyle(button, type, ButtonSize.NORMAL);
+    }
+
+    public static void applyStyle(AbstractButton button, ButtonType type, ButtonSize size) {
+        button.setBackground(type.background);
+        button.setBorder(BorderFactory.createCompoundBorder(type.border, size == ButtonSize.NORMAL ? NORMAL_PADDING : SMALL_PADDING));
+    }
+
+    public static void applyStyle(JPanel panel, PanelType type) {
+        panel.setBackground(type.background);
+        panel.setBorder(type.border);
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import javax.swing.border.Border;
+import javax.swing.border.EmptyBorder;
+import javax.swing.border.EtchedBorder;
+import java.awt.*;
+
+public class HorizontalRuleBorder extends EtchedBorder {
+    public static final int TOP = 0;
+    public static final int BOTTOM = 1;
+    public static final int BOTH = 2;
+
+    private final int size;
+    private final int sides;
+    private final Border outsideBorder;
+
+    public HorizontalRuleBorder(int size) {
+        this(size, BOTH);
+    }
+
+    public HorizontalRuleBorder(int size, int sides) {
+        super();
+        this.size = size;
+        this.sides = sides;
+        this.outsideBorder = new EmptyBorder(this.sides != BOTTOM ? size : 0, 0, this.sides != TOP ? size : 0, 0);
+    }
+
+    /**
+     * Reinitialize the insets parameter with this Border's current Insets.
+     *
+     * @param c the component for which this border insets value applies
+     * @param insets the object to be reinitialized
+     */
+    public Insets getBorderInsets(Component c, Insets insets) {
+        Insets outerInsets = this.outsideBorder.getBorderInsets(c);
+        insets.set(this.sides != BOTTOM ? this.size + outerInsets.top : 0, 0, this.sides != TOP ? this.size + outerInsets.bottom : 0, 0);
+        return insets;
+    }
+
+    /**
+     * Paints the border for the specified component with the
+     * specified position and size.
+     *
+     * @param c the component for which this border is being painted
+     * @param g the paint graphics
+     * @param x the x position of the painted border
+     * @param y the y position of the painted border
+     * @param width the width of the painted border
+     * @param height the height of the painted border
+     */
+    public void paintBorder(Component c, Graphics g, int x, int y, int width, int height) {
+        Insets  nextInsets;
+        int px, py, pw, ph;
+
+        px = x;
+        py = y;
+        pw = width;
+        ph = height;
+
+        outsideBorder.paintBorder(c, g, px, py, pw, ph);
+
+        nextInsets = outsideBorder.getBorderInsets(c);
+        px += nextInsets.left;
+        pw = pw - nextInsets.right - nextInsets.left;
+
+        // Draw top
+        if (sides != BOTTOM) {
+            py += nextInsets.top;
+            g.translate(px, py);
+            draw(c, g, pw);
+            g.translate(-px, -py);
+        }
+
+        // Draw bottom
+        if (sides != TOP) {
+            py += height - nextInsets.bottom - nextInsets.top;
+            g.translate(px, py);
+            draw(c, g, pw);
+            g.translate(-px, -py);
+        }
+    }
+
+    private void draw(Component c, Graphics g, int pw) {
+        g.setColor(etchType == LOWERED? getShadowColor(c) : getHighlightColor(c));
+        g.drawLine(0, 0, pw - 2, 0);
+
+        g.setColor(etchType == LOWERED? getHighlightColor(c) : getShadowColor(c));
+        g.drawLine(1, 1, pw -3, 1);
+    }
+}
+
+package com.adamk33n3r.runelite.recommendedequipment;
+
+import com.google.gson.Gson;
+import net.runelite.client.config.ConfigManager;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Singleton
+public class ActivityManager {
+    private final ConfigManager configManager;
+    private final RecommendedEquipmentConfig config;
+    private final RecEquipClient client;
+
+    @Inject
+    public ActivityManager(ConfigManager configManager, RecommendedEquipmentConfig config, RecEquipClient client, Gson gson) {
+        this.configManager = configManager;
+        this.config = config;
+        this.client = client;
+    }
+
+    public List<Activity> getActivities(boolean forceDownload) throws IOException {
+        List<Activity> activities = this.client.downloadActivities(forceDownload);
+        activities.forEach(activity -> {
+            this.config.favorites().stream()
+                .filter(f -> f.getActivity().equals(activity.getName()))
+                .findFirst()
+                .ifPresent(favorite -> {
+                    activity.setFavorite(favorite.isFavorite());
+                    activity.getEquipmentStyles().forEach(style -> {
+                        if (favorite.getLoadouts().contains(style.getName())) {
+                            style.setFavorite(true);
+                        }
+                    });
+                });
+        });
+        return activities;
+    }
+
+    public void saveFavorite(Activity activity) {
+        Set<Favorite> favorites = this.config.favorites();
+        // Remove if there are no favorites
+        if (!activity.isFavorite() && activity.getEquipmentStyles().stream().noneMatch(ActivityEquipmentStyle::isFavorite)) {
+            favorites.removeIf(f -> f.getActivity().equals(activity.getName()));
+        } else {
+            Favorite favorite = favorites.stream()
+                .filter(f -> f.getActivity().equals(activity.getName()))
+                .findFirst()
+                .orElse(new Favorite(activity.getName()));
+            favorite.setFavorite(activity.isFavorite());
+            favorite.setLoadouts(activity.getEquipmentStyles().stream()
+                .filter(ActivityEquipmentStyle::isFavorite)
+                .map(ActivityEquipmentStyle::getName)
+                .collect(Collectors.toList()));
+            favorites.add(favorite);
+        }
+        this.config.favorites(favorites);
+    }
+}
+

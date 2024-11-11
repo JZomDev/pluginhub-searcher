@@ -1,0 +1,551 @@
+package com.WildernessPlayerAlarm;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class WildernessPlayerAlarmTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(WildernessPlayerAlarmPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.WildernessPlayerAlarm;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+@Getter
+@RequiredArgsConstructor
+public enum FlashControl
+{
+    OFF("Off", -1),
+    SLOW("Slow", 80),
+    NORMAL("Normal", 40),
+    FAST("Fast", 20),
+    SOLID("Solid color", -1);
+
+    private final String type;
+    private final int    rate;
+
+    @Override
+    public String toString()
+    {
+        return type;
+    }
+}
+
+package com.WildernessPlayerAlarm;
+
+import com.google.common.base.Splitter;
+import com.google.inject.Provides;
+
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.stream.Collectors;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Constants;
+import net.runelite.api.Player;
+import net.runelite.api.Varbits;
+import net.runelite.api.Client;
+import net.runelite.api.WorldType;
+import net.runelite.api.Actor;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.Notifier;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+
+@Slf4j
+@PluginDescriptor(
+	name = "Wilderness Player Alarm"
+)
+public class WildernessPlayerAlarmPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private WildernessPlayerAlarmConfig config;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private AlarmOverlay overlay;
+
+	@Inject
+	private Notifier notifier;
+
+	private boolean overlayOn = false;
+
+	private HashSet<String> customIgnores = new HashSet<>();
+
+	private Splitter CONFIG_SPLITTER = Splitter
+			.onPattern("([,\n])")
+			.omitEmptyStrings()
+			.trimResults();
+
+	private final HashMap<String, Integer> playerNameToTimeInRange = new HashMap<>();
+
+	private final SafeZoneHelper zoneHelper = new SafeZoneHelper();
+
+	@Subscribe
+	public void onGameTick(GameTick event) {
+		boolean isInWilderness = client.getVarbitValue(Varbits.IN_WILDERNESS) == 1;
+		boolean isInDangerousPvpArea = config.pvpWorldAlerts() && isInPvp();
+		if (!isInWilderness && !isInDangerousPvpArea)
+		{
+			if (overlayOn)
+			{
+				removeOverlay();
+			}
+			return;
+		}
+
+		List<Player> dangerousPlayers = getPlayersInRange()
+				.stream()
+				.filter(player->shouldPlayerTriggerAlarm(player, isInWilderness))
+				.collect(Collectors.toList());
+
+		// Keep track of how long players have been in range if timeout is enabled
+		if (config.timeoutToIgnore() > 0)
+		{
+			updatePlayersInRange();
+		}
+
+		boolean shouldAlarm = (isInWilderness || isInDangerousPvpArea) && dangerousPlayers.size() > 0;
+		if (shouldAlarm && !overlayOn)
+		{
+			if (config.customizableNotification().isEnabled())
+			{
+				notifier.notify(config.customizableNotification(), "Player spotted!");
+			}
+			addOverlay();
+		}
+
+		if (!shouldAlarm)
+		{
+			removeOverlay();
+		}
+	}
+
+	private List<Player> getPlayersInRange()
+	{
+		LocalPoint currentPosition = client.getLocalPlayer().getLocalLocation();
+		return client.getPlayers()
+				.stream()
+				.filter(player -> (player.getLocalLocation().distanceTo(currentPosition) / 128) <= config.alarmRadius())
+				.collect(Collectors.toList());
+	}
+
+	private boolean shouldPlayerTriggerAlarm(Player player, boolean inWilderness)
+	{
+		// Don't trigger for yourself
+		if (player.getId() == client.getLocalPlayer().getId())
+		{
+			return false;
+		}
+
+		// Don't trigger for clan members if option is selected
+		if (config.ignoreClan() && player.isClanMember())
+		{
+			return false;
+		}
+
+		// Don't trigger for friends if option is selected
+		if (config.ignoreFriends() && player.isFriend())
+		{
+			return false;
+		}
+
+		// Don't trigger for friends if option is selected
+		if (config.ignoreFriendsChat() && player.isFriendsChatMember())
+		{
+			return false;
+		}
+
+		// Don't trigger for ignored players if option is selected
+		if (config.ignoreIgnored() && client.getIgnoreContainer().findByName(player.getName()) != null)
+		{
+			return false;
+		}
+
+		// Don't trigger for players in the custom ignore list
+		if (customIgnores.contains(player.getName().toLowerCase()))
+		{
+			return false;
+		}
+
+		// Ignore players that have been on screen longer than the timeout
+		if (config.timeoutToIgnore() > 0)
+		{
+			int timePlayerIsOnScreen = playerNameToTimeInRange.getOrDefault(player.getName(), 0);
+			if (timePlayerIsOnScreen > config.timeoutToIgnore() * 1000)
+			{
+				return false;
+			}
+		}
+
+		// Don't trigger for players inside Ferox Enclave (short-circuit to only check from wildy)
+		if (inWilderness && zoneHelper.PointInsideFerox(player.getWorldLocation()))
+		{
+			return false;
+		}
+
+		return true;
+	}
+
+	private void updatePlayersInRange()
+	{
+		List<Player> playersInRange = getPlayersInRange();
+
+		// Update players that are still in range
+		for (Player player : playersInRange) {
+			String playerName = player.getName();
+			int timeInRange = playerNameToTimeInRange.containsKey(playerName)
+					? playerNameToTimeInRange.get(playerName) + Constants.GAME_TICK_LENGTH
+					: Constants.GAME_TICK_LENGTH;
+			playerNameToTimeInRange.put(playerName, timeInRange);
+		}
+
+		// Remove players that are out of range
+		List<String> playerNames = playersInRange
+				.stream()
+				.map(Actor::getName)
+				.collect(Collectors.toList());
+		List<String> playersToReset = playerNameToTimeInRange
+				.keySet()
+				.stream()
+				.filter(playerName -> !playerNames.contains(playerName))
+				.collect(Collectors.toList());
+		for (String playerName : playersToReset) {
+			playerNameToTimeInRange.remove(playerName);
+		}
+	}
+
+	private void resetCustomIgnores()
+	{
+		customIgnores.clear();
+		customIgnores.addAll(CONFIG_SPLITTER.splitToList(config.itemList().toLowerCase()));
+	}
+
+	private boolean isInPvp()
+	{
+		boolean pvp = WorldType.isPvpWorld(client.getWorldType()) && (client.getVarbitValue(Varbits.PVP_SPEC_ORB) == 1);
+		String widgetText = client.getWidget(ComponentID.PVP_WILDERNESS_LEVEL).getText();
+		pvp &= !widgetText.startsWith("Protection");
+		pvp &= !widgetText.startsWith("Guarded");
+		return pvp;
+	}
+
+	private void addOverlay()
+	{
+		overlayOn = true;
+		overlayManager.add(overlay);
+	}
+
+	private void removeOverlay()
+	{
+		overlayOn = false;
+		overlayManager.remove(overlay);
+	}
+
+	@Override
+	protected void startUp(){
+		resetCustomIgnores();
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		if (overlayOn)
+		{
+			removeOverlay();
+		}
+	}
+
+	@Subscribe
+	private void onConfigChanged(ConfigChanged event)
+	{
+		if (event.getGroup().equals("WildernessPlayerAlarm"))
+		{
+			resetCustomIgnores();
+		}
+	}
+
+	@Provides
+	WildernessPlayerAlarmConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(WildernessPlayerAlarmConfig.class);
+	}
+}
+
+package com.WildernessPlayerAlarm;
+
+import java.awt.Color;
+import net.runelite.client.config.*;
+
+@ConfigGroup("WildernessPlayerAlarm")
+public interface WildernessPlayerAlarmConfig extends Config
+{
+	@Range(
+		max = 30,
+		min = 0
+	)
+	@ConfigItem(
+			keyName = "alarmRadius",
+			name = "Alarm radius",
+			description = "Distance for another player to trigger the alarm. WARNING: Players within range that are " +
+			"not rendered will not trigger the alarm.",
+			position = 0
+	)
+	default int alarmRadius()
+	{
+		return 15;
+	}
+
+	@ConfigItem(
+			keyName = "customizableNotification",
+			name = "Customizable Notification",
+			description = "Customizable RuneLite notification (it is recommended to not doubly-enable flashing)",
+			position = 1
+	)
+	default Notification customizableNotification()
+	{
+		return new Notification();
+	}
+
+	@ConfigItem(
+			keyName = "pvpWorldAlerts",
+			name = "Pvp world alerts",
+			description = "Will alert you anywhere when in PVP or DMM worlds",
+			position = 2
+	)
+	default boolean pvpWorldAlerts() {
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "ignoreFriends",
+			name = "Ignore friends",
+			description = "Do not alarm for players on your friends list",
+			position = 3
+	)
+	default boolean ignoreFriends()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "ignoreClan",
+			name = "Ignore clan",
+			description = "Do not alarm for players in your clan",
+			position = 4
+	)
+	default boolean ignoreClan()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "ignoreFriendsChat",
+			name = "Ignore friends chat",
+			description = "Do not alarm for players in the same friends chat as you",
+			position = 5
+	)
+	default boolean ignoreFriendsChat()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "ignoreIgnored",
+			name = "Ignore 'ignore list'",
+			description = "Do not alarm for players on your ignore list",
+			position = 6
+	)
+	default boolean ignoreIgnored()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "timeoutToIgnore",
+			name = "Timeout",
+			description = "Ignores players after they've been present for the specified time (in seconds)." +
+					" A value of 0 means players won't be ignored regardless of how long they are present.",
+			position = 7
+	)
+	default int timeoutToIgnore()
+	{
+		return 0;
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "flashColor",
+			name = "Flash color",
+			description = "Sets the color of the alarm flashes",
+			position = 8
+	)
+	default Color flashColor()
+	{
+		return new Color(255, 255, 0, 70);
+	}
+
+	@ConfigItem(
+			keyName = "flashControl",
+			name = "Flash control",
+			description = "Control the cadence at which the screen will flash with the chosen color",
+			position = 9
+	)
+	default FlashControl flashControl() { return FlashControl.NORMAL; }
+
+	@ConfigItem(
+			keyName = "customIgnores",
+			name = "Custom list of players to ignore:",
+			description = "Comma-separated list of players that shouldn't trigger the alarm (case-insensitive)",
+			position = 10
+	)
+	default String itemList()
+	{
+		return "";
+	}
+}
+
+package com.WildernessPlayerAlarm;
+
+import java.awt.*;
+import javax.inject.Inject;
+import net.runelite.api.Client;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPanel;
+
+public class AlarmOverlay extends OverlayPanel
+{
+    private final WildernessPlayerAlarmConfig config;
+    private final Client client;
+    private final Color transparent = new Color(0, 0, 0, 0);
+
+    @Inject
+    private AlarmOverlay(WildernessPlayerAlarmConfig config, Client client)
+    {
+        this.config = config;
+        this.client = client;
+        setLayer(OverlayLayer.ABOVE_SCENE);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        FlashControl configuredSpeed = config.flashControl();
+
+        switch (configuredSpeed)
+        {
+            case OFF:
+                graphics.setColor(transparent);
+                break;
+            case SOLID:
+                graphics.setColor(config.flashColor());
+                break;
+            default:
+                if ((client.getGameCycle() % config.flashControl().getRate()) >= (config.flashControl().getRate() / 2))
+                {
+                    graphics.setColor(config.flashColor());
+                } else
+                {
+                    graphics.setColor(transparent);
+                }
+                break;
+        }
+        //Fill the rectangle using the client width and height
+        graphics.fillRect(0, 0, client.getCanvasWidth(), client.getCanvasHeight());
+        return null;
+    }
+}
+
+package com.WildernessPlayerAlarm;
+
+import java.util.ArrayList;
+import net.runelite.api.coords.WorldPoint;
+
+public class SafeZoneHelper
+{
+    private class Edge
+    {
+        public int x1;
+        public int y1;
+        public int x2;
+        public int y2;
+        Edge(int x1_in, int y1_in, int x2_in, int y2_in)
+        {
+            x1 = x1_in;
+            y1 = y1_in;
+            x2 = x2_in;
+            y2 = y2_in;
+        }
+    }
+
+    private static ArrayList<Edge> FEROX_ENCLAVE = new ArrayList<Edge>();
+
+    SafeZoneHelper()
+    {
+        FEROX_ENCLAVE.add(new Edge(3125, 3639, 3138, 3639));
+        FEROX_ENCLAVE.add(new Edge(3138, 3639, 3138, 3647));
+        FEROX_ENCLAVE.add(new Edge(3138, 3647, 3156, 3647));
+        FEROX_ENCLAVE.add(new Edge(3156, 3647, 3156, 3636));
+        FEROX_ENCLAVE.add(new Edge(3156, 3636, 3154, 3636));
+        FEROX_ENCLAVE.add(new Edge(3154, 3636, 3154, 3626));
+        FEROX_ENCLAVE.add(new Edge(3154, 3626, 3151, 3622));
+        FEROX_ENCLAVE.add(new Edge(3151, 3622, 3144, 3620));
+        FEROX_ENCLAVE.add(new Edge(3144, 3620, 3142, 3618));
+        FEROX_ENCLAVE.add(new Edge(3142, 3618, 3138, 3618));
+        FEROX_ENCLAVE.add(new Edge(3138, 3618, 3138, 3617));
+        FEROX_ENCLAVE.add(new Edge(3138, 3617, 3125, 3617));
+        FEROX_ENCLAVE.add(new Edge(3125, 3617, 3125, 3627));
+        FEROX_ENCLAVE.add(new Edge(3125, 3627, 3123, 3627));
+        FEROX_ENCLAVE.add(new Edge(3123, 3627, 3123, 3633));
+        FEROX_ENCLAVE.add(new Edge(3123, 3633, 3125, 3633));
+        FEROX_ENCLAVE.add(new Edge(3125, 3633, 3125, 3639));
+    }
+
+    // Counter-clockwise order of points 1, 2, 3
+    private static boolean ccw(int x1, int y1, int x2, int y2, int x3, int y3)
+    {
+        return (y3 - y1) * (x2 - x1) > (y2 - y1) * (x3 - x1);
+    }
+
+    private static boolean HasIntersection(Edge lhs, Edge rhs)
+    {
+        return (ccw(lhs.x1, lhs.y1, rhs.x1, rhs.y1, rhs.x2, rhs.y2) != ccw(lhs.x2, lhs.y2, rhs.x1, rhs.y1, rhs.x2, rhs.y2))
+                && (ccw(lhs.x1, lhs.y1, lhs.x2, lhs.y2, rhs.x1, rhs.y1) != ccw(lhs.x1, lhs.y1, lhs.x2, lhs.y2, rhs.x2, rhs.y2));
+    }
+
+    public boolean PointInsideFerox(WorldPoint test)
+    {
+        Edge testRay = new Edge(test.getX(), test.getY(), 0, 0);
+        int intersections = 0;
+        for (Edge i : FEROX_ENCLAVE)
+        {
+            if (HasIntersection(testRay, i))
+            {
+                intersections++;
+            }
+        }
+        return intersections % 2 == 1;
+    }
+
+}
+
+
+

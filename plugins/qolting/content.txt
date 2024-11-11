@@ -1,0 +1,2332 @@
+package com.qolting;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class QoltingPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(QoltingPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.qolting;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import javax.sound.sampled.*;
+
+import com.qolting.AccountManager.QoltingAccountInfo;
+import com.qolting.AccountManager.QoltingAccountManager;
+import com.qolting.AccountManager.QoltingAccountManagerFrame;
+import com.qolting.Blackout.BlackoutQuad;
+import com.qolting.UI.*;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldArea;
+import net.runelite.api.events.*;
+import net.runelite.api.kit.KitType;
+import net.runelite.client.RuneLite;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.events.OverlayMenuClicked;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import org.apache.commons.lang3.ArrayUtils;
+
+
+import java.awt.*;
+import java.io.*;
+import java.util.ArrayList;
+
+@Slf4j
+@PluginDescriptor(
+		name = "Qolting"
+)
+public class QoltingPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+	@Inject
+	private QoltingConfig config;
+	@Inject
+	private OverlayManager overlayManager;
+	@Inject
+	private ItemManager itemManager;
+	@Inject
+	private ConfigManager configManager;
+
+	private QoltingAccountManager qoltingAccountManager;
+
+	private QoltingAccountManagerFrame currentManager = null;
+
+	private File qoltingDirectory = new File(RuneLite.RUNELITE_DIR,"qolting");
+
+	// NOTE: Accessed by QoltingNearbyPanel
+	public ArrayList<GroundItem> nearbyItems = new ArrayList<>();
+
+	private QoltingAltarOverlay qoltingAltarPanel = null;
+	private QoltingRSNOverlay qoltingRSNOverlay = null;
+	private QoltingProfitPanel qoltingProfitPanel = null;
+	private QoltingShoutOverlay qoltingShoutPanel = null;
+	private QoltingNearbyPanel qoltingNearbyPanel = null;
+	private QoltingSlotsLeftOverlay qoltingSlotsLeftOverlay = null;
+	private QoltingBlackoutOverlay qoltingBlackoutOverlay = null;
+
+	private Item[] lastPlayerInventory = null;
+
+	private static final long CLIP_MTIME_UNLOADED = -2;
+	private static final long CLIP_MTIME_BUILTIN = -1;
+
+	public static final String LOCK_FILE = "qoltingDisableBLACKOUT.txt";
+
+	//GP/hr tracking
+	public int GPhr = 0;
+
+
+	public final File[] files = {
+			new File(RuneLite.RUNELITE_DIR, "qolting\\yoink.wav"),
+			new File(RuneLite.RUNELITE_DIR, "qolting\\shard.wav"),
+			new File(RuneLite.RUNELITE_DIR, "qolting\\onyx.wav"),
+			new File(RuneLite.RUNELITE_DIR, "qolting\\prayer.wav"),
+			new File(RuneLite.RUNELITE_DIR, "qolting\\health.wav"),
+			new File(RuneLite.RUNELITE_DIR, "qolting\\regularDrop.wav")
+	};
+	public final Clip[] clips = {
+			null,
+			null,
+			null,
+			null,
+			null,
+			null
+	};
+	private long[] lastClipMTime = {
+			CLIP_MTIME_UNLOADED,
+			CLIP_MTIME_UNLOADED,
+			CLIP_MTIME_UNLOADED,
+			CLIP_MTIME_UNLOADED,
+			CLIP_MTIME_UNLOADED,
+			CLIP_MTIME_UNLOADED
+	};
+	private final byte YOINK = 0;
+	private final byte SHARD = 1;
+	private final byte ONYX = 2;
+	private final byte PRAYER = 3;
+	private final byte HEALTH = 4;
+	private final byte REGULAR_DROP = 5;
+
+	int takingItem = 0;
+	int ownLootTimer = 0;
+	boolean playShardSoundNextTick = false;
+
+	float timeElapsed = 0;
+
+	private void updateAltar() {
+		if(!config.altarBar()) {
+			overlayManager.remove(qoltingAltarPanel);
+			return;
+		}
+		overlayManager.add(qoltingAltarPanel);
+
+		qoltingAltarPanel.maxPrayer = client.getRealSkillLevel(Skill.PRAYER);
+		qoltingAltarPanel.prayer = client.getBoostedSkillLevel(Skill.PRAYER);
+		qoltingAltarPanel.gameWidth = client.getViewportWidth();
+		qoltingAltarPanel.gameHeight = client.getViewportHeight();
+	}
+	private void updateRSN() {
+		if(!config.rsnDisplay()) {
+			overlayManager.remove(qoltingRSNOverlay);
+			return;
+		}
+		overlayManager.add(qoltingRSNOverlay);
+	}
+	private void updateProfit() {
+		timeElapsed += 0.6f;
+		GPhr = Math.round((qoltingProfitPanel.profit / timeElapsed) * 60 * 60)/1000;
+		if(!config.sessionTracker()) {
+			overlayManager.remove(qoltingProfitPanel);
+			return;
+		}
+		overlayManager.add(qoltingProfitPanel);
+	}
+	private void updateShout() {
+		boolean[] thingsToBeFussedAbout = new boolean[]{false,false,false};
+		boolean any = false;
+		if(config.tooAFKIndicator() && tooAFK()) {
+			thingsToBeFussedAbout[QoltingShoutOverlay.TOO_AFK] = true;
+			any = true;
+		}
+		if(config.treasureNear() && shardNear()) {
+			thingsToBeFussedAbout[QoltingShoutOverlay.SHARD_NEARBY] = true;
+			any = true;
+		}
+		if(config.goBank() && inventoryFull()) {
+			thingsToBeFussedAbout[QoltingShoutOverlay.GO_BANK] = true;
+			any = true;
+		}
+		qoltingShoutPanel.thingsToBeFussedAbout = thingsToBeFussedAbout;
+		qoltingShoutPanel.viewportWidth = client.getViewportWidth();
+		qoltingShoutPanel.viewportHeight = client.getViewportHeight();
+		if(any) {
+			overlayManager.add(qoltingShoutPanel);
+		} else {
+			overlayManager.remove(qoltingShoutPanel);
+		}
+	}
+	private void updateNearby() {
+		if(!config.doNearbyDrops()) {
+			overlayManager.remove(qoltingNearbyPanel);
+			return;
+		}
+		overlayManager.add(qoltingNearbyPanel);
+	}
+	private void updateSlotsLeft() {
+		if(!config.slotsLeft()) {
+			overlayManager.remove(qoltingSlotsLeftOverlay);
+			return;
+		}
+		overlayManager.add(qoltingSlotsLeftOverlay);
+		qoltingSlotsLeftOverlay.slotsLeft = getSlotsLeft();
+	}
+	private void updateBlackout() {
+		if(!config.blackoutOverlay() || new File(RuneLite.RUNELITE_DIR,LOCK_FILE).exists()) {
+			overlayManager.remove(qoltingBlackoutOverlay);
+			return;
+		}
+		overlayManager.add(qoltingBlackoutOverlay);
+
+		qoltingBlackoutOverlay.gameHeight = client.getViewportHeight();
+		qoltingBlackoutOverlay.gameWidth = client.getViewportWidth();
+
+		qoltingBlackoutOverlay.quads.clear();
+
+		Polygon altarDoor = Perspective.getCanvasTilePoly(client,LocalPoint.fromWorld(client,3605,3358));
+		Polygon bankDoor = Perspective.getCanvasTilePoly(client,LocalPoint.fromWorld(client,3605,3365));
+
+		//Is in bank or altar, remove overlay entirely
+		if( client.getLocalPlayer().getWorldLocation().isInArea2D(new WorldArea(3601, 3365, 8, 5,0))
+				|| client.getLocalPlayer().getWorldLocation().isInArea2D(new WorldArea(3601, 3353, 8, 6,0))
+		|| isPrayerOff()
+		|| tooAFK()) {
+			qoltingBlackoutOverlay.quads.add(new BlackoutQuad(0,0,client.getViewportWidth(),client.getViewportHeight()));
+			return;
+		}
+
+		//Otherwise, let's selectively remove the overlay on certain things:
+
+		for(GroundItem item : nearbyItems) {
+			if(item.quantity * itemManager.getItemPrice(item.id) < config.nearbyThreshold() || ignoreItem(item.id)) {
+				continue;
+			}
+			LocalPoint location = LocalPoint.fromWorld(client, item.worldPoint);
+			if(location != null) {
+				Polygon gon = Perspective.getCanvasTilePoly(client, location);
+				qoltingBlackoutOverlay.addQuad(gon);
+			}
+		}
+		//Altar
+		if(client.getBoostedSkillLevel(Skill.PRAYER) <= config.altarThreshold()
+				|| (config.blackoutGlobalDisplayAltar() && isAnyAccountLowPrayer())) {
+			Polygon altar = Perspective.getCanvasTileAreaPoly(client, LocalPoint.fromWorld(client,3605,3354),3,3,client.getPlane(),client.getLocalPlayer().getWorldArea().getHeight());
+			qoltingBlackoutOverlay.addQuad(altar);
+		}
+		//Altar door
+		if((client.getBoostedSkillLevel(Skill.PRAYER) <= config.altarThreshold() || client.getLocalPlayer().getWorldLocation().isInArea2D(new WorldArea(3601, 3353, 8, 6,0)) || (config.blackoutGlobalDisplayAltar() && isAnyAccountLowPrayer()))
+			&& isDoorClosed(3605,3358)) {
+			qoltingBlackoutOverlay.addQuad(altarDoor);
+		}
+		//Bank
+		if(getSlotsLeft() <= 2) {
+			Polygon bank = Perspective.getCanvasTilePoly(client,LocalPoint.fromWorld(client,3607,3368));
+			qoltingBlackoutOverlay.addQuad(bank);
+		}
+		//Bank door
+		if((getSlotsLeft() <= 2 || client.getLocalPlayer().getWorldLocation().isInArea2D(new WorldArea(3601, 3365, 8, 5,0)))
+				&& isDoorClosed(3605,3365)) {
+			qoltingBlackoutOverlay.addQuad(bankDoor);
+		}
+
+	}
+
+	public boolean isDoorClosed(int worldX, int worldY) {
+		LocalPoint coords = LocalPoint.fromWorld(client,worldX,worldY);
+		return client.getScene().getTiles()[0][coords.getSceneX()][coords.getSceneY()].getWallObject() != null;
+	}
+
+	public String getItemName(int id) {
+		return client.getItemDefinition(id).getName();
+	}
+	public int getItemPrice(int id) {
+		return itemManager.getItemPrice(id);
+	}
+
+	public boolean inventoryFull() {
+		ItemContainer invent = client.getItemContainer(InventoryID.INVENTORY);
+		if(invent == null) {
+			return false;
+		}
+		if(invent.getItems().length < 28) {
+			return false;
+		}
+		boolean full = true;
+		for(Item i : invent.getItems()) {
+			if(i == null) {
+				full = false;
+				break;
+			}
+			if(i.getQuantity() == 0) {
+				full = false;
+			}
+		}
+		return full;
+	}
+	public int getSlotsLeft() {
+		ItemContainer invent = client.getItemContainer(InventoryID.INVENTORY);
+		if(invent == null) {
+			return 28;
+		}
+		int itemsCounted = 0;
+		for(Item i : invent.getItems()) {
+			if(i == null) {
+				continue;
+			}
+			if(i.getQuantity() == 0) {
+				continue;
+			}
+			itemsCounted++;
+		}
+		return 28-itemsCounted;
+	}
+	public boolean shardNear() {
+		for(GroundItem i : nearbyItems) {
+			if(i.id == ItemID.BLOOD_SHARD) {
+				return true;
+			}
+		}
+		return false;
+	}
+	public boolean tooAFK() {
+		Player localPlayer = client.getLocalPlayer();
+		if(localPlayer == null) {
+			return false;
+		}
+		if(localPlayer.getPlayerComposition().getEquipmentId(KitType.TORSO) == ItemID.VYRE_NOBLE_TOP || localPlayer.getPlayerComposition().getEquipmentId(KitType.LEGS) == ItemID.VYRE_NOBLE_LEGS || localPlayer.getPlayerComposition().getEquipmentId(KitType.BOOTS) == ItemID.VYRE_NOBLE_SHOES) {
+			return true;
+		}
+		if(client.getVarpValue(172) == 1) {
+			return true;
+		}
+		return false;
+	}
+
+	public boolean isPrayerOff() {
+		for (Prayer pray : Prayer.values())	{
+			if (client.isPrayerActive(pray)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	public boolean isAnyAccountLowPrayer() {
+		//this account
+		if(client.getBoostedSkillLevel(Skill.PRAYER) <= config.altarThreshold()) {
+			return true;
+		}
+		//any account
+		ArrayList<QoltingAccountInfo> info = qoltingAccountManager.getAllAccountInfo();
+		for(QoltingAccountInfo i : info) {
+			if(i.prayer <= config.altarThreshold()) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	private boolean isPlayerInGoodRegionToEnablePlugin() {
+		boolean result = false;
+		Player localPlayer = client.getLocalPlayer();
+		if(localPlayer != null) {
+			if(config.onlyInDarkmeyer())
+			{
+				result = localPlayer.getWorldLocation().getRegionID() == 14388 || localPlayer.getWorldLocation().getRegionID() == 14387;
+			}
+			else
+			{
+				result = true;
+			}
+		}
+		return result;
+	}
+
+	public boolean ignoreItem(int id) {
+		String name = getItemName(id);
+		return ignoreItem(name);
+	}
+
+	public boolean ignoreItem(String name) {
+		for(String s : config.nearbyBlacklist().split(",")) {
+			if(s.equalsIgnoreCase(name)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public String getRSN() {
+		if(client.getLocalPlayer() == null || client.getLocalPlayer().getName() == null) {
+			return "?";
+		}
+		return client.getLocalPlayer().getName();
+	}
+
+	private void removeAllPanels() {
+		overlayManager.remove(qoltingAltarPanel);
+		overlayManager.remove(qoltingRSNOverlay);
+		overlayManager.remove(qoltingProfitPanel);
+		overlayManager.remove(qoltingShoutPanel);
+		overlayManager.remove(qoltingNearbyPanel);
+		overlayManager.remove(qoltingSlotsLeftOverlay);
+		overlayManager.remove(qoltingBlackoutOverlay);
+	}
+
+	@Override
+	protected void startUp()
+	{
+		qoltingAccountManager = new QoltingAccountManager(qoltingDirectory);
+
+		qoltingAltarPanel = new QoltingAltarOverlay(this,0,0,config.altarThreshold(),config.altarBackground(),config.altarForeground(),config.altarForegroundLow(),config.altarForegroundOff(),config.altarFlashing());
+		qoltingRSNOverlay = new QoltingRSNOverlay(this);
+		qoltingProfitPanel = new QoltingProfitPanel(this);
+		qoltingShoutPanel = new QoltingShoutOverlay(this,client.getViewportWidth(),client.getViewportHeight());
+		qoltingNearbyPanel = new QoltingNearbyPanel(this);
+		qoltingSlotsLeftOverlay = new QoltingSlotsLeftOverlay(this);
+		qoltingBlackoutOverlay = new QoltingBlackoutOverlay(this,client.getViewportWidth(),client.getViewportHeight(),config.blackoutPadding(),config.blackoutColor());
+
+		updateConfig();
+
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		removeAllPanels();
+	}
+
+	private synchronized void playCustomSound(byte index, boolean justOnce)
+	{
+		File file = files[index];
+		long currentMTime = file.exists() ? file.lastModified() : CLIP_MTIME_BUILTIN;
+		if (clips[index] == null || currentMTime != lastClipMTime[index] || !clips[index].isOpen())
+		{
+			if (clips[index] != null)
+			{
+				clips[index].close();
+			}
+
+			try
+			{
+				clips[index] = AudioSystem.getClip();
+			}
+			catch (LineUnavailableException e)
+			{
+				lastClipMTime[index] = CLIP_MTIME_UNLOADED;
+				log.warn("Unable to play notification", e);
+				return;
+			}
+
+			lastClipMTime[index] = currentMTime;
+
+			if (!tryLoadNotification(index))
+			{
+				return;
+			}
+		}
+		clips[index].setMicrosecondPosition(0);
+		// Using loop instead of start + setFramePosition prevents a the clip
+		// from not being played sometimes, presumably a race condition in the
+		// underlying line driver
+		clips[index].loop(justOnce ? 0 : Math.min(Math.max(0,config.loopBlasters()-1),100));
+	}
+
+	private boolean tryLoadNotification(byte index)
+	{
+		File file = files[index];
+		if (file.exists())
+		{
+			try (InputStream fileStream = new BufferedInputStream(new FileInputStream(file));
+				 AudioInputStream sound = AudioSystem.getAudioInputStream(fileStream))
+			{
+				clips[index].open(sound);
+				return true;
+			}
+			catch (UnsupportedAudioFileException | IOException | LineUnavailableException e)
+			{
+				log.warn("Unable to load notification sound", e);
+			}
+		}
+
+		return false;
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked clicked) {
+		if(clicked.getMenuOption().toLowerCase().contains("take")) {
+			takingItem = 10;
+		}
+	}
+
+	@Subscribe
+	public void onOverlayMenuClicked(OverlayMenuClicked event) {
+		if(event.getEntry().getMenuAction() == MenuAction.RUNELITE_OVERLAY &&
+				event.getEntry().getTarget().equals("List") &&
+				event.getEntry().getOption().equals("Clear")) {
+			nearbyItems.clear();
+		}
+		if(event.getEntry().getMenuAction() == MenuAction.RUNELITE_OVERLAY &&
+				event.getEntry().getTarget().equals("Profit") &&
+				event.getEntry().getOption().equals("Clear")) {
+			qoltingProfitPanel.profit = 0;
+		}
+	}
+
+	private Item[] getInventoryList(ItemContainerChanged changed) {
+		return ArrayUtils.addAll(changed.getItemContainer().getItems(),client.getItemContainer(InventoryID.EQUIPMENT).getItems());
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged containerChanged) {
+		if(containerChanged.getContainerId() == InventoryID.INVENTORY.getId()) {
+			if(takingItem == 0) {
+				lastPlayerInventory = getInventoryList(containerChanged);
+				return;
+			}
+			if(lastPlayerInventory == null) {
+				lastPlayerInventory = getInventoryList(containerChanged);
+				return;
+			}
+			mainLoop: for(int count = 0; count < containerChanged.getItemContainer().getItems().length; count++) {
+				Item i = containerChanged.getItemContainer().getItems()[count];
+				if(i == null) {
+					continue;
+				}
+				//Make sure this item is unique and we aren't checking RUNE PLATEBODIES and things multiple times
+				for(int count2 = 0; count2 < count; count2++) {
+					if(containerChanged.getItemContainer().getItems()[count2].getId() == containerChanged.getItemContainer().getItems()[count].getId()) {
+						continue mainLoop;
+					}
+				}
+
+				int lastAmount = 0;
+				int newAmount = 0;
+				for(Item j : lastPlayerInventory) {
+					if(j.getId() == i.getId()) {
+						lastAmount += j.getQuantity();
+					}
+				}
+				for(Item j : containerChanged.getItemContainer().getItems()) {
+					if(j.getId() == i.getId()) {
+						newAmount += j.getQuantity();
+					}
+				}
+				if(newAmount - lastAmount > 0) {
+					qoltingProfitPanel.profit += itemManager.getItemPrice(i.getId()) * (newAmount-lastAmount);
+				}
+			}
+			lastPlayerInventory = getInventoryList(containerChanged);
+		}
+	}
+
+	@Subscribe
+	public void onNpcLootReceived(NpcLootReceived npcLootReceived) {
+		for(ItemStack i : npcLootReceived.getItems()) {
+			if(i.getId() == ItemID.BLOOD_SHARD) {
+				ownLootTimer = 10;
+				break;
+			}
+		}
+	}
+
+	@Subscribe
+	public void onItemSpawned(ItemSpawned itemSpawned) {
+		TileItem item = itemSpawned.getItem();
+		if (item.getId() == ItemID.BLOOD_SHARD && config.customBlushard()) {
+			//For the yoink sounds, we'll play next tick to compare if it is the player's drop
+			playShardSoundNextTick = true;
+		} else if (item.getId() == ItemID.ONYX_BOLT_TIPS && config.customOnItsBoltTips()) {
+			playCustomSound(ONYX,config.loopUntil());
+		} else if (config.customRegularDrops() && getItemPrice(item.getId()) * item.getQuantity() >= config.nearbyThreshold()) {
+			playCustomSound(REGULAR_DROP,false);
+		}
+		if(client.getLocalPlayer() == null) {
+			return;
+		}
+
+		if(Math.abs(itemSpawned.getTile().getWorldLocation().getX() - client.getLocalPlayer().getWorldLocation().getX()) > config.nearbyRange() ||
+				Math.abs(itemSpawned.getTile().getWorldLocation().getY() - client.getLocalPlayer().getWorldLocation().getY()) > config.nearbyRange()) {
+			//item is outside of the range of the config
+			return;
+		}
+
+		boolean existing = false;
+		/*for(GroundItem i : nearbyItems) {
+			if(i.id == item.getId()) {
+				i.quantity += item.getQuantity();
+				existing = true;
+				break;
+			}
+		}*/
+		// ^ For now, i'll disable the stacking of existing item stacks because I think the functionality
+		// of this will behave better. For example, the blackout manager will now highlight separate blood rune
+		// stacks instead just one that won't even disappear once picked up.
+		//if(!existing) {
+		nearbyItems.add(new GroundItem(item.getId(),item.getQuantity(),itemSpawned.getTile().getWorldLocation(), client.getGameCycle()));
+		//}
+	}
+
+	@Subscribe
+	public void onItemDespawned(ItemDespawned itemDespawned) {
+		TileItem item = itemDespawned.getItem();
+
+		for(GroundItem i : nearbyItems) {
+			if(i.id == item.getId() && i.quantity == itemDespawned.getItem().getQuantity()) {
+				nearbyItems.remove(i);
+				break;
+			}
+		}
+
+	}
+
+	@Subscribe
+	public void onBeforeRender(BeforeRender render) {
+		if(config.blackoutFPS() && isPlayerInGoodRegionToEnablePlugin()) {
+			updateBlackout();
+		}
+	}
+
+	@Subscribe
+	public void onItemQuantityChanged(ItemQuantityChanged itemQuantityChanged) {
+		TileItem item = itemQuantityChanged.getItem();
+
+		for(GroundItem i : nearbyItems) {
+			if(i.id == item.getId() && itemQuantityChanged.getOldQuantity() == i.quantity) {
+				i.quantity = itemQuantityChanged.getNewQuantity();
+				break;
+			}
+		}
+	}
+
+	public void updateConfig() {
+		qoltingAltarPanel.backgroundColor = config.altarBackground();
+		qoltingAltarPanel.foregroundColor = config.altarForeground();
+		qoltingAltarPanel.flashingColor = config.altarFlashing();
+		qoltingAltarPanel.foregroundLowColor = config.altarForegroundLow();
+		qoltingAltarPanel.foregroundOffColor = config.altarForegroundOff();
+		qoltingAltarPanel.threshold = config.altarThreshold();
+		qoltingAltarPanel.barHeight = config.altarSize();
+		qoltingAltarPanel.barOnBottom = config.altarBarOnBottom();
+		qoltingAltarPanel.outlineColor = config.altarOutline();
+		qoltingAltarPanel.displayPrayer = config.altarPrayer();
+		qoltingAltarPanel.flashInterval = config.flashyInterval();
+
+		qoltingRSNOverlay.fontSize = config.rsnFontSize();
+		qoltingSlotsLeftOverlay.fontSize = config.slotsLeftFontSize();
+		qoltingNearbyPanel.threshold = config.nearbyThreshold();
+
+		qoltingShoutPanel.flashInterval = config.flashyInterval();
+
+		qoltingBlackoutOverlay.color = config.blackoutColor();
+		qoltingBlackoutOverlay.padding = config.blackoutPadding();
+
+		if(currentManager != null) {
+			currentManager.frame.setAlwaysOnTop(config.alwaysOnTopTracker());
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged) {
+		updateConfig();
+
+		if(configChanged.getKey().equals("launchAccountTracker")) {
+			if(currentManager != null) {
+				currentManager.close();
+			}
+			currentManager = new QoltingAccountManagerFrame(qoltingAccountManager,config.alwaysOnTopTracker(),this);
+			currentManager.update(config.altarThreshold(),config.nearbyThreshold());
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged) {
+		int state = gameStateChanged.getGameState().getState();
+		if(state == GameState.HOPPING.getState() || state == GameState.LOGGING_IN.getState() || state == GameState.STARTING.getState()) {
+			nearbyItems.clear();
+		}
+	}
+
+	int previousPrayer = 0;
+	int previousHealth = 0;
+
+	public void updateStatusNoise() {
+
+		if(config.customPrayer() && previousPrayer > config.altarThreshold() && client.getBoostedSkillLevel(Skill.PRAYER) <= config.altarThreshold()) {
+			playCustomSound(PRAYER,false);
+		}
+		if(config.customLowHP() && previousHealth > 50 && client.getBoostedSkillLevel(Skill.HITPOINTS) <= 49) {
+			playCustomSound(HEALTH,false);
+		}
+
+
+		previousPrayer = client.getBoostedSkillLevel(Skill.PRAYER);
+		previousHealth = client.getBoostedSkillLevel(Skill.HITPOINTS);
+	}
+
+
+	@Subscribe
+	public void onGameTick(GameTick gameTick) {
+		if(config.useAccountTracker()) {
+			ArrayList<LootItem> items = new ArrayList<>();
+			for(GroundItem item : nearbyItems) {
+				items.add(new LootItem(item,this));
+			}
+			qoltingAccountManager.saveAccountInfo(getRSN(),client.getBoostedSkillLevel(Skill.PRAYER),client.getBoostedSkillLevel(Skill.HITPOINTS),getSlotsLeft(),items,client.getLocalPlayer().getWorldLocation(),qoltingProfitPanel.profit,GPhr);
+		}
+		if(currentManager != null) {
+			currentManager.update(config.altarThreshold(),config.nearbyThreshold());
+		}
+		if(!isPlayerInGoodRegionToEnablePlugin()) {
+			removeAllPanels();
+			return;
+		}
+		if(config.loopUntil()) {
+			for(GroundItem item : nearbyItems) {
+				if(item.id == ItemID.BLOOD_SHARD && (clips[SHARD] == null || !clips[SHARD].isRunning())) {
+					playCustomSound(SHARD,true);
+					break;
+				}
+				if(item.id == ItemID.ONYX_BOLT_TIPS && (clips[ONYX] == null || !clips[ONYX].isRunning())) {
+					playCustomSound(ONYX,true);
+					break;
+				}
+			}
+		} else {
+			if (playShardSoundNextTick) {
+				if (ownLootTimer == 0 && config.customYoink()) {
+					playCustomSound(YOINK,false);
+				} else if (config.customBlushard()) {
+					playCustomSound(SHARD,false);
+				}
+				playShardSoundNextTick = false;
+			}
+		}
+
+		// NOTE: 5-minute expiration timer on nearby items.
+		for(GroundItem i : nearbyItems) {
+			int gameCycle = client.getGameCycle();
+			boolean overflow = ((gameCycle - i.addedAtGameCycle) < 0);
+			if(gameCycle - i.addedAtGameCycle >= GroundItem.GAME_CYCLES_BEFORE_REMOVAL || overflow) {
+				nearbyItems.remove(i);
+			}
+		}
+
+		updateStatusNoise();
+
+		updateAltar();
+		updateRSN();
+		updateProfit();
+		updateShout();
+		updateNearby();
+		updateSlotsLeft();
+		updateBlackout();
+
+		takingItem = Math.max(0,takingItem-1);
+		ownLootTimer = Math.max(0,ownLootTimer-1);
+	}
+
+	@Provides
+	QoltingConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(QoltingConfig.class);
+	}
+}
+
+package com.qolting;
+
+public class LootItem {
+    public String name;
+    public int value;
+    public int quantity;
+
+    public LootItem(String name, int value, int quantity) {
+        this.name = name;
+        this.value = value;
+        this.quantity = quantity;
+    }
+
+    public LootItem(GroundItem item, QoltingPlugin plugin) {
+        this.name = plugin.getItemName(item.id);
+        this.value = plugin.getItemPrice(item.id);
+        this.quantity = item.quantity;
+    }
+
+    public LootItem(String dataStr) {
+        fromString(dataStr);
+    }
+
+    @Override
+    public String toString() {
+        return value + "=" + name + "=" + quantity;
+    }
+
+    public void fromString(String str) {
+        String[] split = str.split("=");
+        this.value = Integer.parseInt(split[0]);
+        this.name = split[1];
+        this.quantity = Integer.parseInt(split[2]);
+    }
+}
+
+package com.qolting.AccountManager;
+
+import com.qolting.GroundItem;
+import com.qolting.LootItem;
+import net.runelite.api.coords.WorldArea;
+import net.runelite.api.coords.WorldPoint;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+
+public class QoltingAccountInfo {
+    public String username;
+    public int health;
+    public int prayer;
+    public int backpackSpaces;
+    public ArrayList<LootItem> items;
+    public boolean atAltarOrBank;
+    public int GPhr;
+    public int profit;
+
+    //variable has to do with the fromString function
+    public final int itemsStartAt = 5;
+
+    public final WorldArea[] altarOrBank = {
+                new WorldArea(3601, 3353, 8, 6,0),
+                new WorldArea(3601, 3365, 8, 5,0)
+    };
+
+    public QoltingAccountInfo(String username, int health, int prayer, int backpackSpaces, ArrayList<LootItem> items, WorldPoint area, int profit, int GPhr) {
+        this.username = username;
+        this.health = health;
+        this.prayer = prayer;
+        this.backpackSpaces = backpackSpaces;
+        this.items = items;
+        this.profit = profit;
+        this.GPhr = GPhr;
+
+        this.atAltarOrBank = (area.isInArea2D(altarOrBank[0]) || area.isInArea2D(altarOrBank[1]));
+    }
+
+    private boolean collision(int x, int y, int w, int h, int x2, int y2) {
+        return x + w >= x2 && y + h >= y2 && x2 >= x && y2 >= y;
+    }
+
+    public QoltingAccountInfo(String dataFromString) {
+        fromString(dataFromString);
+    }
+
+    @Override
+    public String toString() {
+        //https://stackoverflow.com/questions/32987478/produce-a-comma-separated-list-using-stringbuilder
+        String allToString = "";
+        String separator = "";
+        for(LootItem i : items) {
+            allToString += separator + i.toString();
+            separator = ",";
+        }
+        return username + "," + health + "," + prayer + "," + backpackSpaces + "," + atAltarOrBank + "," + profit + "," + GPhr + "," + allToString;
+    }
+    public void fromString(String string) {
+        String[] split = string.split(",");
+        this.username = split[0];
+        this.health = Integer.parseInt(split[1]);
+        this.prayer = Integer.parseInt(split[2]);
+        this.backpackSpaces = Integer.parseInt(split[3]);
+        this.atAltarOrBank = Boolean.parseBoolean(split[4]);
+        this.profit = Integer.parseInt(split[5]);
+        this.GPhr = Integer.parseInt(split[6]);
+
+        items = new ArrayList<LootItem>();
+
+        for(int i = 7; i < split.length; i++) {
+            items.add(new LootItem(split[i]));
+        }
+    }
+}
+
+package com.qolting.AccountManager;
+
+import com.qolting.LootItem;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.coords.WorldPoint;
+
+import java.io.*;
+import java.nio.Buffer;
+import java.nio.channels.FileChannel;
+import java.nio.channels.FileLock;
+import java.time.Instant;
+import java.util.ArrayList;
+
+@Slf4j
+public class QoltingAccountManager {
+
+    private final File directory;
+
+    private final int tooOldAge = 5000;
+
+    public QoltingAccountManager(File qoltingDirectory) {
+        directory = qoltingDirectory;
+        verifyQoltingDirectory();
+    }
+
+    public ArrayList<QoltingAccountInfo> getAllAccountInfo() {
+        verifyQoltingDirectory();
+
+        ArrayList<QoltingAccountInfo> out = new ArrayList<>();
+        if(directory.listFiles() == null) {
+            return out;
+        }
+        for(File f : directory.listFiles()) {
+            if(Instant.now().toEpochMilli() - f.lastModified() >= tooOldAge) {
+                continue;
+            }
+            try {
+                BufferedReader reader = new BufferedReader(new FileReader(f));
+                out.add(new QoltingAccountInfo(reader.readLine()));
+                reader.close();
+            } catch(IOException ex) {
+                ex.printStackTrace();
+            }
+        }
+        return out;
+    }
+
+    //Returns false if unable to save to file
+    public boolean saveAccountInfo(String name, int prayer, int health, int backpackSpace, ArrayList<LootItem> groundItems, WorldPoint playerPosition, int profit, int GPhr) {
+        verifyQoltingDirectory();
+
+        QoltingAccountInfo info = new QoltingAccountInfo(name,health,prayer,backpackSpace,groundItems, playerPosition,profit, GPhr);
+
+        File file = new File(directory,name + ".txt");
+
+        try {
+            file.createNewFile();
+
+            FileWriter writer = new FileWriter(file);
+            writer.write(info.toString());
+            writer.close();
+
+        } catch(IOException ex) {
+            ex.printStackTrace();
+            return false;
+        }
+        return true;
+
+    }
+
+    //Returns true if already exists, false if directory created
+    public boolean verifyQoltingDirectory() {
+        return !directory.mkdir();
+    }
+}
+
+package com.qolting.AccountManager;
+
+import com.qolting.LootItem;
+import com.qolting.QoltingPlugin;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+
+import javax.swing.*;
+import javax.swing.text.AttributeSet;
+import javax.swing.text.SimpleAttributeSet;
+import javax.swing.text.StyleConstants;
+import javax.swing.text.StyleContext;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.awt.event.WindowEvent;
+import java.awt.event.WindowListener;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+@Slf4j
+public class QoltingAccountManagerFrame {
+
+    public JFrame frame;
+
+    private volatile boolean running = true;
+
+    public JTextPane lowPrayer;
+    public JTextPane lootNearby;
+    public JTextPane lowBackpack;
+    public JTextPane atAltarBank;
+
+    public JButton toggleBlackout;
+    public JTextPane GPhr;
+    public JTextPane totalProfit;
+    public JPanel pageEnd;
+
+    public QoltingPlugin plugin;
+
+
+    public volatile QoltingAccountManager manager;
+
+    public QoltingAccountManagerFrame(QoltingAccountManager manager,boolean alwaysOnTop,QoltingPlugin plugin) {
+        this.manager = manager;
+
+        createWindow();
+
+        this.frame.setAlwaysOnTop(alwaysOnTop);
+
+        this.plugin = plugin;
+    }
+
+    public void close() {
+        frame.dispose();
+    }
+
+    public void createWindow() {
+        frame = new JFrame("Qolting Account Manager");
+        frame.setSize(500,300);
+
+        frame.setLayout(new BorderLayout());
+
+        JPanel panel = new JPanel(new GridLayout(1,4));
+
+        lowPrayer = new JTextPane();
+        lootNearby = new JTextPane();
+        lowBackpack = new JTextPane();
+        atAltarBank = new JTextPane();
+
+
+
+        lowPrayer.setEditable(false);
+        lootNearby.setEditable(false);
+        lowBackpack.setEditable(false);
+        atAltarBank.setEditable(false);
+
+        lowPrayer.setContentType("text/html");
+        lowBackpack.setContentType("text/html");
+        lootNearby.setContentType("text/html");
+        atAltarBank.setContentType("text/html");
+
+        toggleBlackout = new JButton("Force Disable Blackout");
+
+        File lock = new File(RuneLite.RUNELITE_DIR,QoltingPlugin.LOCK_FILE);
+        if(lock.exists()) {
+            lock.delete();
+        }
+        toggleBlackout.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                File file = new File(RuneLite.RUNELITE_DIR, QoltingPlugin.LOCK_FILE);
+                if(file.exists()) {
+                    file.delete();
+                    toggleBlackout.setText("Force Disable Blackout");
+                } else {
+                    try {
+                        file.createNewFile();
+                        toggleBlackout.setText("Un-force-disable Blackout");
+                    } catch (IOException ex) {
+                        ex.printStackTrace();
+                        toggleBlackout.setText("Could not disable blackout (try again)");
+                    }
+                }
+            }
+        });
+
+        panel.add(lowPrayer);
+        panel.add(lootNearby);
+        panel.add(lowBackpack);
+        panel.add(atAltarBank);
+
+        GPhr = new JTextPane();
+        GPhr.setContentType("text/html");
+        GPhr.setEditable(false);
+
+        totalProfit = new JTextPane();
+        totalProfit.setContentType("text/html");
+        totalProfit.setEditable(false);
+
+
+        pageEnd = new JPanel(new GridLayout(1,2));
+        pageEnd.setBackground(new Color(5,5,5));
+        frame.add(pageEnd,BorderLayout.PAGE_END);
+
+        pageEnd.add(GPhr);
+        pageEnd.add(totalProfit);
+
+        frame.add(toggleBlackout,BorderLayout.PAGE_START);
+        frame.add(panel,BorderLayout.CENTER);
+
+        frame.setDefaultCloseOperation(WindowConstants.DISPOSE_ON_CLOSE);
+
+        frame.addWindowListener(new WindowListener() {
+            @Override
+            public void windowOpened(WindowEvent e) {
+
+            }
+
+            @Override
+            public void windowClosing(WindowEvent e) {
+                File file = new File(RuneLite.RUNELITE_DIR, QoltingPlugin.LOCK_FILE);
+                if(file.exists()) {
+                    file.delete();
+                }
+            }
+
+            @Override
+            public void windowClosed(WindowEvent e) {
+
+            }
+
+            @Override
+            public void windowIconified(WindowEvent e) {
+
+            }
+
+            @Override
+            public void windowDeiconified(WindowEvent e) {
+
+            }
+
+            @Override
+            public void windowActivated(WindowEvent e) {
+
+            }
+
+            @Override
+            public void windowDeactivated(WindowEvent e) {
+
+            }
+        });
+
+        frame.setVisible(true);
+    }
+
+    public void update(int prayerThreshold, int nearbyThreshold) {
+        if(!frame.isVisible()) {
+            return;
+        }
+
+        ArrayList<QoltingAccountInfo> data = manager.getAllAccountInfo();
+
+        String lowPrayerT = "<HTML>";
+        String lowBackpackT = "<HTML>";
+        String lootNearbyT = "<HTML>";
+        String atAltarBankT = "<HTML>";
+
+
+        lowPrayerT += getSpan("Low Prayer: <br/>",Color.LIGHT_GRAY);
+        lowBackpackT += getSpan("Low Backpack: <br/>",Color.LIGHT_GRAY);
+        lootNearbyT += getSpan("Loot Nearby: <br/>",Color.LIGHT_GRAY);
+        atAltarBankT += getSpan("Stuck Altar/Bank: <br/>",Color.LIGHT_GRAY);
+        int totalGPhr = 0;
+        int totalledProfit = 0;
+        for(QoltingAccountInfo info : data) {
+            totalGPhr += info.GPhr;
+            totalledProfit += info.profit;
+            if(info.prayer <= prayerThreshold) {
+                lowPrayerT += getSpan(info.username + " (" + info.prayer + ")",Color.CYAN);
+            }
+            if(info.backpackSpaces <= 2) {
+                lowBackpackT += getSpan(info.username + " (" + info.backpackSpaces + ")",new Color(40,20,0));
+            }
+            if(info.items.size() > 0) {
+                for(LootItem item : info.items) {
+                    int value = item.value * item.quantity;
+                    if(value < nearbyThreshold) {
+                        continue;
+                    }
+                    if(plugin.ignoreItem(item.name)) {
+                        continue;
+                    }
+                    lootNearbyT += getSpan((value/1000) + "k: " + item.name.substring(0,1).toUpperCase() + item.name.substring(1).toLowerCase() + " * " + item.quantity + " (" + info.username + ")",interpolateColors(Color.LIGHT_GRAY,Color.GREEN,Math.max(0,Math.min(1,value/40000.0f))));
+                }
+            }
+            if(info.atAltarOrBank) {
+                atAltarBankT += getSpan(info.username + "",new Color(100,0,0));
+            }
+        }
+        totalledProfit /= 1000;
+
+        GPhr.setText("<html>" + getSpan(totalGPhr + "k GP/hr (" + (totalGPhr/data.size()) + "k per account)",totalGPhr > 10000 ? new Color(192,220,192) : Color.lightGray));
+        totalProfit.setText("<html><style>body { text-align:right; } </style><body>" + getSpan("+" + totalledProfit + "k GP (" + (totalledProfit/data.size()) + "k per account)</body>",totalledProfit > 10000 ? new Color(192,220,192) : Color.lightGray));
+
+
+
+        lowPrayer.setText(lowPrayerT);
+        lowBackpack.setText(lowBackpackT);
+        lootNearby.setText(lootNearbyT);
+        atAltarBank.setText(atAltarBankT);
+    }
+
+    private int lerp(int x, int y, float a) {
+        return (int)Math.floor(x + (y-x)*a);
+    }
+
+    private Color interpolateColors(Color c1, Color c2, float amt) {
+        return new Color(lerp(c1.getRed(),c2.getRed(),amt),lerp(c1.getGreen(),c2.getGreen(),amt),lerp(c1.getBlue(),c2.getBlue(),amt));
+    }
+
+    private String getSpan(String s, Color c)
+    {
+        //https://stackoverflow.com/questions/3607858/convert-a-rgb-color-value-to-a-hexadecimal-string
+        String hex = "#"+Integer.toHexString(c.getRGB()).substring(2);
+        return " <span style=\"color: rgb(" + c.getRed() + "," + c.getGreen() + "," + c.getBlue() + ")\">" + s + "</span><br/>";
+    }
+
+}
+
+package com.qolting.Blackout;
+
+import java.awt.*;
+
+public class BlackoutQuad {
+
+    BlackoutVector p1;
+    BlackoutVector p2;
+    BlackoutVector p3;
+    BlackoutVector p4;
+
+    public BlackoutQuad(BlackoutVector p1, BlackoutVector p2, BlackoutVector p3, BlackoutVector p4) {
+        this.p1 = p1;
+        this.p2 = p2;
+        this.p3 = p3;
+        this.p4 = p4;
+    }
+
+    public BlackoutQuad(int x, int y, int w, int h) {
+        this.p1 = new BlackoutVector(x,y);
+        this.p2 = new BlackoutVector(x+w,y);
+        this.p3 = new BlackoutVector(x+w,y+h);
+        this.p4 = new BlackoutVector(x,y+h);
+    }
+
+    public BlackoutVector[] getVectors() {
+        return new BlackoutVector[]{p1,p2,p3,p4};
+    }
+
+    public static Rectangle expandRectangle(Rectangle rectangle, int padding) {
+        return new Rectangle(rectangle.x-padding,rectangle.y-padding,rectangle.width+padding*2,rectangle.height+padding*2);
+    }
+
+    public Rectangle getBounds() {
+        int minX = 10000;
+        int minY = 10000;
+        int maxX = -1000;
+        int maxY = -1000;
+        for(BlackoutVector v: getVectors()) {
+            if(v.x < minX)
+                minX = v.x;
+            if(v.x > maxX)
+                maxX = v.x;
+            if(v.y > maxY)
+                maxY = v.y;
+            if(v.y < minY)
+                minY = v.y;
+        }
+        return new Rectangle(minX,minY,maxX-minX,maxY-minY);
+    }
+
+
+    //currently useless stuff but may come in useful
+    /*public boolean intersects(int rx, int ry, int rw, int rh) {
+        return polyRect(rx,ry,rw,rh);
+    }
+
+    //https://www.jeffreythompson.org/collision-detection/poly-rect.php
+    // POLYGON/RECTANGLE
+    boolean polyRect(double rx, double ry, double rw, double rh) {
+        BlackoutVector arr[] = {p1,p2,p3,p4};
+        // go through each of the vertices, plus the next
+        // vertex in the list
+        int next = 0;
+        for (int current=0; current<arr.length; current++) {
+
+            // get next vertex in list
+            // if we've hit the end, wrap around to 0
+            next = current+1;
+            if (next == arr.length) next = 0;
+
+            // get the PVectors at our current position
+            // this makes our if statement a little cleaner
+            BlackoutVector vc = arr[current];    // c for "current"
+            BlackoutVector vn = arr[next];       // n for "next"
+
+            // check against all four sides of the rectangle
+            boolean collision = lineRect(vc.x,vc.y,vn.x,vn.y, rx,ry,rw,rh);
+            if (collision) return true;
+
+            // optional: test if the rectangle is INSIDE the polygon
+            // note that this iterates all sides of the polygon
+            // again, so only use this if you need to
+            boolean inside = polygonPoint(rx,ry);
+            if (inside) return true;
+        }
+
+        return false;
+    }
+
+    //https://www.jeffreythompson.org/collision-detection/poly-rect.php
+    // LINE/RECTANGLE
+    boolean lineRect(double x1, double y1, double x2, double y2, double rx, double ry, double rw, double rh) {
+
+        // check if the line has hit any of the rectangle's sides
+        // uses the Line/Line function below
+        boolean left =   lineLine(x1,y1,x2,y2, rx,ry,rx, ry+rh);
+        boolean right =  lineLine(x1,y1,x2,y2, rx+rw,ry, rx+rw,ry+rh);
+        boolean top =    lineLine(x1,y1,x2,y2, rx,ry, rx+rw,ry);
+        boolean bottom = lineLine(x1,y1,x2,y2, rx,ry+rh, rx+rw,ry+rh);
+
+        // if ANY of the above are true,
+        // the line has hit the rectangle
+        if (left || right || top || bottom) {
+            return true;
+        }
+        return false;
+    }
+
+    //https://www.jeffreythompson.org/collision-detection/poly-rect.php
+    // LINE/LINE
+    boolean lineLine(double x1, double y1, double x2, double y2, double x3, double y3, double x4, double y4) {
+
+        // calculate the direction of the lines
+        double uA = ((x4-x3)*(y1-y3) - (y4-y3)*(x1-x3)) / ((y4-y3)*(x2-x1) - (x4-x3)*(y2-y1));
+        double uB = ((x2-x1)*(y1-y3) - (y2-y1)*(x1-x3)) / ((y4-y3)*(x2-x1) - (x4-x3)*(y2-y1));
+
+        // if uA and uB are between 0-1, lines are colliding
+        if (uA >= 0 && uA <= 1 && uB >= 0 && uB <= 1) {
+            return true;
+        }
+        return false;
+    }
+
+    //https://www.jeffreythompson.org/collision-detection/poly-rect.php
+    // POLYGON/POINT
+    // only needed if you're going to check if the rectangle
+    // is INSIDE the polygon
+    boolean polygonPoint(double px, double py) {
+
+        BlackoutVector vertices[] = {p1,p2,p3,p4};
+        boolean collision = false;
+
+        // go through each of the vertices, plus the next
+        // vertex in the list
+        int next = 0;
+        for (int current=0; current<vertices.length; current++) {
+
+            // get next vertex in list
+            // if we've hit the end, wrap around to 0
+            next = current+1;
+            if (next == vertices.length) next = 0;
+
+            // get the PVectors at our current position
+            // this makes our if statement a little cleaner
+            BlackoutVector vc = vertices[current];    // c for "current"
+            BlackoutVector vn = vertices[next];       // n for "next"
+
+            // compare position, flip 'collision' variable
+            // back and forth
+            if (((vc.y > py && vn.y < py) || (vc.y < py && vn.y > py)) &&
+                    (px < (vn.x-vc.x)*(py-vc.y) / (vn.y-vc.y)+vc.x)) {
+                collision = !collision;
+            }
+        }
+        return collision;
+    }*/
+}
+
+package com.qolting.Blackout;
+
+public class BlackoutVector {
+    public BlackoutVector(int x, int y) {
+        this.x = x;
+        this.y = y;
+    }
+
+    public int x;
+    public int y;
+
+}
+
+package com.qolting;
+
+import lombok.NoArgsConstructor;
+import net.runelite.client.config.*;
+
+import java.awt.*;
+
+@ConfigGroup("qolting")
+public interface QoltingConfig extends Config
+{
+	@ConfigSection(
+				name = "General",
+				description = "Everything general",
+				position = -1
+	)
+	String general = "general";
+
+	@ConfigSection(
+				name = "Altar",
+				description = "Related to the Altar",
+				position = 1
+	)
+	String altar = "altar";
+
+	@ConfigSection(
+			name = "Blackout",
+			description = "Related to the Blackout Overlay",
+			position = 0
+	)
+	String blackout = "blackout";
+
+	@ConfigSection(
+				name = "Screen Blasters",
+				description = "you're gonna have to figure out what that one means ;)",
+				position = 2
+	)
+	String screenBlasters = "screenBlasters";
+
+	@ConfigSection(
+				name = "Ear Blasters",
+				description = "Blasts your ears with pertinent info",
+				position = 3
+	)
+	String earBlasters = "earBlasters";
+
+	@ConfigSection(
+				name = "Nearby Drops",
+				description = "Nearby drops pointer-outer",
+				position = 3
+	)
+	String nearbyDrops = "nearbyDrops";
+
+	@ConfigSection(
+				name = "Tracker",
+				description = "Tracks all accounts using the plugin at once",
+				position = 4
+	)
+	String tracker = "tracker";
+
+	@ConfigItem(
+			keyName = "rsnDisplay",
+			name = "RSN Display",
+			description = "Whether or not to display the account's RSN",
+			section = general
+	)
+	default boolean rsnDisplay() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "onlyInDarkmeyer",
+			name = "Only use Qolting in Darkmeyer",
+			description = "Some people wanted to use the plugin outside Darkmeyer. Here you go.",
+			section = general
+	)
+	default boolean onlyInDarkmeyer() { return true; }
+
+	@ConfigItem(
+			keyName = "blackoutOverlay",
+			name = "Blackout Overlay",
+			description = "Whether or not to display the blackout overlay",
+			section = blackout
+	)
+	default boolean blackoutOverlay() {
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "blackoutFPS",
+			name = "Lock to FPS",
+			description = "Unsure whether this can lower FPS across many many clients",
+			section = blackout
+	)
+	default boolean blackoutFPS() {
+		return true;
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "blackoutColor",
+			name = "Blackout Color",
+			description = "Color and transparency of the blackout overlay",
+			section = blackout
+	)
+	default Color blackoutColor() {
+		return new Color(0,0,0,234);
+	}
+
+	@ConfigItem(
+			keyName = "blackoutGlobalDisplayAltar",
+			name = "Global Display Altar",
+			description = "When any account has low prayer, all accounts will show the altar (Requires 'Use Account Manager' on each client)",
+			section = blackout
+	)
+	default boolean blackoutGlobalDisplayAltar() {
+		return true;
+	}
+
+	@Range(
+			min = 0,
+			max = 100
+	)
+	@ConfigItem(
+			keyName = "blackoutPadding",
+			name = "Padding",
+			description = "Give me some space!",
+			section = blackout
+	)
+	default int blackoutPadding() {
+		return 5;
+	}
+
+	@Range(
+			min=1
+	)
+	@ConfigItem(
+			keyName = "rsnFontSize",
+			name = "RSN Font Size",
+			description = "The size of the RSN",
+			section = general
+	)
+	default int rsnFontSize() {
+		return 50;
+	}
+
+	@ConfigItem(
+			keyName = "flashInterval",
+			name = "Flashing Interval",
+			description = "How many frames it should be before a blood shard flasher or altar prayer bar flasher flashes. (Higher = less flashy, avoid seizures.) At 50 FPS, if a flashing interval of 50 will result in one cycle of flashing per second.",
+			section = general
+	)
+	default int flashyInterval() { return 20; }
+
+	@ConfigItem(
+			keyName = "slotsLeft",
+			name = "Show Slots Left",
+			description = "Show number of item slots open",
+			section = general
+	)
+	default boolean slotsLeft() {
+		return true;
+	}
+
+	@Range(
+			min=1
+	)
+	@ConfigItem(
+			keyName = "slotsLeftFontSize",
+			name = "Slots Left Font Size",
+			description = "Font size for slots left display",
+			section = general
+	)
+	default int slotsLeftFontSize() {
+		return 50;
+	}
+
+	@ConfigItem(
+			keyName = "sessionTracker",
+			name = "Session Tracker",
+			description = "Displays profit from the session",
+			section = general
+	)
+	default boolean sessionTracker() {
+		return true;
+	}
+
+
+	@ConfigItem(
+			keyName = "altarBar",
+			name = "Bar",
+			description = "Whether to show the altar bar",
+			section = altar,
+			position = 0
+	)
+	default boolean altarBar() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "altarBarOnBottom",
+			name = "Bar On Bottom",
+			description = "Whether or not to display the altar bar on the bottom",
+			section = altar,
+			position = 1
+	)
+	default boolean altarBarOnBottom() {
+		return false;
+	}
+
+	@Range(
+			max=99
+	)
+	@ConfigItem(
+			keyName = "altarThreshold",
+			name = "Threshold",
+			description = "The threshold for the altar bar",
+			section = altar,
+			position = 2
+	)
+	default int altarThreshold() {
+		return 5;
+	}
+
+	@ConfigItem(
+			keyName = "altarSize",
+			name = "Size",
+			description = "The size for the altar bar",
+			section = altar,
+			position = 3
+	)
+	default int altarSize() {
+		return 25;
+	}
+
+
+	@ConfigItem(
+			keyName = "altarPrayer",
+			name = "Display Prayer",
+			description = "Whether or not to display prayer",
+			section = altar,
+			position = 5
+	)
+	default boolean altarPrayer() {
+		return true;
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName="altarBackground",
+			name="Background",
+			description = "The background for the altar bar",
+			section = altar
+	)
+	default Color altarBackground() {
+		return new Color(0,0,0,255);
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName="altarOutline",
+			name="Outline",
+			description = "The outline for the altar bar",
+			section = altar
+	)
+	default Color altarOutline() {
+		return new Color(255,255,255,0);
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName="altarForeground",
+			name="Foreground",
+			description = "The foreground for the altar bar",
+			section = altar
+	)
+	default Color altarForeground() {
+		return new Color(38,63,62,255);
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName="altarForegroundOff",
+			name="Foreground Off",
+			description = "The foreground for the altar bar when off",
+			section = altar
+	)
+	default Color altarForegroundOff() {
+		return new Color(0, 5, 10,255);
+	}
+
+
+	@Alpha
+	@ConfigItem(
+			keyName="altarForegroundLow",
+			name="Foreground Low",
+			description = "The foreground for the altar bar when below threshold",
+			section = altar
+	)
+	default Color altarForegroundLow() {
+		return new Color(83,55,29,255);
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "altarFlashing",
+			name="Flashing",
+			description = "The flashing color for the altar bar",
+			section = altar
+	)
+	default Color altarFlashing() {
+		return new Color(192, 157,69,255);
+	}
+
+
+	@ConfigItem(
+			keyName = "goBank",
+			name="Go Bank",
+			description = "Whether or not the inventory is full",
+			section = screenBlasters
+	)
+	default boolean goBank() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "treasureNear",
+			name="Treasure Near",
+			description = "Whether or not there is red treasure near",
+			section = screenBlasters
+	)
+	default boolean treasureNear() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "tooAFKIndicator",
+			name = "Too AFK Indicator",
+			description = "Tells if the account is not retaliating",
+			section = screenBlasters
+	)
+	default boolean tooAFKIndicator() {
+		return true;
+	}
+
+
+	@ConfigItem(
+			keyName = "doNearbyDrops",
+			name="Nearby Drops",
+			description = "Whether or not to list nearby drops",
+			section = nearbyDrops
+	)
+	default boolean doNearbyDrops() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "nearbyThreshold",
+			name = "Valuable Threshold",
+			description = "Threshold in traded value for nearby drops to be considered valuable",
+			section = general
+	)
+	default int nearbyThreshold() {
+		return 6000;
+	}
+
+	@ConfigItem(
+			keyName = "nearbyBlacklist",
+			name = "Valuable Blacklist",
+			description = "Items to ignore when their stack value is over the Nearby Threshold (comma separated list of item names, not case sensitive, don't put spaces between commas)",
+			section = general
+	)
+	default String nearbyBlacklist() {
+		return "rune dagger,vampyre dust";
+	}
+
+	@Range(
+			min=0
+	)
+	@ConfigItem(
+			keyName = "nearbyRange",
+			name = "Range",
+			description = "The range, in tiles, to search for new nearby items in (maximum distance along an axis)",
+			section = nearbyDrops
+	)
+	default int nearbyRange() { return 100; }
+
+	@ConfigItem(
+			keyName = "customBlushard",
+			name = "Shard EarBlaster",
+			description = "Place file in '%userprofile%\\.runelite\\qolting\\shard.wav' on windows",
+			section = earBlasters
+	)
+	default boolean customBlushard() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "customOnItsBoltTips",
+			name = "Onyx EarBlaster",
+			description = "Place file in '%userprofile%\\.runelite\\qolting\\onyx.wav' on windows",
+			section = earBlasters
+	)
+	default boolean customOnItsBoltTips() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "customYoink",
+			name = "Yoink EarBlaster",
+			description = "Place file in '%userprofile%\\.runelite\\qolting\\yoink.wav' on windows",
+			section = earBlasters
+	)
+	default boolean customYoink() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "customPrayer",
+			name = "Prayer EarBlaster",
+			description = "Place file in '%userprofile%\\.runelite\\qolting\\prayer.wav' on windows",
+			section = earBlasters
+	)
+	default boolean customPrayer() {
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "customLowHP",
+			name = "Low HP Blaster",
+			description = "Place file in '%userprofile%\\.runelite\\qolting\\health.wav' on windows",
+			section = earBlasters
+	)
+	default boolean customLowHP() {
+		return true;
+	}
+
+
+	@ConfigItem(
+			keyName = "customRegularDrops",
+			name = "Regular Drop EarBlaster",
+			description = "Place file in '%userprofile%\\.runelite\\qolting\\regularDrop.wav' on windows, only works for items over 'Valuable Threshold' threshold set in General!",
+			section = earBlasters
+	)
+	default boolean customRegularDrops() {
+		return true;
+	}
+
+	@Range(
+			min = 1,
+			max = 100
+	)
+	@ConfigItem(
+			keyName = "numLoops",
+			name = "Play Blasters (#)",
+			description = "How many times to play an Ear Blaster",
+			section = earBlasters,
+			position = -3
+	)
+	default int loopBlasters() { return 1; }
+
+	@ConfigItem(
+			keyName = "infLoop",
+			name = "Loop Shard/Onyx",
+			description = "Loop the ear blaster until a very valuable item has been picked up [overrides 'Play Blasters (#)']",
+			section = earBlasters,
+			position = -2
+	)
+	default boolean loopUntil() { return false; }
+
+	@ConfigItem(
+			keyName = "useAccountTracker",
+			name = "Use Account Tracker",
+			description = "Whether or not to save info to the account tracker at %userprofile%/.runelite/qolting/ (for many functionalities of the plugin this is recommended)",
+			section = tracker
+	)
+	default boolean useAccountTracker() { return true; }
+
+	@ConfigItem(
+			keyName = "launchAccountTracker",
+			name = "Launch Account Tracker",
+			description = "Opens the account tracker window with this client as its parent",
+			section = tracker,
+			position = -2
+	)
+	default boolean launchAccountTracker() { return false; }
+
+
+	@ConfigItem(
+			keyName = "alwaysOnTopTracker",
+			name = "Always On Top",
+			description = "Makes the account tracker always-on-top",
+			section = tracker
+	)
+	default boolean alwaysOnTopTracker() { return false; }
+}
+
+package com.qolting.UI;
+
+import com.qolting.QoltingPlugin;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+public class QoltingRSNOverlay extends Overlay {
+    public String rsn;
+    public QoltingPlugin plugin;
+    public int fontSize = 50;
+
+
+    int padding = 5;
+    @Inject
+    public QoltingRSNOverlay(QoltingPlugin plugin) {
+        super(plugin);
+
+        this.plugin = plugin;
+
+        rsn = plugin.getRSN();
+
+        setDragTargetable(true);
+        setLayer(OverlayLayer.ABOVE_WIDGETS);
+        setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
+        setResizable(false);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        this.rsn = plugin.getRSN();
+        graphics.setFont(new Font(graphics.getFont().getFontName(), Font.PLAIN, fontSize));
+        FontMetrics metrics = graphics.getFontMetrics();
+
+        graphics.setColor(Color.white);
+        graphics.drawString(rsn,padding/2,metrics.getAscent());
+
+        return new Dimension(metrics.stringWidth(rsn) + padding*2,Math.max(5,fontSize));
+    }
+}
+
+package com.qolting.UI;
+
+import com.qolting.QoltingConfig;
+import com.qolting.QoltingPlugin;
+import net.runelite.client.ui.overlay.*;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+public class QoltingAltarOverlay extends Overlay {
+
+    public int prayer;
+    public int maxPrayer;
+    public int threshold;
+
+    public Color backgroundColor;
+    public Color foregroundColor;
+    public Color flashingColor;
+    public Color foregroundLowColor;
+    public Color foregroundOffColor;
+    public Color outlineColor;
+
+    public boolean displayPrayer;
+    public boolean barOnBottom = false;
+
+    private int counter = 0;
+
+    public int gameWidth = 100;
+    public int gameHeight = 100;
+
+    public int barHeight = 25;
+
+    public int flashInterval = 10;
+
+    private final QoltingPlugin plugin;
+
+    @Inject
+    public QoltingAltarOverlay(QoltingPlugin plugin, int prayer, int maxPrayer, int threshold, Color backgroundColor, Color foregroundColor, Color foregroundLowColor, Color foregroundOffColor, Color flashingColor) {
+        super(plugin);
+        this.prayer = prayer;
+        this.maxPrayer = maxPrayer;
+        this.foregroundColor = foregroundColor;
+        this.backgroundColor = backgroundColor;
+        this.flashingColor = flashingColor;
+        this.foregroundLowColor = foregroundLowColor;
+        this.foregroundOffColor = foregroundOffColor;
+        this.threshold = threshold;
+        this.plugin = plugin;
+
+        setPosition(OverlayPosition.DYNAMIC);
+        setDragTargetable(false);
+        setBounds(new Rectangle(0,0,gameWidth,barHeight));
+        setPriority(OverlayPriority.HIGH);
+        setLayer(OverlayLayer.ALWAYS_ON_TOP);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        int rightSideDisplayWidth = displayPrayer ? 50 : 0;
+        counter++;
+
+        graphics.setColor(backgroundColor);
+        if(prayer <= threshold && counter % flashInterval <= flashInterval/2) {
+            graphics.setColor(flashingColor);
+        }
+
+        if(barOnBottom) { graphics.fillRect(0,gameHeight-barHeight,gameWidth,barHeight); }
+        else { graphics.fillRect(0,0,gameWidth,barHeight); }
+
+        graphics.setColor(foregroundColor);
+
+        if(plugin.isPrayerOff()) {
+            graphics.setColor(foregroundOffColor);
+        } else if(prayer <= threshold) {
+            graphics.setColor(foregroundLowColor);
+        }
+
+        if(barOnBottom) { graphics.fillRect(0,gameHeight-barHeight,(gameWidth - rightSideDisplayWidth) * prayer / maxPrayer ,barHeight); }
+        else { graphics.fillRect(0, 0, (gameWidth - rightSideDisplayWidth) * prayer / maxPrayer, barHeight); }
+
+        if(displayPrayer) {
+            graphics.setColor(foregroundColor);
+            if(barOnBottom) { graphics.fillRect(gameWidth - rightSideDisplayWidth + 1, gameHeight - barHeight, rightSideDisplayWidth - 1, barHeight); }
+            else { graphics.fillRect(gameWidth - rightSideDisplayWidth + 1, 0, rightSideDisplayWidth - 1, barHeight); }
+
+            String letsWrite = prayer + "/" + maxPrayer;
+            FontMetrics metrics = graphics.getFontMetrics();
+            graphics.setColor(new Color(backgroundColor.getRGB())); //get rid of alpha
+            if(barOnBottom) { graphics.drawString(letsWrite, gameWidth - (rightSideDisplayWidth / 2) - metrics.stringWidth(letsWrite) / 2, gameHeight - barHeight + ((barHeight / 2) + (metrics.getAscent() / 2))); }
+            else { graphics.drawString(letsWrite, gameWidth - (rightSideDisplayWidth / 2) - metrics.stringWidth(letsWrite) / 2, (barHeight / 2) + (metrics.getAscent() / 2)); }
+        }
+
+        if(outlineColor.getAlpha() > 0) {
+            graphics.setColor(outlineColor);
+            if(barOnBottom) { graphics.fillRect(0, gameHeight - barHeight - 2, gameWidth, 2); }
+            else { graphics.fillRect(0, barHeight - 2, gameWidth, 2); }
+        }
+
+
+        return new Dimension(gameWidth,barHeight);
+    }
+
+}
+
+package com.qolting.UI;
+
+import com.qolting.GroundItem;
+import com.qolting.QoltingPlugin;
+import net.runelite.api.ItemID;
+import net.runelite.api.MenuAction;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayMenuEntry;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+import java.awt.*;
+
+public class QoltingNearbyPanel extends OverlayPanel {
+
+    public int threshold = 0;
+
+    private QoltingPlugin plugin;
+
+    public QoltingNearbyPanel(QoltingPlugin plugin) {
+        super(plugin);
+        this.plugin = plugin;
+        setPosition(OverlayPosition.TOP_RIGHT);
+        setLayer(OverlayLayer.ALWAYS_ON_TOP);
+
+        getMenuEntries().add(new OverlayMenuEntry(MenuAction.RUNELITE_OVERLAY, "Clear","List"));
+    }
+
+    public Dimension render(Graphics2D graphics) {
+
+        for(GroundItem groundItem : plugin.nearbyItems) {
+            if(plugin.getItemPrice(groundItem.id) * groundItem.quantity < threshold || plugin.ignoreItem(groundItem.id)) {
+                continue;
+            }
+            panelComponent.getChildren().add(LineComponent.builder()
+                        .left("*" + groundItem.quantity + " ")
+                        .leftColor(Color.WHITE)
+                        .right(plugin.getItemName(groundItem.id))
+                        .rightColor(Color.GREEN)
+                        .build());
+        }
+
+        return super.render(graphics);
+    }
+}
+
+package com.qolting.UI;
+
+import com.qolting.Blackout.BlackoutQuad;
+import com.qolting.Blackout.BlackoutVector;
+import com.qolting.QoltingPlugin;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+
+import java.awt.*;
+import java.awt.geom.Area;
+import java.util.ArrayList;
+
+public class QoltingBlackoutOverlay extends Overlay {
+
+    public int gameWidth;
+    public int gameHeight;
+    public int padding;
+    public Color color;
+
+    public ArrayList<BlackoutQuad> quads = new ArrayList<>();
+
+    public QoltingBlackoutOverlay(QoltingPlugin plugin, int gameWidth, int gameHeight, int padding, Color color) {
+        super(plugin);
+
+        this.gameHeight = gameHeight;
+        this.gameWidth = gameWidth;
+        this.padding = padding;
+        this.color = color;
+
+        setPosition(OverlayPosition.DYNAMIC);
+        setDragTargetable(false);
+        setBounds(new Rectangle(0,0,gameWidth,gameHeight));
+        setPriority(OverlayPriority.HIGHEST);
+        setLayer(OverlayLayer.ABOVE_WIDGETS);
+    }
+
+    public void addQuad(Polygon gon) {
+        if(gon == null || gon.xpoints == null) {
+            return;
+        }
+        quads.add(new BlackoutQuad(
+                new BlackoutVector(gon.xpoints[0], gon.ypoints[0] ),
+                new BlackoutVector(gon.xpoints[1], gon.ypoints[1]),
+                new BlackoutVector(gon.xpoints[2], gon.ypoints[2]),
+                new BlackoutVector(gon.xpoints[3], gon.ypoints[3]))
+        );
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics2D) {
+        Area clippingArea = new Area(new Rectangle(0,0,gameWidth,gameHeight));
+        for(BlackoutQuad quad : quads) {
+            clippingArea.subtract(new Area(BlackoutQuad.expandRectangle(quad.getBounds(),padding)));
+        }
+        graphics2D.setClip(clippingArea);
+
+        graphics2D.setColor(color);
+        graphics2D.fillRect(0,0,gameWidth,gameHeight);
+
+        return new Dimension(gameWidth,gameHeight);
+    }
+}
+
+package com.qolting.UI;
+
+import com.qolting.QoltingPlugin;
+import net.runelite.api.MenuAction;
+import net.runelite.client.ui.overlay.OverlayMenuEntry;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+public class QoltingProfitPanel extends OverlayPanel {
+
+    public int profit = 0;
+
+    @Inject
+    public QoltingProfitPanel(QoltingPlugin plugin) {
+        super(plugin);
+
+        setPosition(OverlayPosition.BOTTOM_LEFT);
+
+        getMenuEntries().add(new OverlayMenuEntry(MenuAction.RUNELITE_OVERLAY, "Clear","Profit"));
+    }
+
+    private String intToReadableString(int amount) {
+        return (amount/1000) + "k";
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+
+        panelComponent.getChildren().add(TitleComponent.builder()
+                .text("+ " + intToReadableString(profit) + " GP")
+                .color((profit > 10000000) ? Color.GREEN : Color.WHITE) //green cash baby!
+                .build());
+
+        return super.render(graphics);
+    }
+}
+
+package com.qolting.UI;
+
+import com.qolting.QoltingPlugin;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+import net.runelite.client.util.ImageUtil;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+
+public class QoltingShoutOverlay extends Overlay {
+
+    public static final int TOO_AFK = 0;
+    public static final int SHARD_NEARBY = 1;
+    public static final int GO_BANK = 2;
+
+    private int blinker = 0;
+
+    public int flashInterval = 10;
+
+    public int viewportWidth;
+    public int viewportHeight;
+
+    public boolean[] thingsToBeFussedAbout = new boolean[3];
+
+    public BufferedImage shard;
+
+
+    @Inject
+    public QoltingShoutOverlay(QoltingPlugin plugin, int viewportWidth, int viewportHeight) {
+        super(plugin);
+
+        this.viewportHeight = viewportHeight;
+        this.viewportWidth = viewportWidth;
+
+        setPosition(OverlayPosition.DYNAMIC);
+        setResizable(false);
+        setDragTargetable(false);
+
+        shard = ImageUtil.loadImageResource(getClass(),"/shard.png");
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        blinker++;
+        graphics.setFont(new Font(graphics.getFont().getFontName(),Font.PLAIN,30));
+        FontMetrics metrics = graphics.getFontMetrics();
+
+        int x = viewportWidth/4;
+        int y = viewportHeight/4;
+        int w = viewportWidth/2;
+        int h = viewportHeight/2;
+
+        for(boolean b : thingsToBeFussedAbout) {
+            if(b) {
+                graphics.setColor(new Color(0,0,0,20));
+                graphics.fillRect(x-5,y-5,w+10,h+10);
+                graphics.setColor(new Color(250,250,250,30));
+                graphics.fillRect(x,y,w,h);
+                break;
+            }
+        }
+
+        if(thingsToBeFussedAbout[QoltingShoutOverlay.GO_BANK]) {
+            graphics.setColor(Color.BLACK);
+            graphics.drawString("Go bank",x + w/2 - metrics.stringWidth("Go bank")/2,y + metrics.getAscent() + 5);
+        }
+        if(thingsToBeFussedAbout[QoltingShoutOverlay.TOO_AFK]) {
+            graphics.setColor(Color.BLACK);
+            graphics.drawString("TOO AFK (Auto-Retaliate OR Vyre Outfit)",x + w/2 - metrics.stringWidth("TOO AFK (Auto-Retaliate OR Vyre Outfit)")/2, y + h - 5);
+        }
+        /*graphics.setFont(new Font(graphics.getFont().getFontName(),Font.PLAIN,80));
+        metrics = graphics.getFontMetrics();*/
+        if(thingsToBeFussedAbout[QoltingShoutOverlay.SHARD_NEARBY] && blinker % flashInterval > flashInterval/3) {
+            int shardW = 150;
+            //graphics.setColor(Color.RED);
+            //graphics.drawString("SHARD!!@@@", x + w / 2 - metrics.stringWidth("SHARD!!@@@") / 2, y + h / 2 + metrics.getAscent() / 2);
+            graphics.drawImage(shard,x + w / 2 - shardW/2,y + h / 2 - shardW/2,shardW,shardW,null);
+        }
+
+        return new Dimension(w,h);
+    }
+}
+
+package com.qolting.UI;
+
+import com.qolting.QoltingPlugin;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+public class QoltingSlotsLeftOverlay extends Overlay {
+
+    public int slotsLeft = 28;
+    public int fontSize = 50;
+
+    @Inject
+    public QoltingSlotsLeftOverlay(QoltingPlugin qoltingPlugin) {
+        super(qoltingPlugin);
+
+        setPosition(OverlayPosition.BOTTOM_RIGHT);
+        setDragTargetable(true);
+        setResizable(false);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        graphics.setFont(new Font(graphics.getFont().getFontName(),Font.PLAIN,fontSize));
+        FontMetrics metrics = graphics.getFontMetrics();
+        String str = slotsLeft + "";
+
+        graphics.setColor(Color.LIGHT_GRAY);
+        graphics.drawString(str,0,metrics.getAscent());
+
+        return new Dimension(metrics.stringWidth(str),metrics.getAscent());
+    }
+}
+
+package com.qolting;
+
+import net.runelite.api.coords.WorldPoint;
+
+public class GroundItem {
+    public int id;
+    public int quantity;
+
+    public WorldPoint worldPoint;
+
+    // NOTE: This is a hack so we can remove items from the list after 5 minutes.
+    // I presume that "onDespawned" is not always fully reliable (imagine we're away from the area;
+    // would an event get sent? presumably not).
+    // So, I can just remove them after 5 minutes
+    int addedAtGameCycle;
+    static int MILLISECONDS_PER_GAME_CYCLE = 20;
+    static int GAME_CYCLES_BEFORE_REMOVAL = (60*5*1000) / MILLISECONDS_PER_GAME_CYCLE;
+
+    public GroundItem(int id, int quantity, WorldPoint worldPoint, int addedAtGameCycle) {
+        this.id = id;
+        this.quantity = quantity;
+        this.worldPoint = worldPoint;
+        this.addedAtGameCycle = addedAtGameCycle;
+    }
+
+    public GroundItem(String str) {
+        fromString(str);
+    }
+
+    @Override
+    public String toString() {
+        return id + "=" + quantity;
+    }
+
+    public void fromString(String str) {
+        String[] split = str.split("=");
+        this.id = Integer.parseInt(split[0]);
+        this.quantity = Integer.parseInt(split[1]);
+    }
+}
+

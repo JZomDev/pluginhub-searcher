@@ -1,0 +1,790 @@
+package com.cworldender;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PersonalCurrencyTrackerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(PersonalCurrencyTrackerPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.cworldender;
+
+public enum CoinType
+{
+	COINS,
+	BLOOD_MONEY,
+	PURPLE_SWEETS,
+	HALLOWED_MARK,
+	MARK_OF_GRACE,
+	COLLECTION_LOG,
+	PIECES_OF_EIGHT,
+	GOLDEN_NUGGET,
+	PLATINUM_TOKEN,
+	TOKKUL,
+	WARRIOR_GUILD_TOKEN,
+	CUSTOM
+}
+package com.cworldender;
+
+import lombok.Getter;
+
+import java.awt.image.BufferedImage;
+
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.ui.overlay.infobox.Counter;
+
+public class BalanceCounter extends Counter
+{
+	@Getter
+	private final String name;
+
+	BalanceCounter(Plugin plugin, int count, String pName, BufferedImage image)
+	{
+		super(image, plugin, count);
+		name = pName;
+	}
+
+	@Override
+	public String getTooltip()
+	{
+		return name;
+	}
+}
+
+package com.cworldender;
+
+import com.google.inject.Provides;
+
+import java.util.HashSet;
+import java.util.Objects;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.HashMap;
+import javax.imageio.ImageIO;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.Actor;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
+import net.runelite.api.ScriptID;
+import net.runelite.api.Skill;
+import net.runelite.api.VarClientStr;
+import net.runelite.api.events.ActorDeath;
+import net.runelite.api.events.NpcDespawned;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.CommandExecuted;
+import net.runelite.api.events.ScriptPreFired;
+import net.runelite.api.events.HitsplatApplied;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.StatChanged;
+import net.runelite.client.RuneLite;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
+
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.io.File;
+import net.runelite.client.util.Text;
+
+
+@Slf4j
+@PluginDescriptor(
+	name = "Personal Currency Tracker"
+)
+public class PersonalCurrencyTrackerPlugin extends Plugin
+{
+
+	// Custom Image
+	private static final File CUSTOM_COIN_IMAGE = new File(RuneLite.RUNELITE_DIR, "coin.png");
+
+	// Collection Log Reward
+	private boolean notificationStarted;
+
+	// NPC Kill Reward
+	private HashMap<String, Integer> npcRewardsMap; // Stores NPC name -> kill reward with npc name in lowercase
+	private final Set<Actor> taggedActors = new HashSet<>();
+
+	// XP Reward
+	private HashMap<Skill, Integer> skillXPs = new HashMap<>();
+	private int ticksSinceLogin = 0; // Ticks since Login/Hop. Used to ignore StatChanges on login.
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private PersonalCurrencyTrackerConfig config;
+
+	@Inject
+	private InfoBoxManager infoBoxManager;
+	private BalanceCounter balanceBox;
+
+	@Inject
+	private ItemManager itemManager;
+
+	@Override
+	protected void startUp()
+	{
+		log.info("Personal Currency Tracker started!");
+		createInfoBox();
+		updateNPCKillRewardMap(config.npcKillRewards());
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		infoBoxManager.removeInfoBox(balanceBox);
+		notificationStarted = false;
+		taggedActors.clear();
+		log.info("Personal Currency Tracker stopped!");
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged)
+	{
+		if (configChanged.getGroup().equals(config.GROUP))
+		{
+			updateInfobox(config.balance());
+			updateNPCKillRewardMap(config.npcKillRewards());
+		}
+	}
+
+	private void incrementBalance(int amount)
+	{
+		config.setBalance(config.balance() + amount);
+	}
+
+	private void setBalance(int amount)
+	{
+		config.setBalance(amount);
+	}
+
+	@Subscribe
+	protected void onChatMessage(ChatMessage message)
+	{
+		// A large portion of this is very heavily inspired by the screenshot plugin
+		// https://github.com/runelite/runelite/blob/master/runelite-client/src/main/java/net/runelite/client/plugins/screenshot/ScreenshotPlugin.java
+		if (message.getType() != ChatMessageType.GAMEMESSAGE
+			&& message.getType() != ChatMessageType.SPAM
+			&& message.getType() != ChatMessageType.TRADE
+			&& message.getType() != ChatMessageType.FRIENDSCHATNOTIFICATION)
+		{
+			return;
+		}
+
+		String msg = message.getMessage();
+
+		// Clue completion
+		if (
+			config.useCaskets()
+			&& msg.contains("You have completed") && msg.contains("Treasure")
+		)
+		{
+			Pattern NUMBER_PATTERN = Pattern.compile("([0-9]+)");
+			Matcher m = NUMBER_PATTERN.matcher(Text.removeTags(msg));
+			if (m.find()){
+				String clueType = msg.substring(msg.lastIndexOf(m.group()) + m.group().length() + 1, msg.indexOf("Treasure") - 1);
+
+				// Honestly, there has got to be a better way
+				switch(clueType.toLowerCase()){
+					case "beginner":
+						incrementBalance(config.beginnerReward());
+						break;
+					case "easy":
+						incrementBalance(config.easyReward());
+						break;
+					case "medium":
+						incrementBalance(config.mediumReward());
+						break;
+					case "hard":
+						incrementBalance(config.hardReward());
+						break;
+					case "elite":
+						incrementBalance(config.eliteReward());
+						break;
+					case "master":
+						incrementBalance(config.masterReward());
+						break;
+					default:
+						break;
+				}
+			} else if (msg.startsWith("New item added to your collection log:") && config.collLogReward() != 0)
+			{
+				// String[] itemname = msg.split("New item added to your collection log: ")[1];
+				// New Collection log slot --> Update balance
+				incrementBalance(config.collLogReward());
+			}
+		}
+	}
+
+	@Subscribe
+	public void onScriptPreFired(ScriptPreFired scriptPreFired)
+	{
+		// Adapted from Screenshot plugin
+		// https://github.com/runelite/runelite/blob/master/runelite-client/src/main/java/net/runelite/client/plugins/screenshot/ScreenshotPlugin.java
+		switch (scriptPreFired.getScriptId())
+		{
+			case ScriptID.NOTIFICATION_START:
+				notificationStarted = true;
+				break;
+			case ScriptID.NOTIFICATION_DELAY:
+				if (!notificationStarted)
+				{
+					return;
+				}
+				String topText = client.getVarcStrValue(VarClientStr.NOTIFICATION_TOP_TEXT);
+				// String bottomText = client.getVarcStrValue(VarClientStr.NOTIFICATION_BOTTOM_TEXT);
+				if (topText.equalsIgnoreCase("Collection log") && config.collLogReward() != 0)
+				{
+					// String entry = Text.removeTags(bottomText).substring("New item:".length());
+					incrementBalance(config.collLogReward());
+				}
+				// if (topText.equalsIgnoreCase("Combat Task Completed!") && config.combatTaskReward() != 0 && client.getVarbitValue(Varbits.COMBAT_ACHIEVEMENTS_POPUP) == 0)
+				// {
+				// 	//String entry = Text.removeTags(bottomText).substring("Task Completed: ".length());
+				// 	incrementBalance(config.combatTaskReward());
+				// }
+				notificationStarted = false;
+				break;
+		}
+	}
+
+
+	@Subscribe
+	public void onActorDeath(ActorDeath actorDeath)
+	{
+		Actor actor = actorDeath.getActor();
+		if (actor instanceof Player)
+		{
+			Player player = (Player) actor;
+			if (player == client.getLocalPlayer())
+			{
+				incrementBalance(config.deathReward());
+			}
+		}
+
+		if(taggedActors.contains(actor)){
+			incrementBalance(
+				npcRewardsMap.getOrDefault(Objects.requireNonNull(actor.getName()).toLowerCase(), 0)
+			);
+			taggedActors.remove(actor);
+		}
+	}
+
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied hitsplatApplied){
+		Actor actor = hitsplatApplied.getActor();
+
+		if(actor != null && hitsplatApplied.getHitsplat().isMine() && npcRewardsMap.containsKey(actor.getName().toLowerCase())){
+			taggedActors.add((NPC) actor);
+		}
+	}
+
+	@Subscribe
+	public void onNpcDespawned(NpcDespawned npcDespawned)
+	{
+		taggedActors.remove(npcDespawned.getNpc());
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		switch(gameStateChanged.getGameState()){
+			case HOPPING:
+			case LOGGING_IN:
+				taggedActors.clear();
+				ticksSinceLogin = 0;
+				skillXPs.clear();
+		}
+	}
+	private void updateInfobox(int newCount)
+	{
+		if (balanceBox != null) { // Destroy the infopanel
+			infoBoxManager.removeInfoBox(balanceBox);
+		}
+		if (config.infopanel()) // Recreate infopanel if it should be shown
+		{
+			createInfoBox();
+		}
+	}
+
+	private void createInfoBox()
+	{
+		if (config.infopanel())
+		{
+			final BufferedImage image = getCoinImage();
+			balanceBox = new BalanceCounter(this, config.balance(), config.currencyName(), image);
+			infoBoxManager.addInfoBox(balanceBox);
+		}
+	}
+
+	private BufferedImage getCoinImage()
+	{
+		if (config.cointype() == CoinType.CUSTOM)
+		{
+			//Read in an image
+			try
+			{
+				BufferedImage image;
+				synchronized (ImageIO.class)
+				{
+					image = ImageIO.read(CUSTOM_COIN_IMAGE);
+				}
+				return image;
+			}
+			catch (IOException e)
+			{
+				log.error("error loading custom coin image", e);
+				//Will then fall into the second return statement, where by default then the id for normal coins is returned
+			}
+
+		}
+
+		return itemManager.getImage(getItemIdForCoin(config.cointype()), config.balance() * 100, false);
+	}
+
+	private int getItemIdForCoin(CoinType coin)
+	{
+	// TODO: Extract this into another class?
+		switch (coin)
+		{
+			case COINS:
+				return 995;
+			case BLOOD_MONEY:
+				return 13307;
+			case PURPLE_SWEETS:
+				return 10476;
+			case HALLOWED_MARK:
+				return 24711;
+			case MARK_OF_GRACE:
+				return 11849;
+			case COLLECTION_LOG:
+				return 	22711;
+			case PIECES_OF_EIGHT:
+				return 8951;
+			case GOLDEN_NUGGET:
+				return 12012;
+			case PLATINUM_TOKEN:
+				return 13204;
+			case TOKKUL:
+				return 6529;
+			case WARRIOR_GUILD_TOKEN:
+				return 8851;
+			default:
+				// Default to normal coins
+				return getItemIdForCoin(CoinType.COINS);
+		}
+	}
+
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted commandExecuted)
+	{
+		IntegerArgument arg = getIntegerFromCommandArguments(commandExecuted.getArguments());
+		switch (commandExecuted.getCommand().toLowerCase())
+		{
+			case "count":
+				client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "You have " + config.balance() + " " + config.currencyName(), null);
+				break;
+			case "add":
+				if (arg.isValid())
+				{
+					int increment = arg.getValue();
+					incrementBalance(increment);
+					client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "You now have " + config.balance() + " " + config.currencyName(), null);
+				}
+				break;
+			case "subtract":
+			case "remove":
+				if (arg.isValid())
+				{
+					int sub = Integer.parseInt(commandExecuted.getArguments()[0]);
+					incrementBalance(-sub);
+					client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "You now have " + config.balance() + " " + config.currencyName(), null);
+				}
+				break;
+			case "set":
+				if (arg.isValid())
+				{
+					int amount = Integer.parseInt(commandExecuted.getArguments()[0]);
+					setBalance(amount);
+					client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "You now have " + config.balance() + " " + config.currencyName(), null);
+				}
+				break;
+			case "clearxp":
+				config.setXpSinceReward(0);
+				client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "XP since last reward set to 0.", null);
+				break;
+			default:
+				break;
+		}
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged statChanged)
+	{
+		Skill skill = statChanged.getSkill();
+		int xp = statChanged.getXp();
+		if(ticksSinceLogin > 0)
+		{	// This statChange is not due to a login/hop
+			int deltaXP = xp - skillXPs.get(skill);
+			config.setXpSinceReward(config.xpSinceReward() + deltaXP);
+			// Update skill map for next iteration.
+			skillXPs.put(skill, xp);
+			// Reward if applicable
+			int xpSinceReward = config.xpSinceReward();
+			int xpRewardInterval = config.xpRewardInterval();
+			if(xpRewardInterval > 0 && xpSinceReward >= xpRewardInterval){
+				int numRewards = xpSinceReward / xpRewardInterval; // Integer-Division
+				int reward = numRewards * config.xpReward();
+				incrementBalance(numRewards * config.xpReward());
+				int newBalance = config.balance();
+				int remainingXP = xpSinceReward % xpRewardInterval;
+				config.setXpSinceReward(remainingXP);
+			}
+		} else { // Init/Update the Hashmap to calculate the delta XP's
+			skillXPs.put(statChanged.getSkill(), statChanged.getXp());
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick gameTick){
+		ticksSinceLogin++;
+	}
+
+	private IntegerArgument getIntegerFromCommandArguments(String[] args)
+	{
+		if (args.length == 0)
+		{
+			return new IntegerArgument(0, false);
+		}
+		String firstArg = args[0];
+		try
+		{
+			return new IntegerArgument(Integer.parseInt(firstArg), true);
+		}
+		catch (NumberFormatException e)
+		{
+			log.error("Malformed Argument for a PersonalCurrencyTracker Command");
+			return new IntegerArgument(0, false);
+		}
+	}
+
+	private class IntegerArgument
+	{
+		private final boolean valid;
+		private final int value;
+
+		public IntegerArgument(int val, boolean isValid)
+		{
+			valid = isValid;
+			value = val;
+		}
+
+		public boolean isValid()
+		{
+			return valid;
+		}
+
+		public int getValue()
+		{
+			return value;
+		}
+	}
+
+	private void updateNPCKillRewardMap(String configStr) throws IllegalArgumentException{
+		/*
+		 * configStr is a string of comma-separated 'npc-name#kill-reward' pairs.
+		 * Turn this into hashmap mapping name to reward.
+		 */
+
+		HashMap<String, Integer> tempMap = new HashMap<>(); // We don't just want to write over the previous map in case items were deleted
+		if(!configStr.equals("")){
+			String[] pairs = configStr.split(",");
+			for (String s : pairs)
+			{
+				if(s.contains("#")){
+					String[] pair = s.trim().toLowerCase().split("#");
+					if (pair.length != 2)
+					{
+						String msg = "PersonalCurrencyTracker: An (NPC, Kill-Reward) pair has more than 2 components!";
+						log.error(msg);
+						throw new IllegalArgumentException(msg);
+					}
+					else
+					{
+						tempMap.put(pair[0].trim(), Integer.parseInt(pair[1].trim()));
+					}
+				}
+			}
+		}
+		npcRewardsMap = tempMap;
+	}
+
+	@Provides
+	PersonalCurrencyTrackerConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(PersonalCurrencyTrackerConfig.class);
+	}
+}
+
+
+
+
+package com.cworldender;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
+
+@ConfigGroup(PersonalCurrencyTrackerConfig.GROUP)
+public interface PersonalCurrencyTrackerConfig extends Config
+{
+	String GROUP = "personalcurrencytracker";
+
+	@ConfigItem(
+		keyName = "currencyName",
+		name = "Currency Name",
+		description = "The name of your made up currency."
+	)
+	default String currencyName()
+	{
+		return "ChunkCoin";
+	}
+
+	@ConfigItem(
+		keyName = "balance",
+		name = "Balance",
+		description = "How much money do you have?"
+	)
+	default int balance()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "balance",
+		name = "Balance",
+		description = "How much money do you have?"
+	)
+	void setBalance(int balance);
+
+	@ConfigItem(
+		keyName = "cointype",
+		name = "Coin Type",
+		description = "The type of coin to use as your Currency"
+	)
+	default CoinType cointype()
+	{
+		return CoinType.BLOOD_MONEY;
+	}
+
+	@ConfigItem(
+		keyName = "infopanel",
+		name = "Info Panel",
+		description = "Show the info panel"
+	)
+	default boolean infopanel()
+	{
+		return true;
+	}
+
+
+	@ConfigSection(
+		name = "Casket Rewards",
+		description = "Set your coins to be automatically updated when you open caskets.",
+		closedByDefault = true,
+		position = 1
+	)
+	String casketsSection = "casketsSection";
+
+	@ConfigItem(
+		keyName = "useCaskets",
+		name = "Update on Clue Caskets",
+		description = "Update Currency on Clue Casket Opens",
+		section = casketsSection,
+		position = -2
+	)
+	default boolean useCaskets()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "beginnerReward",
+		name = "Beginner Reward",
+		description = "Reward for opening a Beginner Casket",
+		section = casketsSection,
+		position = 0
+	)
+	default int beginnerReward()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "easyReward",
+		name = "Easy Reward",
+		description = "Reward for opening a Easy Casket",
+		section = casketsSection,
+		position = 1
+	)
+	default int easyReward()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "mediumReward",
+		name = "Medium Reward",
+		description = "Reward for opening a Medium Casket",
+		section = casketsSection,
+		position = 2
+	)
+	default int mediumReward()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "hardReward",
+		name = "Hard Reward",
+		description = "Reward for opening a Hard Casket",
+		section = casketsSection,
+		position = 3
+	)
+	default int hardReward()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "eliteReward",
+		name = "Elite Reward",
+		description = "Reward for opening a Elite Casket",
+		section = casketsSection,
+		position = 4
+	)
+	default int eliteReward()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "masterReward",
+		name = "Master Reward",
+		description = "Reward for opening a Master Casket",
+		section = casketsSection,
+		position = 5
+	)
+	default int masterReward()
+	{
+		return 0;
+	}
+
+	@ConfigSection(
+		name = "Miscellaneous Rewards",
+		description = "Set your coins to be automatically updated misc. events.",
+		closedByDefault = true,
+		position = 2
+	)
+	String miscEventsSection = "miscEventsSection";
+
+	@ConfigItem(
+		keyName = "collLogReward",
+		name = "Collection Log Reward",
+		description = "Reward for any new collection log slot filled.",
+		section = miscEventsSection,
+		position = 0
+	)
+	default int collLogReward(){
+		return 0;
+	}
+
+	@Range(
+		min = Integer.MIN_VALUE,
+		max = Integer.MAX_VALUE
+	)
+	@ConfigItem(
+		keyName = "deathReward",
+		name = "Reward for Player Death",
+		description = "Reward for dying (typically negative)",
+		section = miscEventsSection,
+		position = 1
+	)
+	default int deathReward(){
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "npcKillRewards",
+		name = "Reward for NPC Kills",
+		description = "Reward for killing an NPC. Formatted as comma-separated list of npc-name#reward pairs.",
+		section = miscEventsSection,
+		position = 2
+	)
+	default String npcKillRewards(){ return ""; }
+
+	@ConfigItem(
+		keyName = "xpSinceReward",
+		name = "XP Elapsed since last Reward. Do not touch",
+		description = "",
+		hidden = true
+	)
+	default int xpSinceReward(){ return 0; }
+
+	@ConfigItem(
+		keyName = "xpSinceReward",
+		name = "XP Elapsed since last Reward. Do not touch",
+		description = "",
+		hidden = true
+	)
+	void setXpSinceReward(int xpSinceReward);
+
+	@ConfigSection(
+		name = "XP Reward",
+		description = "Config Items for XP Reward",
+		closedByDefault = true,
+		position = 3
+	)
+	String xpSection = "xpSection";
+
+	@ConfigItem(
+		keyName = "xpRewardInterval",
+		name = "XP Reward Interval",
+		description = "Reward Coins every x XP. If set to 0, no rewards will take place (But the accumulated XP will still be counted).",
+		section = xpSection
+	)
+	default int xpRewardInterval(){ return 0; }
+
+	@ConfigItem(
+		keyName = "xpReward",
+		name = "XP Reward",
+		description = "The amount of coins to reward.",
+		section = xpSection
+	)
+	default int xpReward(){ return 0; }
+
+
+// Removed until I figure out how to find out the different images for one type of item. Ideally getting an array of all different coin stacks for one type of coin, then just figure out which image to choose
+//	@ConfigItem(
+//			keyName = "thresholds",
+//			name = "Coin Stack Change Thresholds",
+//			description = "Thresholds for changing the coin stack image as comma-seperated list of integers (Not applicable if Custom Image is selected)"
+//	)
+//	default String thresholds(){ return "1,2,3,4,5,10,15,30,100";}
+}
+

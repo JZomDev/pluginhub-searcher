@@ -1,0 +1,3017 @@
+package io.droptracker;
+
+import io.droptracker.DropTrackerPlugin;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class DropTrackerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(DropTrackerPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package io.droptracker.util;
+
+
+import com.google.gson.Gson;
+import com.google.gson.annotations.SerializedName;
+import com.google.gson.reflect.TypeToken;
+import lombok.AccessLevel;
+import lombok.Data;
+import lombok.Setter;
+import lombok.Value;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ItemComposition;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemVariationMapping;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.BufferedReader;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.OptionalDouble;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Singleton
+public class Rarity {
+    private final Map<String, Collection<Drop>> dropsByNpcName = new HashMap<>(1024);
+    private @Inject Gson gson;
+    private @Inject ItemManager itemManager;
+    public static final double EPSILON = 0.00001;
+    private static final int[] FACTORIALS;
+
+    @Inject
+    void init() {
+        Map<String, List<RawDrop>> raw;
+        try (InputStream is = getClass().getResourceAsStream("/npc_drops.json");
+             Reader reader = new BufferedReader(new InputStreamReader(Objects.requireNonNull(is)))) {
+            raw = gson.fromJson(reader,
+                    new TypeToken<Map<String, List<RawDrop>>>() {}.getType());
+        } catch (Exception e) {
+            log.error("Failed to read monster drop rates", e);
+            return;
+        }
+
+        raw.forEach((npcName, rawDrops) -> {
+            List<Drop> drops = rawDrops.stream()
+                    .map(RawDrop::transform)
+                    .flatMap(Collection::stream)
+                    .collect(Collectors.toList());
+            dropsByNpcName.put(npcName, drops);
+        });
+    }
+
+    public OptionalDouble getRarity(String npcName, int itemId, int quantity) {
+        ItemComposition composition = itemId >= 0 ? itemManager.getItemComposition(itemId) : null;
+        int canonical = composition != null && composition.getNote() != -1 ? composition.getLinkedNoteId() : itemId;
+        String itemName = composition != null ? composition.getMembersName() : "";
+        Collection<Integer> variants = new HashSet<>(
+                ItemVariationMapping.getVariations(ItemVariationMapping.map(canonical))
+        );
+        return dropsByNpcName.getOrDefault(npcName, Collections.emptyList())
+                .stream()
+                .filter(drop -> drop.getMinQuantity() <= quantity && quantity <= drop.getMaxQuantity())
+                .filter(drop -> {
+                    int id = drop.getItemId();
+                    if (id == itemId) return true;
+                    return variants.contains(id) && itemName.equals(itemManager.getItemComposition(id).getMembersName());
+                })
+                .mapToDouble(Drop::getProbability)
+                .reduce(Double::sum);
+    }
+
+    @Value
+    private static class Drop {
+        int itemId;
+        int minQuantity;
+        int maxQuantity;
+        double probability;
+    }
+
+    @Data
+    @Setter(AccessLevel.PRIVATE)
+    private static class RawDrop {
+        private @SerializedName("i") int itemId;
+        private @SerializedName("r") Integer rolls;
+        private @SerializedName("d") double denominator;
+        private @SerializedName("q") Integer quantity;
+        private @SerializedName("m") Integer quantMin;
+        private @SerializedName("n") Integer quantMax;
+
+        Collection<Drop> transform() {
+            int rounds = rolls != null ? rolls : 1;
+            int min = quantMin != null ? quantMin : quantity;
+            int max = quantMax != null ? quantMax : quantity;
+            double prob = 1 / denominator;
+
+            if (rounds == 1) {
+                return List.of(new Drop(itemId, min, max, prob));
+            }
+            List<Drop> drops = new ArrayList<>(rounds);
+            for (int successCount = 1; successCount <= rounds; successCount++) {
+                double density = binomialProbability(prob, rounds, successCount);
+                drops.add(new Drop(itemId, min * successCount, max * successCount, density));
+            }
+            return drops;
+        }
+        public double binomialProbability(double p, int nTrials, int kSuccess) {
+            // https://en.wikipedia.org/wiki/Binomial_distribution#Probability_mass_function
+            return binomialCoefficient(nTrials, kSuccess) * Math.pow(p, kSuccess) * Math.pow(1 - p, nTrials - kSuccess);
+        }
+        private int binomialCoefficient(int n, int k) {
+            assert n < FACTORIALS.length && k <= n && k >= 0;
+            return FACTORIALS[n] / (FACTORIALS[k] * FACTORIALS[n - k]); // https://en.wikipedia.org/wiki/nCk
+        }
+    }
+
+    static {
+        // precompute factorials from 0 to 9 for n-choose-k formula
+        int n = 10; // max rolls in npc_drops.json is 9 (for Bloodthirsty Leagues IV tier 5 relic)
+        int[] facts = new int[n];
+        facts[0] = 1; // 0! = 1
+        for (int i = 1; i < n; i++) {
+            facts[i] = i * facts[i - 1];
+        }
+        FACTORIALS = facts;
+    }
+}
+
+package io.droptracker.util;
+/* Author: https://github.com/pajlads/DinkPlugin */
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+import io.droptracker.models.Drop;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.NPC;
+import net.runelite.api.NpcID;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.events.PlayerLootReceived;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.plugins.chatcommands.ChatCommandsPlugin;
+import net.runelite.client.plugins.loottracker.LootReceived;
+import net.runelite.client.plugins.loottracker.LootTrackerConfig;
+import net.runelite.client.plugins.loottracker.LootTrackerPlugin;
+import net.runelite.http.api.loottracker.LootRecordType;
+import org.apache.commons.lang3.StringUtils;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Map;
+import java.util.OptionalDouble;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@Singleton
+public class KCService {
+
+    public static final String GAUNTLET_NAME = "Gauntlet", GAUNTLET_BOSS = "Crystalline Hunllef";
+    public static final String CG_NAME = "Corrupted Gauntlet", CG_BOSS = "Corrupted Hunllef";
+    private static final String TOA = "Tombs of Amascut";
+    private static final String TOB = "Theatre of Blood";
+    private static final String COX = "Chambers of Xeric";
+
+
+    private static final String RL_CHAT_CMD_PLUGIN_NAME = ChatCommandsPlugin.class.getSimpleName().toLowerCase();
+    private static final String RL_LOOT_PLUGIN_NAME = LootTrackerPlugin.class.getSimpleName().toLowerCase();
+    private static final Pattern CLUE_SCROLL_REGEX = Pattern.compile("You have completed (?<scrollCount>\\d+) (?<scrollType>\\w+) Treasure Trails\\.");
+
+    @Inject
+    private static ConfigManager configManager;
+
+    private ChatMessageEvent chatMessageEventHandler;
+
+    @Inject
+    private static Gson gson;
+
+    @Inject
+    private ScheduledExecutorService executor;
+
+    @Inject
+    private static Rarity rarityService;
+
+    private static final Cache<String, Integer> killCounts = CacheBuilder.newBuilder()
+            .expireAfterAccess(10, TimeUnit.MINUTES)
+            .maximumSize(64L)
+            .build();
+
+    @Getter
+    @Nullable
+    protected static Drop lastDrop = null;
+
+    public void reset() {
+        this.lastDrop = null;
+        this.killCounts.invalidateAll();
+    }
+
+    public void onNpcKill(NpcLootReceived event) {
+        NPC npc = event.getNpc();
+        int id = npc.getId();
+        if (id == NpcID.THE_WHISPERER || id == NpcID.THE_WHISPERER_12205 || id == NpcID.THE_WHISPERER_12206 || id == NpcID.THE_WHISPERER_12207) {
+            // Upstream does not fire NpcLootReceived for the whisperer, since they do not hold a reference to the NPC.
+            // So, we use LootReceived instead (and return here just in case they change their implementation).
+            return;
+        }
+
+        String name = npc.getName();
+        if (GAUNTLET_BOSS.equals(name) || CG_BOSS.equals(name)) {
+            // already handled by onGameMessage
+            return;
+        }
+        if (name != null) {
+            this.incrementKills(LootRecordType.NPC, name, event.getItems());
+        }
+    }
+
+    public void onPlayerKill(PlayerLootReceived event) {
+        String name = event.getPlayer().getName();
+        if (name != null) {
+            this.incrementKills(LootRecordType.PLAYER, name, event.getItems());
+        }
+    }
+
+    public void onLoot(LootReceived event) {
+        boolean increment;
+        switch (event.getType()) {
+            case NPC:
+                // Special case: upstream fires LootReceived for the whisperer, but not NpcLootReceived
+                increment = "The Whisperer".equalsIgnoreCase(event.getName());
+                break;
+            case PLAYER:
+                increment = false; // handled by PlayerLootReceived
+                break;
+            default:
+                increment = true;
+                break;
+        }
+
+        if (increment) {
+            this.incrementKills(event.getType(), getStandardizedSource(event), event.getItems());
+        }
+    }
+
+    public void onGameMessage(String message) {
+        // update cached clue casket count
+        Map.Entry<String, Integer> clue = parseClue(message);
+        if (clue != null) {
+            String tier = ucFirst(clue.getKey());
+            int count = clue.getValue() - 1; // decremented since onLoot will increment
+            killCounts.put("Clue Scroll (" + tier + ")", count);
+            return;
+        }
+
+        chatMessageEventHandler.parseBoss(message).ifPresent(pair -> {
+            String boss = pair.getKey();
+            Integer kc = pair.getValue();
+
+            // Update cache. We store kc - 1 since onNpcLootReceived will increment; kc - 1 + 1 == kc
+            String cacheKey = getCacheKey(LootRecordType.UNKNOWN, boss);
+            killCounts.asMap().merge(cacheKey, kc - 1, Math::max);
+
+            if (boss.equals(GAUNTLET_BOSS) || boss.equals(CG_BOSS) || boss.startsWith(TOA) || boss.startsWith(TOB) || boss.startsWith(COX)) {
+                // populate lastDrop to workaround loot tracker quirks
+                this.lastDrop = new Drop(boss, LootRecordType.EVENT, Collections.emptyList());
+
+                if (!ConfigUtilities.isPluginDisabled(configManager, RL_LOOT_PLUGIN_NAME)) {
+                    // onLoot will already increment kc, no need to schedule task below.
+                    // this early return also simplifies our test code
+                    return;
+                }
+            }
+
+            // However: we don't know if boss message appeared before/after the loot event.
+            // If after, we should store kc. If before, we should store kc - 1.
+            // Given this uncertainty, we wait so that the loot event has passed, and then we can store latest kc.
+            executor.schedule(() -> {
+                killCounts.asMap().merge(cacheKey, kc, Math::max);
+            }, 15, TimeUnit.SECONDS);
+        });
+    }
+
+    public String getStandardizedSource(LootReceived event) {
+        if (isCorruptedGauntlet(event)) {
+            return KCService.CG_NAME;
+        } else if (lastDrop != null && shouldUseChatName(event)) {
+            return lastDrop.getSource(); // distinguish entry/expert/challenge modes
+        }
+        return event.getName();
+    }
+
+    private boolean shouldUseChatName(LootReceived event) {
+        assert lastDrop != null;
+        String lastSource = lastDrop.getSource();
+        Predicate<String> coincides = source -> source.equals(event.getName()) && lastSource.startsWith(source);
+        return coincides.test(TOA) || coincides.test(TOB) || coincides.test(COX);
+    }
+
+    /**
+     * @param event a loot received event that was just fired
+     * @return whether the event represents corrupted gauntlet
+     * @apiNote Useful to distinguish normal vs. corrupted gauntlet since the base loot tracker plugin does not,
+     * which was <a href="https://github.com/pajlads/DinkPlugin/issues/469">reported</a> to our issue tracker.
+     */
+    private boolean isCorruptedGauntlet(LootReceived event) {
+        return event.getType() == LootRecordType.EVENT && lastDrop != null && "The Gauntlet".equals(event.getName())
+                && (CG_NAME.equals(lastDrop.getSource()) || CG_BOSS.equals(lastDrop.getSource()));
+    }
+
+    @Nullable
+    public static Integer getKillCount(LootRecordType type, String sourceName) {
+        if (sourceName == null) return null;
+        Integer stored = getStoredKillCount(type, sourceName);
+        if (stored != null) {
+            return killCounts.asMap().merge(getCacheKey(type, sourceName), stored, Math::max);
+        }
+        return killCounts.getIfPresent(getCacheKey(type, sourceName));
+    }
+
+    private void incrementKills(@NotNull LootRecordType type, @NotNull String sourceName, @NotNull Collection<ItemStack> items) {
+        String cacheKey = getCacheKey(type, sourceName);
+        killCounts.asMap().compute(cacheKey, (key, cachedKc) -> {
+            if (cachedKc != null) {
+                // increment kill count
+                return cachedKc + 1;
+            } else {
+                // pull kc from loot tracker or chat commands plugin
+                Integer kc = getStoredKillCount(type, sourceName);
+                // increment if found
+                return kc != null ? kc + 1 : null;
+            }
+        });
+        this.lastDrop = new Drop(sourceName, type, items);
+    }
+
+    /**
+     * @param type       {@link LootReceived#getType()}
+     * @param sourceName {@link NPC#getName()} or {@link LootReceived#getName()}
+     * @return the kill count stored by base runelite plugins
+     */
+    @Nullable
+    private static Integer getStoredKillCount(@NotNull LootRecordType type, @NotNull String sourceName) {
+        // get kc from base runelite chat commands plugin (if enabled)
+        if (!ConfigUtilities.isPluginDisabled(configManager, RL_CHAT_CMD_PLUGIN_NAME)) {
+            Integer kc = configManager.getRSProfileConfiguration("killcount", cleanBossName(sourceName), int.class);
+            if (kc != null) {
+                return kc - 1; // decremented since chat event typically occurs before loot event
+            }
+        }
+
+        if (ConfigUtilities.isPluginDisabled(configManager, RL_LOOT_PLUGIN_NAME)) {
+            // assume stored kc is useless if loot tracker plugin is disabled
+            return null;
+        }
+        String json = configManager.getConfiguration(LootTrackerConfig.GROUP,
+                configManager.getRSProfileKey(),
+                "drops_" + type + "_" + sourceName
+        );
+        if (json == null) {
+            // no kc stored implies first kill
+            return 0;
+        }
+        try {
+            int kc = gson.fromJson(json, SerializedDrop.class).getKills();
+
+            // loot tracker doesn't count kill if no loot - https://github.com/runelite/runelite/issues/5077
+            OptionalDouble nothingProbability = rarityService.getRarity(sourceName, -1, 0);
+            if (nothingProbability.isPresent() && nothingProbability.getAsDouble() < 1.0) {
+                // estimate the actual kc (including kills with no loot)
+                kc = (int) Math.round(kc / (1 - nothingProbability.getAsDouble()));
+            }
+
+            return kc;
+        } catch (JsonSyntaxException e) {
+            // should not occur unless loot tracker changes stored loot POJO structure
+            log.warn("Failed to read kills from loot tracker config", e);
+            return null;
+        }
+    }
+
+    /**
+     * @param boss {@link LootReceived#getName()}
+     * @return lowercase boss name that {@link ChatCommandsPlugin} uses during serialization
+     */
+    private static String cleanBossName(String boss) {
+        if ("The Gauntlet".equalsIgnoreCase(boss)) return "gauntlet";
+        if ("The Leviathan".equalsIgnoreCase(boss)) return "leviathan";
+        if ("The Whisperer".equalsIgnoreCase(boss)) return "whisperer";
+        if (boss.startsWith("Barrows")) return "barrows chests";
+        if (boss.endsWith("Hallowed Sepulchre)")) return "hallowed sepulchre";
+        if (boss.endsWith("Tempoross)")) return "tempoross";
+        if (boss.endsWith("Wintertodt)")) return "wintertodt";
+        return StringUtils.remove(boss.toLowerCase(), ':');
+    }
+
+    private static String getCacheKey(@NotNull LootRecordType type, @NotNull String sourceName) {
+        switch (type) {
+            case PICKPOCKET:
+                return "pickpocket_" + sourceName;
+            case PLAYER:
+                return "player_" + sourceName;
+            default:
+                if ("The Gauntlet".equals(sourceName)) return GAUNTLET_BOSS;
+                if (CG_NAME.equals(sourceName)) return CG_BOSS;
+                return sourceName;
+        }
+    }
+    @Nullable
+    public static Map.Entry<String, Integer> parseClue(String gameMessage) {
+        Matcher clueMatcher = CLUE_SCROLL_REGEX.matcher(gameMessage);
+        if (!clueMatcher.find()) return null;
+        String tier = clueMatcher.group("scrollType");
+        String count = clueMatcher.group("scrollCount");
+        return Map.entry(tier, Integer.parseInt(count));
+    }
+
+    public String ucFirst(@NotNull String text) {
+        if (text.length() < 2) return text.toUpperCase();
+        return Character.toUpperCase(text.charAt(0)) + text.substring(1).toLowerCase();
+    }
+}
+
+package io.droptracker.util;
+
+/* Author: Dink Plugin */
+
+import lombok.AccessLevel;
+import lombok.Data;
+import lombok.Setter;
+
+/**
+ * Contains kill count observed by base runelite loot tracker plugin, stored in profile configuration.
+ *
+ * @see <a href="https://github.com/runelite/runelite/blob/master/runelite-client/src/main/java/net/runelite/client/plugins/loottracker/ConfigLoot.java#L41">RuneLite class</a>
+ */
+@Data
+@Setter(AccessLevel.PRIVATE)
+public class SerializedDrop {
+    private int kills;
+}
+
+package io.droptracker.util;
+
+import com.google.common.collect.ImmutableSet;
+import io.droptracker.models.CustomWebhookBody;
+import lombok.experimental.UtilityClass;
+import net.runelite.api.Client;
+import net.runelite.api.InventoryID;
+import net.runelite.api.Item;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.ItemID;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.game.ItemVariationMapping;
+import net.runelite.client.util.QuantityFormatter;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.*;
+import java.util.function.BinaryOperator;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static net.runelite.api.ItemID.*;
+
+@UtilityClass
+public class ItemUtilities {
+
+    final String ITEM_CACHE_BASE_URL = "https://static.runelite.net/cache/item/";
+
+    public final Collection<Integer> COIN_VARIATIONS = new HashSet<>(ItemVariationMapping.getVariations(ItemID.COINS));
+
+    private final Set<Integer> NEVER_KEPT_ITEMS = ImmutableSet.of(
+            CLUE_BOX, LOOTING_BAG, FLAMTAER_BAG, JAR_GENERATOR,
+            AMULET_OF_THE_DAMNED, RING_OF_CHAROS, RING_OF_CHAROSA,
+            BRACELET_OF_ETHEREUM, BRACELET_OF_ETHEREUM_UNCHARGED,
+            AVAS_ACCUMULATOR, AVAS_ATTRACTOR, MAGIC_SECATEURS, MAGIC_BUTTERFLY_NET,
+            COOKING_GAUNTLETS, GOLDSMITH_GAUNTLETS, CHAOS_GAUNTLETS, STEEL_GAUNTLETS,
+            SILLY_JESTER_HAT, SILLY_JESTER_TOP, SILLY_JESTER_TIGHTS, SILLY_JESTER_BOOTS,
+            LUNAR_HELM, LUNAR_TORSO, LUNAR_LEGS, LUNAR_GLOVES, LUNAR_BOOTS,
+            LUNAR_CAPE, LUNAR_AMULET, LUNAR_RING, LUNAR_STAFF,
+            SHATTERED_RELICS_ADAMANT_TROPHY, SHATTERED_RELICS_BRONZE_TROPHY, SHATTERED_RELICS_DRAGON_TROPHY,
+            SHATTERED_RELICS_IRON_TROPHY, SHATTERED_RELICS_MITHRIL_TROPHY, SHATTERED_RELICS_RUNE_TROPHY, SHATTERED_RELICS_STEEL_TROPHY,
+            TRAILBLAZER_ADAMANT_TROPHY, TRAILBLAZER_BRONZE_TROPHY, TRAILBLAZER_DRAGON_TROPHY, TRAILBLAZER_IRON_TROPHY,
+            TRAILBLAZER_MITHRIL_TROPHY, TRAILBLAZER_RUNE_TROPHY, TRAILBLAZER_STEEL_TROPHY,
+            TWISTED_ADAMANT_TROPHY, TWISTED_BRONZE_TROPHY, TWISTED_DRAGON_TROPHY, TWISTED_IRON_TROPHY,
+            TWISTED_MITHRIL_TROPHY, TWISTED_RUNE_TROPHY, TWISTED_STEEL_TROPHY
+    );
+
+    private final BinaryOperator<Item> SUM_ITEM_QUANTITIES = (a, b) -> new Item(a.getId(), a.getQuantity() + b.getQuantity());
+    private final BinaryOperator<ItemStack> SUM_ITEM_STACK_QUANTITIES = (a, b) -> new ItemStack(a.getId(), a.getQuantity() + b.getQuantity());
+
+    public boolean isItemNeverKeptOnDeath(int itemId) {
+        return NEVER_KEPT_ITEMS.contains(itemId);
+    }
+
+
+    public Collection<Item> getItems(Client client) {
+        return Stream.of(InventoryID.INVENTORY, InventoryID.EQUIPMENT)
+                .map(client::getItemContainer)
+                .filter(Objects::nonNull)
+                .map(ItemContainer::getItems)
+                .flatMap(Arrays::stream)
+                .filter(Objects::nonNull)
+                .filter(item -> item.getId() >= 0) // -1 implies empty slot
+                .collect(Collectors.toList());
+    }
+
+    public <K, V> Map<K, V> reduce(@NotNull Iterable<V> items, Function<V, K> deriveKey, BinaryOperator<V> aggregate) {
+        final Map<K, V> map = new LinkedHashMap<>();
+        items.forEach(v -> map.merge(deriveKey.apply(v), v, aggregate));
+        return map;
+    }
+
+    public Map<Integer, Item> reduceItems(@NotNull Iterable<Item> items) {
+        return reduce(items, Item::getId, SUM_ITEM_QUANTITIES);
+    }
+
+    @NotNull
+    public Collection<ItemStack> reduceItemStack(@NotNull Iterable<ItemStack> items) {
+        return reduce(items, ItemStack::getId, SUM_ITEM_STACK_QUANTITIES).values();
+    }
+
+    public String getItemImageUrl(int itemId) {
+        return ITEM_CACHE_BASE_URL + "icon/" + itemId + ".png";
+    }
+
+    public String getNpcImageUrl(int npcId) {
+        return String.format("https://chisel.weirdgloop.org/static/img/osrs-npc/%d_128.png", npcId);
+    }
+
+    private static Collection<ItemStack> stack(Collection<ItemStack> items) {
+        final List<ItemStack> list = new ArrayList<>();
+
+        for (final ItemStack item : items) {
+            int quantity = 0;
+            for (final ItemStack i : list) {
+                if (i.getId() == item.getId()) {
+                    quantity = i.getQuantity();
+                    list.remove(i);
+                    break;
+                }
+            }
+            if (quantity > 0) {
+                list.add(new ItemStack(item.getId(), item.getQuantity() + quantity, item.getLocation()));
+            } else {
+                list.add(item);
+            }
+        }
+
+        return list;
+    }
+
+}
+
+package io.droptracker.util;
+
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.io.Reader;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
+
+/**
+ * This thread-safe singleton holds a mapping of item names to their item id, using the RuneLite API.
+ * <p>
+ * Unlike {@link net.runelite.client.game.ItemManager#search(String)}, this mapping supports untradable items.
+ *
+ * Author: iProdigy ( https://github.com/pajlads/DinkPlugin )
+ */
+
+@Slf4j
+@Singleton
+public class ItemIDSearch {
+    final String ITEM_CACHE_BASE_URL = "https://static.runelite.net/cache/item/";
+    private final Map<String, Integer> itemIdByName = Collections.synchronizedMap(new HashMap<>(16384));
+    private @Inject OkHttpClient httpClient;
+    private @Inject Gson gson;
+
+    /**
+     * @param name the exact in-game name of an item
+     * @return the id associated with the item name, or null if not found
+     */
+    @Nullable
+    public Integer findItemId(@NotNull String name) {
+        return itemIdByName.get(name);
+    }
+
+    /**
+     * Begins the initialization process for {@link #itemIdByName}
+     * by querying item names and noted item ids from the RuneLite API,
+     * before passing them to {@link #populate(Map, Set)}
+     *
+     * @implNote This operation does not block the current thread,
+     * by utilizing OkHttp's thread pool and Java's Fork-Join common pool.
+     */
+    @Inject
+    void init() {
+        queryNamesById()
+                .thenAcceptBothAsync(
+                        queryNotedItemIds().exceptionally(e -> {
+                            log.error("Failed to read noted items", e);
+                            return Collections.emptySet();
+                        }),
+                        this::populate
+                )
+                .exceptionally(e -> {
+                    log.error("Failed to read item names", e);
+                    return null;
+                });
+    }
+
+    /**
+     * Populates {@link #itemIdByName} with the inverted mappings of {@code namesById},
+     * while skipping noted items specified in {@code notedIds}.
+     *
+     * @param namesById a mapping of item id's to the corresponding in-game name
+     * @param notedIds  the id's of noted items
+     * @implNote When multiple non-noted item id's have the same in-game name, only the earliest id is saved
+     */
+    @VisibleForTesting
+    void populate(@NotNull Map<Integer, String> namesById, @NotNull Set<Integer> notedIds) {
+        namesById.forEach((id, name) -> {
+            if (!notedIds.contains(id))
+                itemIdByName.putIfAbsent(name, id);
+        });
+
+        log.debug("Completed initialization of item cache with {} entries", itemIdByName.size());
+    }
+
+    /**
+     * @return a mapping of item ids to their in-game names, provided by the RuneLite API
+     */
+    private CompletableFuture<Map<Integer, String>> queryNamesById() {
+        return queryCache("names.json", new TypeToken<Map<Integer, String>>() {});
+    }
+
+    /**
+     * @return a set of id's of noted items, provided by the RuneLite API
+     */
+    private CompletableFuture<Set<Integer>> queryNotedItemIds() {
+        return queryCache("notes.json", new TypeToken<Map<Integer, Integer>>() {})
+                .thenApply(Map::keySet);
+    }
+
+    /**
+     * @param fileName the name of the file to query from RuneLite's cache
+     * @param type     a type token that indicates how the json response should be parsed
+     * @return the transformed cache response, wrapped in a future
+     */
+    private <T> CompletableFuture<T> queryCache(@NotNull String fileName, @NotNull TypeToken<T> type) {
+        return readJson(httpClient, gson, ITEM_CACHE_BASE_URL + fileName, type);
+    }
+    public <T> CompletableFuture<T> readJson(@NotNull OkHttpClient httpClient, @NotNull Gson gson, @NotNull String url, @NotNull TypeToken<T> type) {
+        return readUrl(httpClient, url, reader -> gson.fromJson(reader, type.getType()));
+    }
+    public <T> CompletableFuture<T> readUrl(@NotNull OkHttpClient httpClient, @NotNull String url, @NotNull Function<Reader, T> transformer) {
+        CompletableFuture<T> future = new CompletableFuture<>();
+        Request request = new Request.Builder().url(url).build();
+        httpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(@NotNull Call call, @NotNull IOException e) {
+                future.completeExceptionally(e);
+            }
+
+            @Override
+            public void onResponse(@NotNull Call call, @NotNull Response response) {
+                assert response.body() != null;
+                try (Reader reader = response.body().charStream()) {
+                    future.complete(transformer.apply(reader));
+                } catch (Exception e) {
+                    future.completeExceptionally(e);
+                } finally {
+                    response.close();
+                }
+            }
+        });
+        return future;
+    }
+}
+
+package io.droptracker.util;
+
+import com.google.common.collect.ImmutableMap;
+import com.google.inject.Inject;
+import io.droptracker.DropTrackerConfig;
+import io.droptracker.models.BossNotification;
+import io.droptracker.DropTrackerPlugin;
+import io.droptracker.models.CombatAchievement;
+import io.droptracker.models.CustomWebhookBody;
+import io.droptracker.models.Drop;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.annotations.Varbit;
+import net.runelite.api.annotations.Varp;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.InterfaceID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.plugins.chatcommands.ChatCommandsPlugin;
+import net.runelite.client.plugins.loottracker.LootTrackerPlugin;
+import net.runelite.http.api.loottracker.LootRecordType;
+import org.apache.commons.lang3.ObjectUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.tuple.Pair;
+import org.apache.commons.lang3.tuple.Triple;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+import org.jetbrains.annotations.VisibleForTesting;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.time.LocalTime;
+import java.time.temporal.Temporal;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+import static java.time.temporal.ChronoField.*;
+import static org.apache.commons.lang3.ObjectUtils.defaultIfNull;
+
+@Slf4j
+public class ChatMessageEvent {
+    @Inject
+    private final DropTrackerPlugin plugin;
+    private final DropTrackerConfig config;
+
+    @Inject
+    protected Client client;
+
+    @Inject
+    private Rarity rarity;
+
+    @Inject
+    private ClientThread clientThread;
+
+    private ItemIDSearch itemIDFinder;
+    private final AtomicInteger completed = new AtomicInteger(-1);
+    private final AtomicBoolean popupStarted = new AtomicBoolean(false);
+    public static final @Varp int COMPLETED_VARP = 2943, TOTAL_VARP = 2944;
+
+    private static final Duration RECENT_DROP = Duration.ofSeconds(30L);
+    @Inject
+    public ChatMessageEvent(DropTrackerPlugin plugin, DropTrackerConfig config, ItemIDSearch itemIDFinder) {
+        this.plugin = plugin;
+        this.config = config;
+        this.itemIDFinder = itemIDFinder;
+    }
+    private static final Pattern ACHIEVEMENT_PATTERN = Pattern.compile("Congratulations, you've completed an? (?<tier>\\w+) combat task: (?<task>.+)\\.");
+    private static final Pattern TASK_POINTS = Pattern.compile("\\s+\\(\\d+ points?\\)$");
+    @Varbit
+    public static final int COMBAT_TASK_REPEAT_POPUP = 12456;
+    /**
+     * @see <a href="https://github.com/Joshua-F/cs2-scripts/blob/master/scripts/%5Bproc,ca_tasks_progress_bar%5D.cs2#L6-L11">CS2 Reference</a>
+     */
+    @VisibleForTesting
+    public static final Map<CombatAchievement, Integer> CUM_POINTS_VARBIT_BY_TIER;
+
+    /**
+     * The cumulative points needed to unlock rewards for each tier, in a Red-Black tree.
+     * <p>
+     * This is populated by {@link #initThresholds()} based on {@link #CUM_POINTS_VARBIT_BY_TIER}.
+     *
+     * @see <a href="https://gachi.gay/01CAv">Rewards Thresholds at the launch of the points-based system</a>
+     */
+    private final NavigableMap<Integer, CombatAchievement> cumulativeUnlockPoints = new TreeMap<>();
+
+    private static final Pattern PRIMARY_REGEX = Pattern.compile("Your (?<key>.+)\\s(?<type>kill|chest|completion)\\s?count is: (?<value>[\\d,]+)\\b", Pattern.CASE_INSENSITIVE);
+    private static final Pattern SECONDARY_REGEX = Pattern.compile("Your (?:completed|subdued) (?<key>.+) count is: (?<value>[\\d,]+)\\b");
+    private static final Pattern TIME_REGEX = Pattern.compile(
+            "(?:Duration|time|Subdued in):? (?<time>[\\d:]+(?:\\.\\d+)?)(?:\\. Personal best: (?<bestTime>[\\d:]+(?:\\.\\d+)?))?",
+            Pattern.CASE_INSENSITIVE
+    );
+    private static final String BA_BOSS_NAME = "Penance Queen";
+    public static final String GAUNTLET_NAME = "Gauntlet", GAUNTLET_BOSS = "Crystalline Hunllef";
+
+    static final Pattern COLLECTION_LOG_REGEX = Pattern.compile("New item added to your collection log: (?<itemName>(.*))");
+    public static final String ADDITION_WARNING = "Collection notifier will not fire unless you enable the game setting: Collection log - New addition notification";
+    private static final int POPUP_PREFIX_LENGTH = "New item:".length();
+    public static final String CG_NAME = "Corrupted Gauntlet", CG_BOSS = "Corrupted Hunllef";
+    private static final String TOA = "Tombs of Amascut";
+    private static final String TOB = "Theatre of Blood";
+    private static final String COX = "Chambers of Xeric";
+    private static final String RL_CHAT_CMD_PLUGIN_NAME = ChatCommandsPlugin.class.getSimpleName().toLowerCase();
+    private static final String RL_LOOT_PLUGIN_NAME = LootTrackerPlugin.class.getSimpleName().toLowerCase();
+    @Varbit
+    public static final int TOTAL_POINTS_ID = 14815;
+    @Varbit
+    public static final int GRANDMASTER_TOTAL_POINTS_ID = 14814;
+    @VisibleForTesting
+    static final int MAX_BAD_TICKS = 10;
+
+    private final AtomicInteger badTicks = new AtomicInteger();
+    private final AtomicReference<BossNotification> bossData = new AtomicReference<>();
+
+    private static Pair<String, Integer> mostRecentNpcData = null;
+
+    private static Integer ticksSinceNpcDataUpdate = 0;
+
+    @Varbit
+    public static final int KILL_COUNT_SPAM_FILTER = 4930;
+
+    public boolean isEnabled() {
+        return true;
+    }
+
+    public void onGameMessage(String message) {
+        if (isEnabled())
+            parseBossKill(message).ifPresent(this::updateData);
+            parseCombatAchievement(message).ifPresent(pair -> processCombatAchievement(pair.getLeft(), pair.getRight()));
+    }
+
+    public void onChatMessage(String chatMessage) {
+        if (client.getVarbitValue(Varbits.COLLECTION_LOG_NOTIFICATION) != 1) {
+            // require notifier enabled without popup mode to use chat event
+            return;
+        }
+        Matcher collectionMatcher = COLLECTION_LOG_REGEX.matcher(chatMessage);
+        if (collectionMatcher.find()) {
+            String itemName = collectionMatcher.group("itemName");
+            clientThread.invokeLater(() -> processCollection(itemName));
+        }
+    }
+
+    public void onScript(int scriptId) {
+        if (scriptId == ScriptID.NOTIFICATION_START) {
+            popupStarted.set(true);
+        } else if (scriptId == ScriptID.NOTIFICATION_DELAY) {
+            String topText = client.getVarcStrValue(VarClientStr.NOTIFICATION_TOP_TEXT);
+            if (popupStarted.getAndSet(false) && "Collection log".equalsIgnoreCase(topText) && isEnabled()) {
+                String bottomText = plugin.sanitize(client.getVarcStrValue(VarClientStr.NOTIFICATION_BOTTOM_TEXT));
+                processCollection(bottomText.substring(POPUP_PREFIX_LENGTH).trim());
+            }
+        }
+    }
+
+
+    public void onFriendsChatNotification(String message) {
+        /* Chambers of Xeric completions are sent in the Friends chat channel */
+        if (message.startsWith("Congratulations - your raid is complete!"))
+            this.onGameMessage(message);
+    }
+
+    public void onWidget(WidgetLoaded event) {
+        if (!isEnabled())
+            return;
+        /* Handle BA events */
+        if (event.getGroupId() == InterfaceID.BA_REWARD) {
+            Widget widget = client.getWidget(ComponentID.BA_REWARD_REWARD_TEXT);
+            if (widget != null && widget.getText().contains("80 ") && widget.getText().contains("5 ")) {
+                int gambleCount = client.getVarbitValue(Varbits.BA_GC);
+                BossNotification notification = new BossNotification(BA_BOSS_NAME, gambleCount, "The Queen is dead!", null, null,null);
+                bossData.set(notification);
+            }
+        }
+    }
+    public void onTick() {
+        BossNotification data = this.bossData.get();
+        if (data != null) {
+            if (data.getBoss() != null) {
+                if (isEnabled()) {
+                    processKill(data);
+                }
+                reset();
+            } else if (badTicks.incrementAndGet() > MAX_BAD_TICKS) {
+                reset();
+            }
+        }
+        if (mostRecentNpcData != null) {
+            ticksSinceNpcDataUpdate += 1;
+        } else {
+            if (ticksSinceNpcDataUpdate > 1)  {
+                ticksSinceNpcDataUpdate = 0;
+            }
+        }
+        if (cumulativeUnlockPoints.size() < CUM_POINTS_VARBIT_BY_TIER.size())
+            initThresholds();
+        if (ticksSinceNpcDataUpdate >= 5 && mostRecentNpcData != null) {
+            mostRecentNpcData = null;
+        }
+    }
+    private void processCollection(String itemName) {
+        int completed = this.completed.updateAndGet(i -> i >= 0 ? i + 1 : i);
+        int total = client.getVarpValue(TOTAL_VARP);
+        boolean varpValid = total > 0 && completed > 0;
+        if (!varpValid) {
+            // This occurs if the player doesn't have the character summary tab selected
+            log.debug("Collection log progress varps were invalid ({} / {})", completed, total);
+        }
+        Integer itemId = itemIDFinder.findItemId(itemName);
+        Drop loot = itemId != null ? getLootSource(itemId) : null;
+        Integer killCount = loot != null ? KCService.getKillCount(loot.getCategory(), loot.getSource()) : null;
+        OptionalDouble itemRarity = ((loot != null) && (loot.getCategory() == LootRecordType.NPC)) ?
+                rarity.getRarity(loot.getSource(), itemId, 1) : OptionalDouble.empty();
+
+        CustomWebhookBody collectionLogBody = new CustomWebhookBody();
+        CustomWebhookBody.Embed collEmbed = new CustomWebhookBody.Embed();
+        collEmbed.addField("type", "collection_log",true);
+        collEmbed.addField("source", loot != null ? loot.getSource() : "unknown", true);
+        collEmbed.addField("item", itemName, true);
+        collEmbed.addField("kc", String.valueOf(killCount),true);
+        collEmbed.addField("rarity", String.valueOf(itemRarity),true);
+        collEmbed.addField("item_id", String.valueOf(itemId),true);
+        collEmbed.addField("player", client.getLocalPlayer().getName(), true);
+        collEmbed.addField("slots", total + "/" + completed, true);
+        collEmbed.addField("auth_key", config.token(), true);
+        String accountHash = String.valueOf(client.getAccountHash());
+        collEmbed.addField("acc_hash", accountHash, true);
+        collectionLogBody.getEmbeds().add(collEmbed);
+
+        plugin.sendDropTrackerWebhook(collectionLogBody, "2");
+    }
+
+    private void processCombatAchievement(CombatAchievement tier, String task) {
+        // delay notification for varbits to be updated
+        clientThread.invokeAtTickEnd(() -> {
+            int taskPoints = tier.getPoints();
+            int totalPoints = client.getVarbitValue(TOTAL_POINTS_ID);
+
+            Integer nextUnlockPointsThreshold = cumulativeUnlockPoints.ceilingKey(totalPoints + 1);
+            Map.Entry<Integer, CombatAchievement> prev = cumulativeUnlockPoints.floorEntry(totalPoints);
+            int prevThreshold = prev != null ? prev.getKey() : 0;
+
+            Integer tierProgress, tierTotalPoints;
+            if (nextUnlockPointsThreshold != null) {
+                tierProgress = totalPoints - prevThreshold;
+                tierTotalPoints = nextUnlockPointsThreshold - prevThreshold;
+            } else {
+                tierProgress = tierTotalPoints = null;
+            }
+
+            boolean crossedThreshold = prevThreshold > 0 && totalPoints - taskPoints < prevThreshold;
+            CombatAchievement completedTier = crossedThreshold ? prev.getValue() : null;
+            String completedTierName = completedTier != null ? completedTier.getDisplayName() : "N/A";
+
+            String player = client.getLocalPlayer().getName();
+            CustomWebhookBody combatWebhook = new CustomWebhookBody();
+            combatWebhook.setContent(player + " has completed a new combat task:");
+            CustomWebhookBody.Embed combatAchievementEmbed = new CustomWebhookBody.Embed();
+            combatAchievementEmbed.addField("type", "combat_achievement",true);
+            combatAchievementEmbed.addField("tier", tier.toString(),true);
+            combatAchievementEmbed.addField("task", task,true);
+            combatAchievementEmbed.addField("points", String.valueOf(taskPoints),true);
+            combatAchievementEmbed.addField("total_points", String.valueOf(totalPoints),true);
+            combatAchievementEmbed.addField("completed", completedTierName,true);
+            combatAchievementEmbed.addField("auth_key", config.token(), true);
+            String accountHash = String.valueOf(client.getAccountHash());
+            combatAchievementEmbed.addField("acc_hash", accountHash, true);
+            combatWebhook.getEmbeds().add(combatAchievementEmbed);
+            plugin.sendDropTrackerWebhook(combatWebhook, "3");
+        });
+    }
+
+
+    private void processKill(BossNotification data) {
+        if (data.getBoss() == null || data.getCount() == null)
+            return;
+        boolean ba = data.getBoss().equals(BA_BOSS_NAME);
+        boolean isPb = data.isPersonalBest() == Boolean.TRUE;
+        String player = plugin.getLocalPlayerName();
+        String time = formatTime(data.getTime(), isPreciseTiming(client));
+        String bestTime = formatTime(data.getBestTime(), isPreciseTiming(client));
+        CustomWebhookBody.Embed killEmbed = null;
+        CustomWebhookBody killWebhook = new CustomWebhookBody();
+        killEmbed = new CustomWebhookBody.Embed();
+        killEmbed.setTitle(player + " has killed a boss:");
+        killEmbed.addField("type", "npc_kill", true);
+        killEmbed.addField("boss_name", data.getBoss(), true);
+        killEmbed.addField("player_name", plugin.getLocalPlayerName(), true);
+        killEmbed.addField("kill_time", time, true);
+        killEmbed.addField("best_time", bestTime, true);
+        killEmbed.addField("auth_key", config.token(), true);
+        killEmbed.addField("is_pb", String.valueOf(isPb), true);
+        String accountHash = String.valueOf(client.getAccountHash());
+        killEmbed.addField("acc_hash", accountHash, true);
+
+        killWebhook.getEmbeds().add(killEmbed);
+        plugin.sendDropTrackerWebhook(killWebhook, "1");
+        mostRecentNpcData = null;
+    }
+
+    private void updateData(BossNotification updated) {
+        bossData.getAndUpdate(old -> {
+            if (old == null) {
+                return updated;
+            } else {
+                return new BossNotification(
+                        defaultIfNull(updated.getBoss(), old.getBoss()),
+                        defaultIfNull(updated.getCount(), old.getCount()),
+                        defaultIfNull(updated.getGameMessage(), old.getGameMessage()),
+                        defaultIfNull(updated.getTime(), old.getTime()),
+                        defaultIfNull(updated.getBestTime(), old.getBestTime()),
+                        defaultIfNull(updated.isPersonalBest(), old.isPersonalBest())
+                );
+            }
+        });
+    }
+
+    public void reset() {
+        bossData.set(null);
+        badTicks.set(0);
+    }
+    @VisibleForTesting
+    static Optional<Pair<CombatAchievement, String>> parseCombatAchievement(String message) {
+        Matcher matcher = ACHIEVEMENT_PATTERN.matcher(message);
+        if (!matcher.find()) return Optional.empty();
+        return Optional.of(matcher.group("tier"))
+                .map(CombatAchievement.TIER_BY_LOWER_NAME::get)
+                .map(tier -> Pair.of(
+                        tier,
+                        TASK_POINTS.matcher(
+                                matcher.group("task")
+                        ).replaceFirst("") // remove points suffix
+                ));
+    }
+
+    private Optional<BossNotification> parseBossKill(String message) {
+        Optional<Pair<String, Integer>> boss = parseBoss(message);
+        if (!boss.isPresent()) {
+            parseKillTime(message);
+        }
+        Optional<Object> tempBossData = boss.map(pair -> {
+            BossNotification notification = new BossNotification(pair.getLeft(), pair.getRight(), message, null, null, null);
+
+            mostRecentNpcData = Pair.of(pair.getLeft(), pair.getRight());
+            return notification;
+        });
+
+        if (mostRecentNpcData != null && ticksSinceNpcDataUpdate < 2) {
+            String npcName = mostRecentNpcData.getKey();
+            return parseKillTime(message).map(t -> new BossNotification(mostRecentNpcData.getKey(), mostRecentNpcData.getValue(), message, t.getLeft(), t.getMiddle(), t.getRight()));
+        }
+        return Optional.empty();
+    }
+    private static Optional<Triple<Duration, Duration, Boolean>> parseKillTime(String message) {
+        Matcher matcher = TIME_REGEX.matcher(message);
+        if (matcher.find()) {
+            Duration duration = parseTime(matcher.group("time"));
+            Duration bestTime = matcher.group("bestTime") != null ? parseTime(matcher.group("bestTime")) : null;
+            boolean pb = message.toLowerCase().contains("(new personal best)");
+            return Optional.of(Triple.of(duration, bestTime, pb));
+        }
+
+        return Optional.empty();
+    }
+
+    @NotNull
+    public static Duration parseTime(@NotNull String in) {
+        Pattern TIME_PATTERN = Pattern.compile("\\b(?:(?<hours>\\d+):)?(?<minutes>\\d+):(?<seconds>\\d{2})(?:\\.(?<fractional>\\d{2}))?\\b");
+        Matcher m = TIME_PATTERN.matcher(in);
+        if (!m.find()) return Duration.ZERO;
+
+        int minutes = Integer.parseInt(m.group("minutes"));
+        int seconds = Integer.parseInt(m.group("seconds"));
+
+        Duration d = Duration.ofMinutes(minutes).plusSeconds(seconds);
+
+        String hours = m.group("hours");
+        if (hours != null) {
+            d = d.plusHours(Integer.parseInt(hours));
+        }
+
+        String fractional = m.group("fractional");
+        if (fractional != null) {
+            String f = fractional.length() < 3 ? StringUtils.rightPad(fractional, 3, '0') : fractional.substring(0, 3);
+            d = d.plusMillis(Integer.parseInt(f));
+        }
+
+        return d;
+    }
+
+    static Optional<Pair<String, Integer>> parseBoss(String message) {
+        Matcher primary = PRIMARY_REGEX.matcher(message);
+        Matcher secondary;
+        if (primary.find()) {
+            String boss = parsePrimaryBoss(primary.group("key"), primary.group("type"));
+            String count = primary.group("value");
+            return result(boss, count);
+        } else if ((secondary = SECONDARY_REGEX.matcher(message)).find()) {
+            String key = parseSecondary(secondary.group("key"));
+            String value = secondary.group("value");
+            return result(key, value);
+        }
+        return Optional.empty();
+    }
+
+
+    private static Optional<Pair<String, Integer>> result(String boss, String count) {
+        try {
+            return Optional.ofNullable(boss).map(k -> Pair.of(boss, Integer.parseInt(count)));
+        } catch (NumberFormatException e) {
+            log.debug("Failed to parse kill count [{}] for boss [{}]", count, boss);
+            return Optional.empty();
+        }
+    }
+
+    @Nullable
+    private static String parsePrimaryBoss(String boss, String type) {
+        switch (type.toLowerCase()) {
+            case "chest":
+                if ("Barrows".equalsIgnoreCase(boss))
+                    return boss;
+                if ("Lunar".equals(boss))
+                    return boss + " " + type;
+                return null;
+
+            case "completion":
+                if (GAUNTLET_NAME.equalsIgnoreCase(boss))
+                    return GAUNTLET_BOSS;
+                if (CG_NAME.equalsIgnoreCase(boss))
+                    return CG_BOSS;
+                return null;
+
+            case "kill":
+                return boss;
+
+            default:
+                return null;
+        }
+    }
+
+    private static String parseSecondary(String boss) {
+        if (boss == null || "Wintertodt".equalsIgnoreCase(boss))
+            return boss;
+
+        int modeSeparator = boss.lastIndexOf(':');
+        String raid = modeSeparator > 0 ? boss.substring(0, modeSeparator) : boss;
+        if (raid.equalsIgnoreCase("Theatre of Blood")
+                || raid.equalsIgnoreCase("Tombs of Amascut")
+                || raid.equalsIgnoreCase("Chambers of Xeric")
+                || raid.equalsIgnoreCase("Chambers of Xeric Challenge Mode"))
+            return boss;
+
+        return null;
+    }
+
+
+
+    @NotNull
+    public String formatTime(@Nullable Duration duration, boolean precise) {
+        Temporal time = ObjectUtils.defaultIfNull(duration, Duration.ZERO).addTo(LocalTime.of(0, 0));
+        StringBuilder sb = new StringBuilder();
+
+        int h = time.get(HOUR_OF_DAY);
+        if (h > 0)
+            sb.append(String.format("%02d", h)).append(':');
+
+        sb.append(String.format("%02d", time.get(MINUTE_OF_HOUR))).append(':');
+        sb.append(String.format("%02d", time.get(SECOND_OF_MINUTE)));
+
+        if (precise)
+            sb.append('.').append(String.format("%02d", time.get(MILLI_OF_SECOND) / 10));
+
+        return sb.toString();
+    }
+
+    public boolean isPreciseTiming(@NotNull Client client) {
+        @Varbit int ENABLE_PRECISE_TIMING = 11866;
+        return client.getVarbitValue(ENABLE_PRECISE_TIMING) > 0;
+    }
+
+    private void initThresholds() {
+        CUM_POINTS_VARBIT_BY_TIER.forEach((tier, varbitId) -> {
+            int cumulativePoints = client.getVarbitValue(varbitId);
+            if (cumulativePoints > 0)
+                cumulativeUnlockPoints.put(cumulativePoints, tier);
+        });
+    }
+    static {
+        CUM_POINTS_VARBIT_BY_TIER = ImmutableMap.<CombatAchievement, Integer>builderWithExpectedSize(6)
+                .put(CombatAchievement.EASY, 4132) // 33 = 33 * 1
+                .put(CombatAchievement.MEDIUM, 10660) // 115 = 33 + 41 * 2
+                .put(CombatAchievement.HARD, 10661) // 304 = 115 + 63 * 3
+                .put(CombatAchievement.ELITE, 14812) // 820 = 304 + 129 * 4
+                .put(CombatAchievement.MASTER, 14813) // 1465 = 820 + 129 * 5
+                .put(CombatAchievement.GRANDMASTER, GRANDMASTER_TOTAL_POINTS_ID) // 2005 = 1465 + 90 * 6
+                .build();
+    }
+    @Nullable
+    private Drop getLootSource(int itemId) {
+        Drop drop = KCService.getLastDrop();
+        if (drop == null) return null;
+        if (Duration.between(drop.getTime(), Instant.now()).compareTo(RECENT_DROP) > 0) return null;
+        for (ItemStack item : drop.getItems()) {
+            if (item.getId() == itemId) {
+                return drop;
+            }
+        }
+        return null;
+    }
+}
+
+package io.droptracker.util;
+
+import com.google.gson.TypeAdapter;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonWriter;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.time.format.DateTimeParseException;
+
+/**
+ * Serializes and deserializes {@link Duration} instances
+ * from their equivalent ISO-8601 string representation.
+ * <p>
+ * This adapter exists because GSON does not ship with
+ * a module for the Java 8 time API.
+ *
+ * @see <a href="https://github.com/google/gson/issues/1059">GSON Issue</a>
+ */
+public class DurationAdapter extends TypeAdapter<Duration> {
+    @Override
+    public void write(JsonWriter out, Duration duration) throws IOException {
+        out.value(duration != null ? duration.toString() : null);
+    }
+
+    @Override
+    public Duration read(JsonReader in) throws IOException {
+        if (in.hasNext()) {
+            try {
+                return Duration.parse(in.nextString());
+            } catch (DateTimeParseException ignored) {
+            }
+        }
+        return null;
+    }
+}
+
+package io.droptracker.util;
+
+import com.google.gson.Gson;
+import lombok.experimental.UtilityClass;
+import net.runelite.api.Client;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneLiteConfig;
+import net.runelite.client.util.ColorUtil;
+import org.apache.commons.lang3.StringUtils;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.awt.Color;
+import java.lang.reflect.ParameterizedType;
+import java.lang.reflect.Type;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.Collection;
+import java.util.regex.Pattern;
+import java.util.stream.Stream;
+
+@UtilityClass
+public class ConfigUtilities {
+
+    private final Pattern DELIM = Pattern.compile("[,;\\n]");
+
+    public Stream<String> readDelimited(String value) {
+        if (value == null) return Stream.empty();
+        return DELIM.splitAsStream(value)
+                .map(String::trim)
+                .filter(StringUtils::isNotEmpty);
+    }
+
+    public boolean isPluginDisabled(ConfigManager configManager, String simpleLowerClassName) {
+        return "false".equals(configManager.getConfiguration(RuneLiteConfig.GROUP_NAME, simpleLowerClassName));
+    }
+
+    @Nullable
+    public Object convertTypeFromJson(@NotNull Gson gson, @NotNull Type type, @NotNull Object in) {
+        if (in instanceof Boolean)
+            return type == boolean.class || type == Boolean.class ? in : null;
+
+        if (in instanceof Number) {
+            Number n = (Number) in;
+
+            if (type == int.class || type == Integer.class)
+                return n.intValue();
+
+            if (type == long.class || type == Long.class)
+                return n.longValue();
+
+            if (type == float.class || type == Float.class)
+                return n.floatValue();
+
+            if (type == double.class || type == Double.class)
+                return n.doubleValue();
+
+            if (type == byte.class || type == Byte.class)
+                return n.byteValue();
+
+            if (type == short.class || type == Short.class)
+                return n.shortValue();
+
+            if (type == Instant.class)
+                return Instant.ofEpochMilli(n.longValue());
+
+            if (type == Duration.class)
+                return Duration.ofMillis(n.longValue());
+
+            return null;
+        }
+
+        if (in instanceof String) {
+            String s = (String) in;
+
+            if (type == String.class)
+                return s;
+
+            if (type == Color.class)
+                return ColorUtil.fromString(s);
+
+            if (type instanceof Class && ((Class<?>) type).isEnum()) {
+                try {
+                    // noinspection unchecked,rawtypes
+                    return Enum.valueOf((Class<? extends Enum>) type, s);
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+
+            if (type == Instant.class) {
+                try {
+                    return Instant.parse(s);
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+
+            if (type == Duration.class) {
+                try {
+                    return Duration.parse(s);
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+        }
+
+        if (in instanceof Collection && type instanceof ParameterizedType) {
+            Type rawType = ((ParameterizedType) type).getRawType();
+            if (rawType instanceof Class && Collection.class.isAssignableFrom((Class<?>) rawType)) {
+                try {
+                    return gson.fromJson(gson.toJson(in), type); // inefficient, but unimportant
+                } catch (Exception e) {
+                    return null;
+                }
+            }
+        }
+
+        return null;
+    }
+
+    public boolean isSettingsOpen(@NotNull Client client) {
+        Widget widget = client.getWidget(ComponentID.SETTINGS_INIT);
+        return widget != null && !widget.isHidden();
+    }
+
+    public boolean isKillCountFilterInvalid(int varbitValue) {
+        // spam filter must be disabled for kill count chat message
+        return varbitValue > 0;
+    }
+
+    public boolean isCollectionLogInvalid(int varbitValue) {
+        // collection log notifier requires chat or pop-up notification
+        return varbitValue == 0;
+    }
+
+    public boolean isRepeatPopupInvalid(int varbitValue) {
+        // we discourage repeat notifications for combat task notifier if unintentional
+        return varbitValue > 0;
+    }
+
+    public boolean isPetLootInvalid(int varbitValue) {
+        // LOOT_DROP_NOTIFICATIONS and UNTRADEABLE_LOOT_DROPS must both be set to 1 for reliable pet name parsing
+        return varbitValue < 1;
+    }
+}
+
+package io.droptracker;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+@ConfigGroup(DropTrackerConfig.GROUP)
+public interface DropTrackerConfig extends Config
+	/* Section Positions:
+	1 (0) - General Settings
+	2 (1) - Values
+	2 (2) - Screenshots
+	 */
+{
+	String GROUP = "droptracker";
+	@ConfigSection(
+			name = "Screenshots",
+			description = "Define what events you want to send screenshots for",
+			position = 2,
+			closedByDefault = false
+	)
+	String screenshotSection = "Screenshots";
+	/* Screenshot Section Items */
+	@ConfigItem(
+			keyName = "screenshotValue",
+			name = "Minimum Screenshot Value",
+			description = "What minimum value would you like drops to be sent with an attached image for?",
+			position = -1,
+			section = screenshotSection
+	)
+	default int screenshotValue() { return 250000; }
+	@ConfigItem(
+			keyName = "valueableDrops",
+			name = "Valueable Drops",
+			description = "Do you want to take screenshots when a drop<br />" +
+					"Exceeds the threshold you set?",
+			position = 0,
+			section = screenshotSection
+	)
+	default boolean screenshotDrops() { return true; }
+
+	@ConfigItem(
+			keyName = "screenshotCLog",
+			name = "Collection Logs",
+			description = "Do you want screenshots to be sent when you\n" +
+					"receive new collection log items?",
+			position = 1,
+			section = screenshotSection
+	)
+	default boolean screenshotNewClogs() { return true; }
+	@ConfigItem(
+			keyName = "screenshotPB",
+			name = "Personal Bests",
+			description = "Do you want a screenshot to be sent\n" +
+					"when you acquire a new Personal Best?",
+			position = 2,
+			section = screenshotSection
+	)
+	default boolean screenshotPBs() { return true; }
+	@ConfigItem(
+			keyName = "screenshotCAs",
+			name = "Combat Tasks",
+			description = "Do you want a screenshot to be sent\n" +
+					"when you complete a Combat Task?",
+			position = 3,
+			section = screenshotSection
+	)
+	default boolean screenshotCAs() { return true; }
+	/* PvP is pretty much completely ignored by the server
+	@ConfigItem(
+
+			keyName = "screenshotPKs",
+			name = "Player vs Player",
+			description = "Do you want a screenshot to be sent\n" +
+					"when you kill another player?",
+			position = 4,
+			section = screenshotSection
+	)*/
+	default boolean screenshotPKs() { return true; }
+	/* We are only going to focus on pets that are new collection log slots, for now... */
+//	@ConfigItem(
+//			keyName = "screenshotPets",
+//			name = "Pets",
+//			description = "Do you want a screenshot to be sent\n" +
+//					"when you acquire a new pet?",
+//			position = 5,
+//			section = screenshotSection
+//	)
+//	default boolean screenshotPets() { return true; }
+
+	@ConfigItem(
+			name = "Show Side Panel",
+			keyName = "showSidePanel",
+			description = "<html>Do you want to render the <br>side-panel to lookup players, etc?<br>" +
+					"<b>Note</b>: Requires the API to be enabled.</html>",
+			position = 2
+	)
+	default boolean showSidePanel() { return true; }
+	@ConfigSection(
+			name = "DropTracker Account",
+			description = "Configure your client settings for the DropTracker database",
+			position= 5 ,
+			closedByDefault = false
+	)
+	String apiSection = "DropTracker Account";
+	@ConfigItem(
+			name="Use API Connections",
+			keyName = "useApi",
+			description = "Enables external connections to the DropTracker database, for panel data.<br />" +
+					"<b>Note</b>: The API is currently <b>required</b> for participation in events!",
+			position = -1,
+			section = apiSection,
+			warning = "<html><b>WARNING</b>: Enabling this feature will send external<br>connections" +
+					"to the DropTracker server, which" +
+					"can not<br> be verified by the RuneLite Developers.<br>" +
+					"<b>Are you sure that you want to enable external connections?</b><br></html>"
+	)
+	default boolean useApi() { return false; }
+	@ConfigItem(
+			name = "Token",
+			keyName = "authKey",
+			description = "<html>If you register on Discord, you can obtain an auth key<br>to enter here, which will allow you to be added<br>to the Global Leaderboards.",
+			position = 1,
+			section = apiSection,
+			secret = true
+	)
+	default String token() { return ""; }
+}
+
+package io.droptracker;
+
+import com.google.gson.Gson;
+import com.google.inject.Provides;
+import java.awt.image.BufferedImage;
+import java.awt.image.RenderedImage;
+import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.net.URL;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiConsumer;
+import java.util.regex.Pattern;
+import javax.imageio.ImageIO;
+import javax.inject.Inject;
+
+import io.droptracker.api.DropTrackerApi;
+import io.droptracker.models.CustomWebhookBody;
+import io.droptracker.ui.DropTrackerPanel;
+import io.droptracker.util.ChatMessageEvent;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ScriptPreFired;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.*;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.events.PlayerLootReceived;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.game.NPCManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.loottracker.LootReceived;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.DrawManager;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageCapture;
+
+import static net.runelite.http.api.RuneLiteAPI.GSON;
+
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.LinkBrowser;
+import net.runelite.client.util.Text;
+import net.runelite.http.api.loottracker.LootRecordType;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.HttpUrl;
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+/* Re-written using the Discord Loot Logger base code */
+@Slf4j
+@PluginDescriptor(
+		name = "DropTracker",
+		description = "Track your drops, compete in events, and send Discord webhooks!",
+		tags = {"droptracker", "drop", "webhook", "events"}
+)
+public class DropTrackerPlugin extends Plugin {
+	@Inject
+	private DropTrackerConfig config;
+	@Inject
+	public static DropTrackerApi api;
+	private DropTrackerPanel panel;
+	private NavigationButton navButton;
+	@Inject
+	private Gson gson;
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private OkHttpClient okHttpClient;
+
+	@Inject
+	private ImageCapture imageCapture;
+
+	@Inject
+	private OkHttpClient httpClient;
+	public static final Set<String> SPECIAL_NPC_NAMES = Set.of("The Whisperer", "Araxxor");
+
+	@Inject
+	private DrawManager drawManager;
+	@Inject
+	private ChatCommandManager chatCommandManager;
+
+	/* REGEX FILTERS FOR CHAT MESSAGE DETECTION */
+	private static final Pattern COLLECTION_LOG_ITEM_REGEX = Pattern.compile("New item added to your collection log: (.*)");
+	private static final Pattern KILLCOUNT_PATTERN = Pattern.compile("Your (?<pre>completion count for |subdued |completed )?(?<boss>.+?) (?<post>(?:(?:kill|harvest|lap|completion) )?(?:count )?)is: <col=ff0000>(?<kc>\\d+)</col>");
+	private static final String TEAM_SIZES = "(?<teamsize>\\d+(?:\\+|-\\d+)? players?|Solo)";
+	private static final Pattern RAIDS_PB_PATTERN = Pattern.compile("<col=ef20ff>Congratulations - your raid is complete!</col><br>Team size: <col=ff0000>" + TEAM_SIZES + "</col> Duration:</col> <col=ff0000>(?<pb>[0-9:]+(?:\\.[0-9]+)?)</col> \\(new personal best\\)</col>");
+	private static final Pattern RAIDS_DURATION_PATTERN = Pattern.compile("<col=ef20ff>Congratulations - your raid is complete!</col><br>Team size: <col=ff0000>" + TEAM_SIZES + "</col> Duration:</col> <col=ff0000>(?<current>[0-9:.]+)</col> Personal best: </col><col=ff0000>(?<pb>[0-9:]+(?:\\.[0-9]+)?)</col>");
+	private static final Pattern KILL_DURATION_PATTERN = Pattern.compile("(?i)(?:(?:Fight |Lap |Challenge |Corrupted challenge )?duration:|Subdued in|(?<!total )completion time:) <col=[0-9a-f]{6}>(?<current>[0-9:.]+)</col>\\. Personal best: (?:<col=ff0000>)?(?<pb>[0-9:]+(?:\\.[0-9]+)?)");
+	private static final Pattern NEW_PB_PATTERN = Pattern.compile("(?i)(?:(?:Fight |Lap |Challenge |Corrupted challenge )?duration:|Subdued in|(?<!total )completion time:) <col=[0-9a-f]{6}>(?<pb>[0-9:]+(?:\\.[0-9]+)?)</col> \\(new personal best\\)");
+	public Integer totalLogSlots = 0;
+	@Inject
+	public ChatMessageManager msgManager;
+
+	/* Memory storage for details about the current npc being killed, and it's kill time */
+	private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+	private String currentKillTime = "";
+	private String currentPbTime = "";
+	private String currentNpcName = "";
+	private boolean readyToSendPb = false;
+	private boolean hasUpdatedStoredItems;
+	private ScheduledFuture<?> skillDataResetTask = null;
+	private final Object lock = new Object();
+	private boolean hasReminded = false;
+	public static List<String> webhookUrls = new ArrayList<>();
+
+	private final ExecutorService executor = Executors.newCachedThreadPool();
+	private static final BufferedImage PANEL_ICON = ImageUtil.loadImageResource(DropTrackerPlugin.class, "icon.png");
+	private String logItemReceived;
+	private static final int MAX_RETRIES = 5;
+	private int timesTried = 0;
+	@Inject
+	private ChatMessageEvent chatMessageEventHandler;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	private Client client;
+	@Inject
+	private ClientThread clientThread;
+
+	@Override
+	protected void startUp() {
+		api = new DropTrackerApi(config, msgManager, gson, httpClient, client);
+
+		if(config.showSidePanel()) {
+			createSidePanel();
+		}
+		chatCommandManager.registerCommandAsync("!droptracker", (chatMessage, s) -> {
+			BiConsumer<ChatMessage, String> linkOpener = openLink("discord");
+			if (linkOpener != null && chatMessage.getSender().equalsIgnoreCase(client.getLocalPlayer().getName())) {
+				linkOpener.accept(chatMessage, s);
+			}
+		});
+		if (config.useApi()) {
+			chatCommandManager.registerCommandAsync("!loot", (chatMessage, s) -> {
+				BiConsumer<ChatMessage, String> linkOpener = openLink("website");
+				if (linkOpener != null && chatMessage.getSender().equalsIgnoreCase(client.getLocalPlayer().getName())) {
+					linkOpener.accept(chatMessage, s);
+				}
+			});
+		}
+	}
+	private void createSidePanel() {
+		panel = injector.getInstance(DropTrackerPanel.class);
+		panel.init();
+
+
+		navButton = NavigationButton.builder()
+				.tooltip("DropTracker")
+				.icon(PANEL_ICON)
+				.priority(1)
+				.panel(panel)
+				.build();
+
+		clientToolbar.addNavigation(navButton);
+	}
+	private void removeSidePanel() {
+		clientToolbar.removeNavigation(navButton);
+		panel = null;
+	}
+	/**
+	 * Grabs a random webhook URL from a GitHub sites page that is cycled by the server
+	 * */
+	public static String getRandomWebhookUrl() throws Exception {
+		if (webhookUrls.isEmpty()) {
+			// Grab the current list of webhook URLs from the github-hosted file
+			URL url = new URL("https://joelhalen.github.io/docs/webhooks.json");
+			BufferedReader in = new BufferedReader(new InputStreamReader(url.openStream()));
+			String input;
+			while ((input = in.readLine()) != null) {
+				// Remove double quotes and commas from the input string
+				input = input.replace("\"", "").replace(",", "")
+						.replace("[", "").replace("]", "");
+				// Ensure the target string contains 'discord'
+				if (input.contains("discord")) {
+					webhookUrls.add(input);
+				}
+			}
+			in.close();
+		}
+		Random randomP = new Random();
+		String url = webhookUrls.get(randomP.nextInt(webhookUrls.size()));
+		return url;
+	}
+
+	private static String itemImageUrl(int itemId) {
+		return "https://static.runelite.net/cache/item/icon/" + itemId + ".png";
+	}
+
+	private BiConsumer<ChatMessage, String> openLink(String destination) {
+		HttpUrl webUrl = HttpUrl.parse("https://www.discord.gg/droptracker");
+		if (destination == "website" && config.useApi()) {
+			webUrl = HttpUrl.parse(api.getApiUrl());
+		}
+		HttpUrl.Builder urlBuilder = webUrl.newBuilder();
+		HttpUrl url = urlBuilder.build();
+		LinkBrowser.browse(url.toString());
+		return null;
+	}
+
+	@Override
+	protected void shutDown() {
+		if(navButton != null) {
+			clientToolbar.removeNavigation(navButton);
+		}
+		chatCommandManager.unregisterCommand("!droptracker");
+		chatCommandManager.unregisterCommand("!loot");
+		if (panel != null) {
+			panel.deinit();
+			panel = null;
+		}
+		executor.shutdown();
+	}
+
+	@Provides
+	DropTrackerConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(DropTrackerConfig.class);
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged) {
+		if (configChanged.getGroup().equalsIgnoreCase(DropTrackerConfig.GROUP)) {
+			if (configChanged.getKey().equals("useApi")) {
+				panel.deinit();
+				if(navButton != null) {
+					clientToolbar.removeNavigation(navButton);
+				}
+				createSidePanel();
+				// panel.refreshData();
+				if (client.getAccountHash() != -1) {
+					try {
+						api.lookupPlayer(client.getLocalPlayer().getName());
+					} catch (Exception e) {
+						log.debug("Couldn't look the current player up in the DropTracker database");
+					}
+				}
+			} else if (configChanged.getKey().equals("showSidePanel")) {
+				if (!config.showSidePanel()) {
+					if(navButton != null) {
+						clientToolbar.removeNavigation(navButton);
+					}
+					panel.deinit();
+					panel = null;
+				} else {
+					if(panel == null) {
+						createSidePanel();
+					}
+				}
+			}
+
+
+			//sendChatReminder();
+		}
+	}
+
+	@Subscribe
+	public void onNpcLootReceived(NpcLootReceived npcLootReceived) {
+		NPC npc = npcLootReceived.getNpc();
+		Collection<ItemStack> items = npcLootReceived.getItems();
+		processDropEvent(npc.getName(), "npc", items);
+		//sendChatReminder();
+	}
+
+	@Subscribe
+	public void onPlayerLootReceived(PlayerLootReceived playerLootReceived) {
+		Collection<ItemStack> items = playerLootReceived.getItems();
+		processDropEvent(playerLootReceived.getPlayer().getName(), "pvp", items);
+		//sendChatReminder();
+	}
+
+	@Subscribe
+	public void onLootReceived(LootReceived lootReceived) {
+		/* A select few npc loot sources will arrive here, instead of npclootreceived events */
+	    if (lootReceived.getType() == LootRecordType.NPC && SPECIAL_NPC_NAMES.contains(lootReceived.getName())) {
+			processDropEvent(lootReceived.getName(), "npc", lootReceived.getItems());
+			return;
+		}
+		if (lootReceived.getType() != LootRecordType.EVENT && lootReceived.getType() != LootRecordType.PICKPOCKET) {
+			return;
+		}
+		processDropEvent(lootReceived.getName(), "other", lootReceived.getItems());
+		//sendChatReminder();
+	}
+
+	public String sanitize(String str) {
+		if (str == null || str.isEmpty()) return "";
+		return Text.removeTags(str.replace("<br>", "\n")).replace('\u00A0', ' ').trim();
+	}
+
+	@Subscribe
+	public void onScriptPreFired(ScriptPreFired event) {
+		chatMessageEventHandler.onScript(event.getScriptId());
+	}
+
+	@Subscribe(priority = 1)
+	public void onChatMessage(ChatMessage message) {
+		String chatMessage = sanitize(message.getMessage());
+		switch (message.getType()) {
+			case GAMEMESSAGE:
+				chatMessageEventHandler.onGameMessage(chatMessage);
+				chatMessageEventHandler.onChatMessage(chatMessage);
+			case FRIENDSCHATNOTIFICATION:
+				chatMessageEventHandler.onFriendsChatNotification(chatMessage);
+		}
+	}
+	@Subscribe
+	public void onGameTick(GameTick event) {
+		chatMessageEventHandler.onTick();
+	}
+
+
+	private void scheduleKillTimeReset() {
+		if (skillDataResetTask != null) {
+			skillDataResetTask.cancel(false);
+		}
+		skillDataResetTask = scheduler.schedule(this::resetState, 500, TimeUnit.MILLISECONDS);
+	}
+
+	private void resetState() {
+		synchronized (lock) {
+			currentKillTime = "";
+			currentPbTime = "";
+			currentNpcName = "";
+			readyToSendPb = false;
+		}
+	}
+
+	private void processDropEvent(String npcName, String sourceType, Collection<ItemStack> items) {
+			AtomicReference<Integer> finalValue = new AtomicReference<>(0);
+			CustomWebhookBody customWebhookBody = new CustomWebhookBody();
+			AtomicReference<StringBuilder> itemListBuilder = new AtomicReference<>(new StringBuilder());
+			clientThread.invokeLater(() -> {
+				if (sourceType != "pvp") {
+					for (ItemStack item : stack(items)) {
+						int itemId = item.getId();
+						int qty = item.getQuantity();
+						int price = itemManager.getItemPrice(itemId);
+						ItemComposition itemComposition = itemManager.getItemComposition(itemId);
+						finalValue.set(qty * price);
+						CustomWebhookBody.Embed itemEmbed = new CustomWebhookBody.Embed();
+						itemEmbed.setImage(itemImageUrl(itemId));
+						String accountHash = String.valueOf(client.getAccountHash());
+						itemEmbed.addField("type", "drop", true);
+						itemEmbed.addField("source_type", sourceType, true);
+						itemEmbed.addField("acc_hash", accountHash, true);
+						itemEmbed.addField("item", itemComposition.getName(), true);
+						itemEmbed.addField("auth_key", config.token(), true);
+						itemEmbed.addField("player", getLocalPlayerName(), true);
+						itemEmbed.addField("id", String.valueOf(itemComposition.getId()), true);
+						itemEmbed.addField("quantity", String.valueOf(qty), true);
+						itemEmbed.addField("value", String.valueOf(price), true);
+						itemEmbed.addField("source", npcName, true);
+						itemEmbed.addField("type", sourceType, true);
+						itemEmbed.title = getLocalPlayerName() + " received some drops:";
+						customWebhookBody.getEmbeds().add(itemEmbed);
+					}
+					customWebhookBody.setContent(getLocalPlayerName() + " received some drops:");
+					if (!customWebhookBody.getEmbeds().isEmpty()) {
+						sendDropTrackerWebhook(customWebhookBody, finalValue.get());
+					}
+				} else {
+					/* PVP kills are basically completely ignored on the server side at the moment... */
+					// Tries to send one message for the entire kill, since theoretically a PvP kill could be 70+ items at once
+
+					itemListBuilder.get().append(getLocalPlayerName()).append(" received a PvP kill:\n");
+					Integer totalValue = 0;
+					boolean isFirstPart = true;
+
+					for (ItemStack item : stack(items)) {
+						int itemId = item.getId();
+						int qty = item.getQuantity();
+						int price = itemManager.getItemPrice(itemId);
+						ItemComposition itemComposition = itemManager.getItemComposition(itemId);
+						totalValue = totalValue + (qty * price);
+
+						String itemDetails = "Item: " + itemComposition.getName()
+								+ ", Quantity: " + qty
+								+ ", Value: " + price
+								+ ", Item ID: " + itemId + "\n";
+
+						if (itemListBuilder.get().length() + itemDetails.length() >= 1800) {
+							if (isFirstPart) {
+								itemListBuilder.get().append("\np1");
+								isFirstPart = false;
+							} else {
+								itemListBuilder.get().append("\np2");
+							}
+							itemListBuilder.get().append("\nFrom: ").append(npcName); // refers to the player name in this context
+							customWebhookBody.setContent(itemListBuilder.toString());
+							sendDropTrackerWebhook(customWebhookBody, finalValue.get());
+
+							itemListBuilder.set(new StringBuilder());
+							itemListBuilder.get().append(isFirstPart ? "\np1\n\n" : "\np2\n\n").append(getLocalPlayerName()).append(" received a PvP kill:\n");
+						}
+
+						itemListBuilder.get().append(itemDetails);
+					}
+
+					finalValue.set(totalValue);
+					itemListBuilder.get().append("\nFrom: ").append(npcName); // refers to the player name in this context
+					customWebhookBody.setContent(itemListBuilder.toString());
+					sendDropTrackerWebhook(customWebhookBody, finalValue.get());
+				}
+			});
+
+	}
+
+	public String getLocalPlayerName() {
+		if (client.getLocalPlayer() != null) {
+			return client.getLocalPlayer().getName();
+		} else {
+			return "";
+		}
+	}
+	public void sendDropTrackerWebhook(CustomWebhookBody webhook, String type) {
+		/* Requires a type ID to be passed
+		* "1" = a "Kill Time" or "KC" submission
+		* "2" = a "Collection Log" submission
+		* "3" = a "Combat Achievement" submission
+		*  */
+		Boolean requiredScreenshot = false;
+		if (type.equalsIgnoreCase("1")) {
+			// Kc / kill time
+			List<CustomWebhookBody.Embed> embeds = webhook.getEmbeds();
+			if (config.screenshotPBs()) {
+				for (CustomWebhookBody.Embed embed : embeds) {
+					for (CustomWebhookBody.Field field : embed.getFields()) {
+						if (field.getName().equalsIgnoreCase("is_pb")) {
+							if (field.getValue().equalsIgnoreCase("true")) {
+								requiredScreenshot = true;
+							}
+						}
+					}
+				}
+			}
+
+		}
+		else if (type.equalsIgnoreCase("2")) // clogs {
+			if (config.screenshotNewClogs()) {
+				requiredScreenshot = true;
+		}
+		else { // combat achievements
+			if (config.screenshotCAs()) {
+				requiredScreenshot = true;
+			}
+			}
+		if (requiredScreenshot) {
+			drawManager.requestNextFrameListener(image ->
+			{
+				BufferedImage bufferedImage = (BufferedImage) image;
+				byte[] imageBytes = null;
+				try {
+					imageBytes = convertImageToByteArray(bufferedImage);
+				} catch (IOException e) {
+					log.error("Error converting image to byte array", e);
+				}
+				sendDropTrackerWebhook(webhook, imageBytes);
+			});
+		} else {
+			sendDropTrackerWebhook(webhook, (byte[]) null);
+		}
+	}
+
+
+	public void sendDropTrackerWebhook(CustomWebhookBody customWebhookBody, int totalValue) {
+		// Handles sending drops exclusively
+		if (config.screenshotDrops() && totalValue > config.screenshotValue()) {
+
+				drawManager.requestNextFrameListener(image ->
+				{
+					BufferedImage bufferedImage = (BufferedImage) image;
+
+						byte[] imageBytes = null;
+						try {
+							imageBytes = convertImageToByteArray(bufferedImage);
+						} catch (IOException e) {
+							log.error("Error converting image to byte array", e);
+						}
+						sendDropTrackerWebhook(customWebhookBody, imageBytes);
+
+			});
+		} else {
+			sendDropTrackerWebhook(customWebhookBody, (byte[]) null);
+		}
+	}
+	private void sendDropTrackerWebhook(CustomWebhookBody customWebhookBody, byte[] screenshot) {
+		this.timesTried++;
+		MultipartBody.Builder requestBodyBuilder = new MultipartBody.Builder()
+				.setType(MultipartBody.FORM)
+				.addFormDataPart("payload_json", GSON.toJson(customWebhookBody));
+
+		if (screenshot != null) {
+			requestBodyBuilder.addFormDataPart("file", "image.png",
+					RequestBody.create(MediaType.parse("image/png"), screenshot));
+		}
+		// Add the user's account hash to the embed
+
+		MultipartBody requestBody = requestBodyBuilder.build();
+		String url;
+		try {
+			url = getRandomWebhookUrl();
+		} catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+		HttpUrl u = HttpUrl.parse(url);
+		if (u == null || !isValidDiscordWebhookUrl(u)) {
+			log.info("Invalid or malformed webhook URL: {}", url);
+			return;
+		}
+
+		Request request = new Request.Builder()
+				.url(url)
+				.post(requestBody)
+				.build();
+		okHttpClient.newCall(request).enqueue(new Callback() {
+			@Override
+			public void onFailure(Call call, IOException e) {
+				log.error("Error submitting: ", e);
+				timesTried = 0;
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException {
+				if (response.isSuccessful()) {
+					timesTried = 0;
+				} else if (response.code() == 429 || response.code() == 400) {
+					sendDropTrackerWebhook(customWebhookBody, screenshot);
+				} else {
+					log.info("Failed to send webhook, response code: {}. Retrying...", response.code());
+					sendDropTrackerWebhook(customWebhookBody, screenshot);
+				}
+				response.close();
+			}
+		});
+
+	}
+	private boolean isValidDiscordWebhookUrl(HttpUrl url) {
+		// Ensure that any webhook URLs returned from the GitHub page are actual Discord webhooks
+		// And not external connections of some sort
+		if (!"discord.com".equals(url.host()) && !url.host().endsWith(".discord.com")) {
+			return false;
+		}
+		List<String> segments = url.pathSegments();
+		if (segments.size() >= 4 && "api".equals(segments.get(0)) && "webhooks".equals(segments.get(1))) {
+			return true;
+		}
+
+		return false;
+	}
+	private static byte[] convertImageToByteArray(BufferedImage bufferedImage) throws IOException {
+		ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+		ImageIO.write(bufferedImage, "png", byteArrayOutputStream);
+		return byteArrayOutputStream.toByteArray();
+	}
+	private static Collection<ItemStack> stack(Collection<ItemStack> items) {
+		final List<ItemStack> list = new ArrayList<>();
+
+		for (final ItemStack item : items) {
+			int quantity = 0;
+			for (final ItemStack i : list) {
+				if (i.getId() == item.getId()) {
+					quantity = i.getQuantity();
+					list.remove(i);
+					break;
+				}
+			}
+			if (quantity > 0) {
+				list.add(new ItemStack(item.getId(), item.getQuantity() + quantity, item.getLocation()));
+			} else {
+				list.add(item);
+			}
+		}
+
+		return list;
+	}
+}
+
+package io.droptracker.ui;
+
+import io.droptracker.DropTrackerPlugin;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.ImageUtil;
+
+import javax.swing.*;
+import javax.swing.table.DefaultTableCellRenderer;
+import javax.swing.table.TableColumn;
+import javax.swing.table.TableColumnModel;
+import java.awt.*;
+import java.awt.event.MouseEvent;
+import java.util.Arrays;
+import java.util.Map;
+import java.util.Objects;
+
+public class BossPanel extends JPanel {
+    private static final String[] COLUMNS = {"", "Loot", "Rank"};
+    private JTable bossTable;
+    private String[] npcNames;
+    private Map<String, Map<String, Object>> npcDetailsCache; // Cache for npc details
+
+    public BossPanel() {
+        setLayout(new BorderLayout());
+        npcNames = new String[0];
+        bossTable = new JTable(new String[0][COLUMNS.length], COLUMNS) {
+            @Override
+            public String getToolTipText(MouseEvent e) {
+                int row = rowAtPoint(e.getPoint());
+                int column = columnAtPoint(e.getPoint());
+                if (row != -1) {
+                    String npcName = npcNames[row];
+                    Map<String, Object> details = npcDetailsCache.get(npcName);
+                    return buildTooltip(details, row, column);
+                }
+                return super.getToolTipText();
+            }
+        };
+        bossTable.setEnabled(false); // Prevent editing
+        JScrollPane scrollPane = new JScrollPane(bossTable);
+        add(scrollPane, BorderLayout.CENTER);
+        setCustomRenderers();
+    }
+
+    public void update(Map<String, Map<String, Object>> npcData) {
+        // Clear previous content from the bossPanel
+        removeAll();
+
+        if (npcData == null || npcData.isEmpty()) {
+            revalidate();
+            repaint();
+            return;
+        }
+
+        // Ensure npcNames array matches the size of the incoming data
+        npcNames = new String[npcData.size()];
+        npcDetailsCache = npcData; // Store NPC data for tooltips
+
+        String[][] rowData = new String[npcData.size()][COLUMNS.length];
+        int i = 0;
+
+        for (Map.Entry<String, Map<String, Object>> entry : npcData.entrySet()) {
+            String npcName = entry.getKey();
+            npcNames[i] = npcName;
+
+            Map<String, Object> details = entry.getValue();
+            Map<String, String> loot = (Map<String, String>) details.get("loot");
+            if (loot.get("all-time").equals("0")) {
+                // skip npcs that the user has never reported loot from
+                continue;
+            }
+            Map<String, Object> rankDetails = (Map<String, Object>) details.get("rank");
+
+            String globalRank = rankDetails.get("global") != null ? rankDetails.get("global").toString() : "--";
+
+            // Store row data in array
+            rowData[i][0] = npcName;
+            rowData[i][1] = loot.get("all-time") + " gp";
+            rowData[i][2] = globalRank;
+
+            i++;
+        }
+
+        // Update the table model without recreating the table
+        bossTable.setModel(new javax.swing.table.DefaultTableModel(rowData, COLUMNS));
+        setCustomRenderers();
+
+        // Re-add the updated table to the panel
+        JScrollPane scrollPane = new JScrollPane(bossTable);
+        if (rowData.length > 0) {
+            int height = Math.min(bossTable.getRowHeight() * rowData.length, 400); // Limit the height
+            scrollPane.setPreferredSize(new Dimension(scrollPane.getPreferredSize().width, height));
+        }
+        add(scrollPane, BorderLayout.CENTER);
+        Dimension preferredSize = new Dimension(220, 100);
+        setPreferredSize(preferredSize);
+        // Revalidate and repaint the panel to trigger a layout update
+        revalidate();
+        repaint();
+    }
+
+
+    // Custom renderer to display NPC icons with tooltips
+    private class NpcImageRenderer extends DefaultTableCellRenderer {
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column) {
+            JLabel label = (JLabel) super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+            String npcName = npcNames[row];
+            String imagePath;
+            String lowerName = (npcName.toLowerCase());
+            // Handle edge-case NPCs
+            if (lowerName.contains("barrows")) {
+                imagePath = sanitizeNpcNameForImagePath("barrows chests");
+            } else if (lowerName.contains("fortis")) {
+                imagePath = sanitizeNpcNameForImagePath("sol heredit");
+            } else if(lowerName.contains("gauntlet")){
+                imagePath = sanitizeNpcNameForImagePath("gauntlet");
+            } else if(lowerName.contains(("perilous moons"))) {
+                imagePath = sanitizeNpcNameForImagePath("lunar chests");
+            } else if(lowerName.contains("dagannoth kings")) {
+                imagePath = sanitizeNpcNameForImagePath("dagannoth rex");
+            } else if(lowerName.contains(("theatre of blood"))) {
+                imagePath = sanitizeNpcNameForImagePath("theatre of blood");
+            } else if(lowerName.contains("chambers of xeric")) {
+                imagePath = sanitizeNpcNameForImagePath("chambers of xeric");
+            } else if(lowerName.contains("tombs of amascut")){
+                imagePath = sanitizeNpcNameForImagePath("tombs of amascut");
+            } else if(lowerName.contains("vet'ion")){
+                imagePath = sanitizeNpcNameForImagePath("vetion");
+            } else if( lowerName.contains("callisto")){
+                imagePath = sanitizeNpcNameForImagePath("callisto");
+            } else if(lowerName.contains("venenatis")){
+                imagePath = sanitizeNpcNameForImagePath("venenatis");
+            } else if(lowerName.contains("nightmare")){
+                imagePath = sanitizeNpcNameForImagePath("nightmare");
+            } else {
+                imagePath = sanitizeNpcNameForImagePath(npcName);
+            }
+
+            // Load the NPC icon
+            ImageIcon npcIcon = new ImageIcon(ImageUtil.loadImageResource(DropTrackerPlugin.class, imagePath));
+
+            label.setIcon(npcIcon);
+            label.setText("");  // Hides the NPC name text
+
+            // Ensure npcDetailsCache is not null and contains the data for npcName
+            if (npcDetailsCache != null && npcDetailsCache.containsKey(npcName)) {
+                Map<String, Object> details = npcDetailsCache.get(npcName);
+                label.setToolTipText(buildTooltip(details, row, column));
+            } else {
+                label.setToolTipText("No data available");
+            }
+
+            return label;
+        }
+        private String sanitizeNpcNameForImagePath(String npcName) {
+            String sanitizedNpcName = npcName.toLowerCase().replace(" ", "_");
+            sanitizedNpcName = sanitizedNpcName.replace("'", "").replace(",", "")
+                    .replace("-", "_");
+
+            if (sanitizedNpcName.equals("the_nightmare")) {
+                sanitizedNpcName = "nightmare";
+            }
+
+            return "icons/bosses/" + sanitizedNpcName + ".png";
+        }
+    }
+
+
+    // Renderer to apply alternating row colors and provide tooltips
+    private class AlternatingColorRenderer extends DefaultTableCellRenderer {
+        @Override
+        public Component getTableCellRendererComponent(JTable table, Object value, boolean isSelected, boolean hasFocus, int row, int column) {
+            Component c = super.getTableCellRendererComponent(table, value, isSelected, hasFocus, row, column);
+            c.setBackground(row % 2 == 0 ? ColorScheme.DARKER_GRAY_COLOR : ColorScheme.DARK_GRAY_COLOR);
+            String npcName = npcNames[row];
+            Map<String, Object> details = npcDetailsCache.get(npcName);
+            return c;
+        }
+    }
+
+    private String buildTooltip(Map<String, Object> details, int row, int column) {
+        Map<String, String> loot = (Map<String, String>) details.get("loot");
+        Map<String, Object> rank = (Map<String, Object>) details.get("rank");
+        Map<String, Object> pbDetails = (Map<String, Object>) details.get("PB");
+
+        String monthLoot = loot.get("month") != null ? loot.get("month").toString() : "--";
+        String allTimeLoot = loot.get("all-time") != null ? loot.get("all-time").toString() : "--";
+
+        String groupRank = rank != null && rank.get("clan") != null ? rank.get("clan").toString() : "--";
+        String globalRank = rank != null && rank.get("global") != null ? rank.get("global").toString() : "--";
+
+        String pbTime = pbDetails != null && pbDetails.get("time") != null ? pbDetails.get("time").toString() : "--";
+        String pbRankGlobal = pbDetails != null && pbDetails.get("rank_global") != null ? pbDetails.get("rank_global").toString() : "--";
+        String pbRankClan = pbDetails != null && pbDetails.get("rank_clan") != null ? pbDetails.get("rank_clan").toString() : "--";
+
+        String tooltip = "<html>";
+        switch (column) {
+            case 1: // Loot column
+                tooltip += "All-time: " + allTimeLoot + "<br>This month: " + monthLoot;
+                break;
+            case 2: // Rank column
+                if (groupRank != null && !groupRank.equals("0")) {
+                    tooltip += "Rank (global): " + globalRank + "<br>Rank (clan): " + groupRank;
+                } else {
+                    tooltip += "Rank (global): " + globalRank;
+                }
+                break;
+//            case 3: // PB column
+//                tooltip += "PB: " + pbTime + "<br>Global Rank: " + pbRankGlobal + "<br>Clan Rank: " + pbRankClan;
+//                break;
+            default:
+                // show pb time on tooltip for the boss if there is one present in the server response
+                if (!Objects.equals(pbTime, "--")) {
+                    if (!pbRankClan.equals("--") && pbRankClan != null) {
+                        tooltip += npcNames[row] + "<br>PB: " + pbTime + "<br>Global Rank: " + pbRankGlobal + "<br>Clan Rank: " + pbRankClan;
+                    } else {
+                        tooltip += npcNames[row] + "<br>PB: " + pbTime + " (Rank: " + pbRankGlobal + ")";
+                    }
+                } else {
+                    tooltip += npcNames[row];
+            }
+                break;
+        }
+        tooltip += "</html>";
+        return tooltip;
+    }
+
+    private void setCustomRenderers() {
+        // Get the table's column model
+        TableColumnModel columnModel = bossTable.getColumnModel();
+
+        TableColumn npcColumn = columnModel.getColumn(0);
+        npcColumn.setCellRenderer(new NpcImageRenderer());
+        npcColumn.setPreferredWidth(50);
+
+        TableColumn lootColumn = columnModel.getColumn(1);
+        lootColumn.setCellRenderer(new AlternatingColorRenderer());
+        lootColumn.setPreferredWidth(150);
+
+        // Column 2 (Rank)
+        TableColumn rankColumn = columnModel.getColumn(2);
+        rankColumn.setCellRenderer(new AlternatingColorRenderer());
+        rankColumn.setPreferredWidth(75);
+
+    }
+
+}
+
+package io.droptracker.ui;
+
+import com.google.inject.Inject;
+import io.droptracker.DropTrackerConfig;
+import io.droptracker.DropTrackerPlugin;
+import io.droptracker.api.DropTrackerApi;
+import net.runelite.api.Client;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.plugins.info.InfoPanel;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.IconTextField;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.LinkBrowser;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.Map;
+
+public class DropTrackerPanel extends PluginPanel implements DropTrackerApi.PanelDataLoadedCallback {
+    private static final ImageIcon ARROW_RIGHT_ICON;
+    private static final ImageIcon DISCORD_ICON;
+    private static final ImageIcon WIKI_ICON;
+    private static final ImageIcon TOP_LOGO;
+
+    private final DropTrackerConfig config;
+    private final DropTrackerApi api;
+    private final DropTrackerPlugin plugin;
+    private final Client client;
+
+    private IconTextField searchBar;
+    private JPanel mainContentPanel;
+    private final BossPanel bossPanel;
+    @Inject
+    private EventBus eventBus;
+
+
+    @Inject
+    public DropTrackerPanel(DropTrackerConfig config, DropTrackerApi api, DropTrackerPlugin plugin, Client client) {
+        this.config = config;
+        this.api = api;
+        this.plugin = plugin;
+        this.client = client;
+        this.bossPanel = new BossPanel();  // Initialize BossPanel
+        init();
+    }
+
+    // Initializes the panel components
+    public void init() {
+        setLayout(new BorderLayout());
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+        setBorder(new EmptyBorder(10, 10, 10, 10));
+
+
+        JPanel logoPanel = new JPanel(new BorderLayout());
+        JLabel logoLabel = new JLabel(TOP_LOGO);
+        logoLabel.setHorizontalAlignment(SwingConstants.CENTER);
+        logoPanel.add(logoLabel, BorderLayout.CENTER);
+
+        // Create the search panel
+        JPanel searchPanel = new JPanel();
+        searchPanel.setLayout(new GridBagLayout());
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.gridx = 0;
+        gbc.gridy = GridBagConstraints.RELATIVE;
+        gbc.anchor = GridBagConstraints.WEST;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.weightx = 1;
+        gbc.insets = new Insets(0, 0, 0, 0);
+        searchPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        if (config.useApi()) {
+            searchBar = new IconTextField();
+            searchBar.setIcon(IconTextField.Icon.SEARCH);
+            searchBar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            searchBar.addActionListener(e -> lookupPlayer());
+            searchBar.addClearListener(this::resetPanel);
+
+            JLabel infoText = new JLabel("<html><h2>Welcome to the DropTracker</h2>" +
+                    "You should register your account<br>" +
+                    "through our Discord bot (linked below) to " +
+                    "enhance your experience with the plugin. " +
+                    "Feel free to also visit the Docs<br> to learn more about the project.<br><br></html>");
+            infoText.setForeground(Color.WHITE);
+            JLabel searchBarText = new JLabel("Search for a player:");
+            searchBarText.setForeground(Color.WHITE); // Ensure visibility on dark background
+
+            searchPanel.add(infoText, gbc);
+            searchPanel.add(searchBarText, gbc);
+            searchPanel.add(searchBar, gbc);
+        } else {
+            JLabel noSearchText = new JLabel("<html>Enable the API (plugin config)<br>to search for players.</html>");
+            noSearchText.setForeground(Color.WHITE);
+            searchBar = new IconTextField();
+            searchBar.setIcon(IconTextField.Icon.SEARCH);
+            searchBar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            searchBar.addClearListener(this::resetPanel);
+
+            searchPanel.add(noSearchText, gbc);
+            searchPanel.add(searchBar, gbc);
+        }
+        logoPanel.add(searchPanel, BorderLayout.SOUTH);
+
+        mainContentPanel = new JPanel();
+        mainContentPanel.setLayout(new BoxLayout(mainContentPanel, BoxLayout.Y_AXIS));
+        mainContentPanel.add(logoPanel);
+        add(mainContentPanel, BorderLayout.CENTER);
+
+        // Footer buttons (Discord, Docs)
+        JPanel actionsContainer = new JPanel(new FlowLayout(FlowLayout.CENTER, 10, 0));
+        actionsContainer.setBorder(new EmptyBorder(10, 0, 0, 0));
+        actionsContainer.add(buildRoundedPanel("Discord", "https://www.droptracker.io/discord"));
+        actionsContainer.add(buildRoundedPanel("Docs", "https://www.droptracker.io/docs"));
+        add(actionsContainer, BorderLayout.SOUTH);
+
+
+        if (config.useApi()) {
+            this.api.setDataLoadedCallback(this);
+        }
+
+        revalidate();
+        repaint();
+    }
+    public void deinit()
+    {
+        eventBus.unregister(this);
+    }
+    static
+    {
+        ARROW_RIGHT_ICON = new ImageIcon(ImageUtil.loadImageResource(InfoPanel.class, "/util/arrow_right.png"));
+        DISCORD_ICON = new ImageIcon(ImageUtil.loadImageResource(InfoPanel.class, "discord_icon.png"));
+        WIKI_ICON = new ImageIcon(ImageUtil.loadImageResource(InfoPanel.class, "wiki_icon.png"));
+        TOP_LOGO = new ImageIcon(ImageUtil.loadImageResource(DropTrackerPlugin.class, "toplogo.png"));
+    }
+
+    // Helper method to create rounded buttons
+    private JPanel buildRoundedPanel(String text, String url) {
+        JPanel roundedContainer = new JPanel(new BorderLayout()) {
+            @Override
+            protected void paintComponent(Graphics g) {
+                super.paintComponent(g);
+                Graphics2D g2 = (Graphics2D) g.create();
+                g2.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+                g2.setColor(ColorScheme.MEDIUM_GRAY_COLOR);
+                g2.fillRoundRect(0, 0, getWidth(), getHeight(), 10, 10);
+                g2.dispose();
+            }
+        };
+        roundedContainer.setOpaque(false);
+        roundedContainer.setPreferredSize(new Dimension(100, 35));
+
+        JLabel textLabel = new JLabel(text, SwingConstants.CENTER);
+        textLabel.setForeground(Color.LIGHT_GRAY);
+        textLabel.setFont(FontManager.getRunescapeFont().deriveFont(16f));
+        roundedContainer.add(textLabel, BorderLayout.CENTER);
+
+        roundedContainer.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                roundedContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR.darker());
+            }
+
+            @Override
+            public void mouseReleased(MouseEvent e) {
+                LinkBrowser.browse(url);
+                roundedContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                roundedContainer.setBackground(ColorScheme.DARK_GRAY_COLOR);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e) {
+                roundedContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            }
+        });
+        return roundedContainer;
+    }
+
+    // Resets the panel to its default state
+    private void resetPanel() {
+        searchBar.setIcon(IconTextField.Icon.SEARCH);
+        searchBar.setEditable(true);
+
+
+        bossPanel.removeAll();
+
+
+        revalidate();
+        repaint();
+    }
+
+
+    // Triggers the player lookup when the search bar is used
+    private void lookupPlayer() {
+        String playerName = searchBar.getText().trim();
+        if (!playerName.isEmpty() && config.useApi()) {
+            api.lookupPlayer(playerName).whenCompleteAsync((result, ex) -> updateAfterSearch(playerName, result, ex));
+        }
+    }
+
+    private void updateAfterSearch(String playerName, Map<String, Object> result, Throwable ex) {
+        SwingUtilities.invokeLater(() -> {
+            if (ex != null || result == null) {
+                searchBar.setIcon(IconTextField.Icon.ERROR);
+                JLabel errorMessage = new JLabel("An error occurred: " + ex.getMessage());
+                bossPanel.add(errorMessage, BorderLayout.CENTER);
+                mainContentPanel.add(bossPanel);
+                revalidate();
+                repaint();
+                return;
+            }
+
+            searchBar.setIcon(IconTextField.Icon.SEARCH);
+
+            String message = (String) result.get("message");
+            if (result.get("bossData") != null) {
+                applySearchResult(result);
+                return;
+            }
+
+            // If there is a message from the server, display it
+            JLabel errorMessage;
+            if (message != null) {
+                errorMessage = new JLabel(message);
+            } else {
+                errorMessage = new JLabel("Couldn't search for this player...");
+            }
+
+            bossPanel.removeAll();  // Clear previous content
+            bossPanel.add(errorMessage, BorderLayout.CENTER);
+            mainContentPanel.add(bossPanel);
+            revalidate();
+            repaint();
+        });
+    }
+
+
+    private void applySearchResult(Map<String, Object> data) {
+        mainContentPanel.remove(bossPanel);
+
+        Map<String, Map<String, Object>> bossData = (Map<String, Map<String, Object>>) data.get("bossData");
+        if (bossData == null) {
+            return;
+        }
+
+        // Clear the previous content in bossPanel
+        bossPanel.removeAll();
+
+
+        // Update the BossPanel with the new NPC data
+        bossPanel.update(bossData);
+
+        // Re-add the BossPanel to the mainContentPanel
+        mainContentPanel.add(bossPanel);
+
+        revalidate();
+        repaint();
+    }
+
+    @Override
+    public void onDataLoaded(Map<String, Object> data) {
+        applySearchResult(data);
+    }
+
+
+}
+
+package io.droptracker.ui;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.HashMap;
+import java.util.Map;
+
+class TableRow extends JPanel {
+    Map<String, JLabel> labels = new HashMap<>();
+
+    TableRow(String boss, String killsText, String rankText, String ehbText) {
+        setLayout(new GridLayout(1, 4));
+        addLabel(boss);
+        addLabel(killsText);
+        addLabel(rankText);
+        addLabel(ehbText);
+    }
+
+    private void addLabel(String text) {
+        JLabel label = new JLabel(text);
+        label.setForeground(Color.WHITE);
+        labels.put(text, label);
+        add(label);
+    }
+
+    // Updates the row's labels with data
+    public void update(String kills, String rank, String ehb) {
+        labels.get("kills").setText(String.valueOf(kills));
+        labels.get("rank").setText(String.valueOf(rank));
+        labels.get("ehb").setText(String.valueOf(ehb));
+    }
+
+    // Resets the row to default state
+    public void reset() {
+        labels.get("kills").setText("--");
+        labels.get("rank").setText("--");
+        labels.get("ehb").setText("--");
+    }
+}
+
+class RowPair {
+    private final String skill;
+    private final TableRow row;
+
+    public RowPair(String skill, TableRow row) {
+        this.skill = skill;
+        this.row = row;
+    }
+
+    public String getSkill() {
+        return skill;
+    }
+
+    public TableRow getRow() {
+        return row;
+    }
+}
+
+package io.droptracker.api;
+
+import com.google.gson.Gson;
+import io.droptracker.DropTrackerConfig;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import okhttp3.*;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import java.io.IOException;
+import java.text.DecimalFormat;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+
+public class DropTrackerApi {
+    private final DropTrackerConfig config;
+    @Inject
+    public ChatMessageManager msgManager;
+    @Inject
+    private Client client;
+    @Inject
+    private Gson gson;
+    @Inject
+    private OkHttpClient httpClient;
+    private PanelDataLoadedCallback dataLoadedCallback;
+
+    @Inject
+    public DropTrackerApi(DropTrackerConfig config, ChatMessageManager chatMessageManager, Gson gson, OkHttpClient httpClient, Client client) {
+        this.config = config;
+        this.msgManager = chatMessageManager;
+        this.gson = gson;
+        this.httpClient = httpClient;
+        this.client = client;
+    }
+
+    public void setDataLoadedCallback(PanelDataLoadedCallback callback) {
+        this.dataLoadedCallback = callback;
+    }
+
+    /**
+     * Sends a request to the API to look up a player’s data and returns a CompletionStage for async handling.
+     */
+    public CompletionStage<Map<String, Object>> lookupPlayer(String playerName) {
+        CompletableFuture<Map<String, Object>> future = new CompletableFuture<>();
+
+        // Check if the API is enabled
+        if (!config.useApi()) {
+            future.completeExceptionally(new IllegalStateException("API is not enabled in the plugin config"));
+            return future;
+        }
+
+        String apiUrl = getApiUrl();
+        HttpUrl url = HttpUrl.parse(apiUrl + "/player_lookup/" + playerName);
+
+        if (url == null) {
+            future.completeExceptionally(new IllegalArgumentException("Invalid URL"));
+            return future;
+        }
+
+        Request request = new Request.Builder().url(url).build();
+
+        httpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                e.printStackTrace();
+                future.completeExceptionally(e);
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                try (ResponseBody responseBody = response.body()) {
+                    String responseData = responseBody.string();
+                    Map<String, Object> responseMap = gson.fromJson(responseData, Map.class);
+
+                    if (!response.isSuccessful()) {
+                        // Return the error message as part of the response to be handled
+                        future.complete(responseMap);
+                        return;
+                    }
+
+                    // If response is successful, return the response map
+                    future.complete(responseMap);
+                } catch (IllegalStateException e) {
+                    // If the webserver is down or malfunctioning, this is the likely outcome
+                    future.cancel(true);
+                }
+            }
+        });
+
+        return future;
+    }
+
+
+
+    public String getApiUrl() {
+        return config.useApi() ? "https://droptracker.io/api/" : "";
+    }
+
+    public interface PanelDataLoadedCallback {
+        void onDataLoaded(Map<String, Object> data);
+    }
+
+    public static String formatNumber(double number) {
+        if (number == 0) {
+            return "0";
+        }
+        String[] units = new String[]{"", "K", "M", "B", "T"};
+        int unit = (int) Math.floor((Math.log10(number) / 3));
+
+        if (unit >= units.length) unit = units.length - 1;
+
+        double num = number / Math.pow(1000, unit);
+        DecimalFormat df = new DecimalFormat("#.#");
+        String formattedNum = df.format(num);
+        return formattedNum + units[unit];
+    }
+}
+
+package io.droptracker.models;
+/*  Original Author @pajlads - DinkPlugin
+
+    https://github.com/pajlads/DinkPlugin
+
+ */
+
+import com.google.gson.annotations.JsonAdapter;
+import io.droptracker.util.DurationAdapter;
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+import lombok.experimental.Accessors;
+
+import java.time.Duration;
+import java.util.Collections;
+import java.util.List;
+
+@Value
+@EqualsAndHashCode(callSuper = false)
+public class BossNotification {
+    public List<CustomWebhookBody.Embed> getFields() {
+        return Collections.emptyList();
+    }
+    String boss;
+    Integer count;
+    String gameMessage;
+    @JsonAdapter(DurationAdapter.class)
+    Duration time;
+    @JsonAdapter(DurationAdapter.class)
+    Duration bestTime;
+    @Accessors(fluent = true)
+    Boolean isPersonalBest;
+}
+
+package io.droptracker.models;
+/*
+*  Author: https://github.com/pajlads/DinkPlugin
+* */
+import lombok.Value;
+import net.runelite.client.game.ItemStack;
+import net.runelite.http.api.loottracker.LootRecordType;
+
+import java.time.Instant;
+import java.util.Collection;
+
+@Value
+public class Drop {
+    String source;
+    LootRecordType category;
+    Collection<ItemStack> items;
+    Instant time = Instant.now();
+
+    public static String getAction(LootRecordType type) {
+        switch (type) {
+            case NPC:
+                return "Kill";
+            case PLAYER:
+                return "Player Kill";
+            case PICKPOCKET:
+                return "Pickpocket";
+            default:
+                return "Completion";
+        }
+    }
+}
+
+package io.droptracker.models;
+
+import lombok.Getter;
+
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Map;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+@Getter
+public enum CombatAchievement {
+    EASY,
+    MEDIUM,
+    HARD,
+    ELITE,
+    MASTER,
+    GRANDMASTER;
+
+    /**
+     * The points-based achievement system assigns one point to {@link #EASY} tasks,
+     * and increments by one for each difficulty level.
+     *
+     * @see <a href="https://gachi.gay/01CAv">Point values documented in blog post</a>
+     */
+    private final int points = this.ordinal() + 1;
+    private final String displayName = this.name().charAt(0) + this.name().substring(1).toLowerCase();
+
+    @Override
+    public String toString() {
+        return this.displayName;
+    }
+
+    public static final Map<String, CombatAchievement> TIER_BY_LOWER_NAME = Collections.unmodifiableMap(
+            Arrays.stream(values()).collect(Collectors.toMap(t -> t.name().toLowerCase(), Function.identity()))
+    );
+}
+
+
+package io.droptracker.models;
+
+import java.util.ArrayList;
+import java.util.List;
+import lombok.Data;
+
+@Data
+public class CustomWebhookBody
+{
+	private String content;
+	private List<Embed> embeds = new ArrayList<>();
+	private static Author DropTracker = new Author("https://www.droptracker.io/",
+			"DropTracker",
+			"https://www.droptracker.io/img/droptracker-small.gif");
+
+	@Data
+	public static class Embed
+	{
+		public String title = "";
+		UrlEmbed image = null;
+		final Author author = DropTracker;
+		final List<Field> fields = new ArrayList<>();
+		public void addField(String name, String value, boolean inline) {
+			this.fields.add(new Field(name, value, inline));
+		}
+		public void setImage(String imageUrl) {
+			this.image = new UrlEmbed(imageUrl);
+		}
+	}
+
+	@Data
+	public static class UrlEmbed
+	{
+		final String url;
+	}
+	@Data
+	public static class Author
+	{
+		final String url;
+		final String name;
+		final String icon_url;
+	}
+	@Data
+	public static class Field
+	{
+		final String name;
+		final String value;
+		final boolean inline;
+	}
+}
+

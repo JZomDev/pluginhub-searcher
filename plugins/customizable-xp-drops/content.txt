@@ -1,0 +1,4319 @@
+package com.xpdrops;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ExamplePluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ClassLoader.getSystemClassLoader().setDefaultAssertionStatus(true);
+		ExternalPluginManager.loadBuiltin(CustomizableXpDropsPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.xpdrops.predictedhit;
+
+import com.xpdrops.attackstyles.AttackStyle;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import net.runelite.api.Actor;
+
+@Data
+@AllArgsConstructor
+public class Hit
+{
+	private int hit;
+	private Actor attachedActor;
+	private AttackStyle style;
+}
+
+package com.xpdrops.predictedhit;
+
+import com.google.gson.Gson;
+import com.google.gson.internal.LinkedTreeMap;
+import com.xpdrops.predictedhit.npcswithscalingbonus.ChambersLayoutSolver;
+import com.xpdrops.predictedhit.npcswithscalingbonus.cox.CoXNPCs;
+import com.xpdrops.predictedhit.npcswithscalingbonus.toa.ToANPCs;
+import com.xpdrops.predictedhit.npcswithscalingbonus.tob.ToBNPCs;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Varbits;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+@Slf4j
+public class XpDropDamageCalculator
+{
+	private static final String NPC_JSON_FILE = "npcs.min.json";
+	private static final HashMap<Integer, Double> XP_BONUS_MAPPING = new HashMap<>();
+	private static final Pattern RAID_LEVEL_MATCHER = Pattern.compile("(\\d+)");
+	private static final int RAID_LEVEL_WIDGET_ID = (481 << 16) | 42;
+	private static final int ROOM_LEVEL_WIDGET_ID = (481 << 16) | 45;
+	private static final int COX_SCALED_PARTY_SIZE_VARBIT = 9540;
+
+	private int lastToARaidLevel = 0;
+	private int lastToARaidPartySize = 1;
+	private int lastToARaidRoomLevel = 0;
+
+	private final Gson GSON;
+	private final Client client;
+	private final ChambersLayoutSolver chambersLayoutSolver;
+
+	@Inject
+	protected XpDropDamageCalculator(Gson gson, Client client, ChambersLayoutSolver chambersLayoutSolver)
+	{
+		this.GSON = gson;
+		this.client = client;
+		this.chambersLayoutSolver = chambersLayoutSolver;
+	}
+
+	public void populateMap()
+	{
+		XP_BONUS_MAPPING.clear();
+		XP_BONUS_MAPPING.putAll(getNpcsWithXpBonus());
+	}
+
+	private int getCoxTotalPartySize()
+	{
+		return Math.max(1, client.getVarbitValue(COX_SCALED_PARTY_SIZE_VARBIT));
+	}
+
+	// Currently it checks a varbit for the amount of players in the raid.
+	// Ideally this method returns how many non board scaling accounts started the raid.
+	private int getCoxPlayersInRaid()
+	{
+		return Math.max(1, client.getVarbitValue(Varbits.RAID_PARTY_SIZE));
+	}
+
+	private int getToBPartySize()
+	{
+		int count = 0;
+		for (int i = 330; i < 335; i++)
+		{
+			String jagexName = client.getVarcStrValue(i);
+			if (jagexName != null)
+			{
+				String name = Text.removeTags(jagexName).replace('\u00A0', ' ').trim();
+				if (!"".equals(name))
+				{
+					count++;
+				}
+			}
+		}
+		return count;
+	}
+
+	private int getToAPartySize()
+	{
+		return 1 +
+			(client.getVarbitValue(Varbits.TOA_MEMBER_1_HEALTH) != 0 ? 1 : 0) +
+			(client.getVarbitValue(Varbits.TOA_MEMBER_2_HEALTH) != 0 ? 1 : 0) +
+			(client.getVarbitValue(Varbits.TOA_MEMBER_3_HEALTH) != 0 ? 1 : 0) +
+			(client.getVarbitValue(Varbits.TOA_MEMBER_4_HEALTH) != 0 ? 1 : 0) +
+			(client.getVarbitValue(Varbits.TOA_MEMBER_5_HEALTH) != 0 ? 1 : 0) +
+			(client.getVarbitValue(Varbits.TOA_MEMBER_6_HEALTH) != 0 ? 1 : 0) +
+			(client.getVarbitValue(Varbits.TOA_MEMBER_7_HEALTH) != 0 ? 1 : 0);
+	}
+
+	private int getToARaidLevel()
+	{
+		return client.getVarbitValue(Varbits.TOA_RAID_LEVEL);
+	}
+
+	private int getToARoomLevel()
+	{
+		Widget levelWidget = client.getWidget(ROOM_LEVEL_WIDGET_ID);
+		if (levelWidget != null && !levelWidget.isHidden())
+		{
+			try
+			{
+				return Integer.parseInt(Text.sanitize(levelWidget.getText()));
+			}
+			catch (Exception ignored) {}
+		}
+		return -1;
+	}
+
+	private int calculateHit(int hpXpDiff, double modifier, double configModifier)
+	{
+		if (Math.abs(configModifier) < 1e-6)
+		{
+			configModifier = 1e-6;
+		}
+
+		if (modifier < 1e-6)
+		{
+			return 0;
+		}
+		return (int) Math.round((hpXpDiff * (3.0d / 4.0d)) / modifier / configModifier);
+	}
+
+	public int calculateHitOnPlayer(int cmb, int hpXpDiff, double configModifier)
+	{
+		double modifier = Math.min(1.125d, 1 + Math.floor(cmb / 20.0d) / 40.0d);
+		return calculateHit(hpXpDiff, modifier, configModifier);
+	}
+
+	public int calculateHitOnNpc(int id, int hpXpDiff, double configModifier)
+	{
+		double modifier = 1.0;
+		if (CoXNPCs.isCOXNPC(id))
+		{
+			int scaledPartySize = getCoxTotalPartySize();
+			int playersInRaid = getCoxPlayersInRaid();
+			// Wrong. only follows the setting of the player's board
+//			int raidType = client.getVarbitValue(6385) > 0 ? 1 : 0;
+			int raidType = chambersLayoutSolver.isCM() ? 1 : 0;
+
+			modifier = CoXNPCs.getModifier(id, scaledPartySize, playersInRaid, raidType);
+			log.debug("COX modifier {} {} party size {} players in raid {} raid type {}", id, modifier, scaledPartySize, playersInRaid, raidType);
+		}
+		else if (ToBNPCs.isTOBNPC(id))
+		{
+			int partySize = getToBPartySize();
+			modifier = ToBNPCs.getModifier(id, partySize);
+			log.debug("TOB modifier {} {} part size {}", id, modifier, partySize);
+		}
+		else if (ToANPCs.isToANPC(id))
+		{
+			int partySize = getToAPartySize();
+			int roomLevel = getToARoomLevel();
+			int raidLevel = getToARaidLevel();
+			// If we cannot determine any of the above; use last known settings.
+			if (partySize < 0) partySize = lastToARaidPartySize; else lastToARaidPartySize = partySize;
+			if (roomLevel < 0) roomLevel = lastToARaidRoomLevel; else lastToARaidRoomLevel = roomLevel;
+			if (raidLevel < 0) raidLevel = lastToARaidLevel; else lastToARaidLevel = raidLevel;
+			modifier = ToANPCs.getModifier(id, partySize, raidLevel, roomLevel);
+			log.debug("TOA modifier {} {} party size {} raid level {} room level {}", id, modifier, partySize, raidLevel, roomLevel);
+		}
+		else if (XP_BONUS_MAPPING.containsKey(id))
+		{
+			modifier = XP_BONUS_MAPPING.get(id);
+		}
+		return calculateHit(hpXpDiff, modifier, configModifier);
+	}
+
+	// Don't do this in static block since we may want finer control of when it happens for a possibly long blocking
+	// operation like this.
+	private HashMap<Integer, Double> getNpcsWithXpBonus()
+	{
+		HashMap<Integer, Double> map1 = new HashMap<>();
+		try
+		{
+			try (InputStream resource = XpDropDamageCalculator.class.getResourceAsStream(NPC_JSON_FILE))
+			{
+				BufferedReader reader = new BufferedReader(new InputStreamReader(resource,
+					StandardCharsets.UTF_8));
+				Object jsonResult = GSON.fromJson(reader, Map.class);
+				try
+				{
+					Map<String, LinkedTreeMap<String, Double>> map = (Map<String, LinkedTreeMap<String, Double>>) jsonResult;
+					for (String id : map.keySet())
+					{
+						LinkedTreeMap<String, Double> result = map.get(id);
+						for (String key : result.keySet())
+						{
+							Double xpbonus = result.get(key);
+							xpbonus = (xpbonus + 100) / 100.0d;
+							map1.put(Integer.parseInt(id), xpbonus);
+						}
+					}
+				}
+				catch (ClassCastException castException)
+				{
+					log.warn("Invalid json. Casting to expected hierarchy failed", castException);
+				}
+			}
+		}
+		catch (IOException e)
+		{
+			log.warn("Couldn't open NPC json file", e);
+		}
+
+		return map1;
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+@AllArgsConstructor
+@Getter
+public class NPCStats
+{
+	private int hp;
+	private int att;
+	private int str;
+	private int def;
+	private int mage;
+	private int range;
+
+	private int offensiveAtt;
+	private int offensiveStr;
+//	private int offensiveMage;
+//	private int offensiveMageStr;
+//	private int offensiveRange;
+//	private int offensiveRangeStr;
+
+	private int defensiveStab;
+	private int defensiveSlash;
+	private int defensiveCrush;
+	private int defensiveMage;
+	private int defensiveRange;
+
+	private static final int MAX_HP_FOR_MULTIPLIER = 2000;
+
+	protected static double modifierFromStats(NPCStats npcStats)
+	{
+		int hp = Math.min(npcStats.hp, MAX_HP_FOR_MULTIPLIER);
+		double averageLevel = Math.floor((hp + npcStats.getAtt() + npcStats.getStr() + npcStats.getDef()) / 4.0);
+		double averageDefBonus = Math.floor((npcStats.getDefensiveStab() + npcStats.getDefensiveSlash() + npcStats.getDefensiveCrush()) / 3.0);
+		return 1.0 + 0.025 * Math.floor((averageLevel * (averageDefBonus + npcStats.getOffensiveStr() + npcStats.getOffensiveAtt())) / 5120.0);
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.tob;
+
+import net.runelite.api.NpcID;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+
+// We need a mapping (npc id, raid_type) -> xp bonus
+// EM = Entry Mode
+// HM = Hard Mode
+public enum ToBNPCs
+{
+	// TOB EM
+	// I'm not sure if EM does not scale at all
+	BLOAT_EM(			new ToBNPC(1.075,	1.075, 	1.075	), NpcID.PESTILENT_BLOAT_10812),
+	NYLOCAS_VASILIAS_EM(new ToBNPC(1.025,	1.025, 	1.025	), NpcID.NYLOCAS_VASILIAS_10787, NpcID.NYLOCAS_VASILIAS_10788, NpcID.NYLOCAS_VASILIAS_10789),
+	SOTETSEG_EM(		new ToBNPC(1.045,	1.045, 	1.045	), NpcID.SOTETSEG_10865),
+	VERZIK_P1_EM(		new ToBNPC(1.05,	1.05, 	1.05	), NpcID.VERZIK_VITUR_10831, NpcID.VERZIK_VITUR_10832),
+	VERZIK_P2_EM(		new ToBNPC(1.025,	1.025, 	1.025	), NpcID.VERZIK_VITUR_10833, NpcID.VERZIK_VITUR_10834),
+	VERZIK_P3_EM(		new ToBNPC(1.125,	1.125, 	1.125	), NpcID.VERZIK_VITUR_10835, NpcID.VERZIK_VITUR_10836),
+	// TOB
+	BLOAT(				new ToBNPC(1.7, 	1.775, 	1.85	), NpcID.PESTILENT_BLOAT),
+	NYLOCAS_VASILIAS(	new ToBNPC(1.175,	1.2, 	1.2		), NpcID.NYLOCAS_VASILIAS_8355, NpcID.NYLOCAS_VASILIAS_8356, NpcID.NYLOCAS_VASILIAS_8357),
+	SOTETSEG(			new ToBNPC(1.375,	1.375, 	1.375	), NpcID.SOTETSEG_8388),
+	VERZIK_P1(			new ToBNPC(1.05,	1.05, 	1.05	), NpcID.VERZIK_VITUR_8370, NpcID.VERZIK_VITUR_8371),
+	VERZIK_P2(			new ToBNPC(1.30,	1.30, 	1.30	), NpcID.VERZIK_VITUR_8372, NpcID.VERZIK_VITUR_8373),
+	VERZIK_P3(			new ToBNPC(1.575,	1.575, 	1.575	), NpcID.VERZIK_VITUR_8374, NpcID.VERZIK_VITUR_8375),
+	// TOB HM
+	BLOAT_HM(			new ToBNPC(1.8, 	1.85, 	1.85	), NpcID.PESTILENT_BLOAT_10813),
+	NYLOCAS_VASILIAS_HM(new ToBNPC(1.175,	1.2, 	1.2		), NpcID.NYLOCAS_VASILIAS_10808, NpcID.NYLOCAS_VASILIAS_10809, NpcID.NYLOCAS_VASILIAS_10810),
+	SOTETSEG_HM(		new ToBNPC(1.4,	1.4, 	1.4		), NpcID.SOTETSEG_10868),
+	VERZIK_P1_HM(		new ToBNPC(1.05,	1.05, 	1.05	), NpcID.VERZIK_VITUR_10848, NpcID.VERZIK_VITUR_10849),
+	VERZIK_P2_HM(		new ToBNPC(1.30,	1.30, 	1.30	), NpcID.VERZIK_VITUR_10850, NpcID.VERZIK_VITUR_10851),
+	VERZIK_P3_HM(		new ToBNPC(1.575,	1.575, 	1.575	), NpcID.VERZIK_VITUR_10852, NpcID.VERZIK_VITUR_10853),
+	;
+	private final HashSet<Integer> ids;
+	private final ToBNPC npcWithScalingBonus;
+	ToBNPCs(ToBNPC npcWithScalingBonus, int ... ids)
+	{
+		this.npcWithScalingBonus = npcWithScalingBonus;
+		this.ids = new HashSet<>();
+		Arrays.stream(ids).forEach(this.ids::add);
+	}
+
+	private static final HashMap<Integer, ToBNPC> NPCS_WITH_SCALING_BONUS_MAPPING;
+
+	static
+	{
+		NPCS_WITH_SCALING_BONUS_MAPPING = new HashMap<>();
+		for (ToBNPCs value : ToBNPCs.values())
+		{
+			for (Integer id : value.ids)
+			{
+				NPCS_WITH_SCALING_BONUS_MAPPING.put(id, value.npcWithScalingBonus);
+			}
+		}
+	}
+
+	public static boolean isTOBNPC(int id)
+	{
+		return NPCS_WITH_SCALING_BONUS_MAPPING.containsKey(id);
+	}
+
+	public static double getModifier(int id, int partySize)
+	{
+		if (isTOBNPC(id))
+		{
+			return NPCS_WITH_SCALING_BONUS_MAPPING.get(id).calculateModifier(partySize);
+		}
+		return 1.0;
+	}
+}
+package com.xpdrops.predictedhit.npcswithscalingbonus.tob;
+
+public class ToBNPC
+{
+	private final double[] modifiers;
+
+	ToBNPC(double... modifiers)
+	{
+		this.modifiers = modifiers;
+	}
+
+	public double calculateModifier(int partySize)
+	{
+		return modifiers[Math.min(Math.max(partySize - 3, 0), modifiers.length - 1)];
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.toa;
+
+public class PuzzleRoomNpc extends ToANPC
+{
+	public PuzzleRoomNpc(double baseHP, int att, int str, int def, int mage, int range, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(baseHP, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected int calculateHp(int raidLevel, int partySize, int pathLevel)
+	{
+		return (int)Math.floor(baseHP * raidLevelMod(raidLevel) * teamModifiers[partySize]);
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.toa;
+
+import lombok.Getter;
+import net.runelite.api.NpcID;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+
+public enum ToANPCs
+{
+	AKKHA(ToANPCStats.AKKHA.getToANPC(), NpcID.AKKHA, NpcID.AKKHA_11790, NpcID.AKKHA_11791, NpcID.AKKHA_11792, NpcID.AKKHA_11793, NpcID.AKKHA_11794, NpcID.AKKHA_11795, NpcID.AKKHA_11796),
+	BABA(ToANPCStats.BABA.getToANPC(), NpcID.BABA, NpcID.BABA_11779, NpcID.BABA_11780),
+	BABOON_BRAWLER_56(ToANPCStats.BABOON_BRAWLER_56.getToANPC(), NpcID.BABOON_BRAWLER),
+	BABOON_BRAWLER_68(ToANPCStats.BABOON_BRAWLER_68.getToANPC(), NpcID.BABOON_BRAWLER_11712),
+	BABOON_MAGE_56(ToANPCStats.BABOON_MAGE_56.getToANPC(), NpcID.BABOON_MAGE),
+	BABOON_MAGE_68(ToANPCStats.BABOON_MAGE_68.getToANPC(), NpcID.BABOON_MAGE_11714),
+	BABOON_SHAMAN(ToANPCStats.BABOON_SHAMAN.getToANPC(), NpcID.BABOON_SHAMAN),
+	CURSED_BABOON(ToANPCStats.CURSED_BABOON.getToANPC(), NpcID.CURSED_BABOON),
+	VOLATILE_BABOON(ToANPCStats.VOLATILE_BABOON.getToANPC(), NpcID.VOLATILE_BABOON),
+	KEPHRI(ToANPCStats.KEPHRI.getToANPC(), NpcID.KEPHRI, NpcID.KEPHRI_11720, NpcID.KEPHRI_11721, NpcID.KEPHRI_11722),
+	ARCANE_SCARAB(ToANPCStats.ARCANE_SCARAB.getToANPC(), NpcID.ARCANE_SCARAB),
+	SOLDIER_SCARAB(ToANPCStats.SOLDIER_SCARAB.getToANPC(), NpcID.SOLDIER_SCARAB),
+	SPITTING_SCARAB(ToANPCStats.SPITTING_SCARAB.getToANPC(), NpcID.SPITTING_SCARAB),
+	ZEBAK(ToANPCStats.ZEBAK.getToANPC(), NpcID.ZEBAK_11730, NpcID.ZEBAK_11732, NpcID.ZEBAK_11733),
+	T_WARDEN_489(ToANPCStats.T_WARDEN_489.getToANPC(), NpcID.TUMEKENS_WARDEN_11756, NpcID.TUMEKENS_WARDEN_11757, NpcID.TUMEKENS_WARDEN_11758),
+	T_WARDEN_544(ToANPCStats.T_WARDEN_544.getToANPC(), NpcID.TUMEKENS_WARDEN_11762, NpcID.TUMEKENS_WARDEN_11764),
+	E_WARDEN_489(ToANPCStats.E_WARDEN_489.getToANPC(), NpcID.ELIDINIS_WARDEN_11753, NpcID.ELIDINIS_WARDEN_11754),
+	E_WARDEN_544(ToANPCStats.E_WARDEN_544.getToANPC(), NpcID.ELIDINIS_WARDEN_11761, NpcID.ELIDINIS_WARDEN_11763),
+	AKKHA_SHADOW(ToANPCStats.AKKHA_SHADOW.getToANPC(), NpcID.AKKHAS_SHADOW, NpcID.AKKHAS_SHADOW_11798, NpcID.AKKHAS_SHADOW_11799),
+	OBELISK(ToANPCStats.OBELISK.getToANPC(), NpcID.OBELISK_11750, NpcID.OBELISK_11751, NpcID.OBELISK_11752);
+	private final HashSet<Integer> ids;
+	private final ToANPC npcWithScalingBonus;
+
+	ToANPCs(ToANPC coxnpc, int... ids)
+	{
+		this.npcWithScalingBonus = coxnpc;
+		this.ids = new HashSet<>();
+		Arrays.stream(ids).forEach(this.ids::add);
+	}
+
+	private static final HashMap<Integer, ToANPC> TOANPCMAPPING;
+
+	static
+	{
+		TOANPCMAPPING = new HashMap<>();
+		for (ToANPCs value : ToANPCs.values())
+		{
+			for (Integer id : value.ids)
+			{
+				TOANPCMAPPING.put(id, value.npcWithScalingBonus);
+			}
+		}
+	}
+
+	public static boolean isToANPC(int id)
+	{
+		return TOANPCMAPPING.containsKey(id);
+	}
+
+	public static double getModifier(int id, int partySize, int raidLevel, int pathLevel)
+	{
+		if (isToANPC(id))
+		{
+			return TOANPCMAPPING.get(id).calculateModifier(raidLevel, partySize, pathLevel);
+		}
+		return 1.0;
+	}
+
+	enum ToANPCStats
+	{
+		AKKHA(new CoreBoss(40, 100, 140, 80, 100, 100, 115, 30, 60, 120, 120, 10, 60)),
+		BABA(new CoreBoss(38, 150, 160, 80, 100, 0, 0, 26, 80, 160, 240, 280, 200)),
+		BABOON_BRAWLER_56(new PuzzleRoomNpc(4, 40, 40, 12, 40, 40, 20, 0, 900, 900, 900, -60, 900)),
+		BABOON_BRAWLER_68(new PuzzleRoomNpc(6.9, 60, 60, 20, 60, 40, 25, 0, 900, 900, 900, -60, 900)),
+		BABOON_MAGE_56(new PuzzleRoomNpc(4, 40, 40, 12, 40, 40, 20, 0, 900, 900, 900, 900, -50)),
+		BABOON_MAGE_68(new PuzzleRoomNpc(6, 40, 40, 12, 40, 40, 20, 0, 900, 900, 900, 900, -50)),
+		BABOON_SHAMAN(new PuzzleRoomNpc(16, 60, 60, 20, 60, 60, 25, 0, 900, 900, 900, 900, -50)),
+		CURSED_BABOON(new PuzzleRoomNpc(10, 60, 60, 20, 60, 60, 25, 0, 900, 900, 900, -60, -50)),
+		VOLATILE_BABOON(new PuzzleRoomNpc(8, 60, 60, 20, 60, 60, 25, 0, 900, 900, 900, -60, -50)),
+		KEPHRI(new CoreBoss(15, 0, 0, 80, 125, 0, 0, 0, 60, 300, 100, 200, 300)),
+		ARCANE_SCARAB(new ScarabNPC(40, 75, 80, 80, 100, 95, 0, 55, 15, 250, 30, 75, 50)),
+		SOLDIER_SCARAB(new ScarabNPC(40, 75, 80, 80, 100, 95, 100, 55, 15, 250, 30, 10, 250)),
+		SPITTING_SCARAB(new ScarabNPC(40, 1, 80, 80, 100, 95, 0, 55, 15, 250, 30, 250, 125)),
+		ZEBAK(new CoreBoss(58, 250, 140, 70, 100, 120, 160, 100, 160, 160, 260, 200, 110)),
+		T_WARDEN_489(new RoomLevelInvariant.RoomLevelInvariant5x(28, 300, 150, 100, 190, 190, 0, 25, 70, 70, 70, -30, 70)),
+		T_WARDEN_544(new RoomLevelInvariant.RoomLevelInvariant10x(88, 150, 150, 150, 150, 150, 0, 40, 40, 40, 20, 20, 20)),
+		//T_WARDEN_544_ENRAGED(new RoomLevelInvariant.RoomLevelInvariant10x(88, 150, 150, 180, 150, 150, 0, 40, 40, 40, 20, 20, 20)),
+		E_WARDEN_489(new RoomLevelInvariant.RoomLevelInvariant5x(28, 300, 150, 100, 190, 190, 0, 10, 70, 70, 70, -30, 70)),
+		E_WARDEN_544(new RoomLevelInvariant.RoomLevelInvariant10x(88, 150, 150, 150, 150, 150, 0, 40, 40, 40, 20, 20, 20)),
+		//E_WARDEN_544_ENRAGED(new RoomLevelInvariant.RoomLevelInvariant10x(88, 150, 150, 180, 150, 150, 0, 40, 40, 40, 20, 20, 20)), // Maps to the same ids but also leads to same xp bonus
+		AKKHA_SHADOW(new RoomLevelInvariant.RoomLevelInvariant5x(14, 100, 140, 30, 100, 100, 115, 30, 60, 120, 120, 10, 60)),
+		OBELISK(new RoomLevelInvariant.RoomLevelInvariant10x(26, 200, 150, 100, 100, 100, 0, 0, 70, 70, 70, 50, 60)),
+		;
+		@Getter
+		private final ToANPC toANPC;
+
+		ToANPCStats(ToANPC toANPC)
+		{
+			this.toANPC = toANPC;
+		}
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.toa;
+
+public abstract class RoomLevelInvariant extends ToANPC
+{
+	public static class RoomLevelInvariant5x extends RoomLevelInvariant
+	{
+		public RoomLevelInvariant5x(double baseHP, int att, int str, int def, int mage, int range, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+		{
+			super(baseHP, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+		}
+
+		@Override
+		protected int calculateHp(int raidLevel, int partySize, int pathLevel)
+		{
+			return calculateHp(raidLevel, partySize, pathLevel, 5.0);
+		}
+	}
+
+	public static class RoomLevelInvariant10x extends RoomLevelInvariant
+	{
+		public RoomLevelInvariant10x(double baseHP, int att, int str, int def, int mage, int range, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+		{
+			super(baseHP, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+		}
+
+		@Override
+		protected int calculateHp(int raidLevel, int partySize, int pathLevel)
+		{
+			return calculateHp(raidLevel, partySize, pathLevel, 10.0);
+		}
+	}
+
+	public RoomLevelInvariant(double baseHP, int att, int str, int def, int mage, int range, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(baseHP, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	protected int calculateHp(int raidLevel, int partySize, int pathLevel, double multiplier)
+	{
+		return (int)(Math.round(baseHP * raidLevelMod(raidLevel) * teamModifiers[partySize]) * multiplier);
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.toa;
+
+import com.xpdrops.predictedhit.npcswithscalingbonus.NPCStats;
+
+// Credit: Koekepan for the ToA related formulae used in this class and package.
+public abstract class ToANPC extends NPCStats
+{
+	public static final double[] teamModifiers = {1.0, 1.9, 2.8, 3.4, 4.0, 4.6, 5.2, 5.8};
+	public static final double[] roomModifiers = {1.0, 1.08, 1.13, 1.18, 1.23, 1.28, 1.33};
+
+	protected double baseHP;
+	public ToANPC(double baseHP, int att, int str, int def, int mage, int range, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(0, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+		this.baseHP = baseHP;
+	}
+
+	protected abstract int calculateHp(int raidLevel, int partySize, int pathLevel);
+	protected double raidLevelMod(int raidLevel)
+	{
+		return 1 + raidLevel * 0.004;
+	}
+
+	protected double calculateModifier(int raidLevel, int partySize, int pathLevel)
+	{
+		partySize = Math.max(0, Math.min(teamModifiers.length - 1, partySize - 1));
+		pathLevel = Math.max(0, Math.min(roomModifiers.length - 1, pathLevel));
+		int hp = calculateHp(raidLevel, partySize, pathLevel);
+		NPCStats npcStats = new NPCStats(hp, getAtt(), getStr(), getDef(), getMage(), getRange(), getOffensiveAtt(), getOffensiveStr(), getDefensiveStab(), getDefensiveSlash(), getDefensiveCrush(), getDefensiveMage(), getDefensiveRange());
+		double modifierFromStats = modifierFromStats(npcStats);
+		// not sure if required but following the formulae
+		return Math.max(1.0, modifierFromStats);
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.toa;
+
+// Akkha
+// Baba
+// Kephri
+// Zebak
+public class CoreBoss extends ToANPC
+{
+	public CoreBoss(double baseHP, int att, int str, int def, int mage, int range, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(baseHP, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected int calculateHp(int raidLevel, int partySize, int pathLevel)
+	{
+		return (int)(Math.round(baseHP * raidLevelMod(raidLevel) * roomModifiers[pathLevel] * teamModifiers[partySize]) * 10.0);
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.toa;
+
+public class ScarabNPC extends ToANPC
+{
+	public ScarabNPC(double baseHP, int att, int str, int def, int mage, int range, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(baseHP, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected int calculateHp(int raidLevel, int partySize, int pathLevel)
+	{
+		return (int)(Math.floor(baseHP * raidLevelMod(raidLevel) * roomModifiers[pathLevel] * teamModifiers[partySize]));
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Constants;
+import net.runelite.api.GameState;
+import net.runelite.api.InstanceTemplates;
+import net.runelite.api.NullObjectID;
+import net.runelite.api.Point;
+import net.runelite.api.Tile;
+import net.runelite.api.VarPlayer;
+import net.runelite.api.Varbits;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.client.plugins.raids.Raid;
+import net.runelite.client.plugins.raids.RaidRoom;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+import static net.runelite.api.Perspective.SCENE_SIZE;
+
+// Mostly copied from the core RaidsPlugin
+@Slf4j
+@Singleton
+public class ChambersLayoutSolver
+{
+	static final int ROOM_MAX_SIZE = 32;
+	private static final int LOBBY_PLANE = 3;
+	private static final int SECOND_FLOOR_PLANE = 2;
+	private static final int ROOMS_PER_PLANE = 8;
+	private static final int AMOUNT_OF_ROOMS_PER_X_AXIS_PER_PLANE = 4;
+	private static final WorldPoint TEMP_LOCATION = new WorldPoint(3360, 5152, 2);
+	private static final String CM_RAID_CODE = "SPCFPC#¤CFP SPC#";
+
+	private Client client;
+	boolean checkInRaid;
+	private boolean loggedIn;
+	private boolean inRaidChambers;
+	private int raidPartyID;
+	@Getter
+	private Raid raid;
+
+	@Inject
+	public ChambersLayoutSolver(Client client)
+	{
+		this.client = client;
+	}
+
+	public boolean isCM()
+	{
+		return raid != null && CM_RAID_CODE.equals(raid.toCode());
+	}
+
+	public void onVarbitChanged(VarbitChanged event)
+	{
+		if (event.getVarpId() == VarPlayer.IN_RAID_PARTY)
+		{
+			boolean tempInRaid = client.getVarbitValue(Varbits.IN_RAID) == 1;
+			if (loggedIn && !tempInRaid)
+			{
+				raid = null;
+			}
+
+			raidPartyID = event.getValue();
+		}
+
+		if (event.getVarbitId() == Varbits.IN_RAID)
+		{
+			boolean tempInRaid = event.getValue() == 1;
+			if (tempInRaid && loggedIn)
+			{
+				checkRaidPresence();
+			}
+
+			inRaidChambers = tempInRaid;
+		}
+	}
+
+	public void onGameTick(GameTick event)
+	{
+		if (checkInRaid)
+		{
+			loggedIn = true;
+			checkInRaid = false;
+
+			if (inRaidChambers)
+			{
+				checkRaidPresence();
+			}
+			else
+			{
+				if (raidPartyID == -1)
+				{
+					raid = null;
+				}
+			}
+		}
+	}
+
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		if (client.getGameState() == GameState.LOGGED_IN)
+		{
+			if (client.getLocalPlayer() == null
+				|| client.getLocalPlayer().getWorldLocation().equals(TEMP_LOCATION))
+			{
+				return;
+			}
+
+			checkInRaid = true;
+		}
+		else if (client.getGameState() == GameState.LOGIN_SCREEN
+			|| client.getGameState() == GameState.CONNECTION_LOST)
+		{
+			loggedIn = false;
+		}
+		else if (client.getGameState() == GameState.HOPPING)
+		{
+			raid = null;
+		}
+	}
+
+	private void checkRaidPresence()
+	{
+		if (client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+
+		inRaidChambers = client.getVarbitValue(Varbits.IN_RAID) == 1;
+
+		if (!inRaidChambers)
+		{
+			return;
+		}
+
+		raid = buildRaid(raid);
+	}
+
+	private Raid buildRaid(Raid from)
+	{
+		Raid raid = from;
+
+		if (raid == null)
+		{
+			Point gridBase = findLobbyBase();
+
+			if (gridBase == null)
+			{
+				return null;
+			}
+
+			Integer lobbyIndex = findLobbyIndex(gridBase);
+
+			if (lobbyIndex == null)
+			{
+				return null;
+			}
+
+			raid = new Raid(
+				new WorldPoint(client.getBaseX() + gridBase.getX(), client.getBaseY() + gridBase.getY(), LOBBY_PLANE),
+				lobbyIndex
+			);
+		}
+
+		int baseX = raid.getLobbyIndex() % AMOUNT_OF_ROOMS_PER_X_AXIS_PER_PLANE;
+		int baseY = raid.getLobbyIndex() % ROOMS_PER_PLANE > (AMOUNT_OF_ROOMS_PER_X_AXIS_PER_PLANE - 1) ? 1 : 0;
+
+		for (int i = 0; i < raid.getRooms().length; i++)
+		{
+			int x = i % AMOUNT_OF_ROOMS_PER_X_AXIS_PER_PLANE;
+			int y = i % ROOMS_PER_PLANE > (AMOUNT_OF_ROOMS_PER_X_AXIS_PER_PLANE - 1) ? 1 : 0;
+			int plane = i > (ROOMS_PER_PLANE - 1) ? SECOND_FLOOR_PLANE : LOBBY_PLANE;
+
+			x = x - baseX;
+			y = y - baseY;
+
+			x = raid.getGridBase().getX() + x * ROOM_MAX_SIZE;
+			y = raid.getGridBase().getY() - y * ROOM_MAX_SIZE;
+
+			x = x - client.getBaseX();
+			y = y - client.getBaseY();
+
+			if (x < (1 - ROOM_MAX_SIZE) || x >= SCENE_SIZE)
+			{
+				continue;
+			}
+			else if (x < 1)
+			{
+				x = 1;
+			}
+
+			if (y < 1)
+			{
+				y = 1;
+			}
+
+			Tile tile = client.getScene().getTiles()[plane][x][y];
+
+			if (tile == null)
+			{
+				continue;
+			}
+
+			RaidRoom room = determineRoom(tile);
+			raid.setRoom(room, i);
+		}
+
+		return raid;
+	}
+
+	private Point findLobbyBase()
+	{
+		Tile[][] tiles = client.getScene().getTiles()[LOBBY_PLANE];
+
+		for (int x = 0; x < SCENE_SIZE; x++)
+		{
+			for (int y = 0; y < SCENE_SIZE; y++)
+			{
+				if (tiles[x][y] == null || tiles[x][y].getWallObject() == null)
+				{
+					continue;
+				}
+
+				if (tiles[x][y].getWallObject().getId() == NullObjectID.NULL_12231)
+				{
+					return tiles[x][y].getSceneLocation();
+				}
+			}
+		}
+
+		return null;
+	}
+
+	private RaidRoom determineRoom(Tile base)
+	{
+		int chunkData = client.getInstanceTemplateChunks()[base.getPlane()][(base.getSceneLocation().getX()) / 8][base.getSceneLocation().getY() / 8];
+		InstanceTemplates template = InstanceTemplates.findMatch(chunkData);
+
+		if (template == null)
+		{
+			return RaidRoom.EMPTY;
+		}
+
+		switch (template)
+		{
+			case RAIDS_LOBBY:
+			case RAIDS_START:
+				return RaidRoom.START;
+			case RAIDS_END:
+				return RaidRoom.END;
+			case RAIDS_SCAVENGERS:
+			case RAIDS_SCAVENGERS2:
+				return RaidRoom.SCAVENGERS;
+			case RAIDS_SHAMANS:
+				return RaidRoom.SHAMANS;
+			case RAIDS_VASA:
+				return RaidRoom.VASA;
+			case RAIDS_VANGUARDS:
+				return RaidRoom.VANGUARDS;
+			case RAIDS_ICE_DEMON:
+				return RaidRoom.ICE_DEMON;
+			case RAIDS_THIEVING:
+				return RaidRoom.THIEVING;
+			case RAIDS_FARMING:
+			case RAIDS_FARMING2:
+				return RaidRoom.FARMING;
+			case RAIDS_MUTTADILES:
+				return RaidRoom.MUTTADILES;
+			case RAIDS_MYSTICS:
+				return RaidRoom.MYSTICS;
+			case RAIDS_TEKTON:
+				return RaidRoom.TEKTON;
+			case RAIDS_TIGHTROPE:
+				return RaidRoom.TIGHTROPE;
+			case RAIDS_GUARDIANS:
+				return RaidRoom.GUARDIANS;
+			case RAIDS_CRABS:
+				return RaidRoom.CRABS;
+			case RAIDS_VESPULA:
+				return RaidRoom.VESPULA;
+			default:
+				return RaidRoom.EMPTY;
+		}
+	}
+
+	private Integer findLobbyIndex(Point gridBase)
+	{
+		if (Constants.SCENE_SIZE <= gridBase.getX() + ROOM_MAX_SIZE
+			|| Constants.SCENE_SIZE <= gridBase.getY() + ROOM_MAX_SIZE)
+		{
+			return null;
+		}
+		int x;
+		int y;
+		Tile[][] tiles = client.getScene().getTiles()[LOBBY_PLANE];
+		if (tiles[gridBase.getX()][gridBase.getY() + ROOM_MAX_SIZE] == null)
+		{
+			y = 0;
+		}
+		else
+		{
+			y = 1;
+		}
+		if (tiles[gridBase.getX() + ROOM_MAX_SIZE][gridBase.getY()] == null)
+		{
+			x = 3;
+		}
+		else
+		{
+			for (x = 0; x < 3; x++)
+			{
+				int sceneX = gridBase.getX() - 1 - ROOM_MAX_SIZE * x;
+				if (sceneX < 0 || tiles[sceneX][gridBase.getY()] == null)
+				{
+					break;
+				}
+			}
+		}
+
+		return x + y * AMOUNT_OF_ROOMS_PER_X_AXIS_PER_PLANE;
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+public class Guardian extends CoXNPC
+{
+
+	public Guardian(int hp, int att, int str, int mage, int range, int def, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(hp, att, str, mage, range, def, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	// Formula to calculate average mining level:
+	// floor(total mining level / total party size),
+	// where board scaling accounts have 0 mining.
+	@Override
+	protected double calculateHpScaling(int scaledPartySize, int playersInRaid)
+	{
+		int guardianHp = 250 - 99 + 99 * playersInRaid / scaledPartySize;
+		return (1.0 + Math.floor(scaledPartySize / 2.0)) * guardianHp;
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+public class AbyssalPortal extends CoXNPC
+{
+	public AbyssalPortal(int hp, int att, int str, int mage, int range, int def, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(hp, att, str, mage, range, def, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected double calculateOffensiveScaling(int partySize)
+	{
+		return calculateDefensiveScaling(partySize);
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+// In reality scavenger beast has -97.5% xp bonus or 40x multiplier making it pointless to predict since most hits will not give hp xp
+public class Scavenger extends CoXNPC
+{
+	public Scavenger(int hp, int att, int str, int mage, int range, int def, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(hp, att, str, mage, range, def, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected double calculateHpScaling(int scaledPartySize, int playersInRaid)
+	{
+		return 1.0;
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+import com.xpdrops.predictedhit.npcswithscalingbonus.NPCStats;
+
+// Credits: De0, Bogi153, craigobaker, Ogkek, Machtigeman, and In Africa, for the CoX specific formulae used in this class and package.
+public class CoXNPC extends NPCStats
+{
+	public CoXNPC(int hp, int att, int str, int mage, int range, int def, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(hp, att, str, def, mage, range, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	private boolean isCM(int raidType)
+	{
+		return raidType > 0;
+	}
+
+	protected double cmHpMultiplier()
+	{
+		return 1.5;
+	}
+
+	protected double cmOffensiveMultiplier()
+	{
+		return 1.5;
+	}
+
+	protected double cmDefenceMultiplier()
+	{
+		return 1.5;
+	}
+
+	protected double cmMagicMultiplier()
+	{
+		return 1.5;
+	}
+
+	protected double calculateHpScaling(int scaledPartySize, int playersInRaid)
+	{
+		return 1.0 + Math.floor(scaledPartySize / 2.0);
+	}
+
+	protected double calculateOffensiveScaling(int partySize)
+	{
+		return (Math.floor(Math.sqrt(partySize - 1.0)) * 7.0 + (partySize - 1.0) + 100.0) / 100.0;
+	}
+
+	protected double calculateDefensiveScaling(int partySize)
+	{
+		return (Math.floor(Math.sqrt(partySize - 1.0)) + Math.floor((partySize - 1) * 7.0 / 10.0) + 100.0) / 100.0;
+	}
+
+	// Assumes everyone in the raid is max combat and mining
+	protected double calculateModifier(int raidType, int scaledPartySize, int playersInRaid)
+	{
+		double hpScaling = calculateHpScaling(scaledPartySize, playersInRaid);
+		double offensiveScaling = calculateOffensiveScaling(scaledPartySize);
+		double defensiveScaling = calculateDefensiveScaling(scaledPartySize);
+
+		int hitpoints, attackLevel, strengthLevel, defenceLevel, magicLevel, rangingLevel;
+
+		if (isCM(raidType))
+		{
+			hitpoints = (int) (hpScaling * getHp() * cmHpMultiplier());
+			attackLevel = 1 == getAtt() ? 1 : (int) (offensiveScaling * getAtt() * cmOffensiveMultiplier());
+			strengthLevel = 1 == getStr() ? 1 : (int) (offensiveScaling * getStr() * cmOffensiveMultiplier());
+			defenceLevel = (int) (defensiveScaling * getDef() * cmDefenceMultiplier());
+			magicLevel = 1 == getMage() ? 1 : (int) (offensiveScaling * getMage() * cmMagicMultiplier());
+			rangingLevel = 1 == getRange() ? 1 : (int) (offensiveScaling * getRange() * cmOffensiveMultiplier());
+		} else {
+			hitpoints = (int) (hpScaling * getHp());
+			attackLevel = 1 == getAtt() ? 1 : (int) (offensiveScaling * getAtt());
+			strengthLevel = 1 == getStr() ? 1 : (int) (offensiveScaling * getStr());
+			defenceLevel = (int) (defensiveScaling * getDef());
+			magicLevel = 1 == getMage() ? 1 : (int) (offensiveScaling * getMage());
+			rangingLevel = 1 == getRange() ? 1 : (int) (offensiveScaling * getRange());
+		}
+
+		NPCStats scaledStats = new NPCStats(
+			hitpoints,
+			attackLevel,
+			strengthLevel,
+			defenceLevel,
+			magicLevel,
+			rangingLevel,
+			getOffensiveAtt(),
+			getOffensiveStr(),
+			getDefensiveStab(),
+			getDefensiveSlash(),
+			getDefensiveCrush(),
+			getDefensiveMage(),
+			getDefensiveRange()
+		);
+		return modifierFromStats(scaledStats);
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+public class Tekton extends CoXNPC
+{
+	public Tekton(int hp, int att, int str, int mage, int range, int def, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(hp, att, str, mage, range, def, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected double cmMagicMultiplier()
+	{
+		return 1.2;
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+import lombok.Getter;
+import net.runelite.api.NpcID;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+
+public enum CoXNPCs
+{
+	TEKTON(CoXNPCStats.TEKTON.getCoxnpc(), NpcID.TEKTON_7541, NpcID.TEKTON_7542),
+	TEKTON_ENRAGED(CoXNPCStats.TEKTON_ENRAGED.getCoxnpc(), NpcID.TEKTON_ENRAGED, NpcID.TEKTON_ENRAGED_7544),
+	ICE_DEMON(CoXNPCStats.ICE_DEMON.getCoxnpc(), NpcID.ICE_DEMON, NpcID.ICE_DEMON_7585),
+	LIZARDMAN(CoXNPCStats.LIZARDMAN.getCoxnpc(), NpcID.LIZARDMAN_SHAMAN_7573, NpcID.LIZARDMAN_SHAMAN_7574),
+	MELEE_VANG(CoXNPCStats.MELEE_VANG.getCoxnpc(), NpcID.VANGUARD_7527),
+	MAGE_VANG(CoXNPCStats.MAGE_VANG.getCoxnpc(), NpcID.VANGUARD_7529),
+	RANGE_VANG(CoXNPCStats.RANGE_VANG.getCoxnpc(), NpcID.VANGUARD_7528),
+	VESPULA(CoXNPCStats.VESPULA.getCoxnpc(), NpcID.VESPULA, NpcID.VESPULA_7531, NpcID.VESPULA_7532),
+	ABYSSAL_PORTAL(CoXNPCStats.ABYSSAL_PORTAL.getCoxnpc(), NpcID.ABYSSAL_PORTAL),
+	GUARDIAN(CoXNPCStats.GUARDIAN.getCoxnpc(), NpcID.GUARDIAN, NpcID.GUARDIAN_7570, NpcID.GUARDIAN_7571, NpcID.GUARDIAN_7572),
+	VASA(CoXNPCStats.VASA.getCoxnpc(), NpcID.VASA_NISTIRIO, NpcID.VASA_NISTIRIO_7567),
+	GLOWING_CRYSTAL(CoXNPCStats.GLOWING_CRYSTAL.getCoxnpc(), NpcID.GLOWING_CRYSTAL),
+	MYSTIC(CoXNPCStats.MYSTIC.getCoxnpc(), NpcID.SKELETAL_MYSTIC, NpcID.SKELETAL_MYSTIC_7605, NpcID.SKELETAL_MYSTIC_7606),
+	SMALL_CROC(CoXNPCStats.SMALL_CROC.getCoxnpc(), NpcID.MUTTADILE_7562),
+	BIG_CROC(CoXNPCStats.BIG_CROC.getCoxnpc(), NpcID.MUTTADILE_7563),
+	ROPE_RANGER(CoXNPCStats.ROPE_RANGER.getCoxnpc(), NpcID.DEATHLY_RANGER),
+	ROPE_MAGER(CoXNPCStats.ROPE_MAGER.getCoxnpc(), NpcID.DEATHLY_MAGE),
+	GREAT_OLM(CoXNPCStats.GREAT_OLM.getCoxnpc(), NpcID.GREAT_OLM, NpcID.GREAT_OLM_7554),
+	GREAT_OLM_MAGE_HAND(CoXNPCStats.GREAT_OLM_MAGE_HAND.getCoxnpc(), NpcID.GREAT_OLM_LEFT_CLAW, NpcID.GREAT_OLM_LEFT_CLAW_7555),
+	GREAT_OLM_MELEE_HAND(CoXNPCStats.GREAT_OLM_MELEE_HAND.getCoxnpc(), NpcID.GREAT_OLM_RIGHT_CLAW, NpcID.GREAT_OLM_RIGHT_CLAW_7553),
+	SCAVENGER(CoXNPCStats.SCAVENGER.getCoxnpc(), NpcID.SCAVENGER_BEAST, NpcID.SCAVENGER_BEAST_7549),
+	;
+	private final HashSet<Integer> ids;
+	private final CoXNPC npcWithScalingBonus;
+
+	CoXNPCs(CoXNPC coxnpc, int... ids)
+	{
+		this.npcWithScalingBonus = coxnpc;
+		this.ids = new HashSet<>();
+		Arrays.stream(ids).forEach(this.ids::add);
+	}
+
+	private static final HashMap<Integer, CoXNPC> COXNPC_MAPPING;
+
+	static
+	{
+		COXNPC_MAPPING = new HashMap<>();
+		for (CoXNPCs value : CoXNPCs.values())
+		{
+			for (Integer id : value.ids)
+			{
+				COXNPC_MAPPING.put(id, value.npcWithScalingBonus);
+			}
+		}
+	}
+
+	public static boolean isCOXNPC(int id)
+	{
+		return COXNPC_MAPPING.containsKey(id);
+	}
+
+	public static double getModifier(int id, int scaledPartySize, int playersInRaid, int raidType)
+	{
+		if (isCOXNPC(id))
+		{
+			return COXNPC_MAPPING.get(id).calculateModifier(raidType, scaledPartySize, playersInRaid);
+		}
+		return 1.0;
+	}
+
+	@Getter
+	enum CoXNPCStats
+	{
+		TEKTON(new Tekton(300, 390, 390, 205, 1, 205, 64, 20, 155, 165, 105, 0, 0)),
+		TEKTON_ENRAGED(new Tekton(300, 390, 390, 205, 1, 205, 64, 30, 280, 290, 180, 0, 0)),
+		ICE_DEMON(new CoXNPC(140, 1, 1, 390, 390, 160, 0, 0, 70, 70, 110, 40, 140)),
+		LIZARDMAN(new CoXNPC(190, 130, 130, 130, 130, 210, 58, 52, 102, 160, 150, 160, 0)),
+		MAGE_VANG(new CoXNPC(180, 150, 150, 150, 150, 160, 0, 0, 315, 340, 400, 110, 50)),
+		MELEE_VANG(new CoXNPC(180, 150, 150, 150, 150, 160, 20, 10, 150, 150, 150, 20, 400)),
+		RANGE_VANG(new CoXNPC(180, 150, 150, 150, 150, 160, 0, 0, 55, 60, 100, 400, 300)),
+		VESPULA(new CoXNPC(200, 150, 150, 88, 150, 88, 0, -8, 0, 0, 0, 70, 60)),
+		ABYSSAL_PORTAL(new AbyssalPortal(250, 1, 1, 176, 1, 176, 0, 0, 0, 0, 0, 60, 140)),
+		GUARDIAN(new Guardian(1, 140, 140, 1, 1, 100, 0, 20, 80, 180, -10, 0, 0)),
+		VASA(new CoXNPC(300, 1, 1, 230, 230, 175, 0, 0, 170, 190, 50, 400, 40)),
+		GLOWING_CRYSTAL(new GlowingCrystal(120, 1, 1, 100, 1, 100, 0, 0, -5, 180, 180, 0, 0)),
+		MYSTIC(new CoXNPC(160, 140, 140, 140, 1, 187, 85, 50, 155, 155, 115, 140, 115)),
+		SMALL_CROC(new CoXNPC(250, 150, 150, 1, 150, 138, 71, 48, -5, 72, 50, 60, 0)),
+		BIG_CROC(new CoXNPC(250, 250, 250, 250, 250, 220, 88, 55, -5, 82, 60, 75, 0)),
+		ROPE_RANGER(new CoXNPC(120, 1, 1, 155, 210, 155, 0, 0, 0, 0, 0, 0, 0)),
+		ROPE_MAGER(new CoXNPC(120, 1, 1, 210, 1, 155, 0, 0, 0, 0, 0, 0, 0)),
+		GREAT_OLM(new GreatOlm(800, 250, 250, 250, 250, 150, 0, 0, 200, 200, 200, 200, 50)),
+		GREAT_OLM_MAGE_HAND(new GreatOlm(600, 250, 250, 175, 250, 175, 0, 0, 50, 50, 50, 50, 50)),
+		GREAT_OLM_MELEE_HAND(new GreatOlm(600, 250, 250, 87, 250, 175, 0, 0, 200, 200, 200, 50, 200)),
+		SCAVENGER(new Scavenger(30, 120, 120, 1, 1, 45, 0, 0, 0, 0, 0, 0, 0));
+		private final CoXNPC coxnpc;
+		CoXNPCStats(CoXNPC coxnpc)
+		{
+			this.coxnpc = coxnpc;
+		}
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+// Head and hands
+public class GreatOlm extends CoXNPC
+{
+	public GreatOlm(int hp, int att, int str, int mage, int range, int def, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(hp, att, str, mage, range, def, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected double calculateHpScaling(int scaledPartySize, int playersInRaid)
+	{
+		return (scaledPartySize - 3 * Math.floor(scaledPartySize / 8.0) + 1) / 2.0;
+	}
+
+	@Override
+	protected double cmHpMultiplier()
+	{
+		return 1.0;
+	}
+
+	@Override
+	protected double calculateModifier(int raidType, int scaledPartySize, int playersInRaid)
+	{
+		// From testing, it seems Olm does not ever have xp bonus even though the sheet suggests otherwise.
+		return 1.0;
+	}
+}
+
+package com.xpdrops.predictedhit.npcswithscalingbonus.cox;
+
+public class GlowingCrystal extends CoXNPC
+{
+	public GlowingCrystal(int hp, int att, int str, int mage, int range, int def, int offensiveAtt, int offensiveStr, int defensiveStab, int defensiveSlash, int defensiveCrush, int defensiveMage, int defensiveRange)
+	{
+		super(hp, att, str, mage, range, def, offensiveAtt, offensiveStr, defensiveStab, defensiveSlash, defensiveCrush, defensiveMage, defensiveRange);
+	}
+
+	@Override
+	protected double cmHpMultiplier()
+	{
+		return 1.0;
+	}
+
+	@Override
+	protected double cmDefenceMultiplier()
+	{
+		return 1.0;
+	}
+}
+
+/*
+ * Copyright (c) 2017, honeyhoney <https://github.com/honeyhoney>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.xpdrops.attackstyles;
+
+import com.xpdrops.Skill;
+import lombok.Getter;
+import net.runelite.api.Client;
+import net.runelite.api.StructComposition;
+
+public enum AttackStyle
+{
+	ACCURATE("Accurate", Skill.ATTACK),
+	AGGRESSIVE("Aggressive", Skill.STRENGTH),
+	DEFENSIVE("Defensive", Skill.DEFENCE),
+	CONTROLLED("Controlled", Skill.ATTACK, Skill.STRENGTH, Skill.DEFENCE),
+	RANGING("Ranging", Skill.RANGED),
+	LONGRANGE("Longrange", Skill.RANGED, Skill.DEFENCE),
+	CASTING("Casting", Skill.MAGIC),
+	DEFENSIVE_CASTING("Defensive Casting", Skill.MAGIC, Skill.DEFENCE),
+	OTHER("Other");
+
+	@Getter
+	private final String name;
+	@Getter
+	private final Skill[] skills;
+
+	private static final int WEAPON_STYLES = 3908; // EnumID.WEAPON_STYLES
+	private static final int ATTACK_STYLE_NAME = 1407; // ParamID.ATTACK_STYLE_NAME
+
+	AttackStyle(String name, Skill... skills)
+	{
+		this.name = name;
+		this.skills = skills;
+	}
+
+	// Duplicated from RuneLite's AttackStylesPlugin.java
+	public static AttackStyle[] getAttackStylesForWeaponType(Client client, int weaponType)
+	{
+		// from script4525
+		int weaponStyleEnum = client.getEnum(WEAPON_STYLES).getIntValue(weaponType);
+		if (weaponStyleEnum == -1)
+		{
+			if (weaponType == 30)
+			{
+				// Partisan
+				return new AttackStyle[]{
+					AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.AGGRESSIVE, DEFENSIVE
+				};
+			}
+			return new AttackStyle[0];
+		}
+
+		int[] weaponStyleStructs = client.getEnum(weaponStyleEnum).getIntVals();
+
+		if (weaponStyleStructs == null)
+		{
+			return new AttackStyle[0];
+		}
+
+		AttackStyle[] styles = new AttackStyle[weaponStyleStructs.length];
+		int i = 0;
+		for (int style : weaponStyleStructs)
+		{
+			StructComposition attackStyleStruct = client.getStructComposition(style);
+			String attackStyleName = attackStyleStruct.getStringValue(ATTACK_STYLE_NAME);
+
+			AttackStyle attackStyle = AttackStyle.valueOf(attackStyleName.toUpperCase());
+			if (attackStyle == AttackStyle.OTHER)
+			{
+				// "Other" is used for no style
+				++i;
+				continue;
+			}
+
+			// "Defensive" is used for Defensive and also Defensive casting
+			if (i == 5 && attackStyle == AttackStyle.DEFENSIVE)
+			{
+				attackStyle = AttackStyle.DEFENSIVE_CASTING;
+			}
+
+			styles[i++] = attackStyle;
+		}
+		return styles;
+	}
+}
+
+package com.xpdrops;
+
+import com.google.common.collect.ImmutableSet;
+import com.google.inject.Provides;
+import com.xpdrops.attackstyles.AttackStyle;
+import com.xpdrops.config.XpDropsConfig;
+import com.xpdrops.overlay.XpDropOverlayManager;
+import com.xpdrops.predictedhit.Hit;
+import com.xpdrops.predictedhit.XpDropDamageCalculator;
+import com.xpdrops.predictedhit.npcswithscalingbonus.ChambersLayoutSolver;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.EquipmentInventorySlot;
+import net.runelite.api.GameState;
+import net.runelite.api.InventoryID;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.ItemID;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
+import net.runelite.api.Prayer;
+import net.runelite.api.VarPlayer;
+import net.runelite.api.Varbits;
+import net.runelite.api.events.BeforeRender;
+import net.runelite.api.events.FakeXpDrop;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.events.ScriptPreFired;
+import net.runelite.api.events.StatChanged;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemVariationMapping;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDependency;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.xptracker.XpTrackerPlugin;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import java.util.ArrayDeque;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+import static net.runelite.api.ScriptID.XPDROPS_SETDROPSIZE;
+
+@PluginDependency(XpTrackerPlugin.class)
+// Plugin class and xp drop manager
+@PluginDescriptor(
+	name = "Customizable XP drops",
+	description = "Allows one to use fully customizable xp drops independent of the in-game ones"
+)
+@Slf4j
+public class CustomizableXpDropsPlugin extends Plugin
+{
+	public static final int[] SKILL_PRIORITY = new int[] {1, 5, 2, 6, 3, 7, 4, 15, 17, 18, 0, 16, 11, 14, 13, 9, 8, 10, 19, 20, 12, 22, 21};
+	private static final Set<Integer> VOIDWAKERS = new ImmutableSet.Builder<Integer>()
+		.addAll(ItemVariationMapping.getVariations(ItemID.VOIDWAKER))
+		.build();
+	private static final int LEVIATHAN_ID = 12214;
+	private static final int VARDORVIS_ID = 12223;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private XpDropOverlayManager xpDropOverlayManager;
+
+	@Inject
+	private XpDropsConfig config;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private XpDropDamageCalculator xpDropDamageCalculator;
+
+	@Inject
+	private ChambersLayoutSolver chambersLayoutSolver;
+
+	@Provides
+	XpDropsConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(XpDropsConfig.class);
+	}
+
+	int skillPriorityComparator(XpDrop x1, XpDrop x2)
+	{
+		int priority1 = SKILL_PRIORITY[x1.getSkill().ordinal()];
+		int priority2 = SKILL_PRIORITY[x2.getSkill().ordinal()];
+		return Integer.compare(priority1, priority2);
+	}
+
+	@Getter
+	private final PriorityQueue<XpDrop> queue = new PriorityQueue<>(this::skillPriorityComparator);
+	@Getter
+	private final ArrayDeque<Hit> hitBuffer = new ArrayDeque<>();
+	@Getter
+	private final HashSet<String> filteredSkills = new HashSet<>();
+	@Getter
+	private final HashSet<String> filteredSkillsPredictedHits = new HashSet<>();
+	private static final int EXPERIENCE_TRACKER_TOGGLE = 4702;
+	private static final int XP_TRACKER_SCRIPT_ID = 997;
+	private static final int XP_TRACKER_WIDGET_GROUP_ID = 122;
+	private static final int XP_TRACKER_WIDGET_CHILD_ID = 4;
+	private static final int[] previous_exp = new int[Skill.values().length - 1];
+	private boolean resetXpTrackerLingerTimerFlag = false;
+
+	private int attackStyleVarbit = -1;
+	private int equippedWeaponTypeVarbit = -1;
+	private int castingModeVarbit = -1;
+	@Getter
+	private AttackStyle attackStyle;
+
+	@Override
+	protected void startUp()
+	{
+		long time = System.currentTimeMillis();
+
+		if (client.getGameState() == GameState.LOGGED_IN)
+		{
+			clientThread.invokeLater(() ->
+			{
+				int[] xps = client.getSkillExperiences();
+				System.arraycopy(xps, 0, previous_exp, 0, previous_exp.length);
+
+				initAttackStyles();
+				initShouldDraw();
+			});
+		}
+		else
+		{
+			Arrays.fill(previous_exp, 0);
+		}
+		queue.clear();
+		xpDropOverlayManager.startup();
+
+		filteredSkillsPredictedHits.clear();
+		filteredSkillsPredictedHits.addAll(Text.fromCSV(config.skillsToFilterForPredictedHits()).stream().map(String::toLowerCase).collect(Collectors.toList()));
+		// Since most people know this skill by runecrafting not runecraft
+		if (filteredSkillsPredictedHits.contains("runecrafting"))
+		{
+			filteredSkillsPredictedHits.add("runecraft");
+		}
+
+		filteredSkills.clear();
+		filteredSkills.addAll(Text.fromCSV(config.skillsToFilter()).stream().map(String::toLowerCase).collect(Collectors.toList()));
+		// Since most people know this skill by runecrafting not runecraft
+		if (filteredSkills.contains("runecrafting"))
+		{
+			filteredSkills.add("runecraft");
+		}
+
+		setXpTrackerHidden(config.useXpTracker());
+
+		xpDropDamageCalculator.populateMap();
+
+		long totalTime = System.currentTimeMillis() - time;
+		log.debug("Plugin took {}ms to start.", totalTime);
+	}
+
+	private void initShouldDraw()
+	{
+		boolean shouldDraw = client.getVarbitValue(EXPERIENCE_TRACKER_TOGGLE) == 1;
+		xpDropOverlayManager.setShouldDraw(shouldDraw);
+	}
+
+	private void initAttackStyles()
+	{
+		attackStyleVarbit = client.getVarpValue(VarPlayer.ATTACK_STYLE);
+		equippedWeaponTypeVarbit = client.getVarbitValue(Varbits.EQUIPPED_WEAPON_TYPE);
+		castingModeVarbit = client.getVarbitValue(Varbits.DEFENSIVE_CASTING_MODE);
+		updateAttackStyle(equippedWeaponTypeVarbit, attackStyleVarbit, castingModeVarbit);
+	}
+
+	private void updateAttackStyle(int equippedWeaponType, int attackStyleIndex, int castingMode)
+	{
+		AttackStyle[] attackStyles = AttackStyle.getAttackStylesForWeaponType(client, equippedWeaponType);
+		if (attackStyleIndex < attackStyles.length)
+		{
+			attackStyle = attackStyles[attackStyleIndex];
+			if (attackStyle == null)
+			{
+				attackStyle = AttackStyle.OTHER;
+			}
+			else if ((attackStyle == AttackStyle.CASTING) && (castingMode == 1))
+			{
+				attackStyle = AttackStyle.DEFENSIVE_CASTING;
+			}
+		}
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		xpDropOverlayManager.shutdown();
+		setXpTrackerHidden(false); // should be according to varbit?
+	}
+
+	protected void setXpTrackerHidden(boolean hidden)
+	{
+		clientThread.invokeLater(() ->
+		{
+			final Widget xpTracker = client.getWidget(XP_TRACKER_WIDGET_GROUP_ID, XP_TRACKER_WIDGET_CHILD_ID);
+			if (xpTracker != null)
+			{
+				xpTracker.setHidden(hidden);
+			}
+		});
+	}
+
+	@Subscribe
+	protected void onVarbitChanged(VarbitChanged varbitChanged)
+	{
+		boolean shouldDraw = client.getVarbitValue(EXPERIENCE_TRACKER_TOGGLE) == 1;
+		xpDropOverlayManager.setShouldDraw(shouldDraw);
+
+		int currentAttackStyleVarbit = client.getVarpValue(VarPlayer.ATTACK_STYLE);
+		int currentEquippedWeaponTypeVarbit = client.getVarbitValue(Varbits.EQUIPPED_WEAPON_TYPE);
+		int currentCastingModeVarbit = client.getVarbitValue(Varbits.DEFENSIVE_CASTING_MODE);
+
+		if (attackStyleVarbit != currentAttackStyleVarbit || equippedWeaponTypeVarbit != currentEquippedWeaponTypeVarbit || castingModeVarbit != currentCastingModeVarbit)
+		{
+			attackStyleVarbit = currentAttackStyleVarbit;
+			equippedWeaponTypeVarbit = currentEquippedWeaponTypeVarbit;
+			castingModeVarbit = currentCastingModeVarbit;
+
+			updateAttackStyle(equippedWeaponTypeVarbit, attackStyleVarbit, castingModeVarbit);
+		}
+
+		chambersLayoutSolver.onVarbitChanged(varbitChanged);
+	}
+
+	@Subscribe
+	protected void onGameTick(GameTick gameTick)
+	{
+		chambersLayoutSolver.onGameTick(gameTick);
+	}
+
+	@Subscribe
+	protected void onConfigChanged(ConfigChanged configChanged)
+	{
+		if ("CustomizableXPDrops".equals(configChanged.getGroup()))
+		{
+			if ("skillsToFilter".equals(configChanged.getKey()))
+			{
+				filteredSkills.clear();
+				filteredSkills.addAll(Text.fromCSV(config.skillsToFilter()).stream().map(String::toLowerCase).collect(Collectors.toList()));
+				// Since most people know this skill by runecrafting not runecraft
+				if (filteredSkills.contains("runecrafting"))
+				{
+					filteredSkills.add("runecraft");
+				}
+			}
+
+			if ("skillsToFilterForPredictedHits".equals(configChanged.getKey()))
+			{
+				filteredSkillsPredictedHits.clear();
+				filteredSkillsPredictedHits.addAll(Text.fromCSV(config.skillsToFilterForPredictedHits()).stream().map(String::toLowerCase).collect(Collectors.toList()));
+				// Since most people know this skill by runecrafting not runecraft
+				if (filteredSkillsPredictedHits.contains("runecrafting"))
+				{
+					filteredSkillsPredictedHits.add("runecraft");
+				}
+			}
+
+			if ("useXpTracker".equals(configChanged.getKey()))
+			{
+				setXpTrackerHidden(config.useXpTracker());
+			}
+
+			if ("attachToTarget".equals(configChanged.getKey()) || "attachToPlayer".equals(configChanged.getKey()))
+			{
+				xpDropOverlayManager.overlayTypeConfigChanged();
+			}
+
+			if ("iconOverride".equals(configChanged.getKey()))
+			{
+				xpDropOverlayManager.clearIconCache();
+			}
+
+			if ("xpDropOverlayPriority".equals(configChanged.getKey()))
+			{
+				xpDropOverlayManager.xpDropOverlayPriorityChanged();
+			}
+
+			if ("xpTrackerOverlayPriority".equals(configChanged.getKey()))
+			{
+				xpDropOverlayManager.xpTrackerOverlayPriorityChanged();
+			}
+
+			if ("xpTrackerHideVanilla".equals(configChanged.getKey()))
+			{
+				setXpTrackerHidden(config.xpTrackerHideVanilla());
+			}
+		}
+	}
+
+	@Subscribe
+	public void onScriptPreFired(ScriptPreFired scriptPreFired)
+	{
+		if (!config.xpDropsHideVanilla()) return;
+
+		if (scriptPreFired.getScriptId() == XPDROPS_SETDROPSIZE)
+		{
+			final int[] intStack = client.getIntStack();
+			final int intStackSize = client.getIntStackSize();
+			// This runs prior to the proc being invoked, so the arguments are still on the stack.
+			// Grab the first argument to the script.
+			final int widgetId = intStack[intStackSize - 4];
+
+			final Widget xpdrop = client.getWidget(widgetId);
+			if (xpdrop != null)
+			{
+				xpdrop.setHidden(true);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onScriptPostFired(ScriptPostFired scriptPostFired)
+	{
+		if (!config.xpTrackerHideVanilla()) return;
+
+		if (scriptPostFired.getScriptId() == XP_TRACKER_SCRIPT_ID)
+		{
+			final Widget xpTracker = client.getWidget(XP_TRACKER_WIDGET_GROUP_ID, XP_TRACKER_WIDGET_CHILD_ID);
+			if (xpTracker != null)
+			{
+				xpTracker.setHidden(config.useXpTracker());
+			}
+		}
+	}
+
+	@Subscribe
+	protected void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		if (gameStateChanged.getGameState() == GameState.LOGIN_SCREEN || gameStateChanged.getGameState() == GameState.HOPPING)
+		{
+			Arrays.fill(previous_exp, 0);
+			resetXpTrackerLingerTimerFlag = true;
+		}
+		if (gameStateChanged.getGameState() == GameState.LOGGED_IN && resetXpTrackerLingerTimerFlag)
+		{
+			resetXpTrackerLingerTimerFlag = false;
+			xpDropOverlayManager.setLastSkillSetMillis(System.currentTimeMillis());
+		}
+
+		chambersLayoutSolver.onGameStateChanged(gameStateChanged);
+	}
+
+	@Subscribe
+	protected void onFakeXpDrop(FakeXpDrop event)
+	{
+		int currentXp = event.getXp();
+		if (event.getXp() >= 20000000)
+		{
+			// fake-fake xp drop?
+			return;
+		}
+
+		Player player = client.getLocalPlayer();
+		int lastOpponentId = -1;
+		Actor lastOpponent = null;
+		if (player != null)
+		{
+			lastOpponent = player.getInteracting();
+		}
+		if (event.getSkill() == net.runelite.api.Skill.HITPOINTS)
+		{
+			int hit = 0;
+			if (lastOpponent instanceof Player)
+			{
+				lastOpponentId = lastOpponent.getCombatLevel();
+				hit = xpDropDamageCalculator.calculateHitOnPlayer(lastOpponent.getCombatLevel(), currentXp, config.xpMultiplier());
+			}
+			else if (lastOpponent instanceof NPC)
+			{
+				lastOpponentId = ((NPC) lastOpponent).getId();
+
+				// Special case for Awakened DT2 Bosses
+				if ((lastOpponentId == LEVIATHAN_ID || lastOpponentId == VARDORVIS_ID)
+					&& lastOpponent.getCombatLevel() > 1000)
+				{
+					lastOpponentId *= -1;
+				}
+
+				hit = xpDropDamageCalculator.calculateHitOnNpc(lastOpponentId, currentXp, config.xpMultiplier());
+			}
+			log.debug("Hit npc with fake hp xp drop xp:{} hit:{} npc_id:{}", currentXp, hit, lastOpponentId);
+			hitBuffer.add(new Hit(hit, lastOpponent, attackStyle));
+		}
+
+		XpDrop xpDrop = new XpDrop(Skill.fromSkill(event.getSkill()), currentXp, matchPrayerStyle(Skill.fromSkill(event.getSkill())), true, lastOpponent);
+		queue.add(xpDrop);
+	}
+
+	@Subscribe
+	protected void onStatChanged(StatChanged event)
+	{
+		int currentXp = event.getXp();
+		int previousXp = previous_exp[event.getSkill().ordinal()];
+		if (previousXp > 0 && currentXp - previousXp > 0)
+		{
+			Player player = client.getLocalPlayer();
+			int lastOpponentId = -1;
+			Actor lastOpponent = null;
+			if (player != null)
+			{
+				lastOpponent = player.getInteracting();
+			}
+			if (event.getSkill() == net.runelite.api.Skill.HITPOINTS)
+			{
+				int hit = 0;
+				if (lastOpponent instanceof Player)
+				{
+					lastOpponentId = lastOpponent.getCombatLevel();
+					hit = xpDropDamageCalculator.calculateHitOnPlayer(lastOpponentId, currentXp - previousXp, config.xpMultiplier());
+				}
+				else if (lastOpponent instanceof NPC)
+				{
+					lastOpponentId = ((NPC) lastOpponent).getId();
+					hit = xpDropDamageCalculator.calculateHitOnNpc(lastOpponentId, currentXp - previousXp, config.xpMultiplier());
+				}
+				log.debug("Hit npc with hp xp drop xp:{} hit:{} npc_id:{}", currentXp - previousXp, hit, lastOpponentId);
+				hitBuffer.add(new Hit(hit, lastOpponent, attackStyle));
+			}
+
+			XpDrop xpDrop = new XpDrop(Skill.fromSkill(event.getSkill()), currentXp - previousXp, matchPrayerStyle(Skill.fromSkill(event.getSkill())), false, lastOpponent);
+			queue.add(xpDrop);
+		}
+
+		previous_exp[event.getSkill().ordinal()] = event.getXp();
+	}
+
+	@Subscribe
+	protected void onBeforeRender(BeforeRender beforeRender)
+	{
+		xpDropOverlayManager.update();
+	}
+
+	private XpPrayer getActivePrayer()
+	{
+		for (XpPrayer prayer : XpPrayer.values())
+		{
+			if (client.getServerVarbitValue(prayer.getPrayer().getVarbit()) == 1)
+			{
+				return prayer;
+			}
+		}
+		return null;
+	}
+
+	protected boolean isVoidwakerEquipped()
+	{
+		ItemContainer equipment = client.getItemContainer(InventoryID.EQUIPMENT);
+		if (equipment == null) return false;
+		Item weapon = equipment.getItem(EquipmentInventorySlot.WEAPON.getSlotIdx());
+		return weapon != null && VOIDWAKERS.contains(weapon.getId());
+	}
+
+	protected XpDropStyle matchPrayerStyle(Skill skill)
+	{
+		XpPrayer activePrayer = getActivePrayer();
+		if (activePrayer != null)
+		{
+			if (activePrayer.getStyles().contains(attackStyle))
+			{
+				for (Skill attackStyleSkill : attackStyle.getSkills())
+				{
+					if (attackStyleSkill == skill)
+					{
+						return activePrayer.getType();
+					}
+				}
+			}
+			// Fallback. Triggered for example when manually casting a spell with a non mage weapon equipped.
+			if (skill == Skill.MAGIC && activePrayer.getType() == XpDropStyle.MAGE)
+			{
+				return XpDropStyle.MAGE;
+			}
+			// Voidwaker spec, even though a mage xp drop, should count towards melee style prayers.
+			if (skill == Skill.MAGIC && activePrayer.getType() == XpDropStyle.MELEE && isVoidwakerEquipped())
+			{
+				return XpDropStyle.MELEE;
+			}
+			// The following prayers work for all 3 combat styles
+			if (activePrayer.getPrayer() == Prayer.RP_TRINITAS || activePrayer.getPrayer() == Prayer.RP_INTENSIFY)
+			{
+				switch (skill)
+				{
+					case ATTACK:
+					case STRENGTH:
+					case DEFENCE:
+						return XpDropStyle.MELEE;
+					case RANGED:
+						return XpDropStyle.RANGE;
+					case MAGIC:
+						return XpDropStyle.MAGE;
+				}
+			}
+		}
+		return XpDropStyle.DEFAULT;
+	}
+}
+
+package com.xpdrops;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import net.runelite.api.Actor;
+
+@Data
+@AllArgsConstructor
+public class XpDrop
+{
+	private Skill skill;
+	private int experience;
+	private XpDropStyle style;
+	private boolean fake;
+	private Actor attachedActor;
+}
+
+package com.xpdrops.config;
+
+import com.xpdrops.Skill;
+import lombok.Getter;
+
+public enum XpTrackerSkills
+{
+	OVERALL(Skill.OVERALL),
+	MOST_RECENT(null),
+	ATTACK(Skill.ATTACK),
+	STRENGTH(Skill.STRENGTH),
+	DEFENCE(Skill.DEFENCE),
+	HITPOINTS(Skill.HITPOINTS),
+	RANGED(Skill.RANGED),
+	PRAYER(Skill.PRAYER),
+	MAGIC(Skill.MAGIC),
+	RUNECRAFT(Skill.RUNECRAFT),
+	CONSTRUCTION(Skill.CONSTRUCTION),
+	AGILITY(Skill.AGILITY),
+	HERBLORE(Skill.HERBLORE),
+	THIEVING(Skill.THIEVING),
+	CRAFTING(Skill.CRAFTING),
+	FLETCHING(Skill.FLETCHING),
+	SLAYER(Skill.SLAYER),
+	HUNTER(Skill.HUNTER),
+	MINING(Skill.MINING),
+	SMITHING(Skill.SMITHING),
+	FISHING(Skill.FISHING),
+	COOKING(Skill.COOKING),
+	FIREMAKING(Skill.FIREMAKING),
+	WOODCUTTING(Skill.WOODCUTTING),
+	FARMING(Skill.FARMING);
+
+	@Getter
+	private final Skill associatedSkill;
+
+	XpTrackerSkills(Skill skill)
+	{
+		associatedSkill = skill;
+	}
+}
+
+package com.xpdrops.config;
+
+import com.xpdrops.overlay.TextComponentWithAlpha;
+import lombok.Getter;
+import net.runelite.client.config.Alpha;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
+import net.runelite.client.ui.overlay.OverlayPriority;
+
+import java.awt.Color;
+import java.awt.Font;
+
+@ConfigGroup("CustomizableXPDrops")
+public interface XpDropsConfig extends Config
+{
+	enum FontStyle
+	{
+		BOLD("Bold", Font.BOLD),
+		ITALICS("Italics", Font.ITALIC),
+		BOLD_ITALICS("Bold and italics", Font.BOLD | Font.ITALIC),
+		DEFAULT("Default", Font.PLAIN);
+
+		String name;
+		@Getter
+		private int style;
+
+		FontStyle(String name, int style)
+		{
+			this.style = style;
+			this.name = name;
+		}
+
+		public String getName()
+		{
+			return name;
+		}
+	}
+
+	enum CenterOn
+	{
+		TEXT,
+		ICON_AND_TEXT,
+	}
+
+	enum VerticalDirection
+	{
+		UP,
+		DOWN
+	}
+
+	enum HorizontalDirection
+	{
+		LEFT,
+		RIGHT
+	}
+
+	enum PredictedHitIconStyle
+	{
+		NO_ICON,
+		HITSPLAT,
+		HITSPLAT_SKILL,
+		SKILL
+	}
+
+	@ConfigSection(
+		name = "Xp drop settings",
+		description = "Settings relating to xp drops",
+		position = 1
+	)
+	String xp_drop_settings = "xp_drop_settings";
+
+	@ConfigSection(
+		name = "Font settings",
+		description = "Settings relating to fonts",
+		position = 2,
+		closedByDefault = true
+	)
+	String font_settings = "font_settings";
+
+	@ConfigSection(
+		name = "Predicted hit",
+		description = "Settings relating to predicted hit",
+		position = 3,
+		closedByDefault = true
+	)
+	String predicted_hit = "predicted_hit";
+
+	@ConfigSection(
+		name = "Xp tracker overlay",
+		description = "Settings relating to the xp tracker",
+		position = 4,
+		closedByDefault = true
+	)
+	String xp_tracker_settings = "xp_tracker_settings";
+
+	@ConfigSection(
+		name = "Miscellaneous",
+		description = "Miscellaneous settings",
+		position = 5,
+		closedByDefault = true
+	)
+	String xp_miscellaneous_settings = "xp_miscellaneous_settings";
+
+	@ConfigItem(
+		keyName = "grouped",
+		name = "Group XP drops",
+		description = "Group XP drops",
+		position = 0,
+		section = xp_drop_settings
+	)
+	default boolean isGrouped()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "groupedDelay",
+		name = "XP drop delay",
+		description = "The amount of frames delay between 2 drops when not grouped",
+		position = 0,
+		section = xp_drop_settings
+	)
+	default int groupedDelay()
+	{
+		return 20;
+	}
+
+	@ConfigItem(
+		keyName = "yPixelsPerSecond",
+		name = "Vertical XP drop speed",
+		description = "The amount of pixels per second the drop is moved in vertical direction",
+		position = 1,
+		section = xp_drop_settings
+	)
+	default int yPixelsPerSecond()
+	{
+		return 44;
+	}
+
+	@ConfigItem(
+		keyName = "yDirection",
+		name = "Vertical direction",
+		description = "The direction in which the XP drop moves",
+		position = 1,
+		section = xp_drop_settings
+	)
+	default VerticalDirection yDirection()
+	{
+		return VerticalDirection.UP;
+	}
+
+	@ConfigItem(
+		keyName = "xPixelsPerSecond",
+		name = "Horizontal XP drop speed",
+		description = "The amount of pixels per second the drop is moved in horizontal direction",
+		position = 2,
+		section = xp_drop_settings
+	)
+	default int xPixelsPerSecond()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "xDirection",
+		name = "Horizontal direction",
+		description = "The direction in which the XP drop moves",
+		position = 2,
+		section = xp_drop_settings
+	)
+	default HorizontalDirection xDirection()
+	{
+		return HorizontalDirection.LEFT;
+	}
+
+	@ConfigItem(
+		keyName = "framesPerDrop",
+		name = "Time until disappearance",
+		description = "The amount of frames (50 per second) the XP drop will show for",
+		position = 3,
+		section = xp_drop_settings
+	)
+	default int framesPerDrop()
+	{
+		return 100;
+	}
+
+	@ConfigItem(
+		keyName = "fadeOut",
+		name = "Fade out",
+		description = "Should the XP drop fade out",
+		position = 4,
+		section = xp_drop_settings
+	)
+	default boolean fadeOut()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "showIcons",
+		name = "Show skill icons",
+		description = "Show the skill icons next to the XP drop or predicted hit",
+		position = 5,
+		section = xp_drop_settings
+	)
+	default boolean showIcons()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "iconOverride",
+		name = "Allow icons override",
+		description = "Allow icons to be overridden by other plugins such as resource packs",
+		position = 5,
+		section = xp_drop_settings
+	)
+	default boolean iconOverride()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "showFakeIcon",
+		name = "Show fake icon",
+		description = "Show the fake icon for a fake XP drop",
+		position = 6,
+		section = xp_drop_settings
+	)
+	default boolean showFakeIcon()
+	{
+		return true;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "xpDropColor",
+		name = "Xp drop color",
+		description = "Color of the XP drop text",
+		position = 7,
+		section = xp_drop_settings
+	)
+	default Color xpDropColor()
+	{
+		return Color.WHITE;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "xpDropColorMelee",
+		name = "Xp drop color melee",
+		description = "Color of the XP drop text when praying melee offensively",
+		position = 8,
+		section = xp_drop_settings
+	)
+	default Color xpDropColorMelee()
+	{
+		return Color.WHITE;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "xpDropColorMage",
+		name = "Xp drop color mage",
+		description = "Color of the XP drop text when praying mage offensively",
+		position = 9,
+		section = xp_drop_settings
+	)
+	default Color xpDropColorMage()
+	{
+		return Color.WHITE;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "xpDropColorRange",
+		name = "Xp drop color range",
+		description = "Color of the XP drop text when praying range offensively",
+		position = 10,
+		section = xp_drop_settings
+	)
+	default Color xpDropColorRange()
+	{
+		return Color.WHITE;
+	}
+
+	@ConfigItem(
+		keyName = "fontName",
+		name = "Font",
+		description = "Name of the font to use for XP drops. Leave blank to use RuneLite setting.<br>" +
+			"If the font does not seem to work checkout the 'Installing custom fonts' section on the support page of this plugin",
+		position = 11,
+		section = font_settings
+	)
+	default String fontName()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "fontStyle",
+		name = "Font style",
+		description = "Style of the font to use for XP drops. Only works with custom font.",
+		position = 12,
+		section = font_settings
+	)
+	default FontStyle fontStyle()
+	{
+		return FontStyle.DEFAULT;
+	}
+
+	@ConfigItem(
+		keyName = "fontSize",
+		name = "Font size",
+		description = "Size of the font to use for XP drops. Only works with custom font.",
+		position = 13,
+		section = font_settings
+	)
+	default int fontSize()
+	{
+		return 16;
+	}
+
+	@ConfigItem(
+		keyName = "xpDropBackground",
+		name = "Background",
+		description = "Background of the XP drop text",
+		position = 13,
+		section = font_settings
+	)
+	default TextComponentWithAlpha.Background xpDropBackground()
+	{
+		return TextComponentWithAlpha.Background.SHADOW;
+	}
+
+	@ConfigItem(
+		keyName = "iconSizeOverride",
+		name = "Icon size override",
+		description = "When non zero indicates the size of the skill icons in the xp drop.",
+		position = 13,
+		section = font_settings
+	)
+	default int iconSizeOverride()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "attachToPlayer",
+		name = "Attach to player",
+		description = "Attaches the XP drop location to the player",
+		position = 14,
+		section = xp_drop_settings
+	)
+	default boolean attachToPlayer()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "attachToTarget",
+		name = "Attach to target",
+		description = "Attaches the XP drop location to the targeted Actor(NPC/Player)",
+		position = 14,
+		section = xp_drop_settings
+	)
+	default boolean attachToTarget()
+	{
+		return false;
+	}
+
+	@Range(min = Integer.MIN_VALUE)
+	@ConfigItem(
+		keyName = "attachToOffsetX",
+		name = "Attach to x offset",
+		description = "Change the attach to overlay x position with relation to the target",
+		position = 15,
+		section = xp_drop_settings
+	)
+	default int attachToOffsetX()
+	{
+		return 0;
+	}
+
+	@Range(min = Integer.MIN_VALUE)
+	@ConfigItem(
+		keyName = "attachToOffsetY",
+		name = "Attach to y offset",
+		description = "Change the attach to overlay y position with relation to the target",
+		position = 15,
+		section = xp_drop_settings
+	)
+	default int attachToOffsetY()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "skillsToFilter",
+		name = "Skills to filter",
+		description = "Names of the skills for which a XP drop should not be shown, each name separated by a comma. Must be the full name of the skill as shown when hovered in the skills tab.",
+		position = 17,
+		section = xp_drop_settings
+	)
+	default String skillsToFilter()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "xpDropPrefix",
+		name = "Xp drop prefix",
+		description = "Custom prefix to be placed in front of the xp drop after the icon",
+		position = 18,
+		section = xp_drop_settings
+	)
+	default String xpDropPrefix()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "xpDropSuffix",
+		name = "Xp drop suffix",
+		description = "Custom suffix to be placed after xp drop",
+		position = 19,
+		section = xp_drop_settings
+	)
+	default String xpDropSuffix()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "showPredictedHit",
+		name = "Show predicted hit",
+		description = "Show the amount that is predicted you will hit based on the current xp drop",
+		position = 18,
+		section = predicted_hit
+	)
+	default boolean showPredictedHit()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "neverGroupPredictedHit",
+		name = "Never group predicted hit",
+		description = "Always show the predicted hit as a separate drop regardless of the xp grouped setting",
+		position = 19,
+		section = predicted_hit
+	)
+	default boolean neverGroupPredictedHit()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "predictedHitPrefix",
+		name = "Predicted hit prefix",
+		description = "Custom prefix to be placed in front of the predicted hit after the icon",
+		position = 20,
+		section = predicted_hit
+	)
+	default String predictedHitPrefix()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "predictedHitSuffix",
+		name = "Predicted hit suffix",
+		description = "Custom suffix to be placed after predicted hit",
+		position = 21,
+		section = predicted_hit
+	)
+	default String predictedHitSuffix()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "skillsToFilterForPredictedHits",
+		name = "Skills to filter for hits",
+		description = "Names of the skills for which a predicted hit should not be shown, each name separated by a comma. Must be the full name of the skill as shown when hovered in the skills tab.",
+		position = 22,
+		section = predicted_hit
+	)
+	default String skillsToFilterForPredictedHits()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "xpMultiplier",
+		name = "Xp multiplier",
+		description = "The bonus xp multiplier (from season game mode for example) that should be factored when calculating the hit",
+		position = 23,
+		section = predicted_hit
+	)
+	default double xpMultiplier()
+	{
+		return 1;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "predictedHitColor",
+		name = "Predicted hit color",
+		description = "Color of predicted hit, only works with Predicted hit color override enabled",
+		position = 24,
+		section = predicted_hit
+	)
+	default Color predictedHitColor()
+	{
+		return Color.WHITE;
+	}
+
+	@ConfigItem(
+		keyName = "predictedHitColorOverride",
+		name = "Predicted hit color override",
+		description = "Override the predicted hit text color with custom color",
+		position = 25,
+		section = predicted_hit
+	)
+	default boolean predictedHitColorOverride()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "predictedHitIcon",
+		name = "Predicted hit icon",
+		description = "The style of the predicted hit icon. Only applicable when `Never group predicted hit` is enabled.",
+		position = 26,
+		section = predicted_hit
+	)
+	default PredictedHitIconStyle predictedHitIcon()
+	{
+		return PredictedHitIconStyle.HITSPLAT;
+	}
+
+	@ConfigItem(
+		keyName = "useXpTracker",
+		name = "Use xp tracker",
+		description = "Enable or disable custom xp tracker",
+		position = 24,
+		section = xp_tracker_settings
+	)
+	default boolean useXpTracker()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "showXpTrackerProgressBar",
+		name = "Show progress bar",
+		description = "Show a progress bar in the tracker similar to the progress bar in the vanilla tracker. Configure the start and goal in game.",
+		position = 25,
+		section = xp_tracker_settings
+	)
+	default boolean showXpTrackerProgressBar()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "showIconsXpTracker",
+		name = "Show icons xp tracker",
+		description = "Enable or disable skill icons for xp tracker",
+		position = 26,
+		section = xp_tracker_settings
+	)
+	default boolean showIconsXpTracker()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerSkill",
+		name = "Xp tracker skill",
+		description = "Skill to display within the Xp Tracker",
+		position = 27,
+		section = xp_tracker_settings
+	)
+	default XpTrackerSkills xpTrackerSkill()
+	{
+		return XpTrackerSkills.MOST_RECENT;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerFontName",
+		name = "Font",
+		description = "Name of the font to use for XP tracker. Leave blank to use RuneLite setting.<br>" +
+			"If the font does not seem to work checkout the 'Installing custom fonts' section on the support page of this plugin",
+		position = 28,
+		section = xp_tracker_settings
+	)
+	default String xpTrackerFontName()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerFontStyle",
+		name = "Font style",
+		description = "Style of the font to use for XP tracker. Only works with custom font.",
+		position = 29,
+		section = xp_tracker_settings
+	)
+	default FontStyle xpTrackerFontStyle()
+	{
+		return FontStyle.DEFAULT;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerFontSize",
+		name = "XP tracker font size",
+		description = "Size of font for the XP tracker overlay",
+		position = 30,
+		section = xp_tracker_settings
+	)
+	default int xpTrackerFontSize()
+	{
+		return 16;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerBackground",
+		name = "XP tracker text background",
+		description = "Background of the XP tracker text",
+		position = 30,
+		section = xp_tracker_settings
+	)
+	default TextComponentWithAlpha.Background xpTrackerBackground()
+	{
+		return TextComponentWithAlpha.Background.SHADOW;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerIconSizeOverride",
+		name = "Icon size override",
+		description = "When non zero indicates the size of the skill icons for the XP tracker.",
+		position = 31,
+		section = xp_tracker_settings
+	)
+	default int xpTrackerIconSizeOverride()
+	{
+		return 0;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "xpTrackerColor",
+		name = "XP tracker color",
+		description = "Color for the Xp Tracker",
+		position = 32,
+		section = xp_tracker_settings
+	)
+	default Color xpTrackerColor()
+	{
+		return Color.white;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "xpTrackerBorderColor",
+		name = "XP tracker border color",
+		description = "Color for the Xp Tracker border",
+		position = 33,
+		section = xp_tracker_settings
+	)
+	default Color xpTrackerBorderColor()
+	{
+		return new Color(90, 82, 69);
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerClientTicksToLinger",
+		name = "Time until disappearance",
+		description = "Never disappear when set to 0. The amount of frames (50 per second) the XP tracker will show for.",
+		position = 34,
+		section = xp_tracker_settings
+	)
+	default int xpTrackerClientTicksToLinger()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerFadeOut",
+		name = "Fade out",
+		description = "Should the XP tracker fade out",
+		position = 35,
+		section = xp_tracker_settings
+	)
+	default boolean xpTrackerFadeOut()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "xpDropsHideVanilla",
+		name = "Hide vanilla xp drops",
+		description = "When enabled this plugin will hide the vanilla xp drops",
+		position = 1,
+		section = xp_miscellaneous_settings
+	)
+	default boolean xpDropsHideVanilla()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerHideVanilla",
+		name = "Hide vanilla xp tracker",
+		description = "When enabled and when 'Use xp tracker' is enabled this plugin will hide the vanilla xp tracker",
+		position = 2,
+		section = xp_miscellaneous_settings
+	)
+	default boolean xpTrackerHideVanilla()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "xpDropForceCentered",
+		name = "Force xp drops to be centered",
+		description = "Center xp drops within their overlay box.<br>" +
+			"Note: if this settings is disabled the horizontal direction setting decides if the xp drops are left or right aligned.",
+		position = 3,
+		section = xp_miscellaneous_settings
+	)
+	default boolean xpDropForceCentered()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "xpDropCenterOn",
+		name = "Center xp drop on",
+		description = "Centers the xp drop on the xp drop text only or on the total width of the icon and text.<br>" +
+			"Works with 'attach to x' enabled and without.<br>" +
+			"If 'attach to x' is disabled then this setting will only have any effect when 'Force xp drops to be centered' is enabled",
+		position = 4,
+		section = xp_miscellaneous_settings
+	)
+	default CenterOn xpDropCenterOn()
+	{
+		return CenterOn.ICON_AND_TEXT;
+	}
+
+	@ConfigItem(
+		keyName = "xpDropOverlayPriority",
+		name = "Xp drop overlay priority",
+		description = "The priority of the xp drop overlay with relation to the other overlays.<br>" +
+			"This impacts the sorting of the overlays attached to the same overlay group (eg. the top right corner overlay group).<br>" +
+			"Does NOT impact the overlay if it is not snapped to a group",
+		position = 5,
+		section = xp_miscellaneous_settings
+	)
+	default OverlayPriority xpDropOverlayPriority()
+	{
+		return OverlayPriority.HIGH;
+	}
+
+	@ConfigItem(
+		keyName = "xpTrackerOverlayPriority",
+		name = "Xp tracker overlay priority",
+		description = "The priority of the xp tracker overlay with relation to the other overlays.<br>" +
+			"This impacts the sorting of the overlays attached to the same overlay group (eg. the top right corner overlay group).<br>" +
+			"Does NOT impact the overlay if it is not snapped to a group",
+		position = 6,
+		section = xp_miscellaneous_settings
+	)
+	default OverlayPriority xpTrackerOverlayPriority()
+	{
+		return OverlayPriority.HIGHEST;
+	}
+}
+
+package com.xpdrops;
+
+import com.xpdrops.attackstyles.AttackStyle;
+import lombok.Getter;
+import net.runelite.api.Prayer;
+
+import java.util.Arrays;
+import java.util.HashSet;
+
+import static com.xpdrops.XpDropStyle.DEFAULT;
+import static com.xpdrops.XpDropStyle.MELEE;
+import static com.xpdrops.XpDropStyle.RANGE;
+import static com.xpdrops.XpDropStyle.MAGE;
+import static net.runelite.api.Prayer.AUGURY;
+import static net.runelite.api.Prayer.BURST_OF_STRENGTH;
+import static net.runelite.api.Prayer.CHIVALRY;
+import static net.runelite.api.Prayer.CLARITY_OF_THOUGHT;
+import static net.runelite.api.Prayer.EAGLE_EYE;
+import static net.runelite.api.Prayer.HAWK_EYE;
+import static net.runelite.api.Prayer.IMPROVED_REFLEXES;
+import static net.runelite.api.Prayer.INCREDIBLE_REFLEXES;
+import static net.runelite.api.Prayer.MYSTIC_LORE;
+import static net.runelite.api.Prayer.MYSTIC_MIGHT;
+import static net.runelite.api.Prayer.MYSTIC_WILL;
+import static net.runelite.api.Prayer.PIETY;
+import static net.runelite.api.Prayer.RIGOUR;
+import static net.runelite.api.Prayer.RP_ANCIENT_SIGHT;
+import static net.runelite.api.Prayer.RP_ANCIENT_STRENGTH;
+import static net.runelite.api.Prayer.RP_ANCIENT_WILL;
+import static net.runelite.api.Prayer.RP_ANNIHILATE;
+import static net.runelite.api.Prayer.RP_DECIMATE;
+import static net.runelite.api.Prayer.RP_INTENSIFY;
+import static net.runelite.api.Prayer.RP_TRINITAS;
+import static net.runelite.api.Prayer.RP_VAPORISE;
+import static net.runelite.api.Prayer.SHARP_EYE;
+import static net.runelite.api.Prayer.SUPERHUMAN_STRENGTH;
+import static net.runelite.api.Prayer.ULTIMATE_STRENGTH;
+
+enum XpPrayer
+{
+	XP_BURST_OF_STRENGTH(BURST_OF_STRENGTH, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_CLARITY_OF_THOUGHT(CLARITY_OF_THOUGHT, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_SHARP_EYE(SHARP_EYE, RANGE, AttackStyle.RANGING, AttackStyle.LONGRANGE, AttackStyle.OTHER),
+	XP_MYSTIC_WILL(MYSTIC_WILL, MAGE, AttackStyle.CASTING, AttackStyle.DEFENSIVE_CASTING, AttackStyle.OTHER),
+	XP_SUPERHUMAN_STRENGTH(SUPERHUMAN_STRENGTH, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_IMPROVED_REFLEXES(IMPROVED_REFLEXES, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_HAWK_EYE(HAWK_EYE, RANGE, AttackStyle.RANGING, AttackStyle.LONGRANGE, AttackStyle.OTHER),
+	XP_MYSTIC_LORE(MYSTIC_LORE, MAGE, AttackStyle.CASTING, AttackStyle.DEFENSIVE_CASTING, AttackStyle.OTHER),
+	XP_ULTIMATE_STRENGTH(ULTIMATE_STRENGTH, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_INCREDIBLE_REFLEXES(INCREDIBLE_REFLEXES, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_EAGLE_EYE(EAGLE_EYE, RANGE, AttackStyle.RANGING, AttackStyle.LONGRANGE, AttackStyle.OTHER),
+	XP_MYSTIC_MIGHT(MYSTIC_MIGHT, MAGE, AttackStyle.CASTING, AttackStyle.DEFENSIVE_CASTING, AttackStyle.OTHER),
+	XP_CHIVALRY(CHIVALRY, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_PIETY(PIETY, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_RIGOUR(RIGOUR, RANGE, AttackStyle.RANGING, AttackStyle.LONGRANGE, AttackStyle.OTHER),
+	XP_AUGURY(AUGURY, MAGE, AttackStyle.CASTING, AttackStyle.DEFENSIVE_CASTING, AttackStyle.OTHER),
+
+	XP_RP_ANCIENT_STRENGTH(RP_ANCIENT_STRENGTH, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_RP_ANCIENT_SIGHT(RP_ANCIENT_SIGHT, RANGE, AttackStyle.RANGING, AttackStyle.LONGRANGE, AttackStyle.OTHER),
+	XP_RP_ANCIENT_WILL(RP_ANCIENT_WILL, MAGE, AttackStyle.CASTING, AttackStyle.DEFENSIVE_CASTING, AttackStyle.OTHER),
+	XP_RP_TRINITAS(RP_TRINITAS, DEFAULT),
+	XP_RP_DECIMATE(RP_DECIMATE, MELEE, AttackStyle.ACCURATE, AttackStyle.AGGRESSIVE, AttackStyle.CONTROLLED, AttackStyle.DEFENSIVE, AttackStyle.OTHER),
+	XP_RP_ANNIHILATE(RP_ANNIHILATE, RANGE, AttackStyle.RANGING, AttackStyle.LONGRANGE, AttackStyle.OTHER),
+	XP_RP_VAPORISE(RP_VAPORISE, MAGE, AttackStyle.CASTING, AttackStyle.DEFENSIVE_CASTING, AttackStyle.OTHER),
+	XP_RP_INTENSIFY(RP_INTENSIFY, DEFAULT);
+
+	@Getter
+	private final Prayer prayer;
+	@Getter
+	private final HashSet<AttackStyle> styles;
+	@Getter
+	private final XpDropStyle type;
+
+	XpPrayer(Prayer prayer, XpDropStyle type, AttackStyle... styles)
+	{
+		this.prayer = prayer;
+		this.type = type;
+		this.styles = new HashSet<>(Arrays.asList(styles));
+	}
+}
+
+package com.xpdrops.overlay;
+
+import com.xpdrops.Skill;
+import com.xpdrops.config.XpDropsConfig;
+import net.runelite.api.Client;
+import net.runelite.client.plugins.xptracker.XpTrackerService;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+
+public class XpTrackerOverlay extends Overlay
+{
+	private final XpDropsConfig config;
+	private final XpDropOverlayManager xpDropOverlayManager;
+	private final XpDropFontHandler xpDropFontHandler = new XpDropFontHandler();
+	private static final int PROGRESS_BAR_HEIGHT = 6;
+
+	@Inject
+	private Client client;
+
+	private final XpTrackerService xpTrackerService;
+
+	@Inject
+	private XpTrackerOverlay(XpDropsConfig config, XpDropOverlayManager xpDropOverlayManager, XpTrackerService xpTrackerService)
+	{
+		this.config = config;
+		this.xpDropOverlayManager = xpDropOverlayManager;
+		this.xpTrackerService = xpTrackerService;
+		setLayer(OverlayLayer.UNDER_WIDGETS);
+		setPosition(OverlayPosition.TOP_RIGHT);
+		setPriority(config.xpTrackerOverlayPriority());
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		Dimension dimension = null;
+		if (config.useXpTracker())
+		{
+			xpDropFontHandler.updateFont(config.xpTrackerFontName(), config.xpTrackerFontSize(), config.xpTrackerFontStyle());
+			XpDropOverlayUtilities.setGraphicsProperties(graphics);
+			xpDropFontHandler.handleFont(graphics);
+
+			Skill currentSkill = xpDropOverlayManager.getLastSkill();
+			long xp = getSkillExperience(currentSkill);
+			int icon = getSkillIconIndex(currentSkill);
+			int width = graphics.getFontMetrics().stringWidth(XpDropOverlayManager.XP_FORMAT_PATTERN);
+			int height = graphics.getFontMetrics().getHeight(); // ignores the size of the icon
+
+			if (xpDropOverlayManager.isShouldDraw())
+			{
+				Dimension trackerDimensions = drawXpTracker(graphics, icon, xp);
+				width = (int) trackerDimensions.getWidth();
+				if (config.showXpTrackerProgressBar() && !Skill.OVERALL.equals(currentSkill))
+				{
+					final int startGoalXp = xpTrackerService.getStartGoalXp(currentSkill.toSkill());
+					final int endGoalXp = xpTrackerService.getEndGoalXp(currentSkill.toSkill());
+					int barHeight = drawProgressBar(graphics, 0, (int) trackerDimensions.getHeight() + 1, width, startGoalXp, endGoalXp, xp);
+					height = (int) (trackerDimensions.getHeight() + barHeight);
+				}
+			}
+
+			dimension = new Dimension(width, height);
+		}
+		return dimension;
+	}
+
+	private long getSkillExperience(Skill skill)
+	{
+		long xp;
+		if (Skill.OVERALL.equals(skill))
+		{
+			xp = client.getOverallExperience();
+		}
+		else
+		{
+			xp = client.getSkillExperience(skill.toSkill());
+		}
+		return xp;
+	}
+
+	private int getSkillIconIndex(Skill skill)
+	{
+		return skill.ordinal();
+	}
+
+	private int getAlpha()
+	{
+		int alpha = 0xff;
+		if (config.xpTrackerClientTicksToLinger() != 0)
+		{
+			long deltaTime = System.currentTimeMillis() - xpDropOverlayManager.getLastSkillSetMillis();
+			long deltaClientTicks = deltaTime / 20;
+			if (config.xpTrackerFadeOut())
+			{
+				int delta = Math.min(33, (int) (0.33f * config.xpTrackerClientTicksToLinger()));
+				int threshold = config.xpTrackerClientTicksToLinger() - delta;
+				int point = (int) (deltaClientTicks - threshold);
+				float fade = Math.max(0.0f, Math.min(1.0f, point / (float) delta));
+				alpha = (int) Math.max(0, 0xff - fade * 0xff);
+			}
+			else if (deltaClientTicks > config.xpTrackerClientTicksToLinger())
+			{
+				alpha = 0;
+			}
+		}
+		return alpha;
+	}
+
+	private Dimension drawXpTracker(Graphics2D graphics, int icon, long experience)
+	{
+		String xpTrackerColor = XpDropOverlayUtilities.RGBToHex(config.xpTrackerColor().getRGB());
+		String text = XpDropOverlayManager.XP_FORMATTER.format(experience);
+
+		int textY = graphics.getFontMetrics().getMaxAscent();
+		int textWidth = graphics.getFontMetrics().stringWidth(Text.removeTags(text));
+		int monospacedTextWidth = XpDropOverlayManager.monospacedWidth(graphics, Text.removeTags(text));
+
+		int imageY = textY - graphics.getFontMetrics().getMaxAscent(); // 0
+
+		int alpha = getAlpha();
+		//Adding 5 onto image width to give a little space in between icon and text
+		Dimension iconDimensions = drawIcon(graphics, icon, 0, imageY, alpha);
+		int imageWidth = (int) (iconDimensions.getWidth() + 5);
+
+		XpDropOverlayUtilities.drawText(graphics, XpDropOverlayUtilities.wrapWithTags(xpTrackerColor) + text, imageWidth + monospacedTextWidth - textWidth, textY, alpha, config.xpTrackerBackground());
+
+		return new Dimension(monospacedTextWidth + imageWidth, (int)Math.max(graphics.getFontMetrics().getHeight(), iconDimensions.getHeight()));
+	}
+
+	// Returns height of drawn bar.
+	private int drawProgressBar(Graphics2D graphics, int x, int y, int width, long start, long end, long _current)
+	{
+		if (start < 0 || end < 0 || start == end)
+		{
+			// No point in drawing a bar.
+			return 0;
+		}
+
+		long total = end - start;
+		double ratio = 1.0;
+		long current = Math.max(0, _current - start);
+		if (total > 0)
+		{
+			ratio = current / (double)total;
+		}
+
+		int alpha = getAlpha();
+
+		int progressBarWidth = (int) (ratio * (width - 4));
+		int barHeight = PROGRESS_BAR_HEIGHT;
+
+		Color borderColor = new Color(config.xpTrackerBorderColor().getRed(), config.xpTrackerBorderColor().getGreen(), config.xpTrackerBorderColor().getBlue(), alpha);
+		graphics.setColor(borderColor);
+		graphics.fillRect(x, y, width, barHeight + 2);
+
+		Color blackBackgroundColor = new Color(0, 0, 0, alpha);
+		graphics.setColor(blackBackgroundColor);
+		graphics.fillRect(x + 1, y + 1, width - 2, barHeight);
+
+		final double rMod = 130.0 * ratio;
+		final double gMod = 255.0 * ratio;
+		final Color c = new Color((int) (255 - rMod), (int) (0 + gMod), 0, alpha);
+		graphics.setColor(c);
+		graphics.fillRect(x + 2, y + 2, progressBarWidth, barHeight - 2);
+		return PROGRESS_BAR_HEIGHT;
+	}
+
+	private Dimension drawIcon(Graphics2D graphics, int icon, int x, int y, float alpha)
+	{
+		int iconSize = graphics.getFontMetrics().getHeight();
+		if (config.xpTrackerIconSizeOverride() > 0)
+		{
+			iconSize = config.xpTrackerIconSizeOverride();
+		}
+		BufferedImage image;
+
+		if (config.showIconsXpTracker())
+		{
+			image = xpDropOverlayManager.getStatIcon(icon);
+			if (image != null)
+			{
+				int _iconSize = Math.max(iconSize, 18);
+				int iconWidth = image.getWidth() * _iconSize / 25;
+				int iconHeight = image.getHeight() * _iconSize / 25;
+
+				return XpDropOverlayUtilities.drawIcon(graphics, image, x, y, iconWidth, iconHeight, alpha / 0xff, false);
+			}
+		}
+		return new Dimension(0,0);
+	}
+}
+
+package com.xpdrops.overlay;
+
+import com.xpdrops.XpDropStyle;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import net.runelite.api.Actor;
+
+@Data
+@AllArgsConstructor
+public class XpDropInFlight
+{
+	private int icons;
+	private int amount;
+	private XpDropStyle style;
+	private float yOffset;
+	private float xOffset;
+	private float alpha;
+	private float frame;
+	private int hit;
+	private Actor attachTo;
+	// Can include predicted hit but is not 'just' a predicted hit.
+	boolean isPredictedHit;
+}
+
+package com.xpdrops.overlay;
+
+import com.xpdrops.config.XpDropsConfig;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import java.awt.Dimension;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+
+@Slf4j
+public class XpDropOverlay extends Overlay
+{
+	private final XpDropsConfig config;
+	private final XpDropOverlayManager xpDropOverlayManager;
+	private final XpDropFontHandler xpDropFontHandler = new XpDropFontHandler();
+
+	@Inject
+	private XpDropOverlay(XpDropsConfig config, XpDropOverlayManager xpDropOverlayManager)
+	{
+		this.config = config;
+		this.xpDropOverlayManager = xpDropOverlayManager;
+		setLayer(OverlayLayer.UNDER_WIDGETS);
+		setPosition(OverlayPosition.TOP_RIGHT);
+		setPriority(config.xpDropOverlayPriority());
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		xpDropFontHandler.updateFont(config.fontName(), config.fontSize(), config.fontStyle());
+		XpDropOverlayUtilities.setGraphicsProperties(graphics);
+		xpDropFontHandler.handleFont(graphics);
+
+		if (xpDropOverlayManager.isShouldDraw())
+		{
+			drawXpDrops(graphics);
+		}
+
+		// Roughly estimate a bounding box that doesn't take icons into account.
+		FontMetrics fontMetrics = graphics.getFontMetrics();
+		int width = fontMetrics.stringWidth(XpDropOverlayManager.XP_FORMAT_PATTERN);
+		width += Math.abs(config.framesPerDrop() * config.xPixelsPerSecond() / XpDropOverlayManager.FRAMES_PER_SECOND);
+		int height = fontMetrics.getHeight();
+		height += Math.abs(config.framesPerDrop() * config.yPixelsPerSecond() / XpDropOverlayManager.FRAMES_PER_SECOND);
+
+		return new Dimension(width, height);
+	}
+
+	private void drawXpDrops(Graphics2D graphics)
+	{
+		int width = graphics.getFontMetrics().stringWidth(XpDropOverlayManager.XP_FORMAT_PATTERN);
+		int totalWidth = width + (int) Math.abs(config.framesPerDrop() * config.xPixelsPerSecond() / XpDropOverlayManager.FRAMES_PER_SECOND);
+		int height = graphics.getFontMetrics().getHeight();
+		int totalHeight = height + (int) Math.abs(config.framesPerDrop() * config.yPixelsPerSecond() / XpDropOverlayManager.FRAMES_PER_SECOND);
+
+		for (XpDropInFlight xpDropInFlight : xpDropOverlayManager.getXpDropsInFlight())
+		{
+			if (xpDropInFlight.getFrame() < 0)
+			{
+				continue;
+			}
+			String text = getDropText(xpDropInFlight);
+
+			float xStart = xpDropInFlight.getXOffset();
+			float yStart = xpDropInFlight.getYOffset();
+
+			int textY;
+			if (config.yDirection() == XpDropsConfig.VerticalDirection.DOWN)
+			{
+				textY = (int) (yStart + graphics.getFontMetrics().getMaxAscent());
+			}
+			else
+			{
+				textY = (int) (totalHeight + yStart + graphics.getFontMetrics().getMaxAscent() - graphics.getFontMetrics().getHeight());
+			}
+
+			int textX;
+			if (config.xpDropForceCentered())
+			{
+				// Center the xp drops inside the overlay box indicated by the dimension returned in the render function
+				int textWidth = graphics.getFontMetrics().stringWidth(Text.removeTags(text));
+				int x;
+				if (config.xpDropCenterOn() == XpDropsConfig.CenterOn.TEXT)
+				{
+					x = (int) (totalWidth / 2.0f - textWidth / 2.0f + xStart);
+				}
+				else
+				{
+					int iconsWidth = XpDropOverlayUtilities.getIconWidthForIcons(graphics, xpDropInFlight.getIcons(), config, xpDropOverlayManager);
+					x = (int)(totalWidth / 2.0f - (textWidth + iconsWidth) / 2.0f + iconsWidth + xStart);
+				}
+				XpDropOverlayUtilities.drawText(graphics, text, x, textY, (int) xpDropInFlight.getAlpha(), config.xpDropBackground());
+
+				int imageX = x - 2;
+				int imageY = textY - graphics.getFontMetrics().getMaxAscent();
+				XpDropOverlayUtilities.drawIcons(graphics, xpDropInFlight.getIcons(), imageX, imageY, xpDropInFlight.getAlpha(), true, config, xpDropOverlayManager);
+			}
+			else if (config.xDirection() == XpDropsConfig.HorizontalDirection.RIGHT)
+			{
+				// Direction left to right, draw icons first and text second
+				int imageX = (int) (xStart);
+				int imageY = textY - graphics.getFontMetrics().getMaxAscent();
+				int imageWidth = drawIcons(graphics, xpDropInFlight.getIcons(), imageX, imageY, xpDropInFlight.getAlpha(), false);
+
+				textX = imageX + imageWidth;
+				XpDropOverlayUtilities.drawText(graphics, text, textX, textY, (int) xpDropInFlight.getAlpha(), config.xpDropBackground());
+			}
+			else
+			{
+				// Direction right to left, draw text first and icons second
+				textX = (int) (totalWidth + xStart - graphics.getFontMetrics().stringWidth(Text.removeTags(text)));
+				XpDropOverlayUtilities.drawText(graphics, text, textX, textY, (int) xpDropInFlight.getAlpha(), config.xpDropBackground());
+
+				int imageX = textX - 2;
+				int imageY = textY - graphics.getFontMetrics().getMaxAscent();
+				drawIcons(graphics, xpDropInFlight.getIcons(), imageX, imageY, xpDropInFlight.getAlpha(), true);
+			}
+		}
+	}
+
+	private String getDropText(XpDropInFlight xpDropInFlight)
+	{
+		return XpDropOverlayUtilities.getDropText(xpDropInFlight, config);
+	}
+
+	private int drawIcons(Graphics2D graphics, int icons, int x, int y, float alpha, boolean rightToLeft)
+	{
+		return XpDropOverlayUtilities.drawIcons(graphics, icons, x, y, alpha, rightToLeft, config, xpDropOverlayManager);
+	}
+}
+
+package com.xpdrops.overlay;
+
+import com.xpdrops.config.XpDropsConfig;
+import net.runelite.client.ui.FontManager;
+
+import java.awt.Font;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+
+public class XpDropFontHandler
+{
+	private String lastFont = "";
+	private int lastFontSize = 0;
+	private boolean useRunescapeFont = true;
+	private XpDropsConfig.FontStyle lastFontStyle = XpDropsConfig.FontStyle.DEFAULT;
+	private Font font = null;
+
+	public void handleFont(Graphics2D graphics)
+	{
+		if (font != null)
+		{
+			graphics.setFont(font);
+			if (useRunescapeFont)
+			{
+				graphics.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_OFF);
+			}
+		}
+	}
+
+	public void updateFont(String fontName, int fontSize, XpDropsConfig.FontStyle fontStyle)
+	{
+		if (!lastFont.equals(fontName) || lastFontSize != fontSize || lastFontStyle != fontStyle)
+		{
+			lastFont = fontName;
+			lastFontSize = fontSize;
+			lastFontStyle = fontStyle;
+
+			int style = fontStyle.getStyle();
+			// default to runescape fonts
+			if ("".equals(fontName))
+			{
+
+				if (fontSize < 16)
+				{
+					font = FontManager.getRunescapeSmallFont();
+				}
+				else if (fontStyle == XpDropsConfig.FontStyle.BOLD
+					|| fontStyle == XpDropsConfig.FontStyle.BOLD_ITALICS)
+				{
+					font = XpDropOverlayManager.RUNESCAPE_BOLD_FONT;
+					style ^= Font.BOLD; // Bold is implicit for this Font object, we do not want to derive using bold again.
+				}
+				else
+				{
+					font = FontManager.getRunescapeFont();
+				}
+
+				float size = Math.max(16.0f, fontSize);
+				font = font.deriveFont(style, size);
+
+				useRunescapeFont = true;
+				return;
+			}
+
+			// use a system wide font
+			font = new Font(fontName, style, fontSize);
+			useRunescapeFont = false;
+		}
+	}
+}
+
+package com.xpdrops.overlay;
+
+import com.xpdrops.config.XpDropsConfig;
+import lombok.extern.slf4j.Slf4j;
+
+import java.awt.AlphaComposite;
+import java.awt.Color;
+import java.awt.Composite;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.FontFormatException;
+import java.awt.Graphics2D;
+import java.awt.Point;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.io.InputStream;
+
+@Slf4j
+public class XpDropOverlayUtilities
+{
+	// Find and init RuneScape Bold font
+	public static Font initRuneScapeBold()
+	{
+		Font boldFont;
+
+		try (InputStream inRunescapeBold = XpDropOverlay.class.getResourceAsStream("RuneScape-Bold-12.ttf"))
+		{
+			if (inRunescapeBold == null)
+			{
+				log.warn("Font file could not be loaded.");
+				boldFont = new Font(Font.DIALOG, Font.BOLD, 16);
+			}
+			else
+			{
+				boldFont = Font.createFont(Font.TRUETYPE_FONT, inRunescapeBold)
+					.deriveFont(Font.PLAIN, 16);
+			}
+		}
+		catch (FontFormatException ex)
+		{
+			log.warn("Font loaded, but format incorrect.", ex);
+			boldFont = new Font(Font.DIALOG, Font.BOLD, 16);
+		}
+		catch (IOException ex)
+		{
+			log.warn("Font file not found.", ex);
+			boldFont = new Font(Font.DIALOG, Font.BOLD, 16);
+		}
+		return boldFont;
+	}
+
+	public static String wrapWithTags(String hex)
+	{
+		return "<col=" + hex + ">";
+	}
+
+	public static String getDropText(XpDropInFlight xpDropInFlight, XpDropsConfig config)
+	{
+		String text = XpDropOverlayManager.XP_FORMATTER.format(xpDropInFlight.getAmount());
+
+		if (xpDropInFlight.isPredictedHit())
+		{
+			// This line of text is a predicted hit without xp drop.
+			String colorTag = config.predictedHitColorOverride() ?
+				wrapWithTags(RGBToHex(config.predictedHitColor().getRGB())) :
+				wrapWithTags(RGBToHex(getColor(xpDropInFlight, config).getRGB()));
+			text = colorTag + config.predictedHitPrefix() + text + config.predictedHitSuffix();
+		}
+		else
+		{
+			// This line of text is an XP drop.
+			String colorTag = wrapWithTags(RGBToHex(getColor(xpDropInFlight, config).getRGB()));
+			text = colorTag + config.xpDropPrefix() + text + config.xpDropSuffix();
+		}
+
+		if (xpDropInFlight.getHit() > 0)
+		{
+			// Add predicted hit to the XP drop line of text.
+			String predictedHitColor = "";
+			if (config.predictedHitColorOverride())
+			{
+				predictedHitColor = wrapWithTags(RGBToHex(config.predictedHitColor().getRGB()));
+			}
+			text += predictedHitColor + " (" + config.predictedHitPrefix() + xpDropInFlight.getHit() + config.predictedHitSuffix() + ")";
+		}
+		return text;
+	}
+
+	public static int getIconWidthForIcons(Graphics2D graphics, int icons, XpDropsConfig config, XpDropOverlayManager xpDropOverlayManager)
+	{
+		int width = 0;
+		int iconSize = graphics.getFontMetrics().getHeight();
+		if (config.iconSizeOverride() > 0)
+		{
+			iconSize = config.iconSizeOverride();
+		}
+
+		for (int i = XpDropOverlayManager.SKILL_INDICES.length - 1; i >= 0; i--)
+		{
+			int icon = (icons >> i) & 0x1;
+			if (icon == 0x1)
+			{
+				int index = XpDropOverlayManager.SKILL_INDICES[i];
+				BufferedImage image = xpDropOverlayManager.getStatIcon(index);
+				if (image == null) continue;
+				int _iconSize = Math.max(iconSize, 18);
+				int iconWidth = image.getWidth() * _iconSize / 25;
+				int iconHeight = image.getHeight() * _iconSize / 25;
+				Dimension dimension = new Dimension(iconWidth, iconHeight);
+				width += dimension.getWidth() + 2;
+			}
+		}
+
+		{
+			// FAKE/BLOCKED XP DROP ICON
+			int icon = (icons >> 23) & 0x1;
+			if (icon == 0x1)
+			{
+				int _iconSize = Math.max(iconSize - 4, 14);
+				Dimension dimension = new Dimension(_iconSize, _iconSize);
+				width += dimension.getWidth() + 2;
+			}
+		}
+
+		{
+			// HIT SPLAT ICON
+			int icon = (icons >> 24) & 0x1;
+			if (icon == 0x1)
+			{
+				int _iconSize = Math.max(iconSize - 4, 14);
+				Dimension dimension = new Dimension(_iconSize, _iconSize);
+				width += dimension.getWidth() + 2;
+			}
+		}
+		return width;
+	}
+
+	public static int drawIcons(Graphics2D graphics, int icons, int x, int y, float alpha, boolean rightToLeft, XpDropsConfig config, XpDropOverlayManager xpDropOverlayManager)
+	{
+		int width = 0;
+		int iconSize = graphics.getFontMetrics().getHeight();
+		if (config.iconSizeOverride() > 0)
+		{
+			iconSize = config.iconSizeOverride();
+		}
+
+		for (int i = XpDropOverlayManager.SKILL_INDICES.length - 1; i >= 0; i--)
+		{
+			int icon = (icons >> i) & 0x1;
+			if (icon == 0x1)
+			{
+				int index = XpDropOverlayManager.SKILL_INDICES[i];
+				BufferedImage image = xpDropOverlayManager.getStatIcon(index);
+				if (image == null) continue;
+				int _iconSize = Math.max(iconSize, 18);
+				int iconWidth = image.getWidth() * _iconSize / 25;
+				int iconHeight = image.getHeight() * _iconSize / 25;
+				Dimension dimension = drawIcon(graphics, image, x, y, iconWidth, iconHeight, alpha / 0xff, rightToLeft);
+
+				if (rightToLeft)
+				{
+					x -= dimension.getWidth() + 2;
+				}
+				else
+				{
+					x += dimension.getWidth() + 2;
+				}
+				width += dimension.getWidth() + 2;
+			}
+		}
+
+		{
+			// FAKE/BLOCKED XP DROP ICON
+			int icon = (icons >> 23) & 0x1;
+			if (icon == 0x1)
+			{
+				BufferedImage image = xpDropOverlayManager.getFakeSkillIcon();
+				int _iconSize = Math.max(iconSize - 4, 14);
+				Dimension dimension = drawIcon(graphics, image, x, y, _iconSize, _iconSize, alpha / 0xff, rightToLeft);
+				width += dimension.getWidth() + 2;
+			}
+		}
+
+		{
+			// HIT SPLAT ICON
+			int icon = (icons >> 24) & 0x1;
+			if (icon == 0x1)
+			{
+				BufferedImage image = xpDropOverlayManager.getHitsplatIcon();
+				int _iconSize = Math.max(iconSize - 4, 14);
+				Dimension dimension = drawIcon(graphics, image, x, y, _iconSize, _iconSize, alpha / 0xff, rightToLeft);
+				width += dimension.getWidth() + 2;
+			}
+		}
+		return width;
+	}
+
+	public static Dimension drawIcon(Graphics2D graphics, BufferedImage image, int x, int y, int width, int height, float alpha, boolean rightToLeft)
+	{
+		int yOffset = graphics.getFontMetrics().getHeight() / 2 - height / 2;
+		int xOffset = rightToLeft ? width : 0;
+
+		Composite composite = graphics.getComposite();
+		graphics.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+		graphics.drawImage(image, x - xOffset, y + yOffset, width, height, null);
+		graphics.setComposite(composite);
+		return new Dimension(width, height);
+	}
+
+	public static Color getColor(XpDropInFlight xpDropInFlight, XpDropsConfig config)
+	{
+		switch (xpDropInFlight.getStyle())
+		{
+			case DEFAULT:
+				return config.xpDropColor();
+			case MELEE:
+				return config.xpDropColorMelee();
+			case MAGE:
+				return config.xpDropColorMage();
+			case RANGE:
+				return config.xpDropColorRange();
+		}
+		return Color.WHITE;
+	}
+
+	public static void setGraphicsProperties(Graphics2D graphics)
+	{
+		graphics.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BICUBIC);
+	}
+
+	public static Dimension drawText(Graphics2D graphics, String text, int textX, int textY, int alpha, TextComponentWithAlpha.Background background)
+	{
+		TextComponentWithAlpha textComponent = new TextComponentWithAlpha();
+		textComponent.setText(text);
+		textComponent.setAlphaOverride(alpha);
+		textComponent.setPosition(new Point(textX, textY));
+		textComponent.setBackground(background);
+		return textComponent.render(graphics);
+	}
+
+	public static String RGBToHex(int rgb)
+	{
+		StringBuilder hex = new StringBuilder(Integer.toHexString(rgb)); // Apparently never contains more than 8 hex digits.
+		if (hex.length() < 8) while (hex.length() < 8) hex.insert(0, "0");
+		return hex.toString();
+	}
+}
+
+package com.xpdrops.overlay;
+
+import com.xpdrops.config.XpDropsConfig;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.Point;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+
+@Slf4j
+public class XpDropSceneOverlay extends Overlay
+{
+	private final XpDropsConfig config;
+	private final XpDropOverlayManager xpDropOverlayManager;
+	private final XpDropFontHandler xpDropFontHandler = new XpDropFontHandler();
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private XpDropSceneOverlay(XpDropsConfig config, XpDropOverlayManager xpDropOverlayManager)
+	{
+		this.config = config;
+		this.xpDropOverlayManager = xpDropOverlayManager;
+		setLayer(OverlayLayer.UNDER_WIDGETS);
+		setPosition(OverlayPosition.DYNAMIC);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		xpDropFontHandler.updateFont(config.fontName(), config.fontSize(), config.fontStyle());
+		XpDropOverlayUtilities.setGraphicsProperties(graphics);
+		xpDropFontHandler.handleFont(graphics);
+
+		if (client.getLocalPlayer() != null)
+		{
+			if (xpDropOverlayManager.isShouldDraw())
+			{
+				drawAttachedXpDrops(graphics);
+			}
+		}
+
+		return null;
+	}
+
+	private Point getCanvasTextLocation(Graphics2D graphics, Actor actor)
+	{
+		int zOffset = Math.min(actor.getLogicalHeight(), 140);
+		return actor.getCanvasTextLocation(graphics, "x", zOffset);
+	}
+
+	private void drawAttachedXpDrops(Graphics2D graphics)
+	{
+		for (XpDropInFlight xpDropInFlight : xpDropOverlayManager.getXpDropsInFlight())
+		{
+			if (xpDropInFlight.getFrame() < 0)
+			{
+				continue;
+			}
+			String text = XpDropOverlayUtilities.getDropText(xpDropInFlight, config);
+
+			Actor target = xpDropInFlight.getAttachTo();
+			if (target == null || !config.attachToTarget())
+			{
+				target = client.getLocalPlayer();
+			}
+			if (target == null)
+			{
+				continue;
+			}
+			Point point = getCanvasTextLocation(graphics, target);
+			if (point == null)
+			{
+				continue;
+			}
+			point = new Point(point.getX() + config.attachToOffsetX(), point.getY() - config.attachToOffsetY()); // subtract y since conventional y-axis is from bottom to top
+
+			float xStart = xpDropInFlight.getXOffset();
+			float yStart = xpDropInFlight.getYOffset();
+
+			int textWidth = graphics.getFontMetrics().stringWidth(Text.removeTags(text));
+			int x;
+			if (config.xpDropCenterOn() == XpDropsConfig.CenterOn.TEXT)
+			{
+				x = (int) (xStart + point.getX() - textWidth / 2.0f);
+			}
+			else
+			{
+				int iconsWidth = XpDropOverlayUtilities.getIconWidthForIcons(graphics, xpDropInFlight.getIcons(), config, xpDropOverlayManager);
+				int totalWidth = textWidth + iconsWidth;
+				x = (int)(xStart + point.getX() - totalWidth / 2.0f + iconsWidth);
+			}
+			int y = (int) (yStart + point.getY());
+
+			// Keep the xp drop within viewport. Maybe good for later but for now it is not ideal.
+//			x = Math.max(client.getViewportXOffset(), x);
+//			y = Math.max(client.getViewportYOffset() + graphics.getFontMetrics().getMaxAscent(), y);
+//			x = Math.min(client.getViewportXOffset() + client.getViewportWidth() - graphics.getFontMetrics().stringWidth(text), x);
+//			y = Math.min(client.getViewportYOffset() + client.getViewportHeight(), y);
+
+			XpDropOverlayUtilities.drawText(graphics, text, x, y, (int) xpDropInFlight.getAlpha(), config.xpDropBackground());
+
+			int imageX = x - 2;
+			int imageY = y - graphics.getFontMetrics().getMaxAscent();
+			XpDropOverlayUtilities.drawIcons(graphics, xpDropInFlight.getIcons(), imageX, imageY, xpDropInFlight.getAlpha(), true, config, xpDropOverlayManager);
+		}
+	}
+}
+
+package com.xpdrops.overlay;
+
+import com.xpdrops.CustomizableXpDropsPlugin;
+import com.xpdrops.Skill;
+import com.xpdrops.XpDrop;
+import com.xpdrops.XpDropStyle;
+import com.xpdrops.attackstyles.AttackStyle;
+import com.xpdrops.config.XpDropsConfig;
+import com.xpdrops.config.XpTrackerSkills;
+import com.xpdrops.predictedhit.Hit;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.SpritePixels;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.awt.Font;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+import java.text.DecimalFormat;
+import java.util.ArrayList;
+import java.util.HashMap;
+
+@Slf4j
+@Singleton
+public class XpDropOverlayManager
+{
+	private static final int RED_HIT_SPLAT_SPRITE_ID = 1359;
+	private static final int FAKE_SKILL_ICON_ID = 423; //sprite index 11
+	private static final int[] SKILL_ICON_ORDINAL_ICONS = new int[]{
+		197, 199, 198, 203, 200, 201, 202, 212, 214, 208,
+		211, 213, 207, 210, 209, 205, 204, 206, 216, 217, 215, 220, 221, 898
+	};
+
+	// key: icon + spriteIndex << 16
+	private static final HashMap<Integer, BufferedImage> ICON_CACHE = new HashMap<>();
+
+	public static final String XP_FORMAT_PATTERN = "###,###,###";
+	public static final float FRAMES_PER_SECOND = 50;
+	public static final float CONSTANT_FRAME_TIME = 1000.0f / FRAMES_PER_SECOND;
+	public static final DecimalFormat XP_FORMATTER = new DecimalFormat(XP_FORMAT_PATTERN);
+	public static final Font RUNESCAPE_BOLD_FONT = XpDropOverlayUtilities.initRuneScapeBold();
+	// Used to order skills in the same order as the vanilla xp drops would display them
+	public static final int[] SKILL_INDICES = new int[] {10, 0, 2, 4, 6, 1, 3, 5, 16, 15, 17, 12, 20, 14, 13, 7, 11, 8, 9, 18, 19, 22, 21};
+
+	@Inject
+	private XpDropOverlay xpDropOverlay;
+	@Inject
+	private XpDropSceneOverlay xpDropSceneOverlay;
+	@Inject
+	private XpTrackerOverlay xpTrackerOverlay;
+	@Inject
+	private Client client;
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Getter
+	private final ArrayList<XpDropInFlight> xpDropsInFlight = new ArrayList<>();
+	@Getter
+	@Setter
+	private boolean shouldDraw = true;
+	@Getter
+	@Setter
+	private long lastFrameTime = 0;
+	@Getter
+	private Skill lastSkill = Skill.OVERALL;
+	@Setter
+	@Getter
+	private long lastSkillSetMillis = 0;
+
+	private Overlay currentXpDropOverlay;
+	private Overlay currentXpTrackerOverlay;
+
+	private final CustomizableXpDropsPlugin plugin;
+	private final XpDropsConfig config;
+
+	private static MaxMonospaceDigit maxMonospaceDigit;
+
+	@Inject
+	private XpDropOverlayManager(CustomizableXpDropsPlugin plugin, XpDropsConfig xpDropsConfig)
+	{
+		this.plugin = plugin;
+		this.config = xpDropsConfig;
+	}
+
+	@Data
+	@AllArgsConstructor
+	static class MaxMonospaceDigit
+	{
+		int width;
+		String character;
+		Font font;
+	}
+
+	@Nullable
+	public BufferedImage getStatIcon(int index)
+	{
+		int icon = SKILL_ICON_ORDINAL_ICONS[index];
+		return getIcon(icon, 0);
+	}
+
+	@Nullable
+	public BufferedImage getFakeSkillIcon()
+	{
+		return getIcon(FAKE_SKILL_ICON_ID, 11);
+	}
+
+	@Nullable
+	public BufferedImage getHitsplatIcon()
+	{
+		return getIcon(RED_HIT_SPLAT_SPRITE_ID, 0);
+	}
+
+	public void xpDropOverlayPriorityChanged()
+	{
+		xpDropOverlay.setPriority(config.xpDropOverlayPriority());
+		overlayManager.saveOverlay(xpDropOverlay);
+	}
+
+	public void xpTrackerOverlayPriorityChanged()
+	{
+		xpTrackerOverlay.setPriority(config.xpTrackerOverlayPriority());
+		overlayManager.saveOverlay(xpTrackerOverlay);
+	}
+
+	public void overlayTypeConfigChanged()
+	{
+		if (config.attachToPlayer() || config.attachToTarget())
+		{
+			if (currentXpDropOverlay != xpDropSceneOverlay)
+			{
+				overlayManager.remove(currentXpDropOverlay);
+				currentXpDropOverlay = xpDropSceneOverlay;
+				overlayManager.add(currentXpDropOverlay);
+			}
+		}
+		else
+		{
+			if (currentXpDropOverlay != xpDropOverlay)
+			{
+				overlayManager.remove(currentXpDropOverlay);
+				currentXpDropOverlay = xpDropOverlay;
+				overlayManager.add(currentXpDropOverlay);
+			}
+		}
+	}
+
+	public void startup()
+	{
+		clearIconCache();
+
+		if (config.attachToTarget() || config.attachToPlayer())
+		{
+			currentXpDropOverlay = xpDropSceneOverlay;
+		}
+		else
+		{
+			currentXpDropOverlay = xpDropOverlay;
+		}
+		currentXpTrackerOverlay = xpTrackerOverlay; // only have 1 currently
+
+		//add overlays
+		overlayManager.add(currentXpDropOverlay);
+		overlayManager.add(currentXpTrackerOverlay);
+	}
+
+	public void shutdown()
+	{
+		//remove overlays
+		overlayManager.remove(currentXpDropOverlay);
+		overlayManager.remove(currentXpTrackerOverlay);
+	}
+
+	public void update()
+	{
+		if (lastFrameTime <= 0)
+		{
+			lastFrameTime = System.currentTimeMillis() - 20; // set last frame 20 ms ago.
+		}
+
+		Skill _lastSkill = pollLastSkill();
+		if (_lastSkill != null)
+		{
+			lastSkillSetMillis = System.currentTimeMillis();
+			lastSkill = _lastSkill;
+		}
+
+		updateDrops();
+		pollDrops();
+
+		lastFrameTime = System.currentTimeMillis();
+	}
+
+	private Skill pollLastSkill()
+	{
+		Skill currentSkill = null;
+		if (config.xpTrackerSkill().equals(XpTrackerSkills.MOST_RECENT))
+		{
+			XpDrop topDrop = plugin.getQueue().peek();
+			for (XpDrop xpDrop : plugin.getQueue())
+			{
+				if (xpDrop != null && !plugin.getFilteredSkills().contains(xpDrop.getSkill().toString().toLowerCase()))
+				{
+					return xpDrop.getSkill();
+				}
+			}
+		}
+		else
+		{
+			currentSkill = config.xpTrackerSkill().getAssociatedSkill();
+		}
+		return currentSkill;
+	}
+
+	private void updateDrops()
+	{
+		xpDropsInFlight.removeIf(xpDropInFlight -> xpDropInFlight.getFrame() > config.framesPerDrop());
+
+		int xModifier = config.xDirection() == XpDropsConfig.HorizontalDirection.LEFT ? -1 : 1;
+		int yModifier = config.yDirection() == XpDropsConfig.VerticalDirection.UP ? -1 : 1;
+
+		float frameTime = System.currentTimeMillis() - lastFrameTime;
+		float frameTimeModifier = frameTime / CONSTANT_FRAME_TIME;
+
+		for (XpDropInFlight xpDropInFlight : xpDropsInFlight)
+		{
+			if (xpDropInFlight.getFrame() >= 0)
+			{
+				xpDropInFlight.setXOffset(xpDropInFlight.getXOffset() + config.xPixelsPerSecond() / FRAMES_PER_SECOND * xModifier * frameTimeModifier);
+				xpDropInFlight.setYOffset(xpDropInFlight.getYOffset() + config.yPixelsPerSecond() / FRAMES_PER_SECOND * yModifier * frameTimeModifier);
+			}
+			xpDropInFlight.setFrame(xpDropInFlight.getFrame() + frameTimeModifier);
+		}
+
+		if (config.fadeOut())
+		{
+			int threshold = (int) (0.66f * config.framesPerDrop());
+			int delta = config.framesPerDrop() - threshold;
+			for (XpDropInFlight xpDropInFlight : xpDropsInFlight)
+			{
+				if (xpDropInFlight.getFrame() > threshold)
+				{
+					int point = (int)xpDropInFlight.getFrame() - threshold;
+					float fade = Math.max(0.0f, Math.min(1.0f, point / (float) delta));
+					xpDropInFlight.setAlpha(Math.max(0, 0xff - fade * 0xff));
+				}
+			}
+		}
+	}
+
+	private void pollDrops()
+	{
+		float lastFrame = 0;
+		if (xpDropsInFlight.size() > 0)
+		{
+			XpDropInFlight xpDropInFlight = xpDropsInFlight.get(xpDropsInFlight.size() - 1);
+			lastFrame = xpDropInFlight.getFrame();
+			lastFrame -= config.groupedDelay();
+		}
+
+		ArrayList<XpDropInFlight> drops = new ArrayList<>();
+
+		int totalHit = 0;
+		AttackStyle predictedHitAttackStyle = null;
+		Actor target = null;
+		{
+			Hit hit = plugin.getHitBuffer().poll();
+			while (hit != null)
+			{
+				totalHit += hit.getHit();
+				target = hit.getAttachedActor();
+				predictedHitAttackStyle = hit.getStyle();
+
+				hit = plugin.getHitBuffer().poll();
+			}
+		}
+
+		if (!config.showPredictedHit())
+		{
+			totalHit = 0;
+		}
+
+		boolean filteredHit = false;
+		XpDropStyle style = XpDropStyle.DEFAULT;
+		for (XpDrop xpDrop : plugin.getQueue())
+		{
+			filteredHit |= plugin.getFilteredSkillsPredictedHits().contains(xpDrop.getSkill().getName().toLowerCase());
+
+			// We track this even for ignored skills.
+			if (xpDrop.getStyle() != XpDropStyle.DEFAULT)
+			{
+				style = xpDrop.getStyle();
+			}
+		}
+
+		if (config.showPredictedHit() && config.neverGroupPredictedHit() && totalHit > 0 && !filteredHit)
+		{
+			Skill skill = null;
+			if (predictedHitAttackStyle != null && predictedHitAttackStyle.getSkills().length > 0)
+			{
+				skill = predictedHitAttackStyle.getSkills()[0];
+			}
+			int icons = 0;
+			if (skill != null &&
+				(config.predictedHitIcon() == XpDropsConfig.PredictedHitIconStyle.SKILL ||
+					config.predictedHitIcon() == XpDropsConfig.PredictedHitIconStyle.HITSPLAT_SKILL))
+			{
+				icons |= 1 << CustomizableXpDropsPlugin.SKILL_PRIORITY[skill.ordinal()];
+			}
+			if (config.predictedHitIcon() == XpDropsConfig.PredictedHitIconStyle.HITSPLAT ||
+					config.predictedHitIcon() == XpDropsConfig.PredictedHitIconStyle.HITSPLAT_SKILL)
+			{
+				icons |= 1 << 24;
+			}
+
+			XpDropInFlight xpDropInFlight = new XpDropInFlight(icons, totalHit, style, 0, 0, 0xff, 0, 0, target, true);
+			drops.add(xpDropInFlight);
+		}
+
+		if (config.isGrouped())
+		{
+			int amount = 0;
+			int icons = 0;
+
+			XpDrop xpDrop = plugin.getQueue().poll();
+			while (xpDrop != null)
+			{
+				if (!plugin.getFilteredSkills().contains(xpDrop.getSkill().getName().toLowerCase()))
+				{
+					amount += xpDrop.getExperience();
+					if (config.showIcons())
+					{
+						icons |= 1 << CustomizableXpDropsPlugin.SKILL_PRIORITY[xpDrop.getSkill().ordinal()];
+					}
+
+					if (xpDrop.isFake() && config.showFakeIcon())
+					{
+						icons |= 1 << 23;
+					}
+				}
+
+				xpDrop = plugin.getQueue().poll();
+			}
+			if (amount > 0)
+			{
+				int hit = config.neverGroupPredictedHit() || filteredHit ? 0 : totalHit;
+				XpDropInFlight xpDropInFlight = new XpDropInFlight(icons, amount, style, 0, 0, 0xff, 0, hit, target, false);
+				drops.add(xpDropInFlight);
+			}
+		}
+		else
+		{
+			XpDrop xpDrop = plugin.getQueue().poll();
+			HashMap<Skill, XpDropInFlight> dropsInFlightMap = new HashMap<>();
+			ArrayList<XpDropInFlight> dropsInFlight = new ArrayList<>();
+			while (xpDrop != null)
+			{
+				if (!plugin.getFilteredSkills().contains(xpDrop.getSkill().getName().toLowerCase()))
+				{
+					int icons = 0;
+					if (config.showIcons())
+					{
+						icons = 1 << CustomizableXpDropsPlugin.SKILL_PRIORITY[xpDrop.getSkill().ordinal()];
+					}
+					int amount = xpDrop.getExperience();
+
+					if (xpDrop.isFake() && config.showFakeIcon())
+					{
+						icons |= 1 << 23;
+					}
+
+					if (dropsInFlightMap.containsKey(xpDrop.getSkill()))
+					{
+						int hit = config.neverGroupPredictedHit() || filteredHit ? 0 : totalHit;
+						XpDropInFlight xpDropInFlight = dropsInFlightMap.get(xpDrop.getSkill());
+						xpDropInFlight.setHit(hit);
+						xpDropInFlight.setAmount(xpDropInFlight.getAmount() + amount);
+					}
+					else
+					{
+						int hit = config.neverGroupPredictedHit() || filteredHit ? 0 : totalHit;
+						XpDropInFlight xpDropInFlight = new XpDropInFlight(icons, amount, style, 0, 0, 0xff, 0, hit, xpDrop.getAttachedActor(), false);
+						dropsInFlightMap.put(xpDrop.getSkill(), xpDropInFlight);
+						dropsInFlight.add(xpDropInFlight);
+					}
+				}
+
+				xpDrop = plugin.getQueue().poll();
+			}
+			drops.addAll(dropsInFlight);
+		}
+
+		int index = 0;
+		lastFrame = Math.min(0, lastFrame);
+		for (XpDropInFlight drop : drops)
+		{
+			float frameOffset = -index * config.groupedDelay() + lastFrame;
+			drop.setFrame(frameOffset);
+
+			xpDropsInFlight.add(drop);
+			index++;
+		}
+	}
+
+	public void clearIconCache()
+	{
+		ICON_CACHE.clear();
+	}
+
+	private BufferedImage getIcon(int icon, int spriteIndex)
+	{
+		int key = icon + spriteIndex << 16;
+		if (ICON_CACHE.containsKey(key) && ICON_CACHE.get(key) != null)
+		{
+			return ICON_CACHE.get(key);
+		}
+		if (client == null)
+		{
+			return null;
+		}
+		if (config.iconOverride() && client.getSpriteOverrides().containsKey(icon))
+		{
+			BufferedImage img = client.getSpriteOverrides().get(icon).toBufferedImage();
+			ICON_CACHE.put(key, img);
+			return img;
+		}
+		SpritePixels[] pixels = client.getSprites(client.getIndexSprites(), icon, 0);
+		if (pixels != null && pixels.length >= spriteIndex + 1 && pixels[spriteIndex] != null)
+		{
+			BufferedImage img = pixels[spriteIndex].toBufferedImage();
+			ICON_CACHE.put(key, img);
+			return img;
+		}
+		return null;
+	}
+
+	// Since most fonts are not monospace we can use this function to determine the width for the given string when each
+	// digit is replaced with the widest digit.
+	public static int monospacedWidth(Graphics2D graphics, String text)
+	{
+		// maxMonospaceDigit is used for caching
+		if (maxMonospaceDigit == null || maxMonospaceDigit.getFont() == null || !maxMonospaceDigit.getFont().equals(graphics.getFont()))
+		{
+			maxMonospaceDigit = new MaxMonospaceDigit(0, "0", graphics.getFont());
+			char[] chars = new char[] {'1', '2', '3', '4', '5', '6', '7', '8', '9', '0'};
+			for (char aChar : chars)
+			{
+				if (graphics.getFontMetrics().charWidth(aChar) >= maxMonospaceDigit.getWidth())
+				{
+					maxMonospaceDigit.setCharacter(String.valueOf(aChar));
+					maxMonospaceDigit.setWidth(graphics.getFontMetrics().charWidth(aChar));
+				}
+			}
+		}
+
+		return graphics.getFontMetrics().stringWidth(text.replaceAll("[0-9]", maxMonospaceDigit.getCharacter()));
+	}
+}
+
+package com.xpdrops.overlay;
+
+import lombok.Setter;
+import net.runelite.client.ui.overlay.RenderableEntity;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.Text;
+
+import javax.annotation.Nullable;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.Point;
+import java.util.regex.Pattern;
+
+// Copy of TextComponent
+@Setter
+public class TextComponentWithAlpha implements RenderableEntity
+{
+	public enum Background
+	{
+		NONE,
+		SHADOW,
+		OUTLINE
+	}
+
+	int alphaOverride = 255;
+
+	private static final String COL_TAG_REGEX = "(<col=([0-9a-fA-F]){2,8}>)";
+	private static final Pattern COL_TAG_PATTERN_W_LOOKAHEAD = Pattern.compile("(?=" + COL_TAG_REGEX + ")");
+
+	String text;
+	Point position = new Point();
+	Color color = Color.WHITE;
+	Background background = Background.SHADOW;
+	/**
+	 * The text font.
+	 */
+	@Nullable
+	Font font;
+
+	// If color string has >6 hex digits use first 2 as alpha and calculate the minimum alpha using the given default value.
+	private static int calculateAlpha(String colorString, int _defaultAlpha)
+	{
+		int alpha = _defaultAlpha;
+		if (colorString.length() > 6)
+		{
+			try
+			{
+				alpha = Math.min(Integer.decode("#" + colorString.substring(0, 2)), alpha);
+			}
+			catch (NumberFormatException ignored) { }
+		}
+		return alpha;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		Font originalFont = null;
+		if (font != null)
+		{
+			originalFont = graphics.getFont();
+			graphics.setFont(font);
+		}
+
+		final FontMetrics fontMetrics = graphics.getFontMetrics();
+
+		if (COL_TAG_PATTERN_W_LOOKAHEAD.matcher(text).find())
+		{
+			final String[] parts = COL_TAG_PATTERN_W_LOOKAHEAD.split(text);
+			int x = position.x;
+
+			for (String textSplitOnCol : parts)
+			{
+				final String textWithoutCol = Text.removeTags(textSplitOnCol);
+				final String argbString = textSplitOnCol.substring(textSplitOnCol.indexOf("=") + 1, textSplitOnCol.indexOf(">"));
+				final String rgbString = argbString.length() > 6 ? argbString.substring(2) : argbString;
+				final int alpha = calculateAlpha(argbString, alphaOverride);
+
+				graphics.setColor(ColorUtil.colorWithAlpha(Color.BLACK, alpha));
+
+				switch (background)
+				{
+					case OUTLINE :
+					{
+						graphics.drawString(textWithoutCol, x, position.y + 1);
+						graphics.drawString(textWithoutCol, x, position.y - 1);
+						graphics.drawString(textWithoutCol, x + 1, position.y);
+						graphics.drawString(textWithoutCol, x - 1, position.y);
+						break;
+					}
+					case SHADOW:
+					{
+						graphics.drawString(textWithoutCol, x + 1, position.y + 1);
+						break;
+					}
+					default:
+						break;
+				}
+
+				// actual text
+				graphics.setColor(ColorUtil.colorWithAlpha(Color.decode("#" + rgbString), alpha));
+				graphics.drawString(textWithoutCol, x, position.y);
+
+				x += fontMetrics.stringWidth(textWithoutCol);
+			}
+		}
+		else
+		{
+			graphics.setColor(ColorUtil.colorWithAlpha(Color.BLACK, alphaOverride));
+
+			switch (background)
+			{
+				case OUTLINE :
+				{
+					graphics.drawString(text, position.x, position.y + 1);
+					graphics.drawString(text, position.x, position.y - 1);
+					graphics.drawString(text, position.x + 1, position.y);
+					graphics.drawString(text, position.x - 1, position.y);
+					break;
+				}
+				case SHADOW:
+				{
+					graphics.drawString(text, position.x + 1, position.y + 1);
+					break;
+				}
+				default:
+					break;
+			}
+
+			// actual text
+			graphics.setColor(ColorUtil.colorWithAlpha(color, alphaOverride));
+			graphics.drawString(text, position.x, position.y);
+		}
+
+		int width = fontMetrics.stringWidth(text);
+		int height = fontMetrics.getHeight();
+
+		if (originalFont != null)
+		{
+			graphics.setFont(originalFont);
+		}
+
+		return new Dimension(width, height);
+	}
+}
+
+package com.xpdrops;
+
+public enum XpDropStyle
+{
+	DEFAULT,
+	MELEE,
+	MAGE,
+	RANGE
+}
+
+/*
+ * Copyright (c) 2016-2017, Adam <Adam@sigterm.info>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+package com.xpdrops;
+
+/**
+ * An enumeration of skills that a player can level.
+ */
+public enum Skill
+{
+	ATTACK("Attack"),
+	DEFENCE("Defence"),
+	STRENGTH("Strength"),
+	HITPOINTS("Hitpoints"),
+	RANGED("Ranged"),
+	PRAYER("Prayer"),
+	MAGIC("Magic"),
+	COOKING("Cooking"),
+	WOODCUTTING("Woodcutting"),
+	FLETCHING("Fletching"),
+	FISHING("Fishing"),
+	FIREMAKING("Firemaking"),
+	CRAFTING("Crafting"),
+	SMITHING("Smithing"),
+	MINING("Mining"),
+	HERBLORE("Herblore"),
+	AGILITY("Agility"),
+	THIEVING("Thieving"),
+	SLAYER("Slayer"),
+	FARMING("Farming"),
+	RUNECRAFT("Runecraft"),
+	HUNTER("Hunter"),
+	CONSTRUCTION("Construction"),
+	/**
+	 * The level of all skills added together.
+	 */
+	OVERALL("Overall");
+
+	private final String name;
+
+	Skill(String name)
+	{
+		this.name = name;
+	}
+
+	/**
+	 * Gets the name of the skill.
+	 *
+	 * @return the skill name
+	 */
+	public String getName()
+	{
+		return name;
+	}
+
+	public static Skill fromSkill(net.runelite.api.Skill skill) {
+		return skill.ordinal() < Skill.values().length ? Skill.values()[skill.ordinal()] : null;
+//		return Skill.valueOf(skill.getName().toUpperCase());
+	}
+
+	public net.runelite.api.Skill toSkill() {
+		return ordinal() < net.runelite.api.Skill.values().length ? net.runelite.api.Skill.values()[ordinal()] : null;
+//		return net.runelite.api.Skill.valueOf(getName().toUpperCase());
+	}
+}

@@ -1,0 +1,323 @@
+package com.casketsounds;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class CasketSoundsPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(CasketSoundsPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.casketsounds;
+
+public enum Sound {
+    CASKET("casket.wav"),
+    CASKET2("casket2.wav"),
+
+    CASKET3("casket3.wav");
+
+    private final String fileName;
+
+    Sound(String fileName) {
+        this.fileName = fileName;
+    }
+
+    String getFileName() {
+        return fileName;
+    }
+
+    public static final Sound[] CASKET_SOUNDS = new Sound[]{
+            Sound.CASKET,
+            Sound.CASKET2,
+            Sound.CASKET3
+    };
+}
+
+package com.casketsounds;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.ItemSpawned;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.InventoryID;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import okhttp3.OkHttpClient;
+import org.slf4j.Logger;
+
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadLocalRandom;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Casket Sounds"
+)
+public class CasketSoundsPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private CasketSoundsConfig config;
+
+	@Inject
+	private SoundEngine soundEngine;
+
+	@Inject
+	private ScheduledExecutorService executor;
+
+	@Inject
+	private OkHttpClient okHttpClient;
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		executor.submit(() -> {
+			FileManager.ensureDownloadDirectoryExists();
+			FileManager.downloadAllMissingSounds(okHttpClient);
+		});
+
+		log.info("CasketSounds started!");
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		soundEngine.close();
+		log.info("CasketSounds stopped!");
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage chatMessage) {
+		if (chatMessage.getType() == ChatMessageType.MESBOX && chatMessage.getMessage().toLowerCase().contains("casket")) {
+			int whichSound = ThreadLocalRandom.current().nextInt(1, 4);
+
+			switch(whichSound)
+			{
+				case(2):
+					log.info("Playing CASKET2 sound.");
+					soundEngine.playClip(Sound.CASKET2);
+					break;
+				case(3):
+					log.info("Playing CASKET3 sound.");
+					soundEngine.playClip(Sound.CASKET3);
+					break;
+				default:
+					log.info("Playing default CASKET sound.");
+					soundEngine.playClip(Sound.CASKET);
+			}
+		}
+	}
+
+	@Provides
+	CasketSoundsConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(CasketSoundsConfig.class);
+	}
+}
+
+package com.casketsounds;
+
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.sound.sampled.*;
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+@Singleton
+@Slf4j
+public class SoundEngine {
+
+    @Inject
+    private CasketSoundsConfig config;
+
+    private static final long CLIP_MTIME_UNLOADED = -2;
+    private long lastClipMTime = CLIP_MTIME_UNLOADED;
+    private Clip clip = null;
+
+    private boolean loadClip(Sound sound) {
+        try (InputStream stream = new BufferedInputStream(FileManager.getSoundStream(sound))) {
+            try (AudioInputStream audioInputStream = AudioSystem.getAudioInputStream(stream)) {
+                clip.open(audioInputStream); // liable to error with pulseaudio, works on windows, one user informs me mac works
+            }
+            return true;
+        } catch (UnsupportedAudioFileException | IOException | LineUnavailableException e) {
+            log.warn("Failed to load Casket Sounds sound: " + sound, e);
+        }
+        return false;
+    }
+
+    public void playClip(Sound sound) {
+        long currentMTime = System.currentTimeMillis();
+        if (clip == null || currentMTime != lastClipMTime || !clip.isOpen()) {
+            if (clip != null && clip.isOpen()) {
+                clip.close();
+            }
+
+            try {
+                clip = AudioSystem.getClip();
+            } catch (LineUnavailableException e) {
+                lastClipMTime = CLIP_MTIME_UNLOADED;
+                log.warn("Failed to get clip for Casket Sounds sound: " + sound, e);
+                return;
+            }
+
+            lastClipMTime = currentMTime;
+            if (!loadClip(sound)) {
+                return;
+            }
+        }
+
+        // User configurable volume
+        FloatControl volume = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
+        float gain = 20f * (float) Math.log10(config.announcementVolume() / 100f);
+        gain = Math.min(gain, volume.getMaximum());
+        gain = Math.max(gain, volume.getMinimum());
+        volume.setValue(gain);
+
+        // From RuneLite base client Notifier class:
+        // Using loop instead of start + setFramePosition prevents the clip
+        // from not being played sometimes, presumably a race condition in the
+        // underlying line driver
+        clip.loop(0);
+    }
+
+    public void close()
+    {
+        if (clip != null && clip.isOpen())
+        {
+            clip.close();
+        }
+    }
+}
+
+package com.casketsounds;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Slf4j
+public abstract class FileManager {
+
+    private static final File DOWNLOAD_DIR = new File(RuneLite.RUNELITE_DIR.getPath() + File.separator + "casket-sounds");
+    private static final HttpUrl RAW_GITHUB = HttpUrl.parse("https://github.com/jarrodcabalzar/CasketSounds/raw/sounds/");
+
+    @SuppressWarnings("ResultOfMethodCallIgnored")
+    public static void ensureDownloadDirectoryExists() {
+        if (!DOWNLOAD_DIR.exists()) {
+            DOWNLOAD_DIR.mkdirs();
+        }
+    }
+
+    public static void downloadAllMissingSounds(final OkHttpClient okHttpClient) {
+        // Get set of existing files in our dir - existing sounds will be skipped, unexpected files (not dirs, some sounds depending on config) will be deleted
+        Set<String> filesPresent = getFilesPresent();
+
+        // Download any sounds that are not yet present but desired
+        for (Sound sound : getDesiredSoundList()) {
+            String fileNameToDownload = sound.getFileName();
+            if (filesPresent.contains(fileNameToDownload)) {
+                filesPresent.remove(fileNameToDownload);
+                continue;
+            }
+
+            if (RAW_GITHUB == null) {
+                log.error("Casket Sounds could not download sounds due to an unexpected null RAW_GITHUB value");
+                return;
+            }
+
+            HttpUrl soundUrl = RAW_GITHUB.newBuilder().addPathSegment(fileNameToDownload).build();
+            Path outputPath = Paths.get(DOWNLOAD_DIR.getPath(), fileNameToDownload);
+            try (Response res = okHttpClient.newCall(new Request.Builder().url(soundUrl).build()).execute()) {
+                if (res.body() != null)
+                    Files.copy(new BufferedInputStream(res.body().byteStream()), outputPath, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                log.error("Casket Sounds could not download sounds!", e);
+                return;
+            }
+        }
+
+        for (String filename : filesPresent) {
+            File toDelete = new File(DOWNLOAD_DIR, filename);
+            //noinspection ResultOfMethodCallIgnored
+            toDelete.delete();
+        }
+    }
+
+    private static Set<String> getFilesPresent() {
+        File[] downloadDirFiles = DOWNLOAD_DIR.listFiles();
+        if (downloadDirFiles == null || downloadDirFiles.length == 0)
+            return new HashSet<>();
+
+        return Arrays.stream(downloadDirFiles)
+                .filter(file -> !file.isDirectory())
+                .map(File::getName)
+                .collect(Collectors.toSet());
+    }
+
+    private static Set<Sound> getDesiredSoundList() {
+        return Arrays.stream(Sound.values()).collect(Collectors.toSet());
+    }
+
+    public static InputStream getSoundStream(Sound sound) throws FileNotFoundException {
+        return new FileInputStream(new File(DOWNLOAD_DIR, sound.getFileName()));
+    }
+}
+package com.casketsounds;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Range;
+
+@ConfigGroup("CasketSounds")
+public interface CasketSoundsConfig extends Config
+{
+	@Range(
+		min = 0,
+		max = 200
+	)
+	@ConfigItem(
+		keyName = "announcementVolume",
+		name = "Casket Sounds volume",
+		description = "Adjust how loud the sounds are played.",
+		position = 0
+	)
+	default int announcementVolume() {
+		return 100;
+	}
+}
+

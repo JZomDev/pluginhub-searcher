@@ -1,0 +1,297 @@
+package xyz.evaan;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class TediousCollectionLogPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(TediousCollectionLogPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package xyz.evaan;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("tediouscollectionlog")
+public interface TediousCollectionLogConfig extends Config {
+    @ConfigItem(
+            keyName = "announcementVolume",
+            name = "Announcement volume",
+            description = "Adjust how loud the audio announcements are played!",
+            position = 0
+    )
+    default int announcementVolume() {
+        return 100;
+    }
+}
+
+package xyz.evaan;
+
+public enum Sound {
+    COLLECTION_LOG_SLOT("the_collection_log.wav");
+
+    private final String resourceName;
+
+    Sound(String resNam) {
+        resourceName = resNam;
+    }
+
+    String getResourceName() {
+        return resourceName;
+    }
+}
+
+package xyz.evaan;
+
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.sound.sampled.*;
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+@Singleton
+@Slf4j
+public class SoundEngine {
+    @Inject
+    private TediousCollectionLogConfig config;
+
+    private static final long CLIP_MTIME_UNLOADED = -2;
+
+    private long lastClipMTime = CLIP_MTIME_UNLOADED;
+    private Clip clip = null;
+
+    private boolean loadClip(Sound sound) {
+        try (InputStream stream = new BufferedInputStream(SoundFileManager.getSoundStream(sound))) {
+            try (AudioInputStream audioInputStream = AudioSystem.getAudioInputStream(stream)) {
+                clip.open(audioInputStream); // liable to error with pulseaudio, works on windows, one user informs me mac works
+            }
+            return true;
+        } catch (UnsupportedAudioFileException | IOException | LineUnavailableException e) {
+            log.warn("Failed to load Tedious sound " + sound, e);
+        }
+        return false;
+    }
+
+    public void playClip(Sound sound) {
+        long currentMTime = System.currentTimeMillis();
+        if (clip == null || currentMTime != lastClipMTime || !clip.isOpen()) {
+            if (clip != null && clip.isOpen()) {
+                clip.close();
+            }
+
+            try {
+                clip = AudioSystem.getClip();
+            } catch (LineUnavailableException e) {
+                lastClipMTime = CLIP_MTIME_UNLOADED;
+                log.warn("Failed to get clip for Tedious sound " + sound, e);
+                return;
+            }
+
+            lastClipMTime = currentMTime;
+            if (!loadClip(sound)) {
+                return;
+            }
+        }
+
+        // User configurable volume
+        FloatControl volume = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
+        float gain = 20f * (float) Math.log10(config.announcementVolume() / 100f);
+        gain = Math.min(gain, volume.getMaximum());
+        gain = Math.max(gain, volume.getMinimum());
+        volume.setValue(gain);
+
+        // From RuneLite base client Notifier class:
+        // Using loop instead of start + setFramePosition prevents the clip
+        // from not being played sometimes, presumably a race condition in the
+        // underlying line driver
+        clip.loop(0);
+    }
+}
+
+package xyz.evaan;
+
+import com.google.inject.Provides;
+import java.util.HashMap;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import static net.runelite.api.Varbits.DIARY_KARAMJA_EASY;
+import static net.runelite.api.Varbits.DIARY_KARAMJA_HARD;
+import static net.runelite.api.Varbits.DIARY_KARAMJA_MEDIUM;
+import net.runelite.api.annotations.Varbit;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import okhttp3.OkHttpClient;
+
+import javax.inject.Inject;
+import java.util.EnumMap;
+import java.util.Map;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Tedious Collection Log",
+	description = "Tedious announces new collection log slots",
+	tags = {"tedious", "announce", "collection", "log"}
+)
+
+public class TediousCollectionLogPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Getter(AccessLevel.PACKAGE)
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private SoundEngine soundEngine;
+
+	@Inject
+	private ScheduledExecutorService executor;
+
+	@Inject
+	private OkHttpClient okHttpClient;
+
+	private static final Pattern COLLECTION_LOG_ITEM_REGEX = Pattern.compile("New item added to your collection log:.*");
+
+	@Provides
+	TediousCollectionLogConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(TediousCollectionLogConfig.class);
+	}
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		executor.submit(() -> {
+			SoundFileManager.ensureDownloadDirectoryExists();
+			SoundFileManager.downloadAllMissingSounds(okHttpClient);
+		});
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage chatMessage) {
+		if (chatMessage.getType() != ChatMessageType.GAMEMESSAGE && chatMessage.getType() != ChatMessageType.SPAM) {
+			return;
+		}
+
+		if (COLLECTION_LOG_ITEM_REGEX.matcher(chatMessage.getMessage()).matches()) {
+			client.addChatMessage(ChatMessageType.PUBLICCHAT, "Tedious", "The collection log.", null);
+			soundEngine.playClip(Sound.COLLECTION_LOG_SLOT);
+		}
+
+	}
+}
+
+package xyz.evaan;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+@Slf4j
+public abstract class SoundFileManager {
+
+    private static final File DOWNLOAD_DIR = new File(RuneLite.RUNELITE_DIR.getPath() + File.separator + "tedious-sounds");
+    private static final String DELETE_WARNING_FILENAME = "EXTRA_FILES_WILL_BE_DELETED_BUT_FOLDERS_WILL_REMAIN";
+    private static final File DELETE_WARNING_FILE = new File(DOWNLOAD_DIR, DELETE_WARNING_FILENAME);
+    private static final HttpUrl RAW_GITHUB = HttpUrl.parse("https://raw.githubusercontent.com/evaan/tedious-collection-log/sounds");
+
+    @SuppressWarnings("ResultOfMethodCallIgnored")
+    public static void ensureDownloadDirectoryExists() {
+        if (!DOWNLOAD_DIR.exists()) {
+            DOWNLOAD_DIR.mkdirs();
+        }
+        try {
+            DELETE_WARNING_FILE.createNewFile();
+        } catch (IOException ignored) { }
+    }
+
+    public static void downloadAllMissingSounds(final OkHttpClient okHttpClient) {
+        File[] downloadDirFiles = DOWNLOAD_DIR.listFiles();
+
+        // Get set of existing files in our dir - existing sounds will be skipped, unexpected files (not dirs) will be deleted
+        Set<String> filesPresent = new HashSet<>();
+        if (downloadDirFiles != null && downloadDirFiles.length > 0) {
+            Arrays.stream(downloadDirFiles)
+                    .filter(file -> !file.isDirectory())
+                    .map(File::getName)
+                    .filter(filename -> !DELETE_WARNING_FILENAME.equals(filename))
+                    .forEach(filesPresent::add);
+        }
+
+        // Download any sounds that are not yet present but exist in Sound enum
+        Sound[] allSounds = Sound.values();
+        for (Sound sound : allSounds) {
+            String fileName = sound.getResourceName();
+            if (filesPresent.contains(fileName)) {
+                filesPresent.remove(fileName);
+                continue;
+            }
+
+            if (RAW_GITHUB == null) {
+                // Hush intellij, it's okay, the potential NPE can't hurt you now
+                log.error("Tedious Collection Log could not download sounds due to an unexpected null RAW_GITHUB value");
+                return;
+            }
+            HttpUrl soundUrl = RAW_GITHUB.newBuilder().addPathSegment(fileName).build();
+            Path outputPath = Paths.get(DOWNLOAD_DIR.getPath(), fileName);
+            try (Response res = okHttpClient.newCall(new Request.Builder().url(soundUrl).build()).execute()) {
+                if (res.body() != null)
+                    Files.copy(new BufferedInputStream(res.body().byteStream()), outputPath, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                log.error("Tedious Collection Log could not download sounds", e);
+                return;
+            }
+        }
+
+        // filesPresent now contains only files in our directory that we weren't expecting
+        // (eg. old versions of sounds)
+        // We now delete them to avoid cluttering up disk space
+        // We leave dirs behind (filesPresent filters them out early on) as we aren't creating those anyway so they won't build up over time
+        for (String filename : filesPresent) {
+            File toDelete = new File(DOWNLOAD_DIR, filename);
+            //noinspection ResultOfMethodCallIgnored
+            toDelete.delete();
+        }
+    }
+
+    public static InputStream getSoundStream(Sound sound) throws FileNotFoundException {
+        return new FileInputStream(new File(DOWNLOAD_DIR, sound.getResourceName()));
+    }
+}
+

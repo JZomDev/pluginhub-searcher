@@ -1,0 +1,593 @@
+package com.playtime;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PlayTimePluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(PlayTimePlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.playtime;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.http.api.RuneLiteAPI;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.*;
+import java.util.ArrayList;
+
+import static net.runelite.client.RuneLite.RUNELITE_DIR;
+
+@Slf4j
+@Singleton
+public class TimeRecordWriter {
+    private static final String FILE_EXTENSION = ".log";
+    private static final File PLAY_TIME_DIR = new File(RUNELITE_DIR, "playTime");
+    private String playerName;
+
+    @Inject
+    public TimeRecordWriter() {
+        PLAY_TIME_DIR.mkdir();
+    }
+
+    public void setPlayerUsername(final String username)
+    {
+        playerName = username;
+    }
+
+    public synchronized ArrayList<PlayTimeRecord> loadPlayTimeRecords()
+    {
+        if (playerName == null) {
+            return new ArrayList();
+        }
+        final String fileName = playerName.trim() + FILE_EXTENSION;
+        final File file = new File(PLAY_TIME_DIR, fileName);
+        final ArrayList<PlayTimeRecord> data = new ArrayList<>();
+        if (!file.exists()) {
+            return new ArrayList();
+        }
+        try (final BufferedReader br = new BufferedReader(new FileReader(file)))
+        {
+            String line;
+            while ((line = br.readLine()) != null)
+            {
+                // Skips the empty line at end of file
+                if (line.length() > 0)
+                {
+                    final PlayTimeRecord r = RuneLiteAPI.GSON.fromJson(line, PlayTimeRecord.class);
+                    data.add(r);
+                }
+            }
+
+        }
+        catch (FileNotFoundException e)
+        {
+            log.debug("File not found: {}", fileName);
+        }
+        catch (IOException e)
+        {
+            log.warn("IOException for file {}: {}", fileName, e.getMessage());
+        }
+
+        return data;
+    }
+
+    public synchronized boolean writePlayTimeFile(final ArrayList<PlayTimeRecord> times)
+    {
+        final File timeFile = new File(PLAY_TIME_DIR, playerName.trim() + FILE_EXTENSION);
+
+        try
+        {
+            final BufferedWriter file = new BufferedWriter(new FileWriter(String.valueOf(timeFile), false));
+            for (final PlayTimeRecord rec : times)
+            {
+                // Convert entry to JSON
+                final String dataAsString = RuneLiteAPI.GSON.toJson(rec);
+                file.append(dataAsString);
+                file.newLine();
+            }
+            file.close();
+
+            return true;
+        }
+        catch (IOException ioe)
+        {
+            log.warn("Error rewriting loot data to file {}: {}", playerName.trim() + FILE_EXTENSION, ioe.getMessage());
+            return false;
+        }
+    }
+}
+
+package com.playtime;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("play-time")
+public interface PlayTimeConfig extends Config
+{
+	@ConfigItem(
+			keyName = "showAverages",
+			name = "Show Averages",
+			description = "Show average values for week and month."
+	)
+	default boolean showAverages()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "showSeconds",
+			name = "Show Seconds",
+			description = "Show seconds on times"
+	)
+	default boolean showSeconds()
+	{
+		return false;
+	}
+}
+
+package com.playtime;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.NpcID;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.reportbutton.TimeStyle;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
+
+import java.awt.image.BufferedImage;
+import java.text.DateFormat;
+import java.text.SimpleDateFormat;
+import java.time.*;
+import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Play Time"
+)
+public class PlayTimePlugin extends Plugin
+{
+	private static final ZoneId UTC = ZoneId.of("UTC");
+	private static final ZoneId JAGEX = ZoneId.of("Europe/London");
+	public static final DateTimeFormatter DATE_FORMAT = DateTimeFormatter.ofPattern("dd.MM.yy");
+	public static final String HANS_TIME_KEY = "OLD";
+
+	private boolean ready = false;
+	private boolean loadedData = false;
+	private boolean loadedHans = false;
+
+	public long getSessionTicks() {
+		return sessionTicks;
+	}
+
+	private long sessionTicks = 0;
+
+	public long getTotalTicks() {
+		return totalTicks;
+	}
+
+	private long totalTicks = 0;
+
+	private PlayTimePanel panel;
+	private NavigationButton navButton;
+
+	@Inject
+	private TimeRecordWriter writer;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	private PlayTimeConfig config;
+
+	private PlayTimeRecord record;
+	public HashMap<String, PlayTimeRecord> records = new HashMap<>();
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		panel = new PlayTimePanel(this);
+
+		final BufferedImage icon = ImageUtil.getResourceStreamFromClass(getClass(), "pluginicon.png");
+
+		navButton = NavigationButton.builder()
+				.tooltip("Play Time")
+				.priority(6)
+				.icon(icon)
+				.panel(panel)
+				.build();
+
+		clientToolbar.addNavigation(navButton);
+
+		if (client.getGameState().equals(GameState.LOGGED_IN) || client.getGameState().equals(GameState.LOADING))
+		{
+			loadData();
+		}
+		panel.showView();
+	}
+
+	public PlayTimeConfig getConfig() {
+		return config;
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		clientToolbar.removeNavigation(navButton);
+		saveData();
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		if (client.getGameState() != GameState.LOGGED_IN)
+		{
+			panel.showView();
+			return;
+		}
+
+		Widget npcHead = client.getWidget(WidgetInfo.DIALOG_NPC_HEAD_MODEL);
+		if (npcHead != null && npcHead.getModelId() == NpcID.HANS && !loadedHans) {
+			Widget textw = client.getWidget(WidgetInfo.DIALOG_NPC_TEXT);
+			String text = textw.getText();
+			text = text.replaceAll("<br>", "");
+			Matcher m = Pattern.compile("([0-9]+)[^0-9]*([0-9]+)[^0-9]*([0-9]+)").matcher(text);
+			if (m.find() && m.groupCount() == 3 && text.startsWith("You've spent")) {
+				long days = Long.parseLong(m.group(1));
+				long hours = Long.parseLong(m.group(2));
+				long mins = Long.parseLong(m.group(3));
+				long total = (days * 100 * 60 * 24) + (hours * 100 * 60) + (mins * 100);
+				if (records != null) {
+					long trackedTime = 0;
+					for (int i = 0; i < records.size(); i++) {
+						PlayTimeRecord rec = records.get(i);
+						if (rec != null && rec.getDate() != HANS_TIME_KEY) {
+							trackedTime += rec.getTime();
+						}
+					}
+					total -= trackedTime;
+					totalTicks = total + trackedTime;
+				}
+				PlayTimeRecord rec = records.get(HANS_TIME_KEY);
+				if (rec == null) {
+					rec = new PlayTimeRecord(HANS_TIME_KEY, total);
+					records.put(HANS_TIME_KEY, rec);
+				}
+				else {
+					rec.setTime(total);
+				}
+				if (records == null) {
+					totalTicks = total;
+				}
+				saveData();
+				loadedHans = true;
+			}
+		}
+		else if (npcHead == null || npcHead.getModelId() != NpcID.HANS) {
+			loadedHans = false;
+		}
+		sessionTicks++;
+		totalTicks++;
+
+		PlayTimeRecord rec = getCurrentRecord();
+		rec.setTime(rec.getTime() + 1);
+
+		if (sessionTicks % 10 == 0) {
+			saveData();
+		}
+		loadData();
+		panel.showView();
+	}
+
+	public PlayTimeRecord getCurrentRecord() {
+		if (!loadedData) {
+			return null;
+		}
+		if (record != null && record.getDate() == LocalDate.now().format(DATE_FORMAT)) {
+			return record;
+		}
+		PlayTimeRecord rec = records.get(LocalDate.now().format(DATE_FORMAT));
+		if (rec == null) {
+			rec = new PlayTimeRecord(LocalDate.now().format(DATE_FORMAT), 0);
+			records.put(rec.getDate(), rec);
+		}
+		record = rec;
+		return rec;
+	}
+
+	public void resetCounter() {
+		sessionTicks = 0;
+	}
+
+	public void loadData() {
+		if (loadedData) {
+			return;
+		}
+		writer.setPlayerUsername(client.getUsername());
+		ArrayList<PlayTimeRecord> recs = writer.loadPlayTimeRecords();
+		totalTicks = 0;
+		recs.forEach((rec) -> {
+			totalTicks += rec.getTime();
+			records.put(rec.getDate(), rec);
+		});
+		loadedData = true;
+	}
+
+	public void saveData() {
+		if (!loadedData) {
+			return;
+		}
+		ArrayList<PlayTimeRecord> recs = new ArrayList<>();
+		records.forEach((k, v) -> recs.add(v));
+		writer.writePlayTimeFile(recs);
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		GameState state = event.getGameState();
+		if (panel != null) {
+			panel.showView();
+		}
+		switch (state)
+		{
+			case LOGGING_IN:
+			case HOPPING:
+			case CONNECTION_LOST:
+				ready = true;
+				panel.showView();
+				break;
+			case LOGGED_IN:
+				if (ready)
+				{
+					loadData();
+					ready = false;
+				}
+				panel.showView();
+				break;
+			case LOGIN_SCREEN:
+				sessionTicks = 0;
+				panel.showView();
+				break;
+		}
+	}
+
+	@Provides
+	PlayTimeConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(PlayTimeConfig.class);
+	}
+}
+
+package com.playtime;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.PluginErrorPanel;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.ActionEvent;
+import java.awt.event.ActionListener;
+import java.time.DayOfWeek;
+import java.time.LocalDate;
+import java.time.temporal.TemporalAdjusters;
+import java.time.temporal.WeekFields;
+import java.util.ArrayList;
+import java.util.Locale;
+
+import static java.time.temporal.ChronoUnit.DAYS;
+
+@Slf4j
+public class PlayTimePanel extends PluginPanel {
+    private final static Color BACKGROUND_COLOR = ColorScheme.DARK_GRAY_COLOR;
+    private final static Color BUTTON_HOVER_COLOR = ColorScheme.DARKER_GRAY_HOVER_COLOR;
+
+    private final PlayTimePlugin plugin;
+    private JLabel totalTime = new JLabel();
+    private JLabel sessionTime = new JLabel();
+    private JLabel dayTime = new JLabel();
+    private JLabel weekTime = new JLabel();
+    private JLabel weekAverage = new JLabel();
+    private JLabel monthTime = new JLabel();
+    private JLabel monthAverage = new JLabel();
+
+    private boolean shown = false;
+
+    public PlayTimePanel(final PlayTimePlugin plugin)
+    {
+        super(false);
+        this.plugin = plugin;
+
+        this.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        this.setLayout(new BorderLayout());
+    }
+
+    public void showView()
+    {
+        updateTimes();
+        if (shown) {
+            return;
+        }
+        shown = true;
+        final PluginErrorPanel errorPanel = new PluginErrorPanel();
+        errorPanel.setBorder(new EmptyBorder(10, 25, 10, 25));
+        errorPanel.setContent("Play Time", "Time played");
+
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.add(sessionTime);
+        panel.add(dayTime);
+        panel.add(weekTime);
+        panel.add(weekAverage);
+        panel.add(monthTime);
+        panel.add(monthAverage);
+        panel.add(totalTime);
+
+        JPanel panel2 = new JPanel();
+        JButton button = new JButton("Reset session counter");
+        button.addActionListener(new ActionListener() {
+            @Override
+            public void actionPerformed(ActionEvent e) {
+                plugin.resetCounter();
+            }
+        });
+        panel2.add(button);
+
+        this.add(errorPanel, BorderLayout.NORTH);
+        this.add(wrapContainer(panel), BorderLayout.CENTER);
+        this.add(panel2, BorderLayout.SOUTH);
+
+        this.revalidate();
+        this.repaint();
+    }
+
+    public void updateTimes() {
+        if (plugin.getSessionTicks() == 0) {
+            sessionTime.setText("Login for times to be displayed");
+            dayTime.setText("");
+            weekTime.setText("");
+            weekAverage.setText("");
+            monthTime.setText("");
+            monthAverage.setText("");
+            totalTime.setText("");
+            return;
+        }
+        if (plugin.getConfig().showSeconds() || plugin.getSessionTicks() % (100) == 0) {
+            PlayTimeRecord rec = plugin.getCurrentRecord();
+            sessionTime.setText("Session: " + (rec != null ? getTimeStampFromTicks(plugin.getSessionTicks()) : "?"));
+            dayTime.setText("Today: " + (rec != null ? getTimeStampFromTicks(rec.getTime()) : "?"));
+            if (rec == null) {
+                weekTime.setText("This week: ?");
+                monthTime.setText("This month: ?");
+                totalTime.setText("Total: ?");
+
+                if (plugin.getConfig().showAverages()) {
+                    weekAverage.setText("This week average: ?");
+                    monthAverage.setText("This month average: ?");
+                }
+            } else {
+                DayOfWeek firstDayOfWeek = WeekFields.of(Locale.getDefault()).getFirstDayOfWeek();
+                LocalDate startDate = LocalDate.now().with(TemporalAdjusters.previousOrSame(firstDayOfWeek));
+                LocalDate endDate = LocalDate.now();
+                long weekTicks = ticksBetweenDates(startDate, endDate);
+
+                startDate = LocalDate.now().withDayOfMonth(1);
+                long monthTicks = ticksBetweenDates(startDate, endDate);
+
+                weekTime.setText("This week: " + getTimeStampFromTicks(weekTicks));
+                monthTime.setText("This month: " + getTimeStampFromTicks(monthTicks));
+                totalTime.setText("Total: " + getTimeStampFromTicks(plugin.getTotalTicks()));
+
+                if (plugin.getConfig().showAverages()) {
+                    startDate = LocalDate.now().with(TemporalAdjusters.previousOrSame(firstDayOfWeek));
+                    weekAverage.setText("This week average: " + getTimeStampFromTicks(weekTicks / DAYS.between(startDate, endDate)));
+                    startDate = LocalDate.now().withDayOfMonth(1);
+                    monthAverage.setText("This month average: " + getTimeStampFromTicks(monthTicks / DAYS.between(startDate, endDate)));
+                }
+            }
+        }
+    }
+
+    private long ticksBetweenDates(LocalDate startDate, LocalDate endDate) {
+        long days = DAYS.between(startDate, endDate);
+        ArrayList<LocalDate> dates = new ArrayList<>();
+        for (int i = 0; i <= days; i++) {
+            LocalDate d = startDate.plusDays(i);
+            dates.add(d);
+        }
+        long ticks = 0;
+        for (int i = 0; i <= days; i++) {
+            PlayTimeRecord r = plugin.records.get(dates.get(i).format(plugin.DATE_FORMAT));
+            if (r != null) {
+                ticks += r.getTime();
+            }
+        }
+        return ticks;
+    }
+
+    private String getTimeStampFromTicks(long time) {
+        long days = (long)Math.floor((double)time / (100 * 60 * 24));
+        time -= days * (100 * 60 * 24);
+        long hours = (long)Math.floor((double)time / (100 * 60));
+        time -= hours * 100 * 60;
+        long min = (long)Math.floor((double)time / 100);
+        time -= min * 100;
+        if (plugin.getConfig().showSeconds()) {
+            return String.format("%dd, %dh, %dm, %ds", days, hours, min, (long)(time * 0.6));
+        }
+        return String.format("%dd, %dh, %dm", days, hours, min);
+    }
+
+    private JScrollPane wrapContainer(final JPanel container)
+    {
+        final JPanel wrapped = new JPanel(new BorderLayout());
+        wrapped.add(container, BorderLayout.NORTH);
+        wrapped.setBackground(BACKGROUND_COLOR);
+
+        final JScrollPane scroller = new JScrollPane(wrapped);
+        scroller.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        scroller.getVerticalScrollBar().setPreferredSize(new Dimension(8, 0));
+        scroller.setBackground(BACKGROUND_COLOR);
+
+        return scroller;
+    }
+}
+
+package com.playtime;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+
+@Data
+@AllArgsConstructor
+public class PlayTimeRecord {
+    private String date;
+    private long time;
+
+    public long getTime() {
+        return time;
+    }
+
+    public void setTime(long time) {
+        this.time = time;
+    }
+
+    public String getDate() {
+        return date;
+    }
+
+    public void setDate(String date) {
+        this.date = date;
+    }
+}
+

@@ -1,0 +1,2110 @@
+package com.chrono;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ChronoPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ChronoPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.chrono;
+
+import com.chrono.regionlocker.RegionTypes;
+import com.chrono.ui.UIButton;
+import com.chrono.ui.UILabel;
+import com.google.common.annotations.VisibleForTesting;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import com.google.inject.Provides;
+import javax.inject.Inject;
+
+import com.chrono.regionlocker.RegionBorderOverlay;
+import com.chrono.regionlocker.RegionLocker;
+import com.chrono.regionlocker.RegionLockerOverlay;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.annotations.Varbit;
+import net.runelite.api.events.*;
+import net.runelite.api.widgets.*;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.callback.Hooks;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import java.awt.*;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.lang.reflect.Type;
+import java.text.ParseException;
+import java.util.*;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Slf4j
+@PluginDescriptor(
+		name = "Chrono",
+		description = "Travel back in time",
+		tags = {"time traveler", "by release"},
+		conflicts = {"Region Locker"}
+)
+public class ChronoPlugin extends Plugin {
+	public static final String CONFIG_GROUP_KEY = "chrono";
+	public static final String CONFIG_RELEASE_DATE_KEY = "releasedate";
+
+	private static final int SOUND_EFFECT_FAIL = 2277;
+	private static final int SOUND_EFFECT_INACTIVE = 2673;
+	private static final List<String> MENU_BLACKLIST = Arrays.asList("Use", "Take", "Wield","Empty", "Eat", "Wear", "Read", "Check", "Teleport", "Commune", "Drink", "Bury");
+
+	/* Widget IDs */
+	private static final int PRAYER_TAB = 35454979;
+	private static final int PRAYER_ORB = 10485777;
+	private static final int QUICK_PRAYER = 10485779;
+
+	private static final List<Integer> PRAYER_VARBITS = Arrays.asList(Varbits.PRAYER_PROTECT_FROM_MAGIC);
+
+	@Inject
+	private Client client;
+
+	@Inject
+	@Getter
+	private ChronoConfig config;
+
+	@Inject
+	private RegionLockerOverlay regionLockerOverlay;
+
+	@Inject
+	private RegionBorderOverlay regionBorderOverlay;
+
+	@Inject
+	@Getter
+	private ConfigManager configManager;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private ChronoItemOverlay itemOverlay;
+
+	@Inject
+	private Gson gson;
+
+	@Inject
+	private Hooks hooks;
+
+	@Getter
+	private Release currentRelease;
+
+	@Getter
+	@Setter
+	private int hoveredRegion = -1;
+
+	private RegionLocker regionLocker;
+
+	private Map<String, List<Widget>> skillOverlays;
+
+	@Getter
+	private boolean mapEnabled;
+
+	/* Widgets */
+	private UILabel prayerLocked;
+	private UIButton quickPrayer;
+
+	private final Hooks.RenderableDrawListener drawListener = this::shouldDraw;
+
+	@Provides
+	ChronoConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(ChronoConfig.class);
+	}
+
+	@Override
+	protected void startUp() {
+		loadDefinitions();
+		currentRelease = Release.getReleaseByDate(config.release());
+		overlayManager.add(itemOverlay);
+		regionLocker = new RegionLocker(client, config, configManager, this);
+		regionLocker.setRegions(currentRelease.getRegions(), RegionTypes.UNLOCKED);
+		overlayManager.add(regionLockerOverlay);
+		overlayManager.add(regionBorderOverlay);
+		hooks.registerRenderableDrawListener(drawListener);
+	}
+
+	@Override
+	protected void shutDown() {
+		RegionLocker.renderLockedRegions = false;
+		overlayManager.remove(itemOverlay);
+		overlayManager.remove(regionLockerOverlay);
+		overlayManager.remove(regionBorderOverlay);
+		hooks.unregisterRenderableDrawListener(drawListener);
+	}
+
+	private void loadDefinitions() {
+		Type defMapType = new TypeToken<Map<Integer, EntityDefinition>>() {}.getType();
+		EntityDefinition.itemDefinitions = loadDefinitionResource(defMapType, "items.json");
+		EntityDefinition.monsterDefinition = loadDefinitionResource(defMapType, "monsters.json");
+
+		Release.setReleases(loadDefinitionResource(Release[].class, "releases.json"));
+	}
+
+
+	private <T> T loadDefinitionResource(Type type, String resource) {
+		// Load the resource as a stream and wrap it in a reader
+		InputStream resourceStream = ChronoPlugin.class.getResourceAsStream(resource);
+		assert resourceStream != null;
+		InputStreamReader definitionReader = new InputStreamReader(resourceStream);
+
+		// Load the objects from the JSON file
+		return gson.fromJson(definitionReader, type);
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged e) {
+		if(!e.getGroup().equals(CONFIG_GROUP_KEY)) return;
+
+		if(e.getKey().equals(CONFIG_RELEASE_DATE_KEY)) {
+			currentRelease = Release.getReleaseByDate(config.release());
+			clientThread.invokeLater(() -> this.updatePrayers());
+			clientThread.invokeLater(() -> this.updateQuests());
+			clientThread.invokeLater(() -> this.updateSkillOverlays());
+
+			clientThread.invokeLater(() -> {
+				Widget w = client.getWidget(14286848);
+				Object[] onLoadListener = w.getOnInvTransmitListener();
+
+				if (onLoadListener == null)
+				{
+					return;
+				}
+
+				client.runScript(onLoadListener);
+			});
+
+			regionLocker.readConfig();
+			regionLocker.setRegions(currentRelease.getRegions(), RegionTypes.UNLOCKED);
+
+			configManager.setConfiguration(CONFIG_GROUP_KEY, "description", currentRelease.getDescription());
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged e){
+		if(e.getGameState().equals(GameState.LOGGED_IN)) {
+
+		}
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked e) throws ParseException {
+		if(e.getMenuOption().equals("Activate")) {
+			List<ChronoPrayer> prayers = Arrays.stream(ChronoPrayer.values()).filter(p -> e.getMenuTarget().contains(p.getName())).collect(Collectors.toList());
+
+			if(prayers.size() > 0) {
+				List<Prayer> unlockedPrayers = Release.getPrayers(currentRelease);
+
+				if(!unlockedPrayers.contains(prayers.get(0).getPrayer())) {
+					e.consume();
+					client.playSoundEffect(SOUND_EFFECT_INACTIVE);
+				}
+			}
+		}
+
+		if(e.getMenuOption().equals("Cast")) {
+			List<ChronoSpell> unlockedSpells = Release.getSpells(currentRelease);
+			List<ChronoSpell> validSpells = unlockedSpells.stream().filter(s -> e.getMenuTarget().contains(s.getName())).collect(Collectors.toList());
+
+			if(validSpells.size() == 0) {
+				e.consume();
+				client.playSoundEffect(SOUND_EFFECT_INACTIVE);
+			}
+		}
+
+		if(MENU_BLACKLIST.contains(e.getMenuOption())) {
+			if(e.getItemId() < 0) return;
+
+			// Catch a weird special case where it says the item ID is 0 when theres no item
+			if(e.getItemId() == 0 && !e.getMenuTarget().equals("Dwarf Remains")) return;
+
+			int id = e.getItemId();
+
+			if(!isItemUnlocked(id)) {
+				EntityDefinition def = EntityDefinition.itemDefinitions.get(id);
+				if(def == null) return;
+
+				e.consume();
+				String was = def.getName().endsWith("s") ? "were" : "was";
+				addWarningMessage(def.getName()+" "+was+" released after "+config.release().getName()+".", true);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onWidgetLoaded(WidgetLoaded e) {
+		if(e.getGroupId() == WidgetInfo.SKILLS_CONTAINER.getGroupId()) {
+			this.createLockedSkillOverlays();
+		}
+		else if (e.getGroupId() == WidgetInfo.RESIZABLE_VIEWPORT_PRAYER_TAB.getGroupId() || e.getGroupId() == WidgetInfo.FIXED_VIEWPORT_PRAYER_TAB.getGroupId()) {
+			this.createPrayerLockWidgets();
+			this.updatePrayers();
+		}
+		else if(e.getGroupId() == WidgetInfo.QUESTLIST_BOX.getGroupId()) {
+			this.updateQuests();
+		}
+		else if(e.getGroupId() == 218) {
+			this.updateSpells();
+		}
+	}
+
+	@Subscribe
+	public void onScriptPostFired(ScriptPostFired e) {
+		if(e.getScriptId() == 1340) {
+			clientThread.invokeLater(this::updateQuests);
+		}
+		else if(e.getScriptId() == 2610) {
+			clientThread.invokeLater(this::updateSpells);
+		}
+		else if((e.getScriptId() == 2760 || e.getScriptId() == 461)&& client.getWidget(PRAYER_TAB) != null) {
+			updatePrayers();
+		}
+	}
+
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged e) {
+		if(PRAYER_VARBITS.contains(e.getVarbitId())) updatePrayers();
+	}
+
+	@VisibleForTesting
+	boolean shouldDraw(Renderable renderable, boolean drawingUI) {
+		if (renderable instanceof NPC)
+		{
+			NPC npc = (NPC) renderable;
+
+			if(npc.getInteracting() == client.getLocalPlayer()) {
+				return true;
+			}
+
+			try {
+				return EntityDefinition.isMonsterUnlocked(npc.getId(), config.release().getDate());
+			} catch(ParseException e) {
+				e.printStackTrace();
+				return true;
+			}
+		}
+
+		return true;
+	}
+
+	private void addWarningMessage(String message, boolean playSound) {
+		final ChatMessageBuilder chatMessage = new ChatMessageBuilder()
+				.append(ChatColorType.HIGHLIGHT)
+				.append(message)
+				.append(ChatColorType.NORMAL);
+
+		chatMessageManager.queue(QueuedMessage.builder()
+				.type(ChatMessageType.CONSOLE)
+				.runeLiteFormattedMessage(chatMessage.build())
+				.build());
+
+		client.playSoundEffect(SOUND_EFFECT_FAIL);
+	}
+
+	public boolean isItemUnlocked(int itemId) throws ParseException {
+		return EntityDefinition.isItemUnlocked(itemId, config.release().getDate());
+	}
+
+	private void createLockedSkillOverlays() {
+		List<ChronoSkill> skillWidgets = Arrays.asList(ChronoSkill.values());
+		this.skillOverlays = new HashMap<>();
+
+		skillWidgets.forEach(skill -> addSkillOverlay(skill.getSkill(), skill.getWidgetID()));
+	}
+
+	private void addSkillOverlay(Skill skill, int widgetID) {
+		Widget skillWidget = client.getWidget(widgetID);
+		if(skillWidget == null) return;
+
+		boolean isUnlocked = Release.getSkills(currentRelease).contains(skill);
+		List<Widget> widgets = new ArrayList<>();
+
+		Widget icon = skillWidget.createChild(-1, WidgetType.GRAPHIC);
+		Widget level = skillWidget.createChild(-1, WidgetType.GRAPHIC);
+		level.setSpriteId(176);
+		level.setSize(36, 36);
+		level.setPos(28, -2);
+		level.setOpacity(90);
+		level.setHidden(isUnlocked);
+		icon.setSpriteId(174);
+		icon.setSize(36, 36);
+		icon.setPos(-2, -2);
+		icon.setOpacity(90);
+		icon.setHidden(isUnlocked);
+
+		widgets.add(icon);
+		widgets.add(level);
+		skillOverlays.put(skill.getName(), widgets);
+	}
+
+	private void createPrayerLockWidgets() {
+		Widget prayerOrb = client.getWidget(PRAYER_ORB);
+		Widget orbWidget = prayerOrb.createChild(-1, WidgetType.GRAPHIC);
+		quickPrayer = new UIButton(orbWidget);
+		quickPrayer.setSize(prayerOrb.getWidth(), prayerOrb.getHeight());
+		quickPrayer.addAction("Disabled", () -> client.playSoundEffect(SOUND_EFFECT_FAIL));
+		quickPrayer.setVisibility(false);
+
+		Widget container = client.getWidget(35454976);
+		Widget prayerLabel = container.createChild(-1, WidgetType.TEXT);
+		prayerLocked = new UILabel(prayerLabel);
+		prayerLocked.setText("Prayers have not been released yet.");
+		prayerLocked.setColour(ColorScheme.BRAND_ORANGE.getRGB());
+		prayerLocked.setSize(150, 75);
+		prayerLocked.setPosition(getCenterX(container, 150), getCenterY(container, 75));
+		prayerLocked.setVisibility(false);
+	}
+
+	private void updatePrayers() {
+		if(prayerLocked == null) return;
+		
+		// Prayers were released in May 2001, despite the skill being available before
+		if(currentRelease.getDate().getDate().before(ReleaseDate.MAY_2001.getDate())) {
+			client.getWidget(QUICK_PRAYER).setHidden(true);
+			client.getWidget(PRAYER_TAB).setHidden(true);
+			prayerLocked.setVisibility(true);
+			quickPrayer.setVisibility(true);
+		}
+		else {
+			client.getWidget(QUICK_PRAYER).setHidden(false);
+			client.getWidget(PRAYER_TAB).setHidden(false);
+			prayerLocked.setVisibility(false);
+			quickPrayer.setVisibility(false);
+
+			List<Prayer> unlockedPrayers = Release.getPrayers(currentRelease);
+			int offset = 4; // IDs change due to updates occasionally, but will always change by the same amount
+			for(ChronoPrayer prayer : ChronoPrayer.values()) {
+				Widget parent = client.getWidget(prayer.getPackedID() + offset);
+				Widget original = parent.getChild(1);
+
+				if(original == null) continue;
+				if(unlockedPrayers.contains(prayer.getPrayer())) original.setSpriteId(prayer.getUnlockedSpriteID());
+				else original.setSpriteId(prayer.getLockedSpriteID());
+				original.revalidate();
+			}
+		}
+	}
+
+	private void updateSpells() {
+		Widget parent = client.getWidget(14286851);
+
+		if(parent == null) return;
+
+		List<ChronoSpell> unlockedSpells = Release.getSpells(currentRelease);
+		for(ChronoSpell spell : ChronoSpell.values()) {
+			if(unlockedSpells.contains(spell)) continue;
+
+			Widget spellWidget = client.getWidget(spell.getPackedID());
+
+			if(spellWidget == null) continue;
+
+			spellWidget.setSpriteId(spell.getLockedSpriteID());
+		}
+	}
+
+	private void updateQuests() {
+		Widget parent = client.getWidget(26148871);
+
+		if(parent == null) return;
+
+		Widget[] quests = parent.getChildren();
+		List<Quest> unlockedQuests = Release.getQuests(currentRelease);
+
+		for(Widget questWidget : quests) {
+			List<Quest> validQuests = unlockedQuests.stream().filter(q -> q.getName().contains(questWidget.getText())).collect(Collectors.toList());
+
+			// Quest is not unlocked and this is not a header
+			if(validQuests.size() == 0 && questWidget.getFontId() == 494) {
+				questWidget.setHasListener(false);
+				questWidget.setTextColor(Color.GRAY.getRGB());
+			}
+			else if(questWidget.getFontId() == 494 && questWidget.getTextColor() == Color.GRAY.getRGB()) {
+				questWidget.setHasListener(false);
+				int color = validQuests.get(0).getState(client) == QuestState.FINISHED ? Integer.parseInt("dc10d", 16) : Integer.parseInt("ff0000", 16);
+				questWidget.setTextColor(color);
+			}
+		}
+	}
+
+	private void updateSkillOverlays() {
+		if(this.skillOverlays == null) return;
+
+		List<Skill> unlocked = Release.getSkills(currentRelease);
+
+		for(Skill skill : Skill.values()) {
+			boolean hide = unlocked.contains(skill);
+			List<Widget> overlay = this.skillOverlays.get(skill.getName());
+			if(overlay != null && overlay.size() > 0) {
+				overlay.forEach(widget -> widget.setHidden(hide));
+			}
+		}
+	}
+
+	public static int getCenterX(Widget window, int width) {
+		return (window.getWidth() / 2) - (width / 2);
+	}
+
+	public static int getCenterY(Widget window, int height) {
+		return (window.getHeight() / 2) - (height / 2);
+	}
+}
+
+package com.chrono;
+
+import lombok.Getter;
+import net.runelite.api.Prayer;
+
+@Getter
+public enum ChronoPrayer {
+    THICK_SKIN(Prayer.THICK_SKIN, "Thick Skin", 35454981, 115, 135),
+    BURST_OF_STRENGTH(Prayer.BURST_OF_STRENGTH, "Burst of Strength", 35454982,  116, 136),
+    CLARITY_OF_THOUGH(Prayer.CLARITY_OF_THOUGHT, "Clarity of Thought", 35454983,  117, 137),
+    SHARP_EYE(Prayer.SHARP_EYE, "Sharp Eye",  35454999, 133, 153),
+    MYSTIC_WILL(Prayer.MYSTIC_WILL, "Mystic Will", 35455000, 134, 154),
+    ROCK_SKIN(Prayer.ROCK_SKIN,  "Rock Skin",35454984, 118, 138),
+    SUPERHUMAN_STRENGTH(Prayer.SUPERHUMAN_STRENGTH, "Superhuman Strength", 35454985,  119, 139),
+    IMPROVED_REFLEXES(Prayer.IMPROVED_REFLEXES, "Improved Reflexes", 35454986,  120, 140),
+    RAPID_HEAL(Prayer.RAPID_HEAL, "Rapid Heal", 35454987, 121, 141),
+    RAPID_RESTORE(Prayer.RAPID_RESTORE, "Rapid Restore", 35454988, 122, 142),
+    PROTECT_ITEM(Prayer.PROTECT_ITEM, "Protect Item", 35454989, 123, 143),
+    STEEL_SKIN(Prayer.STEEL_SKIN, "Steel Skin", 35454990, 124, 144),
+    ULTIMATE_STRENGTH(Prayer.ULTIMATE_STRENGTH, "Ultimate Strength", 35454991,  125, 145),
+    INCREDIBLE_REFLEXES(Prayer.INCREDIBLE_REFLEXES, "Incredible Reflexes", 35454992,  126, 146),
+    PROTECT_FROM_MAGIC(Prayer.PROTECT_FROM_MAGIC, "Protect from Magic", 35454993,  127, 147),
+    PROTECT_FROM_MISSILES(Prayer.PROTECT_FROM_MISSILES, "Protect from Missiles", 35454994,  128, 148),
+    PROTECT_FROM_MELEE(Prayer.PROTECT_FROM_MELEE, "Protect from Melee", 35454995,  129, 149),
+    RETRIBUTION(Prayer.RETRIBUTION, "Retribution", 35454996,  131, 151),
+    REDEMPTION(Prayer.REDEMPTION, "Redemption", 35454997,  130, 150),
+    SMITE(Prayer.SMITE, "Smite", 35454998,  132, 152),
+    HAWK_EYE(Prayer.HAWK_EYE, "Hawk Eye", 35455001,  502, 506),
+    MYSTIC_LORE(Prayer.MYSTIC_LORE, "Mystic Lore", 35455002,  503, 507),
+    EAGLE_EYE(Prayer.EAGLE_EYE, "Eagle Eye", 35455003,  504, 508),
+    MYSTIC_MIGHT(Prayer.MYSTIC_MIGHT, "Mystic Might", 35455004,  505, 509),
+    CHIVALRY(Prayer.CHIVALRY, "Chivalry", 35455005,  945, 949),
+    PIETY(Prayer.PIETY, "Piety", 35455006,  946, 950),
+    RIGOUR(Prayer.RIGOUR, "Rigour", 35455007,  1420, 1424),
+    AUGURY(Prayer.AUGURY, "Augury", 35455008,  1421, 1425),
+    PRESERVE(Prayer.PRESERVE, "Preserve", 35455009,  947, 951);
+
+    private Prayer prayer;
+    private String name;
+    private int packedID;
+    private int unlockedSpriteID;
+    private int lockedSpriteID;
+
+    ChronoPrayer(Prayer prayer, String name, int packedID, int unlockedSpriteID, int lockedSpriteID) {
+        this.prayer = prayer;
+        this.name = name;
+        this.packedID = packedID;
+        this.unlockedSpriteID = unlockedSpriteID;
+        this.lockedSpriteID = lockedSpriteID;
+    }
+}
+
+package com.chrono;
+
+import net.runelite.client.config.*;
+
+import java.awt.*;
+
+@ConfigGroup(ChronoPlugin.CONFIG_GROUP_KEY)
+public interface ChronoConfig extends Config
+{
+	@ConfigSection(
+			name = "Set date to travel back to",
+			description = "General settings for the plugin",
+			position = 0
+	)
+	String generalSettings = "generalSettings";
+
+	@ConfigSection(
+			name = "Environment Looks",
+			description = "Settings relating to locked regions look",
+			position = 1
+	)
+	String environmentSettings = "environmentSettings";
+
+	@ConfigSection(
+			name = "Map Settings",
+			description = "Settings relating to the map overlay",
+			position = 2
+	)
+	String mapSettings = "mapSettings";
+
+	// General Settings
+
+	@ConfigItem(
+			keyName = ChronoPlugin.CONFIG_RELEASE_DATE_KEY,
+			name = "Date",
+			description = "Release you are restricted to",
+			position = 1,
+			section = generalSettings
+	)
+	default ReleaseDate release()
+	{
+		return ReleaseDate.JANUARY_2001;
+	}
+
+	@ConfigItem(
+			keyName = "description",
+			name = "What is new?",
+			description = "If the wrong list is showing, close the plugin and reopen it",
+			position = 2,
+			section = generalSettings
+	)
+	default String description()
+	{
+		return "";
+	}
+
+	// Environment Looks
+
+	@ConfigItem(
+			keyName = "renderLockedRegions",
+			name = "Locked chunk shader",
+			description = "Adds graphical change to all chunk that are locked",
+			position = 21,
+			section = environmentSettings
+	)
+	default boolean renderLockedRegions()
+	{
+		return true;
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "shaderGrayColor",
+			name = "Chunk shader color",
+			description = "The color of the locked chunks in the shader",
+			position = 22,
+			section = environmentSettings
+	)
+	default Color shaderGrayColor()
+	{
+		return new Color(0, 31, 77, 204);
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "shaderGrayAmount",
+			name = "Chunk shader opacity",
+			description = "The amount of gray scale that is applied to a locked chunk in the shader (alpha only)",
+			position = 23,
+			section = environmentSettings
+	)
+	default Color shaderGrayAmount()
+	{
+		return new Color(0, 0, 0, 204);
+	}
+
+	@ConfigItem(
+			keyName = "hardBorder",
+			name = "Hard chunk border",
+			description = "True = hard border cutoff, False = chunk border gradient",
+			position = 24,
+			section = environmentSettings
+	)
+	default boolean hardBorder()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "renderRegionBorders",
+			name = "Draw chunk border lines",
+			description = "Draw the chunk borders in the environment marked by lines",
+			position = 25,
+			section = environmentSettings
+	)
+	default boolean renderRegionBorders()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "regionBorderWidth",
+			name = "Chunk border width",
+			description = "How wide the region border will be",
+			position = 26,
+			section = environmentSettings
+	)
+	default int regionBorderWidth()
+	{
+		return 1;
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "regionBorderColor",
+			name = "Chunk border color",
+			description = "The color of the chunk borders",
+			position = 27,
+			section = environmentSettings
+	)
+	default Color regionBorderColor()
+	{
+		return new Color(0, 200, 83, 200);
+	}
+
+	// Map Settings
+
+	@ConfigItem(
+			keyName = "drawMapOverlay",
+			name = "Draw chunks on map",
+			description = "Draw a color overlay for each locked/unlocked chunk",
+			position = 28,
+			section = mapSettings
+	)
+	default boolean drawMapOverlay()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "invertMapOverlay",
+			name = "Invert map overlay",
+			description = "Switches which chunks the map will draw the color overlay for (true = locked, false = unlocked)",
+			position = 29,
+			section = mapSettings
+	)
+	default boolean invertMapOverlay()
+	{
+		return true;
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "mapOverlayColor",
+			name = "Map overlay color",
+			description = "The color the map overlay will draw the chunks in",
+			position = 30,
+			section = mapSettings
+	)
+	default Color mapOverlayColor()
+	{
+		return new Color(200, 16, 0, 100);
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "unlockableOverlayColor",
+			name = "Unlockable overlay color",
+			description = "The color the map overlay will draw the unlockable chunks in",
+			position = 31,
+			section = mapSettings
+	)
+	default Color unlockableOverlayColor()
+	{
+		return new Color(60, 200, 160, 100);
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "blacklistedOverlayColor",
+			name = "Blacklisted overlay color",
+			description = "The color the map overlay will draw the blacklisted chunks in",
+			position = 32,
+			section = mapSettings
+	)
+	default Color blacklistedOverlayColor()
+	{
+		return new Color(0, 0, 0, 200);
+	}
+
+	@ConfigItem(
+			keyName = "drawMapGrid",
+			name = "Draw map grid",
+			description = "Draw the grid of chunks on the map",
+			position = 33,
+			section = mapSettings
+	)
+	default boolean drawMapGrid()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "drawRegionId",
+			name = "Draw region IDs",
+			description = "Draw the chunk ID for each chunk on the map",
+			position = 34,
+			section = mapSettings
+	)
+	default boolean drawRegionId()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "tierFilter",
+			name = "Tier Filter",
+			description = "Filter by tier in the plugin panel",
+			hidden = true
+	)
+	default String tierFilter() { return "1,2,3,4,5"; }
+
+	@ConfigItem(
+			keyName = "regionFilter",
+			name = "Region Filter",
+			description = "Filter by region in the plugin panel",
+			hidden = true
+	)
+	default String regionFilter() { return "Misthalin,Desert,Kandarin,Asgarnia,Fremennik,Tirannwn,Karamja,Morytania,Wilderness,Lower Zeah,Upper Zeah,Kebos"; }
+
+	@ConfigItem(
+			keyName = "showCompletedTasks",
+			name = "Show Completed Tasks",
+			description = "Show completed tasks in the plugin panel",
+			hidden = true
+	)
+	default boolean showCompletedTasks() { return true; }
+}
+package com.chrono;
+
+import lombok.Getter;
+import net.runelite.api.Skill;
+
+public enum ChronoSkill {
+    ATTACK(Skill.ATTACK, 20971521),
+    STRENGTH(Skill.STRENGTH, 20971522),
+    DEFENCE(Skill.DEFENCE, 20971523),
+    RANGED(Skill.RANGED, 20971524),
+    PRAYER(Skill.PRAYER, 20971525),
+    MAGIC(Skill.MAGIC, 20971526),
+    RUNECRAFT(Skill.RUNECRAFT, 20971527),
+    CONSTRUCTION(Skill.CONSTRUCTION, 20971528),
+    HITPOINTS(Skill.HITPOINTS, 20971529),
+    AGILITY(Skill.AGILITY, 20971530),
+    HERBLORE(Skill.HERBLORE, 20971531),
+    THIEVING(Skill.THIEVING, 20971532),
+    CRAFTING(Skill.CRAFTING, 20971533),
+    FLETCHING(Skill.FLETCHING, 20971534),
+    SLAYER(Skill.SLAYER, 20971535),
+    HUNTER(Skill.HUNTER, 20971536),
+    MINING(Skill.MINING, 20971537),
+    SMITHING(Skill.SMITHING, 20971538),
+    FISHING(Skill.FISHING, 20971539),
+    COOKING(Skill.COOKING, 20971540),
+    FIREMAKING(Skill.FIREMAKING, 20971541),
+    WOODCUTTING(Skill.WOODCUTTING, 20971542),
+    FARMING(Skill.FARMING, 20971543);
+
+    @Getter
+    private Skill skill;
+    @Getter
+    private int widgetID;
+
+    ChronoSkill(Skill skill, int id) {
+        this.skill = skill;
+        this.widgetID = id;
+    }
+}
+
+/*
+ * Copyright (c) 2018, Seth <https://github.com/sethtroll>
+ * Copyright (c) 2019, Slay to Stay <https://github.com/slaytostay>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.chrono.regionlocker;
+
+import com.chrono.ChronoConfig;
+import com.chrono.ChronoPlugin;
+import com.google.inject.Inject;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.geom.Rectangle2D;
+import net.runelite.api.Client;
+import net.runelite.api.Point;
+import net.runelite.api.RenderOverview;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+
+public class RegionLockerOverlay extends Overlay
+{
+	private static final Color WHITE_TRANSLUCENT = new Color(255, 255, 255, 127);
+	private static final int LABEL_PADDING = 4;
+	private static final int REGION_SIZE = 1 << 6;
+	// Bitmask to return first coordinate in region
+	private static final int REGION_TRUNCATE = ~((1 << 6) - 1);
+
+	private final Client client;
+	private final ChronoPlugin regionLockerPlugin;
+	private final ChronoConfig config;
+
+	@Inject
+	private RegionLockerOverlay(Client client, ChronoPlugin regionLockerPlugin, ChronoConfig config)
+	{
+		setPosition(OverlayPosition.DYNAMIC);
+		setPriority(OverlayPriority.HIGHEST);
+		setLayer(OverlayLayer.ALWAYS_ON_TOP);
+		this.client = client;
+		this.regionLockerPlugin = regionLockerPlugin;
+		this.config = config;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (config.drawMapOverlay()) drawRegionOverlay(graphics);
+
+		return null;
+	}
+
+	private void drawRegionOverlay(Graphics2D graphics)
+	{
+		Widget map = client.getWidget(WidgetInfo.WORLD_MAP_VIEW);
+
+		if (map == null) return;
+
+		RenderOverview ro = client.getRenderOverview();
+		Float pixelsPerTile = ro.getWorldMapZoom();
+		Rectangle worldMapRect = map.getBounds();
+		graphics.setClip(worldMapRect);
+
+		int widthInTiles = (int) Math.ceil(worldMapRect.getWidth() / pixelsPerTile);
+		int heightInTiles = (int) Math.ceil(worldMapRect.getHeight() / pixelsPerTile);
+
+		Point worldMapPosition = ro.getWorldMapPosition();
+
+		// Offset in tiles from anchor sides
+		int yTileMin = worldMapPosition.getY() - heightInTiles / 2;
+		int xRegionMin = (worldMapPosition.getX() - widthInTiles / 2) & REGION_TRUNCATE;
+		int xRegionMax = ((worldMapPosition.getX() + widthInTiles / 2) & REGION_TRUNCATE) + REGION_SIZE;
+		int yRegionMin = (yTileMin & REGION_TRUNCATE);
+		int yRegionMax = ((worldMapPosition.getY() + heightInTiles / 2) & REGION_TRUNCATE) + REGION_SIZE;
+		int regionPixelSize = (int) Math.ceil(REGION_SIZE * pixelsPerTile);
+
+		Point mousePos = client.getMouseCanvasPosition();
+
+		regionLockerPlugin.setHoveredRegion(-1);
+		graphics.setColor(WHITE_TRANSLUCENT);
+		for (int x = xRegionMin; x < xRegionMax; x += REGION_SIZE)
+		{
+			for (int y = yRegionMin; y < yRegionMax; y += REGION_SIZE)
+			{
+				int yTileOffset = -(yTileMin - y);
+				int xTileOffset = x + widthInTiles / 2 - worldMapPosition.getX();
+
+				int xPos = ((int) (xTileOffset * pixelsPerTile)) + (int) worldMapRect.getX();
+				int yPos = (worldMapRect.height - (int) (yTileOffset * pixelsPerTile)) + (int) worldMapRect.getY();
+				// Offset y-position by a single region to correct for drawRect starting from the top
+				yPos -= regionPixelSize;
+
+				int regionId = ((x >> 6) << 8) | (y >> 6);
+				String regionText = String.valueOf(regionId);
+				FontMetrics fm = graphics.getFontMetrics();
+				Rectangle2D textBounds = fm.getStringBounds(regionText, graphics);
+				Rectangle regionRect = new Rectangle(xPos, yPos, regionPixelSize, regionPixelSize);
+
+				RegionTypes regionType = RegionLocker.getType(regionId);
+				boolean containsRegion = (regionType != null) ^ config.invertMapOverlay();
+				boolean unlockable = regionType == RegionTypes.UNLOCKABLE;
+				boolean blacklisted = regionType == RegionTypes.BLACKLISTED;
+				if (containsRegion || unlockable || blacklisted)
+				{
+					Color color;
+					if (blacklisted)
+					{
+						color = config.blacklistedOverlayColor();
+					}
+					else if (unlockable)
+					{
+						color = config.unlockableOverlayColor();
+					}
+					else
+					{
+						color = config.mapOverlayColor();
+					}
+					if (regionRect.contains(mousePos.getX(), mousePos.getY()))
+						color = color.brighter();
+					graphics.setColor(color);
+					graphics.fillRect(xPos, yPos, regionPixelSize, regionPixelSize);
+				}
+
+
+				if (regionRect.contains(mousePos.getX(), mousePos.getY()))
+					regionLockerPlugin.setHoveredRegion(regionId);
+
+				graphics.setColor(new Color(0, 19, 36, 127));
+				if (config.drawMapGrid()) graphics.drawRect(xPos, yPos, regionPixelSize, regionPixelSize);
+
+				graphics.setColor(WHITE_TRANSLUCENT);
+				if (config.drawRegionId())
+					graphics.drawString(regionText, xPos + LABEL_PADDING, yPos + (int) textBounds.getHeight() + LABEL_PADDING);
+			}
+		}
+
+		int currentId = client.getLocalPlayer().getWorldLocation().getRegionID();
+		String regionText = String.valueOf(currentId);
+		FontMetrics fm = graphics.getFontMetrics();
+		Rectangle2D textBounds = fm.getStringBounds(regionText, graphics);
+		if (config.drawRegionId()) {
+			if (regionLockerPlugin.getHoveredRegion() >= 0)
+				graphics.drawString("Hovered chunk: " + regionLockerPlugin.getHoveredRegion(), (int) worldMapRect.getX() + LABEL_PADDING, (int) (worldMapRect.getY() + worldMapRect.getHeight()) - LABEL_PADDING - (int) textBounds.getHeight());
+			graphics.drawString("Player chunk: " + regionText, (int) worldMapRect.getX() + LABEL_PADDING, (int) (worldMapRect.getY() + worldMapRect.getHeight()) - LABEL_PADDING);
+		}
+
+	}
+
+}
+
+/*
+ * Copyright (c) 2019, Slay to Stay <https://github.com/slaytostay>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.chrono.regionlocker;
+
+import java.awt.Color;
+import java.util.*;
+
+import com.chrono.ChronoConfig;
+import com.chrono.ChronoPlugin;
+import lombok.Getter;
+import net.runelite.api.Client;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.util.Text;
+
+public class RegionLocker
+{
+	private final Client client;
+	private final ChronoConfig config;
+	private final ConfigManager configManager;
+
+	@Getter
+	private static Map<String, RegionTypes> regions = new HashMap<>();
+
+	private ChronoPlugin chronoPlugin;
+
+	public static boolean renderLockedRegions;
+	public static Color grayColor;
+	public static int grayAmount;
+	public static boolean hardBorder;
+	public static boolean invertShader;
+
+	public RegionLocker(Client client, ChronoConfig config, ConfigManager configManager, ChronoPlugin plugin)
+	{
+		this.client = client;
+		this.config = config;
+		this.configManager = configManager;
+		this.chronoPlugin = plugin;
+		readConfig();
+	}
+
+	private List<String> StringToList(String s)
+	{
+		List<String> regs;
+		if (s.isEmpty())
+			regs = new ArrayList<>();
+		else
+			regs = new ArrayList<>(Text.fromCSV(s));
+		return regs;
+	}
+
+	public void readConfig()
+	{
+		renderLockedRegions = config.renderLockedRegions();
+		grayColor = config.shaderGrayColor();
+		grayAmount = config.shaderGrayAmount().getAlpha();
+		hardBorder = config.hardBorder();
+		regions.clear();
+	}
+
+	private void setConfig()
+	{
+		List<String> unlockedRegions = new ArrayList<>();
+		List<String> unlockableRegions = new ArrayList<>();
+		List<String> blacklistedRegions = new ArrayList<>();
+
+		chronoPlugin.getCurrentRelease().getRegions().forEach(e -> unlockedRegions.add(e+""));
+
+		String csv = Text.toCSV(unlockedRegions);
+		configManager.setConfiguration(ChronoPlugin.CONFIG_GROUP_KEY, "unlockedRegions", csv);
+	}
+
+	public void setRegions(List<Integer> regs, RegionTypes type)
+	{
+		for (int id : regs)
+		{
+			regions.put(id+"", type);
+		}
+	}
+
+	public void addRegion(int regionId)
+	{
+		String id = Integer.toString(regionId);
+		RegionTypes type = regions.get(id);
+		if (type == null)
+			regions.put(id, RegionTypes.UNLOCKABLE);
+		else if (type == RegionTypes.UNLOCKABLE)
+			regions.put(id, RegionTypes.UNLOCKED);
+		else
+			regions.remove(id);
+		setConfig();
+	}
+
+	public static RegionTypes getType(int regionId)
+	{
+		String id = Integer.toString(regionId);
+//		if (!id.equals("") && trailblazerRegions != null && trailblazerRegions.size() > 0) {
+//			for(int i = 0;i < trailblazerRegions.size();i++) {
+//				if (Arrays.asList(trailblazerRegions.get(i).regions).contains(id))
+//					return RegionTypes.UNLOCKED;
+//			}
+//		}
+		int y = getY(regionId);
+		if (y >= 4160 && y < 5952) return RegionTypes.UNLOCKED;
+		if (y >= 8960) return RegionTypes.UNLOCKED;
+		if (regions == null) return null;
+		return regions.get(id);
+	}
+
+	public static boolean hasRegion(int regionId)
+	{
+		RegionTypes type = getType(regionId);
+		if (type == null) return false;
+		return type == RegionTypes.UNLOCKED;
+	}
+
+	public static boolean isUnlockable(int regionId)
+	{
+		RegionTypes type = getType(regionId);
+		if (type == null) return false;
+		return type == RegionTypes.UNLOCKABLE;
+	}
+
+	public static boolean isBlacklisted(int regionId)
+	{
+		RegionTypes type = getType(regionId);
+		if (type == null) return false;
+		return type == RegionTypes.BLACKLISTED;
+	}
+
+
+	public static int getX(int id)
+	{
+		return ((id >> 8) << 6);
+	}
+
+	public static int getY(int id)
+	{
+		return ((id & 255) << 6);
+	}
+}
+/*
+ * Copyright (c) 2018, Seth <https://github.com/sethtroll>
+ * Copyright (c) 2019, Slay to Stay <https://github.com/slaytostay>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.chrono.regionlocker;
+
+import com.chrono.ChronoConfig;
+import com.google.inject.Inject;
+import java.awt.BasicStroke;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.geom.GeneralPath;
+import net.runelite.api.Client;
+import net.runelite.api.Perspective;
+import net.runelite.api.Point;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+
+public class RegionBorderOverlay extends Overlay
+{
+	private static final int LOCAL_TILE_SIZE = Perspective.LOCAL_TILE_SIZE;
+	private static final int CHUNK_SIZE = 8;
+	private static final int MAP_SQUARE_SIZE = CHUNK_SIZE * CHUNK_SIZE; // 64
+	private static final int CULL_CHUNK_BORDERS_RANGE = 16;
+
+	private final Client client;
+	private final ChronoConfig config;
+
+	@Inject
+	private RegionBorderOverlay(Client client, ChronoConfig config)
+	{
+		setPosition(OverlayPosition.DYNAMIC);
+		setPriority(OverlayPriority.HIGH);
+		setLayer(OverlayLayer.ABOVE_SCENE);
+		this.client = client;
+		this.config = config;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (config.renderRegionBorders()) renderMapSquares(graphics);
+
+		return null;
+	}
+
+	private void renderMapSquares(Graphics2D graphics)
+	{
+		WorldPoint wp = client.getLocalPlayer().getWorldLocation();
+		int startX = (wp.getX() - CULL_CHUNK_BORDERS_RANGE + MAP_SQUARE_SIZE - 1) / MAP_SQUARE_SIZE * MAP_SQUARE_SIZE;
+		int startY = (wp.getY() - CULL_CHUNK_BORDERS_RANGE + MAP_SQUARE_SIZE - 1) / MAP_SQUARE_SIZE * MAP_SQUARE_SIZE;
+		int endX = (wp.getX() + CULL_CHUNK_BORDERS_RANGE) / MAP_SQUARE_SIZE * MAP_SQUARE_SIZE;
+		int endY = (wp.getY() + CULL_CHUNK_BORDERS_RANGE) / MAP_SQUARE_SIZE * MAP_SQUARE_SIZE;
+
+		graphics.setStroke(new BasicStroke(config.regionBorderWidth()));
+		Color c = config.regionBorderColor();
+		graphics.setColor(c);
+
+		GeneralPath path = new GeneralPath();
+		for (int x = startX; x <= endX; x += MAP_SQUARE_SIZE)
+		{
+			LocalPoint lp1 = LocalPoint.fromWorld(client, x, wp.getY() - CULL_CHUNK_BORDERS_RANGE);
+			LocalPoint lp2 = LocalPoint.fromWorld(client, x, wp.getY() + CULL_CHUNK_BORDERS_RANGE);
+
+			boolean first = true;
+			for (int y = lp1.getY(); y <= lp2.getY(); y += LOCAL_TILE_SIZE)
+			{
+				Point p = Perspective.localToCanvas(client,
+						new LocalPoint(lp1.getX() - LOCAL_TILE_SIZE / 2, y - LOCAL_TILE_SIZE / 2),
+						client.getPlane());
+				if (p != null)
+				{
+					if (first)
+					{
+						path.moveTo(p.getX(), p.getY());
+						first = false;
+					}
+					else
+					{
+						path.lineTo(p.getX(), p.getY());
+					}
+				}
+			}
+		}
+		for (int y = startY; y <= endY; y += MAP_SQUARE_SIZE)
+		{
+			LocalPoint lp1 = LocalPoint.fromWorld(client, wp.getX() - CULL_CHUNK_BORDERS_RANGE, y);
+			LocalPoint lp2 = LocalPoint.fromWorld(client, wp.getX() + CULL_CHUNK_BORDERS_RANGE, y);
+
+			boolean first = true;
+			for (int x = lp1.getX(); x <= lp2.getX(); x += LOCAL_TILE_SIZE)
+			{
+				Point p = Perspective.localToCanvas(client,
+						new LocalPoint(x - LOCAL_TILE_SIZE / 2, lp1.getY() - LOCAL_TILE_SIZE / 2),
+						client.getPlane());
+				if (p != null)
+				{
+					if (first)
+					{
+						path.moveTo(p.getX(), p.getY());
+						first = false;
+					}
+					else
+					{
+						path.lineTo(p.getX(), p.getY());
+					}
+				}
+			}
+		}
+		graphics.draw(path);
+	}
+}
+
+/*
+ * Copyright (c) 2019, Slay to Stay <https://github.com/slaytostay>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.chrono.regionlocker;
+
+public enum RegionTypes
+{
+	UNLOCKABLE,
+	BLACKLISTED,
+	UNLOCKED
+}
+
+package com.chrono;
+
+import lombok.Getter;
+
+@Getter
+public enum ChronoSpell {
+    LUMBRIDGE_HOME_TELEPORT("Lumbridge Home Teleport",  14286854, 356, 406),
+    WIND_STRIKE("Wind Strike",                          14286855, 15,65),
+    CONFUSE("Confuse",                                  14286856, 16, 66),
+    ENCHANT_CROSSBOW_BOLT("Enchant Crossbow Bolt",      14286857, 358, 408),
+    WATER_STRIKE("Water Strike",                        14286858, 17,67),
+    LVL_1_ENCHANT("Lvl-1 Enchant",                      14286859, 18, 68),
+    EARTH_STRIKE("Earth Strike",                        14286860, 19, 69),
+    WEAKEN("Weaken",                                    14286861, 20, 70),
+    FIRE_STRIKE("Fire Strike",                          14286862, 21, 71),
+    BONES_TO_BANANAS("Bones to Bananas", 14286863, 22, 72),
+    WIND_BOLT("Wind Bolt", 14286864, 23, 73),
+    CURSE("Curse", 14286865, 24, 74),
+    BIND("Bind", 14286866, 319, 369),
+    LOW_LEVEL_ALCHEMY("Low Level Alchemy", 14286867, 25, 75),
+    WATER_BOLT("Water Bolt", 14286868, 26, 76),
+    VARROCK_TELEPORT("Varrock Teleport", 14286869, 27, 77),
+    LVL_2_ENCHANT("Lvl-2 Enchant", 14286870, 28, 78),
+    EARTH_BOLT("Earth Bolt", 14286871, 29, 79),
+    LUMBRIDGE_TELEPORT("Lumbridge Teleport", 14286872, 30, 80),
+    TELEKINETIC_GRAB("Telekinetic Grab", 14286873, 31, 81),
+    FIRE_BOLT("Fire Bolt", 14286874, 32, 82),
+    FALADOR_TELEPORT("Falador Teleport", 14286875, 33, 83),
+    CRUMBLE_UNDEAD("Crumble Undead", 14286876, 34, 84),
+    TELEPORT_TO_HOUSE("Teleport to House", 14286877, 355, 405),
+    WIND_BLAST("Wind Blast", 14286878, 35, 85),
+    SUPERHEAT_ITEM("Superheat Item", 14286879, 36, 86),
+    CAMELOT_TELEPORT("Camelot Teleport", 14286880, 37, 87),
+    WATER_BLAST("Water Blast", 14286881, 38, 88),
+    LVL_3_ENCHANT("Lvl-3 Enchant", 14286882, 39, 89),
+    IBAN_BLAST("Iban Blast", 14286883, 53, 103),
+    SNARE("Snare", 14286884, 320, 370),
+    MAGIC_DART("Magic Dart", 14286885, 324, 374),
+    ARDOUGNE_TELEPORT("Ardougne Teleport", 14286886, 54, 104),
+    EARTH_BLAST("Earth Blast", 14286887, 40, 90),
+    HIGH_LEVEL_ALCHEMY("High Level Alchemy", 14286888, 41, 91),
+    CHARGE_WATER_ORB("Charge Water Orb", 14286889, 42, 92),
+    LVL_4_ENCHANT("Lvl-4 Enchant", 14286890, 43, 93),
+    WATCHTOWER_TELEPORT("Watchtower Teleport", 14286891, 55, 105),
+    FIRE_BLAST("Fire Blast", 14286892, 44, 94),
+    CHARGE_EARTH_ORB("Charge Earth Orb", 14286893, 45, 95),
+    BONES_TO_PEACHES("Bones to Peaches", 14286894, 354, 404),
+    SARADOMIN_STRIKE("Saradomin Strike", 14286895, 61, 111),
+    FLAMES_OF_ZAMORAK("Flames of Zamorak", 14286896, 60, 110),
+    CLAWS_OF_GUTHIX("Claws of Guthix", 14286897, 59, 109),
+    TROLLHEIM_TELEPORT("Trollheim Teleport", 14286898, 323, 373),
+    WIND_WAVE("Wind Wave", 14286899, 46, 96),
+    CHARGE_FIRE_ORB("Charge Fire Orb", 14286900, 47, 97),
+    APE_ATOLL_TELEPORT("Ape Atoll Teleport", 14286901, 357, 407),
+    WATER_WAVE("Water Wave", 14286902, 48, 98),
+    CHARGE_AIR_ORB("Charge Air Orb", 14286903, 49, 99),
+    VULNERABILITY("Vulnerability", 14286904, 56, 106),
+    LVL_5_ENCHANT("Lvl-5 Enchant", 14286905, 50, 100),
+    KOUREND_CASTLE_TELEPORT("Kourend Castle Teleport", 14286906, 360, 410),
+    EARTH_WAVE("Earth Wave", 14286907, 51, 101),
+    ENFEEBLE("Enfeeble", 14286908, 57, 107),
+    TELEOTHER_LUMBRIDGE("Teleother Lumbridge", 14286909, 349, 399),
+    FIRE_WAVE("Fire Wave", 14286910, 52, 102),
+    ENTANGLE("Entangle", 14286911, 321, 371),
+    STUN("Stun", 14286912, 58, 108),
+    CHARGE("Charge", 14286913, 322, 372),
+    WIND_SURGE("Wind Surge", 14286914, 362, 412),
+    TELEOTHER_FALADOR("Teleother Falador", 14286915, 350, 400),
+    WATER_SURGE("Water Surge", 14286916, 363, 413),
+    TELE_BLOCK("Tele Block", 14286917, 352, 402),
+    TELEPORT_TO_TARGET("Teleport to Target", 14286918, 359, 409),
+    LVL_6_ENCHANT("Lvl-6 Enchant", 14286919, 353, 403),
+    TELEOTHER_CAMELOT("Teleother Camelot", 14286920, 351, 401),
+    EARTH_SURGE("Earth Surge", 14286921, 364, 414),
+    LVL_7_ENCHANT("Lvl-7 Enchant", 14286922, 361, 411),
+    FIRE_SURGE("Fire Surge", 14286923, 365, 415);
+
+
+    private String name;
+    private int packedID;
+    private int unlockedSpriteID;
+    private int lockedSpriteID;
+
+    ChronoSpell(String name, int packedID, int unlockedSpriteID, int lockedSpriteID) {
+        this.name = name;
+        this.packedID = packedID;
+        this.lockedSpriteID = lockedSpriteID;
+        this.unlockedSpriteID = unlockedSpriteID;
+    }
+}
+
+package com.chrono;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Prayer;
+import net.runelite.api.Quest;
+import net.runelite.api.Skill;
+
+import java.util.*;
+
+@Slf4j
+public class Release {
+    @Getter
+    private static List<Release> RELEASES = new ArrayList<>();
+
+    @Getter
+    private ReleaseDate date;
+    @Getter
+    private List<Integer> regions;
+    @Getter
+    private List<Skill> skills;
+    @Getter
+    private List<Prayer> prayers;
+    @Getter
+    private List<Quest> quests;
+    @Getter
+    private List<ChronoSpell> spells;
+    @Getter
+    private String description;
+
+    public Release(ReleaseDate date, List<Integer> regions, List<Skill> skills, List<Prayer> prayers, List<Quest> quests, List<ChronoSpell> spells, String description) {
+        this.date = date;
+        this.skills = skills;
+        this.regions = regions;
+        this.prayers = prayers;
+        this.quests = quests;
+        this.spells = spells;
+        this.description = description;
+    }
+
+    public static void setReleases(Release[] releases) {
+        RELEASES = Arrays.asList(releases);
+    }
+
+    public static Release getReleaseByDate(ReleaseDate date) {
+        for(Release r : RELEASES) {
+            if(r.getDate().equals(date)) return r;
+        }
+
+        return null;
+    }
+
+    public static List<Skill> getSkills(Release release) {
+        List<Skill> skills = new ArrayList<>();
+
+        for(Release r : RELEASES) {
+            if(r.skills != null) skills.addAll(r.getSkills());
+            if(r.equals(release)) break;
+        }
+
+        return skills;
+    }
+
+    public static List<Prayer> getPrayers(Release release) {
+        List<Prayer> prayers = new ArrayList<>();
+
+        for(Release r : RELEASES) {
+            if(r.prayers != null) prayers.addAll(r.getPrayers());
+            if(r.equals(release)) break;
+        }
+
+        return prayers;
+    }
+
+    public static List<Quest> getQuests(Release release) {
+        List<Quest> quests = new ArrayList<>();
+
+        for(Release r : RELEASES) {
+            if(r.quests != null) quests.addAll(r.getQuests());
+            if(r.equals(release)) break;
+        }
+
+        return quests;
+    }
+
+    public static List<ChronoSpell> getSpells(Release release) {
+        List<ChronoSpell> spells = new ArrayList<>();
+
+        for(Release r : RELEASES) {
+            if(r.spells != null) spells.addAll(r.getSpells());
+            if(r.equals(release)) break;
+        }
+
+        return spells;
+    }
+}
+
+package com.chrono;
+
+import lombok.Getter;
+
+import java.util.Calendar;
+import java.util.Date;
+import java.util.GregorianCalendar;
+
+@Getter
+public enum ReleaseDate {
+    //_04_JANUARY_2001("04 January 2001", new GregorianCalendar(2001, Calendar.JANUARY, 5).getTime()),
+    JANUARY_2001("28 January 2001",new GregorianCalendar(2001, Calendar.FEBRUARY, 31).getTime()),
+    FEBRUARY_2001("February 2001",new GregorianCalendar(2001, Calendar.FEBRUARY, 28).getTime()),
+    MARCH_2001("March 2001",new GregorianCalendar(2001, Calendar.MARCH, 31).getTime()),
+    APRIL_2001("April 2001",new GregorianCalendar(2001, Calendar.APRIL, 30).getTime()),
+    //_08_MAY_2001("08 May 2001",new GregorianCalendar(2001, Calendar.MAY, 8).getTime()),
+    MAY_2001("24 May 2001",new GregorianCalendar(2001, Calendar.MAY, 31).getTime()),
+    JUNE_2001("June 2001", new GregorianCalendar(2001, Calendar.JUNE, 30).getTime()),
+    JULY_2001("July 2001", new GregorianCalendar(2001, Calendar.JULY, 31).getTime()),
+    AUGUST_2001("August 2001", new GregorianCalendar(2001, Calendar.AUGUST, 31).getTime()),
+    SEPTEMBER_2001("September 2001", new GregorianCalendar(2001, Calendar.DECEMBER, 30).getTime()),
+    __("empty slot to separate 01 and 02", new GregorianCalendar(2001, Calendar.DECEMBER, 31).getTime()),
+    FEBRUARY_2002("February 2002", new GregorianCalendar(2002, Calendar.FEBRUARY, 28).getTime()),
+    //_18_MARCH_2002("18 March 2002", new GregorianCalendar(2002, Calendar.MARCH, 19).getTime()),
+    MARCH_2002("March 2002", new GregorianCalendar(2002, Calendar.MARCH, 31).getTime()),
+    //_09_APRIL_2002("9 April 2002", new GregorianCalendar(2002, Calendar.MARCH, 31).getTime()),
+    APRIL_2002("30 April 2002", new GregorianCalendar(2002, Calendar.APRIL, 30).getTime()),
+    //_10_MAY_2002("10 May 2002", new GregorianCalendar(2002, Calendar.MAY, 31).getTime()),
+    MAY_2002("28 May 2002", new GregorianCalendar(2002, Calendar.MAY, 31).getTime()),
+    JUNE_2002("June 2002", new GregorianCalendar(2002, Calendar.JUNE, 30).getTime()),
+    JULY_2002("July 2002", new GregorianCalendar(2002, Calendar.JULY, 31).getTime()),
+    AUGUST_2002("August 2002", new GregorianCalendar(2002, Calendar.AUGUST, 31).getTime()),
+    SEPTEMBER_2002("September 2002", new GregorianCalendar(2002, Calendar.SEPTEMBER, 30).getTime()),
+    OCTOBER_2002("October 2002", new GregorianCalendar(2002, Calendar.OCTOBER, 31).getTime()),
+    DECEMBER_2002("December 2002", new GregorianCalendar(2002, Calendar.DECEMBER, 31).getTime()),
+    ___("Empty space separating 02-03", new GregorianCalendar(2002, Calendar.DECEMBER, 31).getTime()),
+    JANUARY_2003("January 2003", new GregorianCalendar(2003, Calendar.JANUARY, 31).getTime()),
+    //_3_MARCH_2003("3 March 2003", new GregorianCalendar(2003, Calendar.MARCH, 3).getTime()),
+    MARCH_2003("March 2003", new GregorianCalendar(2003, Calendar.MARCH, 31).getTime()),
+    APRIL_2003("April 2003", new GregorianCalendar(2003, Calendar.APRIL, 30).getTime()),
+    MAY_2003("May 2003", new GregorianCalendar(2003, Calendar.MAY, 31).getTime()),
+    JUNE_2003("June 2003", new GregorianCalendar(2003, Calendar.JUNE, 30).getTime()),
+    JULY_2003("July 2003", new GregorianCalendar(2003, Calendar.JULY, 31).getTime()),
+    AUGUST_2003("August 2003", new GregorianCalendar(2003, Calendar.AUGUST, 31).getTime()),
+    SEPTEMBER_2003("September 2003", new GregorianCalendar(2003, Calendar.DECEMBER, 31).getTime()),
+    ____("space between 03-04", new GregorianCalendar(2003, Calendar.DECEMBER, 31).getTime()),
+    MARCH_2004("29 March 2004", new GregorianCalendar(2004, Calendar.MARCH, 31).getTime()),
+    APRIL_2004("20 April 2004", new GregorianCalendar(2004, Calendar.APRIL, 30).getTime()),
+    MAY_2004("18 May 2004", new GregorianCalendar(2004, Calendar.MAY, 31).getTime()),
+    JUNE_2004("29 June 2004", new GregorianCalendar(2004, Calendar.JUNE, 30).getTime()),
+    JULY_2004("27 July 2004", new GregorianCalendar(2004, Calendar.JULY, 30).getTime()),
+    //_9_AUGUST_2004("9 August 2004", new GregorianCalendar(2004, Calendar.AUGUST, 10).getTime()),
+    AUGUST_2004("24 August 2004", new GregorianCalendar(2004, Calendar.AUGUST, 30).getTime()),
+    SEPTEMBER_2004("September 2004", new GregorianCalendar(2004, Calendar.SEPTEMBER, 30).getTime()),
+    OCTOBER_2004("October 2004", new GregorianCalendar(2004, Calendar.OCTOBER, 31).getTime()),
+    //_2_NOVEMBER_2004("2 November 2004", new GregorianCalendar(2004, Calendar.NOVEMBER, 4).getTime()),
+    //_17_NOVEMBER_2004("17 November 2004", new GregorianCalendar(2004, Calendar.NOVEMBER, 20).getTime()),
+    NOVEMBER_2004("November 2004", new GregorianCalendar(2004, Calendar.NOVEMBER, 30).getTime()),
+    //_6_DECEMBER_2004("6 December 2004", new GregorianCalendar(2004, Calendar.DECEMBER, 10).getTime()),
+    //_13_DECEMBER_2004("13 December 2004", new GregorianCalendar(2004, Calendar.DECEMBER, 20).getTime()),
+    DECEMBER_2004("December 2004",new GregorianCalendar(2004, Calendar.DECEMBER, 30).getTime()),
+    _____("space betwwen 04-05",new GregorianCalendar(2004, Calendar.DECEMBER, 31).getTime()),
+    JANUARY_2005("January 2005",new GregorianCalendar(2005, Calendar.JANUARY, 31).getTime());
+
+    public String name;
+    public Date date;
+
+    ReleaseDate(String name, Date date) {
+        this.name = name;
+        this.date = date;
+    }
+}
+
+package com.chrono.ui;
+
+import net.runelite.api.FontID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetTextAlignment;
+
+import java.awt.*;
+
+/**
+ * This class wraps a game widget and gives it the functionality of
+ * a text label component, with basic control over text colour and font.
+ * @author Antipixel
+ */
+public class UILabel extends UIComponent
+{
+	/**
+	 * Constructs a new label component
+	 * @param labelWidget the underlying widget
+	 */
+	public UILabel(Widget labelWidget)
+	{
+		super(labelWidget);
+
+		// Set default font and text colour
+		this.setFont(FontID.PLAIN_11);
+		this.setColour(Color.WHITE.getRGB());
+
+		// Set the alignment to centre and enable text shadowing
+		labelWidget.setXTextAlignment(WidgetTextAlignment.CENTER);
+		labelWidget.setYTextAlignment(WidgetTextAlignment.CENTER);
+		labelWidget.setTextShadowed(true);
+	}
+
+	/**
+	 * Sets the display text of the label
+	 * @param text the display text
+	 */
+	public void setText(String text)
+	{
+		this.getWidget().setText(text);
+	}
+
+	/**
+	 * Sets the font of the label
+	 * @param fontID the font ID, specified in {@link FontID}
+	 */
+	public void setFont(int fontID)
+	{
+		this.getWidget().setFontId(fontID);
+	}
+
+	/**
+	 * Sets the colour of the label text
+	 * @param colour the RGB colour
+	 */
+	public void setColour(int colour)
+	{
+		this.getWidget().setTextColor(colour);
+	}
+}
+
+package com.chrono.ui;
+
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.ScriptEvent;
+import net.runelite.api.widgets.JavaScriptCallback;
+import net.runelite.api.widgets.Widget;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * UI Component classes allow for complex user interface functionality by
+ * wrapping the gaming widget and carefully controlling its behaviour
+ * @author Antipixel
+ */
+public abstract class UIComponent
+{
+	private static final int MAX_OPACITY = 255;
+	private static final String BTN_NAME_FORMAT = "<col=ff9040>%s</col>";
+
+	@Getter
+	private Widget widget;
+
+	/* Actions and events */
+	private List<MenuAction> actions;
+
+	@Setter
+	private ComponentEventListener hoverListener;
+
+	@Setter
+	private ComponentEventListener leaveListener;
+
+	/**
+	 * Constructs a new UIComponent
+	 * @param widget the underlying game widget
+	 */
+	public UIComponent(Widget widget)
+	{
+		this.widget = widget;
+
+		// Assign the event listeners to the widget
+		this.widget.setOnOpListener((JavaScriptCallback) this::onActionSelected);
+		this.widget.setOnMouseOverListener((JavaScriptCallback) this::onMouseHover);
+		this.widget.setOnMouseLeaveListener((JavaScriptCallback) this::onMouseLeave);
+		this.widget.setHasListener(true);
+
+		this.actions = new ArrayList<>();
+	}
+
+	/**
+	 * Adds an action option to the component's menu
+	 * @param action the action name
+ 	 * @param callback the callback event, which is trigger upon the
+	 *                 selection of this menu option
+	 */
+	public void addAction(String action, MenuAction callback)
+	{
+		this.widget.setAction(actions.size(), action);
+		this.actions.add(callback);
+	}
+
+	/**
+	 * Triggered upon the selection of menu option
+	 * @param e the script event
+	 */
+	protected void onActionSelected(ScriptEvent e)
+	{
+		// If there's no actions specified, ignore
+		if (this.actions.isEmpty())
+			return;
+
+		// Get the action action event object for this menu option
+		MenuAction actionEvent = this.actions.get(e.getOp() - 1);
+
+		// Call the action listener for this option
+		actionEvent.onMenuAction();
+	}
+
+	/**
+	 * Triggered upon the mouse entering the component
+	 * @param e the script event
+	 */
+	protected void onMouseHover(ScriptEvent e)
+	{
+		// If a hover event is specified, trigger it
+		if (this.hoverListener != null)
+			this.hoverListener.onComponentEvent(this);
+	}
+
+	/**
+	 * Triggered upon the mouse leaving the component
+	 * @param e the script event
+	 */
+	protected void onMouseLeave(ScriptEvent e)
+	{
+		// If a leave event is specified, trigger it
+		if (this.leaveListener != null)
+			this.leaveListener.onComponentEvent(this);
+	}
+
+	/**
+	 * Sets a listener which will be called upon the mouse
+	 * hovering over the widget
+	 * @param listener the listener
+	 */
+	public void setOnHoverListener(ComponentEventListener listener)
+	{
+		this.hoverListener = listener;
+	}
+
+	/**
+	 * Sets a listener which will be called upon the mouse
+	 * exiting from over the widget
+	 * @param listener the listener
+	 */
+	public void setOnLeaveListener(ComponentEventListener listener)
+	{
+		this.leaveListener = listener;
+	}
+
+	/**
+	 * Sets the name of the component widget
+	 * @param name the component name
+	 */
+	public void setName(String name)
+	{
+		this.widget.setName(String.format(BTN_NAME_FORMAT, name));
+	}
+
+	/**
+	 * Sets the component size
+	 * @param width the component width
+	 * @param height the component height
+	 */
+	public void setSize(int width, int height)
+	{
+		this.widget.setOriginalWidth(width);
+		this.widget.setOriginalHeight(height);
+	}
+
+	/**
+	 * Sets the position of the component, relative
+	 * to the parent layer widget
+	 * @param x the x position
+	 * @param y the y position
+	 */
+	public void setPosition(int x, int y)
+	{
+		this.setX(x);
+		this.setY(y);
+	}
+
+	/**
+	 * Sets the X position of the component, relative
+	 * to the parent layer
+	 * @param x the x position
+	 */
+	public void setX(int x)
+	{
+		this.widget.setOriginalX(x);
+	}
+
+	/**
+	 * Sets the Y position of the component, relative
+	 * to the parent layer
+	 * @param y the x position
+	 */
+	public void setY(int y)
+	{
+		this.widget.setOriginalY(y);
+	}
+
+	/**
+	 * Gets the X position of the component, relative
+	 * to the the parent layer
+	 * @return the x position
+	 */
+	public int getX()
+	{
+		return this.widget.getOriginalX();
+	}
+
+	/**
+	 * Gets the Y position of the component, relative
+	 * to the the parent layer
+	 * @return the y position
+	 */
+	public int getY()
+	{
+		return this.widget.getOriginalY();
+	}
+
+
+	/**
+	 * Sets the visibility of the component
+	 * @param visible true for visible, false for hidden
+	 */
+	public void setVisibility(boolean visible)
+	{
+		this.widget.setHidden(!visible);
+	}
+
+	/**
+	 * Sets the opacity of the widget
+	 * @param opacity the opacity value. Expects a value
+	 *                between 0.0 (transparent) and 1.0 (opaque)
+	 */
+	public void setOpacity(float opacity)
+	{
+		// Cap the opacity to 1.0
+		if (opacity > 1.0)
+			opacity = 1.0f;
+
+		// Invert the percentage
+		float percentage = 1.0f - opacity;
+
+		// Convert the percentage value to a 0-255 integer
+		this.widget.setOpacity((int)(percentage * MAX_OPACITY));
+	}
+
+	/**
+	 * Gets the opacity of the widget
+	 * @return an opacity value between 0.0 (transparent) and 1.0 (opaque)
+	 */
+	public float getOpacity()
+	{
+		// Convert the opacity to a percentage
+		float opacity = (float)this.widget.getOpacity() / MAX_OPACITY;
+
+		// Invert the percentage
+		return 1.0f - opacity;
+	}
+
+	public void clearActions() {
+		actions.clear();
+	}
+}
+
+package com.chrono.ui;
+
+import net.runelite.api.ScriptEvent;
+import net.runelite.api.widgets.Widget;
+
+/**
+ * This class wraps a game widget and gives it the functionality
+ * of a button, with the option of a second sprite shown on hover
+ * @author Antipixel
+ */
+public class UIButton extends UIComponent
+{
+	private int spriteStandard;
+	private int spriteHover;
+
+	/**
+	 * Constructs a new button component
+	 * @param widget the underlying widget
+	 */
+	public UIButton(Widget widget)
+	{
+		super(widget);
+
+		// Blank the sprites
+		this.spriteStandard = -1;
+		this.spriteHover = -1;
+	}
+
+	@Override
+	protected void onMouseHover(ScriptEvent e)
+	{
+		// Call the parent method
+		super.onMouseHover(e);
+
+		// Update the sprite
+		this.getWidget().setSpriteId(this.spriteHover);
+	}
+
+	@Override
+	protected void onMouseLeave(ScriptEvent e)
+	{
+		// Call the parent method
+		super.onMouseLeave(e);
+
+		// Update the sprite
+		this.getWidget().setSpriteId(this.spriteStandard);
+	}
+
+	/**
+	 * Sets the button sprite for both standard and hover
+	 * @param standard the standard sprite id
+	 * @param hover the sprite to display on hover
+	 */
+	public void setSprites(int standard, int hover)
+	{
+		this.spriteStandard = standard;
+		this.spriteHover = hover;
+
+		// Update the widgets sprite
+		this.getWidget().setSpriteId(this.spriteStandard);
+	}
+
+	/**
+	 * Sets the sprite for the button, for buttons
+	 * without a sprite for hovering state
+	 * @param standard the button sprite
+	 */
+	public void setSprites(int standard)
+	{
+		this.setSprites(standard, standard);
+	}
+}
+
+package com.chrono.ui;
+
+/**
+ * A listener interface for receiving UI component events
+ * @author Antipixel
+ */
+public interface ComponentEventListener
+{
+	/**
+	 * Invoked upon a component event
+	 * @param src the source component responsible for the event
+	 */
+	void onComponentEvent(UIComponent src);
+}
+
+
+package com.chrono.ui;
+
+/**
+ * A listener interface for receiving menu actions
+ * @author Antipixel
+ */
+public interface MenuAction
+{
+	/**
+	 * Invoked upon selection of the menu action that is is bound to
+	 */
+	void onMenuAction();
+}
+
+package com.chrono;
+
+import net.runelite.api.widgets.WidgetItem;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.overlay.WidgetItemOverlay;
+
+import com.google.common.cache.Cache;
+import com.google.common.cache.CacheBuilder;
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.Image;
+import java.awt.Rectangle;
+import java.text.ParseException;
+import javax.inject.Inject;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.ImageUtil;
+
+public class ChronoItemOverlay extends WidgetItemOverlay {
+
+    private final ItemManager itemManager;
+    private ChronoPlugin chronoPlugin;
+    private final Cache<Long, Image> fillCache;
+
+    @Inject
+    private ChronoItemOverlay(ItemManager itemManager, ChronoPlugin plugin)
+    {
+        this.itemManager = itemManager;
+        this.chronoPlugin = plugin;
+        showOnEquipment();
+        showOnInventory();
+        fillCache = CacheBuilder.newBuilder()
+                .concurrencyLevel(1)
+                .maximumSize(32)
+                .build();
+    }
+
+    @Override
+    public void renderItemOverlay(Graphics2D graphics, int itemId, WidgetItem widgetItem) {
+        final Color color = Color.GRAY;
+
+        try {
+            if(!chronoPlugin.isItemUnlocked(itemId)) {
+                Rectangle bounds = widgetItem.getCanvasBounds();
+                final Image image = getFillImage(color, widgetItem.getId(), widgetItem.getQuantity());
+                graphics.drawImage(image, (int) bounds.getX(), (int) bounds.getY(), null);
+            }
+        } catch (ParseException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private Image getFillImage(Color color, int itemId, int qty)
+    {
+        long key = (((long) itemId) << 32) | qty;
+        Image image = fillCache.getIfPresent(key);
+        if (image == null)
+        {
+            final Color fillColor = ColorUtil.colorWithAlpha(color, 150);
+            image = ImageUtil.fillImage(itemManager.getImage(itemId, qty, false), fillColor);
+            fillCache.put(key, image);
+        }
+        return image;
+    }
+
+    void invalidateCache()
+    {
+        fillCache.invalidateAll();
+    }
+}
+
+package com.chrono;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.NPC;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.*;
+
+@Getter
+@Slf4j
+public class EntityDefinition {
+    private int id;
+    private String name;
+    private String releaseDate;
+    private String lastUpdated;
+
+    static Map<Integer, EntityDefinition> itemDefinitions;
+    static Map<Integer, EntityDefinition> monsterDefinition;
+
+    public static boolean isItemUnlocked(int itemId, Date release) throws ParseException {
+        EntityDefinition def = itemDefinitions.get(itemId);
+
+        if(def == null) return false;
+        Date releaseDate = new SimpleDateFormat("yyyy-MM-dd").parse(def.getReleaseDate());
+        return releaseDate.before(release);
+    }
+
+    public static boolean isMonsterUnlocked(int npcId, Date release) throws ParseException {
+        EntityDefinition def = monsterDefinition.get(npcId);
+
+        if(def == null) return true;
+
+        Date releaseDate = new SimpleDateFormat("yyyy-MM-dd").parse(def.getReleaseDate());
+        return releaseDate.before(release);
+    }
+}
+

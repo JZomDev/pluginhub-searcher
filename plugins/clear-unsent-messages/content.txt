@@ -1,0 +1,248 @@
+package xyz.cecchetti.clearunsentmessages;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class Bootstrap {
+
+    /**
+     * Starts RuneLite with the plugin loaded to aid in development
+     * @param args
+     */
+    public static void main(String[] args) {
+        ExternalPluginManager.loadBuiltin(ClearUnsentPlugin.class);
+        try {
+            RuneLite.main(args);
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+}
+
+package xyz.cecchetti.clearunsentmessages;
+
+import net.runelite.api.Client;
+import net.runelite.api.VarClientStr;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.input.KeyManager;
+import org.junit.Test;
+
+import java.util.concurrent.Executors;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * This is definitely not an exact science, but it should give a rough idea of how well the on-game-thread portion is
+ * performing, which will help gauge what impact this plugin has on render performance.
+ */
+public class Benchmark {
+
+    @Test
+    public void benchmark() {
+        final Client client = mock(Client.class);
+        when(client.getVarcStrValue(VarClientStr.CHATBOX_TYPED_TEXT)).thenReturn("beep boop");
+
+        final Widget chatBox = mock(Widget.class);
+        when(client.getWidget(162, 55)).thenReturn(chatBox);
+
+        final ClearUnsentConfig clearUnsentConfig = mock(ClearUnsentConfig.class);
+        final KeyManager keyManager = mock(KeyManager.class);
+
+        final ChatMessageManager underTest = new ChatMessageManager(client, mock(ClientThread.class), clearUnsentConfig,
+                keyManager, Executors.newSingleThreadScheduledExecutor());
+
+        // Warm up
+        for (int i = 0; i < 100000; i++) {
+            underTest.onMessageChanged();
+        }
+
+        // Timed iterations
+        final long startTime = System.currentTimeMillis();
+        for (int i = 0; i < 100000; i++) {
+            underTest.onMessageChanged();
+        }
+        System.out.println("Took: " + (System.currentTimeMillis() - startTime));
+    }
+}
+
+package xyz.cecchetti.clearunsentmessages;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.VarClientStr;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.input.KeyManager;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.awt.event.KeyEvent;
+import java.util.Optional;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+public class ChatMessageManager {
+
+    private static final Pattern PATTERN_ONLY_SPACES_AND_NUMBERS = Pattern.compile("^[ |\\d]*$");
+    private static final Pattern PATTERN_CHATBOX_TEXT_PREFIX = Pattern.compile("(.*?): <col=(.*?)>");
+    private static final String CHATBOX_TEXT_EMPTY_MESSAGE_FORMAT = "%s: <col=%s></col><col=%<s>*</col>";
+    private static final Component STUB_COMPONENT = new Component() {};
+
+    private final AtomicReference<Widget> chatboxWidgetHolder = new AtomicReference<>();
+
+    private final Client client;
+    private final ClientThread clientThread;
+    private final ClearUnsentConfig config;
+    private final KeyManager keyManager;
+    private final ScheduledExecutorService executorService;
+
+    private ScheduledFuture<?> future = null;
+
+    @Inject
+    ChatMessageManager(
+            Client client,
+            ClientThread clientThread,
+            ClearUnsentConfig config,
+            KeyManager keyManager,
+            ScheduledExecutorService executorService
+    ) {
+        this.client = client;
+        this.clientThread = clientThread;
+        this.config = config;
+        this.keyManager = keyManager;
+        this.executorService = executorService;
+    }
+
+    public void onMessageChanged() {
+        Optional.ofNullable(future).ifPresent(f -> f.cancel(true));
+        future = executorService.schedule(this::maybeClearMessage, config.delay(), TimeUnit.MILLISECONDS);
+    }
+
+    private void maybeClearMessage() {
+        clientThread.invokeLater(() -> {
+            final String typedText = client.getVarcStrValue(VarClientStr.CHATBOX_TYPED_TEXT);
+            if (!shouldClearMessage(typedText)) {
+                log.debug("No update needed: [" + typedText + "]");
+                return;
+            }
+            log.debug("(executed) Clearing: [" + typedText + "]");
+            clearMessage();
+            sendBackspace();
+        });
+    }
+
+    private boolean shouldClearMessage(String msg) {
+        return !config.onlySpacesNumbers() || PATTERN_ONLY_SPACES_AND_NUMBERS.matcher(msg).matches();
+    }
+
+    private void clearMessage() {
+        // This changes what value the client is going to send when you press enter
+        client.setVarcStrValue(VarClientStr.CHATBOX_TYPED_TEXT, "");
+
+        // This changes what value you _see_ down in the chatbox
+        Widget chatboxWidget = chatboxWidgetHolder.updateAndGet(w -> w != null ? w : client.getWidget(162, 55));
+        if (chatboxWidget == null) {
+            return;
+        }
+        final String widgetText = chatboxWidget.getText();
+        if (widgetText == null) {
+            return;
+        }
+        Matcher matcher = PATTERN_CHATBOX_TEXT_PREFIX.matcher(widgetText);
+        if (!matcher.find()) {
+            return;
+        }
+        chatboxWidget.setText(String.format(CHATBOX_TEXT_EMPTY_MESSAGE_FORMAT, matcher.group(1), matcher.group(2)));
+        chatboxWidget.setXTextAlignment(0);
+    }
+
+    private void sendBackspace() {
+        // Fixes compatibility with the Key Remapping plugin, causing it to lock the chat after we clear it
+        KeyEvent fakeKeyEvent = new KeyEvent(STUB_COMPONENT, 1, System.currentTimeMillis(), 0, KeyEvent.VK_BACK_SPACE,
+                (char) KeyEvent.VK_BACK_SPACE);
+        keyManager.processKeyPressed(fakeKeyEvent);
+        keyManager.processKeyReleased(fakeKeyEvent);
+        keyManager.processKeyTyped(fakeKeyEvent);
+    }
+
+    public void releaseChatboxWidget() {
+        chatboxWidgetHolder.set(null);
+    }
+
+}
+
+package xyz.cecchetti.clearunsentmessages;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("cfg")
+public interface ClearUnsentConfig extends Config {
+	@ConfigItem(
+		keyName = "delay",
+		name = "Delay",
+		description = "After this period, any unsent message will cleared"
+	)
+	default int delay() {
+		return 1500;
+	}
+
+	@ConfigItem(
+		keyName = "onlySpacesNumbers",
+		name = "Only spaces/numbers",
+		description = "If checked, only clears unsent messages made up of spaces and numbers. If unchecked, clears any unsent message."
+	)
+	default boolean onlySpacesNumbers() {
+		return false;
+	}
+}
+
+package xyz.cecchetti.clearunsentmessages;
+
+import com.google.inject.Inject;
+import com.google.inject.Provides;
+import net.runelite.api.VarClientStr;
+import net.runelite.api.events.VarClientStrChanged;
+import net.runelite.api.events.WidgetClosed;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+
+@PluginDescriptor(name = "Clear Unsent Messages")
+public class ClearUnsentPlugin extends Plugin {
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
+	@Provides
+	ClearUnsentConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(ClearUnsentConfig.class);
+	}
+
+	@Subscribe
+	public void onWidgetClosed(WidgetClosed widgetClosed) {
+		if (widgetClosed.getGroupId() == 162) {
+			chatMessageManager.releaseChatboxWidget();
+		}
+	}
+
+	@Subscribe
+	public void onVarClientStrChanged(VarClientStrChanged strChanged) {
+		if (strChanged.getIndex() == VarClientStr.CHATBOX_TYPED_TEXT) {
+			chatMessageManager.onMessageChanged();
+		}
+	}
+
+}
+

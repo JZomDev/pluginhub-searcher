@@ -1,0 +1,1080 @@
+package com.example;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PartyHealthStatusPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(PartyHealthStatusPlugin.class);
+		RuneLite.main(args);
+	}
+}
+/*
+ * Copyright (c) 2022, Jamal <http://github.com/1Defence>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.example;
+
+import com.google.inject.Provides;
+
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import javax.inject.Inject;
+
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+
+import net.runelite.api.*;
+import net.runelite.api.events.AccountHashChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.StatChanged;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.PartyChanged;
+
+import net.runelite.client.events.RuneScapeProfileChanged;
+import net.runelite.client.party.WSClient;
+import net.runelite.client.party.events.UserJoin;
+import net.runelite.client.party.events.UserPart;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDependency;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.party.PartyPlugin;
+import net.runelite.client.plugins.party.PartyPluginService;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.Text;
+
+import static com.example.PartyHealthStatusConfig.TextRenderType;
+import static com.example.PartyHealthStatusConfig.ColorType;
+
+@PluginDescriptor(
+		name = "Party Health Status",
+		description = "Visual health display of party members"
+)
+
+@PluginDependency(PartyPlugin.class)
+@Slf4j
+public class PartyHealthStatusPlugin extends Plugin
+{
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private PartyService partyService;
+
+	@Getter(AccessLevel.PACKAGE)
+	@Inject
+	private PartyPluginService partyPluginService;
+
+	@Inject
+	private PartyHealthStatusOverlay partyHealthStatusOverlay;
+
+	@Inject
+	private PartyHealthStatusConfig config;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private WSClient wsClient;
+
+	@Getter(AccessLevel.PACKAGE)
+	private final Map<String, PartyHealthStatusMember> members = new ConcurrentHashMap<>();
+
+	@Getter(AccessLevel.PACKAGE)
+	@Setter(AccessLevel.PACKAGE)
+	private int lastKnownHP = -1;
+
+	@Getter(AccessLevel.PACKAGE)
+	@Setter(AccessLevel.PACKAGE)
+	private boolean queuedUpdate = false;
+
+	/**
+	 * Visible players from the configuration (Strings)
+	 */
+	@Getter(AccessLevel.PACKAGE)
+	private List<String> visiblePlayers = new ArrayList<>();
+
+	/**
+	 * Hidden players from the configuration (Strings)
+	 */
+	@Getter(AccessLevel.PACKAGE)
+	private List<String> hiddenPlayers = new ArrayList<>();
+
+	private final String DEFAULT_MEMBER_NAME = "<unknown>";
+	private String currentLocalUsername;
+
+	/*<|Cached Configs*/
+
+	int healthyOffSet,
+			hullOpacity,
+			hitPointsMinimum,
+			mediumHP,
+			lowHP,
+			offSetTextHorizontal,
+			offSetTextVertical,
+			offSetTextZ,
+			offSetStackVertical,
+			fontSize;
+
+
+	Color healthyColor,
+			highColor,
+			mediumColor,
+			lowColor;
+
+
+	boolean hideAllPlayers,
+			hideSelf,
+			renderPlayerHull,
+			recolorHealOther,
+			drawPercentByName,
+			drawParentheses,
+			boldFont;
+
+	TextRenderType nameRender,
+			hpRender;
+
+	ColorType colorType;
+	/*Cached Configs|>*/
+
+	@Provides
+	PartyHealthStatusConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(PartyHealthStatusConfig.class);
+	}
+
+	@Override
+	protected void startUp()
+	{
+		CacheConfigs();
+		overlayManager.add(partyHealthStatusOverlay);
+		lastKnownHP = -1;
+		queuedUpdate = true;
+		wsClient.registerMessage(PartyHealthStatusUpdate.class);
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		wsClient.unregisterMessage(PartyHealthStatusUpdate.class);
+		overlayManager.remove(partyHealthStatusOverlay);
+		members.clear();
+	}
+
+	@Subscribe
+	public void onPartyChanged(PartyChanged partyChanged)
+	{
+		members.clear();
+	}
+
+	@Subscribe
+	public void onUserJoin(final UserJoin message)
+	{
+		//when a user joins, request an update for the next registered game tick
+		queuedUpdate = true;
+	}
+
+	@Subscribe
+	public void onRuneScapeProfileChanged(RuneScapeProfileChanged runeScapeProfileChanged)
+	{
+		queuedUpdate = true;
+	}
+
+	@Subscribe
+	public void onUserPart(final UserPart message) {
+		//name not always present, find by id
+		String name = "";
+		for (Map.Entry<String, PartyHealthStatusMember> entry: members.entrySet()) {
+			if(entry.getValue().getMemberID() == message.getMemberId()){
+				name = entry.getKey();
+			}
+		}
+		if(!name.isEmpty()) {
+			members.remove(name);
+		}
+	}
+
+	void RegisterMember(long memberID, String memberName, int currentHP, int maxHP){
+		if(memberName.equals(DEFAULT_MEMBER_NAME)){
+			return;
+		}
+		PartyHealthStatusMember member = members.computeIfAbsent(memberName, PartyHealthStatusMember::new);
+		member.setMemberID(memberID);
+		member.setCurrentHP(currentHP);
+		member.setMaxHP(maxHP);
+	}
+
+
+	public List<String> parsePlayerList(String playerList)
+	{
+		final String configPlayers = playerList.toLowerCase();
+
+		if (configPlayers.isEmpty())
+		{
+			return Collections.emptyList();
+		}
+
+		return Text.fromCSV(configPlayers);
+	}
+
+	public List<String> parseVisiblePlayers(){
+		return parsePlayerList(config.getVisiblePlayers());
+	}
+
+	public List<String> parseHiddenPlayers(){
+		return parsePlayerList(config.getHiddenPlayers());
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged)
+	{
+		if (!configChanged.getGroup().equals("partyhealthstatus"))
+		{
+			return;
+		}
+
+		CacheConfigs();
+	}
+
+	public void CacheConfigs(){
+
+		healthyOffSet = config.healthyOffset();
+				hullOpacity = config.hullOpacity();
+				hitPointsMinimum = config.getHitpointsMinimum();
+				mediumHP = config.getMediumHP();
+				lowHP = config.getLowHP();
+				offSetTextHorizontal = config.offSetTextHorizontal();
+				offSetTextVertical = config.offSetTextVertial();
+				offSetTextZ = config.offSetTextZ();
+				offSetStackVertical = config.offSetStackVertical();
+				fontSize = config.fontSize();
+
+		healthyColor = config.getHealthyColor();
+				highColor = config.getHighColor();
+				mediumColor = config.getMediumColor();
+				lowColor = config.getLowColor();
+
+
+		hideAllPlayers = config.hideAllPlayers();
+				hideSelf = config.hideSelf();
+				renderPlayerHull = config.renderPlayerHull();
+				recolorHealOther = config.recolorHealOther();
+				drawPercentByName = config.drawPercentByName();
+				drawParentheses = config.drawParentheses();
+				boldFont = config.boldFont();
+
+		colorType = config.getColorType();
+
+		nameRender = config.nameRender();
+				hpRender = config.hpRender();
+
+
+		visiblePlayers = parseVisiblePlayers();
+		hiddenPlayers = parseHiddenPlayers();
+	}
+
+
+	@Subscribe
+	public void onPartyHealthStatusUpdate(PartyHealthStatusUpdate update)
+	{
+
+		if (partyService.getLocalMember().getMemberId() == update.getMemberId())
+		{
+			return;
+		}
+
+		String name = partyService.getMemberById(update.getMemberId()).getDisplayName();
+		if (name == null)
+		{
+			return;
+		}
+
+		RegisterMember(update.getMemberId(),name,update.getCurrentHealth(), update.getMaxHealth());
+	}
+
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		//an update has been requested, resync party members hp data
+		if (queuedUpdate && client.getLocalPlayer() != null && partyService.isInParty() && partyService.getLocalMember() != null)
+		{
+			currentLocalUsername = SanitizeName(client.getLocalPlayer().getName());
+			String partyName = partyService.getMemberById(partyService.getLocalMember().getMemberId()).getDisplayName();
+			//dont send unless the partyname has updated to the local name
+			if (currentLocalUsername != null && currentLocalUsername.equals(partyName))
+			{
+				queuedUpdate = false;
+				SendUpdate(currentLocalUsername, client.getBoostedSkillLevel(Skill.HITPOINTS), client.getRealSkillLevel(Skill.HITPOINTS));
+			}
+		}
+	}
+	@Subscribe
+	public void onStatChanged(StatChanged statChanged)
+	{
+		Skill skill = statChanged.getSkill();
+		if (skill != Skill.HITPOINTS)
+		{
+			return;
+		}
+
+		int currentHP = client.getBoostedSkillLevel(skill);
+
+		if (currentHP != lastKnownHP)
+		{
+			queuedUpdate = true;
+		}
+
+		lastKnownHP = currentHP;
+	}
+	public void SendUpdate(String name, int currentHP, int maxHP){
+		if(partyService.getLocalMember() != null) {
+			partyService.send(new PartyHealthStatusUpdate(currentHP, maxHP));
+			//handle self locally.
+			RegisterMember(partyService.getLocalMember().getMemberId(),name,currentHP,maxHP);
+		}
+	}
+
+	String SanitizeName(String name){
+		return Text.removeTags(Text.toJagexName(name));
+	}
+
+	public boolean RenderText(TextRenderType textRenderType, boolean healthy){
+		if(textRenderType == TextRenderType.NEVER)
+			return false;
+		return textRenderType == TextRenderType.ALWAYS
+				|| (textRenderType == TextRenderType.WHEN_MISSING_HP && !healthy);
+	}
+
+	public int ClampMax(float val, float max){
+		return val > max ? (int)max : (int)val;
+	}
+
+	public float ClampMinf(float val, float min){
+		return val < min ? min : val;
+	}
+
+	public boolean IsHealthy(int currentHP,int maxHP){
+		return currentHP == -1 || currentHP >= (maxHP-healthyOffSet);
+	}
+
+	public Color GetHitPointsColor(int currentHP, int maxHP){
+		Color color = healthyColor;
+
+		if(currentHP == -1) {
+			return color;
+		}
+
+		if(currentHP > maxHP){
+			currentHP = maxHP;
+		}
+
+		switch (colorType){
+
+			case LERP_2D:
+			{
+				float hpThreshold = hitPointsMinimum;
+				float currentRatio = (currentHP - hpThreshold <= 0) ? 0 : ClampMinf(((float) currentHP - hpThreshold) / maxHP, 0);
+				int r = ClampMax((1 - currentRatio) * 255, 255);
+				int g = ClampMax(currentRatio * 255, 255);
+				color = new Color(r, g, 0, hullOpacity);
+			}
+			break;
+			case LERP_3D:
+			{
+				float halfHP = (float)maxHP/2f;
+				if(currentHP >= halfHP){
+					color = ColorUtil.colorLerp(Color.orange, Color.green, (((float)currentHP-halfHP)/halfHP));
+				}else{
+					color = ColorUtil.colorLerp(Color.red, Color.orange, (float)currentHP/halfHP);
+				}
+			}
+			break;
+			case COLOR_THRESHOLDS:
+			{
+				float hpPerc = ((float)currentHP/(float)maxHP)*maxHP;
+				color = hpPerc <= lowHP ? lowColor
+						: hpPerc <= mediumHP ? mediumColor
+						: hpPerc < maxHP ? highColor : healthyColor;
+			}
+			break;
+		}
+		return color;
+	}
+
+
+	boolean RenderPlayer(String sanitizedName){
+		if(!members.containsKey(sanitizedName))
+			return false;
+		if(!visiblePlayers.isEmpty() && !visiblePlayers.contains(sanitizedName.toLowerCase()))
+			return false;
+		if(hiddenPlayers.contains(sanitizedName.toLowerCase()))
+			return false;
+		if(hideSelf && currentLocalUsername.equals(sanitizedName)){
+			return false;
+		}
+		return true;
+	}
+
+	String GenerateTargetText(Player player){
+		String rawName = player.getName();
+		String sanitizedName = SanitizeName(rawName);
+		boolean validMember = RenderPlayer(sanitizedName);
+		int currentHP = validMember ? members.get(sanitizedName).getCurrentHP() : -1;
+		int maxHP = validMember ? members.get(sanitizedName).getMaxHP() : -1;
+		boolean healthy = IsHealthy(currentHP,maxHP);
+
+		Color greyedOut = new Color(128,128,128);
+		Color color = GetHitPointsColor(currentHP,maxHP);
+
+		return ColorUtil.wrapWithColorTag("Heal Other", healthy ? greyedOut : Color.green) +
+				ColorUtil.wrapWithColorTag(" -> ", healthy ? greyedOut : Color.white) +
+				ColorUtil.wrapWithColorTag(rawName, healthy ? greyedOut : color) +
+				ColorUtil.wrapWithColorTag(healthy ? "" : ("  (HP-" + currentHP + ")"), healthy ? greyedOut : color);
+	}
+
+	@Subscribe
+	public void onMenuEntryAdded(MenuEntryAdded event)
+	{
+		if(!recolorHealOther)
+			return;
+
+		int type = event.getType();
+		final MenuAction menuAction = MenuAction.of(type);
+
+		if(menuAction.equals(MenuAction.WIDGET_TARGET_ON_PLAYER)){
+			String option = event.getMenuEntry().getOption();
+			String target = Text.removeTags(event.getMenuEntry().getTarget());
+
+			if(option.equals("Cast") && target.startsWith("Heal Other")){
+
+				Player player = client.getCachedPlayers()[event.getIdentifier()];
+
+				MenuEntry[] menuEntries = client.getMenuEntries();
+				final MenuEntry menuEntry = menuEntries[menuEntries.length - 1];
+
+				menuEntry.setTarget(GenerateTargetText(player));
+				client.setMenuEntries(menuEntries);
+
+			}
+		}
+	}
+
+}
+
+/*
+ * Copyright (c) 2022, Jamal <http://github.com/1Defence>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.example;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.Setter;
+
+
+@RequiredArgsConstructor
+@Getter
+@Setter
+class PartyHealthStatusMember
+{
+    private final String name;
+    private long memberID;
+    private int currentHP;
+    private int maxHP;
+
+    public PartyHealthStatusMember(String name, long memberID, int currentHP, int maxHP){
+        this.name = name;
+        this.memberID = memberID;
+        this.currentHP = currentHP;
+        this.maxHP = maxHP;
+    }
+
+
+}
+/*
+ * Copyright (c) 2022, Jamal <http://github.com/1Defence>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.example;
+
+import net.runelite.client.config.*;
+
+import java.awt.*;
+
+@ConfigGroup("partyhealthstatus")
+public interface PartyHealthStatusConfig extends Config
+{
+
+	enum ColorType { LERP_2D,LERP_3D,COLOR_THRESHOLDS,STATIC}
+	enum TextRenderType { ALWAYS,NEVER,WHEN_MISSING_HP}
+	@ConfigSection(name="Color Thresholds", description="Values used when Color Type is Color Thresholds", position=2, closedByDefault=true)
+	String colorThresholds = "customThresholds";
+	@ConfigSection(name="Color Lerp 2d", description="Values used when Color Type is Lerp 2d", position=2, closedByDefault=true)
+	String colorLerp2d = "colorLerp2d";
+	@ConfigSection(name="Visual Overlay", description="visual overlay settings", position=1, closedByDefault=false)
+	String visualOverlay = "visualOverlay";
+	@ConfigSection(name="Text Overlay", description="text overlay settings", position=2, closedByDefault=true)
+	String textOverlay = "textOverlay";
+
+	/*Visual Overlay*/
+
+	@ConfigItem(
+			position = 0,
+			keyName = "hideAllPlayers",
+			name = "Hide All Players",
+			description = "Enable this when you only want to send your health information to other party members",
+			section = visualOverlay)
+	default boolean hideAllPlayers()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			position = 1,
+			keyName = "hideSelf",
+			name = "Hide Self",
+			description = "Local player won't have visuals shown",
+			section = visualOverlay)
+	default boolean hideSelf()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			position = 2,
+			keyName = "visiblePlayers",
+			name = "Visible Players",
+			description = "Only names listed will have visuals shown, if list is empty all connected party members will show up",
+			section = visualOverlay
+	)
+	default String getVisiblePlayers()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+			position = 3,
+			keyName = "hiddenPlayers",
+			name = "Hidden Players",
+			description = "Names listed will not have visuals",
+			section = visualOverlay
+	)
+	default String getHiddenPlayers()
+	{
+		return "";
+	}
+
+	@Alpha
+	@ConfigItem(
+			position = 4,
+			keyName = "healthyColor",
+			name = "Healthy Color",
+			description = "The default color of a healthy full-HP player",
+			section = visualOverlay
+	)
+	default Color getHealthyColor()
+	{
+		return new Color(255,255,255,50);
+	}
+	@ConfigItem(
+			position = 5,
+			keyName = "healthyOffset",
+			name = "Healthy Offset",
+			description = "The offset from maximum hp to render an account as healthy/full-HP, ex 10 @99hp would be 89",
+			section = visualOverlay)
+	default int healthyOffset()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+			position = 6,
+			keyName = "hullOpacity",
+			name = "Hull Opacity",
+			description = "hull opcacity, 30 recommended",
+			section = visualOverlay)
+	default int hullOpacity() { return 30; }
+
+	@ConfigItem(
+			position = 7,
+			keyName = "renderPlayerHull",
+			name = "Render Player Hull",
+			description = "Render the hull of visible party members",
+			section = visualOverlay)
+	default boolean renderPlayerHull()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			position = 8,
+			keyName = "recolorHealOther",
+			name = "Recolor Heal Other",
+			description = "Recolor heal other menus based on current hitpoints, grey will indicate the member is healthy/full hitpoints",
+			section = visualOverlay)
+	default boolean recolorHealOther()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			position = 9,
+			keyName = "colorType",
+			name = "Color Type",
+			description = "Method of color calculation",
+			section = visualOverlay
+	)
+	default ColorType getColorType()
+	{
+		return ColorType.LERP_2D;
+	}
+
+	/*Color Thresholds*/
+	@ConfigItem(
+			position = 0,
+			keyName = "highColor",
+			name = "High Color",
+			description = "The Color when party members hitpoints are below MAX hitpoints",
+			section = colorThresholds
+	)
+	default Color getHighColor()
+	{
+		return new Color(0,255,0);
+	}
+
+	@Range(min = 1, max = 99)
+	@ConfigItem(
+			position = 1,
+			keyName = "mediumHP",
+			name = "Medium HP",
+			description = "Hitpoints percentage to render the MEDIUM Color (at or below this number)",
+			section = colorThresholds
+	)
+	default int getMediumHP()
+	{
+		return 70;
+	}
+
+	@ConfigItem(
+			position = 2,
+			keyName = "mediumColor",
+			name = "Medium Color",
+			description = "The Color when party members hitpoints are at or below the MEDIUM threshold",
+			section = colorThresholds
+	)
+	default Color getMediumColor()
+	{
+		return new Color(255, 200, 0);
+	}
+	@Range(min = 1, max = 99)
+	@ConfigItem(
+			position = 3,
+			keyName = "lowHP",
+			name = "Low HP",
+			description = "Hitpoints percentage to render the LOW Color (at or below this number)",
+			section = colorThresholds
+	)
+	default int getLowHP()
+	{
+		return 40;
+	}
+
+	@ConfigItem(
+			position = 4,
+			keyName = "lowColor",
+			name = "Low Color",
+			description = "The Color when party members hitpoints are at or below the LOW threshold",
+			section = colorThresholds
+	)
+	default Color getLowColor()
+	{
+		return new Color(255, 0, 0);
+	}
+
+	/*Color Lerp 2d*/
+	@Range(max = 40)
+	@ConfigItem(
+			position = 0,
+			keyName = "hitPointsMinimum",
+			name = "Hitpoints Minimum",
+			description = "The amount of hitpoints the player should be highlighted fully red at(1-99), 20 recommended",
+			section = colorLerp2d
+	)
+	default int getHitpointsMinimum()
+	{
+		return 20;
+	}
+
+	/*Text Overlay*/
+	@ConfigItem(
+			position = -2,
+			keyName = "nameRender",
+			name = "Name Render",
+			description = "Configures how player names should render",
+			section = textOverlay
+	)
+	default TextRenderType nameRender()
+	{
+		return TextRenderType.WHEN_MISSING_HP;
+	}
+	@ConfigItem(
+			position = 0,
+			keyName = "hpRender",
+			name = "HP Render",
+			description = "Configures how player hitpoints should render",
+			section = textOverlay
+	)
+	default TextRenderType hpRender()
+	{
+		return TextRenderType.WHEN_MISSING_HP;
+	}
+
+	@ConfigItem(
+			position = 1,
+			keyName = "drawPercentByName",
+			name = "Draw Percent By Name",
+			description = "Draw a % beside the numeral value of remaining hp",
+			section = textOverlay)
+	default boolean drawPercentByName() { return false; }
+
+	@ConfigItem(
+			position = 2,
+			keyName = "drawParentheses",
+			name = "Draw Parentheses By Name",
+			description = "Draw parentheses surrounding hp number",
+			section = textOverlay)
+	default boolean drawParentheses() { return false; }
+
+	@ConfigItem(
+			position = 3,
+			keyName = "offSetTextHorizontal",
+			name = "OffSet Text Horizontal",
+			description = "OffSet the text horizontally",
+			section = textOverlay)
+	default int offSetTextHorizontal() { return 0; }
+
+	@ConfigItem(
+			position = 4,
+			keyName = "offSetTextVertical",
+			name = "OffSet Text Vertical",
+			description = "OffSet the text vertically",
+			section = textOverlay)
+	default int offSetTextVertial() { return 0; }
+
+	@ConfigItem(
+			position = 5,
+			keyName = "offSetTextZ",
+			name = "OffSet Text Z",
+			description = "OffSet the text Z",
+			section = textOverlay)
+	default int offSetTextZ() { return 65; }
+
+	@Range(min = 1,max=20)
+	@ConfigItem(
+			position = 6,
+			keyName = "offSetStackVertical",
+			name = "OffSet Stack Vertical",
+			description = "OffSet the text vertically when multiple accounts are stacked",
+			section = textOverlay)
+	default int offSetStackVertical() { return 10; }
+
+	@Range(max=16, min=8)
+	@ConfigItem(
+			position=7,
+			keyName="fontSize",
+			name="Font Size",
+			description="font size",
+			section = textOverlay)
+	default int fontSize() {
+		return 12;
+	}
+
+	@ConfigItem(
+			keyName = "boldFont",
+			name = "Bold Font",
+			description = "Configures whether font is bold or not",
+			position = 8,
+			section = textOverlay
+	)
+	default boolean boldFont()
+	{
+		return true;
+	}
+
+}
+
+/*
+ * Copyright (c) 2022, Jamal <http://github.com/1Defence>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.example;
+
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+
+@Value
+@EqualsAndHashCode(callSuper = true)
+public class PartyHealthStatusUpdate extends PartyMemberMessage
+{
+    int currentHealth;
+    int maxHealth;
+}
+/*
+ * Copyright (c) 2022, Jamal <http://github.com/1Defence>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.example;
+
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+import javax.inject.Inject;
+
+import net.runelite.api.*;
+import net.runelite.api.Point;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayUtil;
+import net.runelite.client.util.Text;
+
+public class PartyHealthStatusOverlay extends Overlay
+{
+    private final Client client;
+    private final PartyHealthStatusPlugin plugin;
+
+    @Inject
+    PartyHealthStatusOverlay(Client client, PartyHealthStatusPlugin plugin)
+    {
+        this.client = client;
+        this.plugin = plugin;
+        setPosition(OverlayPosition.DYNAMIC);
+        setLayer(OverlayLayer.UNDER_WIDGETS);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        //skip redundant checking
+        if(plugin.hideAllPlayers){
+            return null;
+        }
+
+        graphics.setFont(new Font(FontManager.getRunescapeFont().toString(), plugin.boldFont ? Font.BOLD : Font.PLAIN, plugin.fontSize));
+
+        //track player locations for vertical-offsetting purposes, when players are stacked their names/hp(if rendered) should stack instead of overlapping
+        List<WorldPoint> trackedLocations = new ArrayList<>();
+
+
+        for(Player player : client.getPlayers()){
+
+            if (player == null || player.getName() == null)
+            {
+                continue;
+            }
+
+            String name = plugin.SanitizeName(player.getName());
+            if(!plugin.RenderPlayer(name)){
+                continue;
+            }
+
+
+            int currentHP = plugin.getMembers().get(name).getCurrentHP();
+            int maxHP = plugin.getMembers().get(name).getMaxHP();
+
+            boolean healthy = plugin.IsHealthy(currentHP,maxHP);
+
+            boolean nameRendered = plugin.RenderText(plugin.nameRender,healthy) || plugin.RenderText(plugin.hpRender,healthy);
+            Color col = plugin.healthyColor;
+
+            if(nameRendered){
+                int playersTracked = 0;
+                WorldPoint currentLoc = player.getWorldLocation();
+                for(int i=0; i<trackedLocations.size(); i++){
+                    WorldPoint compareLoc = trackedLocations.get(i);
+                    if(compareLoc.getX() == currentLoc.getX() && compareLoc.getY() == currentLoc.getY()){
+                        playersTracked++;
+                    }
+                }
+                trackedLocations.add(player.getWorldLocation());
+
+                if(!healthy){
+                    col = plugin.GetHitPointsColor(currentHP,maxHP);
+                }
+
+                col = new Color(col.getRed(),col.getGreen(),col.getBlue(),plugin.hullOpacity);
+
+                renderPlayerOverlay(graphics, player, col, playersTracked,currentHP,maxHP,healthy);
+
+            }
+
+            if(plugin.renderPlayerHull) {
+                Shape objectClickbox = player.getConvexHull();
+                renderPoly(graphics, col, objectClickbox);
+            }
+
+
+        }
+
+        return null;
+    }
+
+    private void renderPoly(Graphics2D graphics, Color color, Shape shape)
+    {
+        if (shape != null)
+        {
+            graphics.setColor(color);
+            graphics.setStroke(new BasicStroke(2));
+            graphics.draw(shape);
+            graphics.setColor(new Color(color.getRed(), color.getGreen(), color.getBlue(), plugin.hullOpacity));
+            graphics.fill(shape);
+        }
+    }
+
+    private void renderPlayerOverlay(Graphics2D graphics, Player actor, Color color, int playersTracked, int currentHP, int maxHP, boolean healthy)
+    {
+        String playerName = plugin.RenderText(plugin.nameRender,healthy) ? Text.removeTags(actor.getName()) : "";
+        String endingPercentString = plugin.drawPercentByName ? "%" : "";
+        String startingParenthesesString = plugin.drawParentheses ? "(" : "";
+        String endingParenthesesString = plugin.drawParentheses ? ")" : "";
+
+        int healthValue = plugin.drawPercentByName ? ((currentHP*100)/maxHP) : currentHP;
+
+        playerName += plugin.RenderText(plugin.hpRender,healthy) ? " "+(startingParenthesesString+healthValue+endingPercentString+endingParenthesesString) : "";
+
+
+        Point textLocation = actor.getCanvasTextLocation(graphics, playerName, plugin.offSetTextZ/*(playersTracked*20)*/);
+
+        float verticalOffSetMultiplier = 1f + (playersTracked * (((float)plugin.offSetStackVertical)/100f));
+
+        if(textLocation != null)
+        {
+            textLocation = new Point(textLocation.getX() + plugin.offSetTextHorizontal, (-plugin.offSetTextVertical)+(int) (textLocation.getY() * verticalOffSetMultiplier));
+            OverlayUtil.renderTextLocation(graphics, textLocation, playerName, color);
+        }
+
+    }
+
+
+
+
+
+}
+

@@ -1,0 +1,905 @@
+
+package com.profittracker;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ProfitTrackerTest
+{
+    public static void main(String[] args) throws Exception
+    {
+        ExternalPluginManager.loadBuiltin(ProfitTrackerPlugin.class);
+        RuneLite.main(args);
+    }
+}
+
+package com.profittracker;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.client.game.ItemManager;
+
+import java.util.Arrays;
+import java.util.stream.LongStream;
+
+@Slf4j
+public class ProfitTrackerInventoryValue {
+    /*
+    Provide functional methods for calculating inventory value
+     */
+    /*
+    Singletons which will be provided at creation by the plugin
+     */
+
+    static final int EMPTY_SLOT_ITEMID = -1;
+
+    private final int[] RUNE_POUCH_ITEM_IDS = {
+            ItemID.RUNE_POUCH,
+            ItemID.RUNE_POUCH_L,
+            ItemID.DIVINE_RUNE_POUCH,
+            ItemID.DIVINE_RUNE_POUCH_L
+    };
+
+    private final int[] RUNE_POUCH_AMOUNT_VARBITS = {
+            Varbits.RUNE_POUCH_AMOUNT1,
+            Varbits.RUNE_POUCH_AMOUNT2,
+            Varbits.RUNE_POUCH_AMOUNT3,
+            Varbits.RUNE_POUCH_AMOUNT4
+    };
+
+    private final int[] RUNE_POUCH_RUNE_VARBITS = {
+            Varbits.RUNE_POUCH_RUNE1,
+            Varbits.RUNE_POUCH_RUNE2,
+            Varbits.RUNE_POUCH_RUNE3,
+            Varbits.RUNE_POUCH_RUNE4
+    };
+
+    private final ItemManager itemManager;
+    private final Client client;
+
+    public ProfitTrackerInventoryValue( Client client, ItemManager itemManager) {
+        this.client = client;
+        this.itemManager = itemManager;
+    }
+
+    private long calculateItemValue(Item item) {
+        /*
+        Calculate GE value of single item
+         */
+
+        int itemId = item.getId();
+
+        if (itemId < -1)
+        {
+            // unexpected
+            log.debug("Bad item id!" + itemId);
+            return 0;
+
+        }
+
+        if (itemId == EMPTY_SLOT_ITEMID)
+        {
+            return 0;
+        }
+
+        if (Arrays.stream(RUNE_POUCH_ITEM_IDS).anyMatch(pouchID -> itemId == pouchID))
+        {
+            log.debug(String.format("calculateItemValue itemId = %d (Rune pouch variant)", itemId));
+            return calculateRunePouchValue();
+        }
+
+        log.debug(String.format("calculateItemValue itemId = %d", itemId));
+
+        // multiply quantity  by GE value
+        return item.getQuantity() * (itemManager.getItemPrice(itemId));
+    }
+
+    public long calculateContainerValue(InventoryID ContainerID)
+    {
+        /*
+        calculate total inventory value
+         */
+
+        long newInventoryValue;
+
+        ItemContainer container = client.getItemContainer(ContainerID);
+
+        if (container == null)
+        {
+            return 0;
+        }
+
+        Item[] items = container.getItems();
+
+        newInventoryValue = Arrays.stream(items).flatMapToLong(item ->
+                LongStream.of(calculateItemValue(item))
+        ).sum();
+
+        return newInventoryValue;
+    }
+
+
+    public long calculateInventoryValue()
+    {
+        /*
+        calculate total inventory value
+         */
+
+        return calculateContainerValue(InventoryID.INVENTORY);
+
+    }
+
+    public long calculateEquipmentValue()
+    {
+        /*
+        calculate total equipment value
+         */
+        return calculateContainerValue(InventoryID.EQUIPMENT);
+    }
+
+    public long calculateRunePouchValue()
+    {
+        long runePouchValue = 0;
+        EnumComposition runePouchEnum = client.getEnum(EnumID.RUNEPOUCH_RUNE);
+
+        for (int i = 0; i < RUNE_POUCH_AMOUNT_VARBITS.length; i++)
+        {
+            runePouchValue += calculateRuneValue(
+                    client.getVarbitValue(RUNE_POUCH_RUNE_VARBITS[i]),
+                    client.getVarbitValue(RUNE_POUCH_AMOUNT_VARBITS[i]),
+                    runePouchEnum
+            );
+        }
+
+        return runePouchValue;
+    }
+
+    public long calculateRuneValue(int runeId, int runeQuantity, EnumComposition runePouchEnum)
+    {
+        if (runeQuantity == 0){
+            return 0;
+        }
+        log.debug(String.format("calculateRuneValue runeId = %d", runeId));
+        return itemManager.getItemPrice(runePouchEnum.getIntValue(runeId)) * runeQuantity;
+    }
+
+    public long calculateInventoryAndEquipmentValue()
+    {
+        /*
+        calculate total inventory + equipment value
+         */
+
+        return calculateInventoryValue() + calculateEquipmentValue();
+    }
+
+
+}
+
+package com.profittracker;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.ScriptPreFired;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.util.AsyncBufferedImage;
+import net.runelite.client.util.ImageUtil;
+
+import java.awt.*;
+
+import static net.runelite.api.ScriptID.XPDROPS_SETDROPSIZE;
+import static net.runelite.api.ScriptID.XPDROP_DISABLED;
+import static net.runelite.api.widgets.WidgetInfo.TO_CHILD;
+import static net.runelite.api.widgets.WidgetInfo.TO_GROUP;
+
+@Slf4j
+public class ProfitTrackerGoldDrops {
+    /*
+       Implement gold drops.
+       We do this by using the XPDrop mechanism, namely the Fake XPDrop script,
+       which is intended to generate xp drops for maxed out skills.
+       Fake XP Drops are composed of a skill sprite,
+        and a text widget with a mod icon (<img=11> in text)
+       So to create a gold drop, we create a fake xp drop, and interefere in the middle,
+       and change the sprite and text to our liking.
+
+       Flow is:
+
+       1. create xp drop using runScript (see requestGoldDrop)
+       2. getting in the middle of the drop, changing icon and text (see handleXpDrop)
+
+       A more correct way to do this is probably by calling Item.GetImage with wanted
+       coin quantity, which will give us correct coin icon and correct text,
+       and simply drawing that image ourselfs somehow. Instead of using xp drop mechanism.
+     */
+
+    /*
+    Free sprite id for the gold icons.
+     */
+    private static final int COINS_SPRITE_ID = -1337;
+
+    // Skill ordinal to send in the fake xp drop script.
+    // doesn't matter which skill expect it's better not be attack/defense/magic to avoid collision with
+    // XpDropPlugin which looks for those and might change text color
+    private static final int XPDROP_SKILL = Skill.FISHING.ordinal();
+
+    // Value to send in the fake xp drop script. Doesn't matter at all
+    // since we don't use this value, but we use currentGoldDropValue
+    private static final int XPDROP_VALUE = 6;
+
+    /*
+    Singletons which will be provided at creation by the plugin
+     */
+    private final ItemManager itemManager;
+    private final Client client;
+
+    /* var currentGoldDropValue will have
+    the gold value of the current ongoing gold drop. 2 purposes:
+      1. to know the value later when we actually use it,
+      2. to know to catch the next fake xpdrop in onScriptPreFired
+    */
+    private long currentGoldDropValue;
+
+    ProfitTrackerGoldDrops(Client client, ItemManager itemManager)
+    {
+        this.client = client;
+        this.itemManager = itemManager;
+
+        prepareCoinSprite();
+
+        currentGoldDropValue = 0L;
+
+    }
+
+    public void onScriptPreFired(ScriptPreFired scriptPreFired)
+    {
+        /*
+        We check for scripts of type XPDROPS_SETDROPSIZE to interfere with the XPdrop
+        and write our own values
+         */
+
+        // is this current script type?
+        if (scriptPreFired.getScriptId() != XPDROPS_SETDROPSIZE)
+        {
+            return;
+        }
+
+        // Get xpdrop widget id using the stack
+        // taken from XpDropPlugin!
+
+        // This runs prior to the proc being invoked, so the arguments are still on the stack.
+        // Grab the first argument to the script.
+        final int[] intStack = client.getIntStack();
+        final int intStackSize = client.getIntStackSize();
+
+        final int widgetId = intStack[intStackSize - 4];
+
+        // extract information from currentGoldDropValue
+        boolean isThisGoldDrop =   (currentGoldDropValue != 0);
+        long     goldDropValue =     currentGoldDropValue;
+
+        // done with this gold drop anyway
+        currentGoldDropValue = 0;
+
+        handleXpDrop(widgetId, isThisGoldDrop, goldDropValue);
+
+    }
+
+    private void handleXpDrop(int xpDropWidgetId, boolean isThisGoldDrop, long goldDropValue)
+    {
+        final Widget xpDropWidget;
+        final Widget dropTextWidget;
+
+        Widget[] xpDropWidgetChildren;
+
+        // get widget from ID
+        xpDropWidget = client.getWidget(TO_GROUP(xpDropWidgetId), TO_CHILD(xpDropWidgetId));
+
+        if (xpDropWidget == null)
+        {
+            log.error("xpDropWidget was null");
+            return;
+        }
+
+        xpDropWidgetChildren = xpDropWidget.getChildren();
+
+        if (xpDropWidgetChildren.length < 1)
+        {
+            log.error(String.format("Unexpected xpDropWidgets length! %d", xpDropWidgetChildren.length));
+            return;
+        }
+
+        dropTextWidget = xpDropWidgetChildren[0];
+
+        if (isThisGoldDrop)
+        {
+            final Widget dropSpriteWidget;
+
+            if (xpDropWidgetChildren.length < 2)
+            {
+                log.error(String.format(
+                        "Unexpected xpDropWidgetChildren length for a gold drop! length! %d",
+                        xpDropWidgetChildren.length));
+                return;
+            }
+
+            dropSpriteWidget = xpDropWidgetChildren[1];
+
+            xpDropToGoldDrop(dropTextWidget, dropSpriteWidget, goldDropValue);
+        }
+        else
+        {
+            // reset text color for all regular xpdrops
+            resetXpDropTextColor(dropTextWidget);
+        }
+
+
+    }
+    private void xpDropToGoldDrop(Widget dropTextWidget, Widget dropSpriteWidget, long goldDropValue)
+    {
+        /*
+        Change xpdrop icon and text, to make a gold drop
+         */
+
+
+        dropTextWidget.setText(formatGoldDropText(goldDropValue));
+
+        if (goldDropValue > 0)
+        {
+            // green text for profit
+            dropTextWidget.setTextColor(Color.GREEN.getRGB());
+        }
+        else
+        {
+            // red for loss
+            dropTextWidget.setTextColor(Color.RED.getRGB());
+        }
+
+        // change skill sprite to coin sprite
+        dropSpriteWidget.setSpriteId(COINS_SPRITE_ID);
+
+    }
+
+    private void prepareCoinSprite()
+    {
+        /*
+        Prepare coin sprites for use in the gold drops.
+        It seems item icons are not available as sprites with id,
+        so we convert in this function.
+
+        */
+
+        AsyncBufferedImage coin_image_raw;
+
+        // get image object by coin item id
+        coin_image_raw = itemManager.getImage(ItemID.COINS_995, 10000, false);
+
+        // since getImage returns an AsyncBufferedImage, which is not loaded initially,
+        // we schedule sprite conversion and sprite override for when the image is actually loaded
+        coin_image_raw.onLoaded(() -> {
+            final SpritePixels coin_sprite;
+
+            // convert image to sprite
+            coin_sprite = ImageUtil.getImageSpritePixels(coin_image_raw, client);
+
+            // register new coin sprite by overriding a free sprite id
+            client.getSpriteOverrides().put(COINS_SPRITE_ID, coin_sprite);
+        });
+
+    }
+
+    public void requestGoldDrop(long amount)
+    {
+        /*
+        We create gold drops by faking a fake xp drop :)
+         */
+
+        log.debug(String.format("goldDrop: %d", amount));
+
+        // save the value and mark an ongoing gold drop
+        currentGoldDropValue = amount;
+
+        // Create a fake xp drop. the 2 last arguments don't matter:
+        // 1. skill ordinal - we will replace the icon anyway
+        // 2. value - since we want to be able to pass negative numbers, we pass the value using
+        // currentGoldDropValue instead of this argument
+
+        client.runScript(XPDROP_DISABLED, XPDROP_SKILL, XPDROP_VALUE);
+
+    }
+
+    private void resetXpDropTextColor(Widget xpDropTextWidget)
+    {
+        // taken from XpDropPlugin
+        EnumComposition colorEnum = client.getEnum(EnumID.XPDROP_COLORS);
+        int defaultColorId = client.getVarbitValue(Varbits.EXPERIENCE_DROP_COLOR);
+        int color = colorEnum.getIntValue(defaultColorId);
+        xpDropTextWidget.setTextColor(color);
+    }
+
+    private String formatGoldDropText(long goldDropValue)
+    {
+        // format gold value runescape style
+        // up to 10,000K
+        // I.E: 100,000 -> 100K
+
+        if (Math.abs(goldDropValue) < 10000L)
+        {
+            return Long.toString(goldDropValue);
+        }
+        else if (Math.abs(goldDropValue) < 1000L * 1000L)
+        {
+            return (goldDropValue / 1000) + "K";
+        }
+        else
+        {
+            return "ALOT";
+        }
+
+    }
+}
+
+package com.profittracker;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.*;
+
+import java.text.DecimalFormat;
+/**
+ * The ProfitTrackerOverlay class is used to display profit values for the user
+ */
+public class ProfitTrackerOverlay extends Overlay {
+    private long profitValue;
+    private long startTimeMillies;
+    private boolean inProfitTrackSession;
+
+    private final ProfitTrackerConfig ptConfig;
+    private final PanelComponent panelComponent = new PanelComponent();
+
+    public static String FormatIntegerWithCommas(long value) {
+        DecimalFormat df = new DecimalFormat("###,###,###");
+        return df.format(value);
+    }
+    @Inject
+    private ProfitTrackerOverlay(ProfitTrackerConfig config)
+    {
+        setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
+        profitValue = 0L;
+        ptConfig = config;
+        startTimeMillies = 0;
+        inProfitTrackSession = false;
+    }
+
+    /**
+     * Render the item value overlay.
+     * @param graphics the 2D graphics
+     * @return the value of {@link PanelComponent#render(Graphics2D)} from this panel implementation.
+     */
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        String titleText = "Profit Tracker:";
+        long secondsElapsed;
+        long profitRateValue;
+
+        if (startTimeMillies > 0)
+        {
+            secondsElapsed = (System.currentTimeMillis() - startTimeMillies) / 1000;
+        }
+        else
+        {
+            // there was never any session
+            secondsElapsed = 0;
+        }
+
+        profitRateValue = calculateProfitHourly(secondsElapsed, profitValue);
+
+        // Not sure how this can occur, but it was recommended to do so
+        panelComponent.getChildren().clear();
+
+        // Build overlay title
+        panelComponent.getChildren().add(TitleComponent.builder()
+                .text(titleText)
+                .color(Color.GREEN)
+                .build());
+
+        if (!inProfitTrackSession)
+        {
+            // not in session
+            // notify user to reset plugin in order to start
+            panelComponent.getChildren().add(TitleComponent.builder()
+                    .text("Reset plugin to start")
+                    .color(Color.RED)
+                    .build());
+
+        }
+
+        // Set the size of the overlay (width)
+        panelComponent.setPreferredSize(new Dimension(
+                graphics.getFontMetrics().stringWidth(titleText) + 40,
+                0));
+
+        // elapsed time
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("Time:")
+                .right(formatTimeIntervalFromSec(secondsElapsed))
+                .build());
+
+        // Profit
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("Profit:")
+                .right(FormatIntegerWithCommas(profitValue))
+                .build());
+
+        // Profit Rate
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left("Rate:")
+                .right(profitRateValue + "K/H")
+                .build());
+
+        return panelComponent.render(graphics);
+    }
+
+    /**
+     * Updates profit value display
+     * @param newValue the value to update the profitValue's {{@link #panelComponent}} with.
+     */
+    public void updateProfitValue(final long newValue) {
+        SwingUtilities.invokeLater(() ->
+            profitValue = newValue
+        );
+    }
+
+
+    /**
+     * Updates startTimeMillies display
+     */
+    public void updateStartTimeMillies(final long newValue) {
+        SwingUtilities.invokeLater(() ->
+                startTimeMillies = newValue
+        );
+    }
+
+    public void startSession()
+    {
+        SwingUtilities.invokeLater(() ->
+                inProfitTrackSession = true
+        );
+    }
+
+    private static String formatTimeIntervalFromSec(final long totalSecElapsed)
+    {
+        /*
+        elapsed seconds to format HH:MM:SS
+         */
+        final long sec = totalSecElapsed % 60;
+        final long min = (totalSecElapsed / 60) % 60;
+        final long hr = totalSecElapsed / 3600;
+
+        return String.format("%02d:%02d:%02d", hr, min, sec);
+    }
+
+    static long calculateProfitHourly(long secondsElapsed, long profit)
+    {
+        long averageProfitThousandForHour;
+        long averageProfitForSecond;
+
+        if (secondsElapsed > 0)
+        {
+            averageProfitForSecond = (profit) / secondsElapsed;
+        }
+        else
+        {
+            // can't divide by zero, not enough time has passed
+            averageProfitForSecond = 0;
+        }
+
+        averageProfitThousandForHour = averageProfitForSecond * 3600 / 1000;
+
+        return averageProfitThousandForHour;
+    }
+}
+
+package com.profittracker;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+/**
+ * The ProfitTrackerConfig class is used to provide user preferences to the ProfitTrackerPlugin.
+ */
+@ConfigGroup("ptconfig")
+public interface ProfitTrackerConfig extends Config
+{
+
+    @ConfigItem(
+            keyName = "goldDrops",
+            name = "Show value changes (gold drops) ",
+            description = "Show each profit increase or decrease"
+    )
+    default boolean goldDrops()
+    {
+        return true;
+    }
+}
+
+
+package com.profittracker;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+
+import net.runelite.api.events.*;
+
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.api.events.VarbitChanged;
+
+import java.util.Arrays;
+
+@Slf4j
+@PluginDescriptor(
+        name = "Profit Tracker"
+)
+public class ProfitTrackerPlugin extends Plugin
+{
+    ProfitTrackerGoldDrops goldDropsObject;
+    ProfitTrackerInventoryValue inventoryValueObject;
+
+    // the profit will be calculated against this value
+    private long prevInventoryValue;
+    private long totalProfit;
+
+    private long startTickMillis;
+
+    private boolean skipTickForProfitCalculation;
+    private boolean inventoryValueChanged;
+    private boolean inProfitTrackSession;
+    private boolean runePouchContentsChanged;
+    private int[] RUNE_POUCH_VARBITS = {
+            Varbits.RUNE_POUCH_AMOUNT1,
+            Varbits.RUNE_POUCH_AMOUNT2,
+            Varbits.RUNE_POUCH_AMOUNT3,
+            Varbits.RUNE_POUCH_AMOUNT4,
+            Varbits.RUNE_POUCH_RUNE1,
+            Varbits.RUNE_POUCH_RUNE2,
+            Varbits.RUNE_POUCH_RUNE3,
+            Varbits.RUNE_POUCH_RUNE4
+    };
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private ProfitTrackerConfig config;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private ProfitTrackerOverlay overlay;
+
+    @Override
+    protected void startUp() throws Exception
+    {
+        // Add the inventory overlay
+        overlayManager.add(overlay);
+
+        goldDropsObject = new ProfitTrackerGoldDrops(client, itemManager);
+
+        inventoryValueObject = new ProfitTrackerInventoryValue(client, itemManager);
+
+        initializeVariables();
+
+        // start tracking only if plugin was re-started mid game
+        if (client.getGameState() == GameState.LOGGED_IN)
+        {
+            startProfitTrackingSession();
+        }
+
+    }
+
+    private void initializeVariables()
+    {
+        // value here doesn't matter, will be overwritten
+        prevInventoryValue = -1;
+
+        // profit begins at 0 of course
+        totalProfit = 0;
+
+        // this will be filled with actual information in startProfitTrackingSession
+        startTickMillis = 0;
+
+        // skip profit calculation for first tick, to initialize first inventory value
+        skipTickForProfitCalculation = true;
+
+        inventoryValueChanged = false;
+
+        inProfitTrackSession = false;
+
+        runePouchContentsChanged = false;
+
+    }
+
+    private void startProfitTrackingSession()
+    {
+        /*
+        Start tracking profit from now on
+         */
+
+        initializeVariables();
+
+        // initialize timer
+        startTickMillis = System.currentTimeMillis();
+
+        overlay.updateStartTimeMillies(startTickMillis);
+
+        overlay.startSession();
+
+        inProfitTrackSession = true;
+    }
+
+    @Override
+    protected void shutDown() throws Exception
+    {
+        // Remove the inventory overlay
+        overlayManager.remove(overlay);
+
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick gameTick)
+    {
+        /*
+        Main plugin logic here
+
+        1. If inventory changed,
+            - calculate profit (inventory value difference)
+            - generate gold drop (nice animation for showing gold earn or loss)
+
+        2. Calculate profit rate and update in overlay
+
+        */
+
+        long tickProfit;
+
+        if (!inProfitTrackSession)
+        {
+            return;
+        }
+
+        if (inventoryValueChanged || runePouchContentsChanged)
+        {
+            tickProfit = calculateTickProfit();
+
+            // accumulate profit
+            totalProfit += tickProfit;
+
+            overlay.updateProfitValue(totalProfit);
+
+            // generate gold drop
+            if (config.goldDrops() && tickProfit != 0)
+            {
+                goldDropsObject.requestGoldDrop(tickProfit);
+            }
+
+            inventoryValueChanged = false;
+            runePouchContentsChanged = false;
+        }
+
+    }
+
+    private long calculateTickProfit()
+    {
+        /*
+        Calculate and return the profit for this tick
+        if skipTickForProfitCalculation is set, meaning this tick was bank / deposit
+        so return 0
+
+         */
+        long newInventoryValue;
+        long newProfit;
+
+        // calculate current inventory value
+        newInventoryValue = inventoryValueObject.calculateInventoryAndEquipmentValue();
+
+        if (!skipTickForProfitCalculation)
+        {
+            // calculate new profit
+            newProfit = newInventoryValue - prevInventoryValue;
+
+        }
+        else
+        {
+            /* first time calculation / banking / equipping */
+            log.debug("Skipping profit calculation!");
+
+            skipTickForProfitCalculation = false;
+
+            // no profit this tick
+            newProfit = 0;
+        }
+
+        // update prevInventoryValue for future calculations anyway!
+        prevInventoryValue = newInventoryValue;
+
+        return newProfit;
+    }
+
+    @Subscribe
+    public void onItemContainerChanged(ItemContainerChanged event)
+    {
+        /*
+        this event tells us when inventory has changed
+        and when banking/equipment event occured this tick
+         */
+        log.debug("onItemContainerChanged container id: " + event.getContainerId());
+
+        int containerId = event.getContainerId();
+
+        if( containerId == InventoryID.INVENTORY.getId() ||
+            containerId == InventoryID.EQUIPMENT.getId()) {
+            // inventory has changed - need calculate profit in onGameTick
+            inventoryValueChanged = true;
+
+        }
+
+        // in these events, inventory WILL be changed but we DON'T want to calculate profit!
+        if(     containerId == InventoryID.BANK.getId()) {
+            // this is a bank interaction.
+            // Don't take this into account
+            skipTickForProfitCalculation = true;
+
+        }
+
+    }
+
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged event)
+    {
+        runePouchContentsChanged = Arrays.stream(RUNE_POUCH_VARBITS).anyMatch(vb -> event.getVarbitId() == vb);
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked event) {
+        /* for ignoring deposit in deposit box */
+        log.debug(String.format("Click! ID: %d ,menuOption: %s, menuTarget: %s",
+                  event.getId(), event.getMenuOption(), event.getMenuTarget()));
+
+        if (event.getId() == ObjectID.BANK_DEPOSIT_BOX || event.getId() == ObjectID.DEPOSIT_POOL || event.getId() == ObjectID.BANK_DEPOSIT_CHEST) {
+            // we've interacted with a deposit box/pool. Don't take this tick into account for profit calculation
+            skipTickForProfitCalculation = true;
+        }
+
+
+    }
+
+    @Provides
+    ProfitTrackerConfig provideConfig(ConfigManager configManager)
+    {
+        return configManager.getConfig(ProfitTrackerConfig.class);
+    }
+
+
+    @Subscribe
+    public void onScriptPreFired(ScriptPreFired scriptPreFired)
+    {
+        goldDropsObject.onScriptPreFired(scriptPreFired);
+    }
+}
+

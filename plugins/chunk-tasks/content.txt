@@ -1,0 +1,1834 @@
+package com.chunktasks;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ChunkTasksPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ChunkTasksPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.chunktasks.services;
+
+import com.chunktasks.tasks.*;
+import com.chunktasks.types.TaskType;
+import com.chunktasks.managers.InventoryManager;
+import com.chunktasks.managers.ChunkTasksManager;
+import com.chunktasks.managers.MapManager;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.ChatMessage;
+
+import javax.inject.Inject;
+import java.util.*;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+
+@Slf4j
+public class ChunkTaskChecker {
+    @Inject private Client client;
+    @Inject private ChunkTasksManager chunkTasksManager;
+    @Inject private InventoryManager inventoryManager;
+    @Inject private MapManager mapManager;
+
+    public List<ChunkTask> checkPrayerTasks() {
+        return checkTasks(TaskType.PRAYER, (ChunkTask task) -> client.isPrayerActive(task.prayer));
+    }
+
+    public List<ChunkTask> checkXpTasks(Skill skill, int xpGained) {
+        return checkTasks(TaskType.XP, (ChunkTask task) -> {
+            MapBoundary locationRequirement = task.xpTaskConfig.getLocation();
+            MapCoordinate currentLocation = mapManager.getCurrentLocation();
+            if (locationRequirement != null && (currentLocation == null || !locationRequirement.contains(currentLocation)))
+                return false;
+            if (task.xpTaskConfig.getSkill() != skill)
+                return false;
+            return task.xpTaskConfig.getXpMin() <= xpGained && xpGained <= task.xpTaskConfig.getXpMax();
+        });
+    }
+
+    public List<ChunkTask> checkInteractionTasks(String target) {
+        return checkTasks(TaskType.INTERACTION, (ChunkTask task) -> task.targetRequirement.equalsIgnoreCase(target));
+    }
+
+    public List<ChunkTask> checkMovementTasks() {
+        MapMovement movementHistory = mapManager.getMovementHistory();
+        return checkTasks(TaskType.MOVEMENT, (ChunkTask task) -> task.movementRequirement.stream().anyMatch(movementHistory::includes));
+    }
+
+    public List<ChunkTask> checkLocationTasks() {
+        MapCoordinate coordinate = mapManager.getCurrentLocation();
+        return checkTasks(TaskType.MOVEMENT, (ChunkTask task) -> task.locationRequirement.contains(coordinate));
+    }
+
+    public List<ChunkTask> checkQuestSkillRequirementTasks(Skill changedSkill) {
+        return checkTasks(TaskType.SKILL_REQUIREMENT, (ChunkTask task) -> {
+            if (task.skills == null || !task.skills.containsKey(changedSkill))
+                return false;
+
+            boolean skillRequirementsMet = true;
+            for (Map.Entry<Skill, Integer> skillRequirement : task.skills.entrySet()) {
+                int skillLevel = client.getRealSkillLevel(skillRequirement.getKey());
+                int requiredSkillLevel = skillRequirement.getValue();
+                if (skillLevel < requiredSkillLevel) {
+                    skillRequirementsMet = false;
+                    break;
+                }
+            }
+            return skillRequirementsMet;
+        });
+    }
+
+    public List<ChunkTask> checkEquipItemIdTasks() {
+        List<Integer> equipmentItemIds = getInventoryItemIds(InventoryID.EQUIPMENT);
+        if (equipmentItemIds.isEmpty())
+            return new ArrayList<>();
+
+        return checkTasks(TaskType.EQUIP_ITEM_ID, (ChunkTask task) -> task.itemIds.stream().anyMatch(equipmentItemIds::contains));
+    }
+
+    public List<ChunkTask> checkEquipItemTasks() {
+        List<String> equipment = getInventoryItems(InventoryID.EQUIPMENT);
+        if (equipment.isEmpty())
+            return new ArrayList<>();
+
+        return checkTasks(TaskType.EQUIP_ITEM, (ChunkTask task) -> !Collections.disjoint(getPotentialTaskItems(task), equipment));
+    }
+
+    public List<ChunkTask> checkObtainItemTasks() {
+        List<String> newInventoryItems = getNewInventoryItems();
+        if (newInventoryItems == null || newInventoryItems.isEmpty())
+            return new ArrayList<>();
+
+        return checkTasks(TaskType.OBTAIN_ITEM, (ChunkTask task) -> !Collections.disjoint(getPotentialTaskItems(task), newInventoryItems));
+    }
+
+    public List<ChunkTask> checkObtainItemIdTasks() {
+        List<Integer> inventoryItemIds = getInventoryItemIds(InventoryID.INVENTORY);
+        if (inventoryItemIds.isEmpty())
+            return new ArrayList<>();
+
+        return checkTasks(TaskType.OBTAIN_ITEM_ID, (ChunkTask task) -> task.itemIds.stream().anyMatch(inventoryItemIds::contains));
+    }
+
+    public List<ChunkTask> checkChatMessageTasks(ChatMessage chatMessage) {
+        return checkTasks(TaskType.CHAT_MESSAGE, (ChunkTask task) -> {
+            if (task.chatMessageConfig.getChatMessageType() != chatMessage.getType())
+                return false;
+
+            MapBoundary locationRequirement = task.chatMessageConfig.getLocation();
+            if (locationRequirement != null && !locationRequirement.contains(mapManager.getCurrentLocation()))
+                return false;
+
+            HashMap<Skill, Integer> skillRequirements = task.chatMessageConfig.getSkills();
+            if (skillRequirements != null && !checkSkillRequirements(skillRequirements))
+                return false;
+
+            String item = task.chatMessageConfig.getItem();
+            if (item != null) {
+                String sanitizedItemName = sanitizeItemName(item);
+                List<String> inventoryItems = getInventoryItems(InventoryID.INVENTORY);
+                List<String> equippedItems = getInventoryItems(InventoryID.EQUIPMENT);
+                if (!inventoryItems.contains(sanitizedItemName) && !equippedItems.contains(sanitizedItemName))
+                    return false;
+            }
+            return chatMessage.getMessage().contains(task.chatMessageConfig.getMessage());
+        });
+    }
+
+    public List<ChunkTask> checkPlayerTasks() {
+        return checkTasks(TaskType.PLAYER, (ChunkTask task) -> false);
+    }
+
+    public List<ChunkTask> checkSkillingItemTasks() {
+        List<String> newInventoryItems = getNewInventoryItems();
+        if (newInventoryItems == null)
+            return new ArrayList<>();
+
+        return checkTasks(TaskType.SKILLING_ITEM, (ChunkTask task) -> {
+            List<String> potentialItems = getPotentialTaskItems(task);
+            boolean itemObtained = !Collections.disjoint(potentialItems, newInventoryItems);
+            if (!itemObtained)
+                return false;
+
+            return task.skills == null || checkSkillRequirements(task.skills);
+        });
+    }
+
+    public List<ChunkTask> checkFarmingPatchTasks(int varbitId, int varbitValue) {
+        return checkTasks(TaskType.FARMING_PATCH, (ChunkTask task) -> {
+           if (IntStream.of(task.farmingPatchConfig.getPatchType().getVarbits()).noneMatch(id -> id == varbitId))
+               return false;
+
+           return task.farmingPatchConfig.getVarbitRanges().stream().anyMatch(range -> range.contains(varbitValue));
+        });
+    }
+
+    private List<Integer> getInventoryItemIds(InventoryID inventoryID) {
+        final ItemContainer itemContainer = client.getItemContainer(inventoryID);
+        if (itemContainer == null)
+            return new ArrayList<>();
+
+        return Arrays.stream(itemContainer.getItems())
+                .mapToInt(Item::getId)
+                .boxed()
+                .collect(Collectors.toList());
+    }
+
+    private List<String> getInventoryItems(InventoryID inventoryID) {
+        final ItemContainer itemContainer = client.getItemContainer(inventoryID);
+        if (itemContainer == null)
+            return new ArrayList<>();
+
+        return Arrays.stream(itemContainer.getItems())
+                .map(item -> sanitizeItemName(client.getItemDefinition(item.getId()).getName()))
+                .collect(Collectors.toList());
+    }
+
+    private boolean checkSkillRequirements(HashMap<Skill, Integer> skills) {
+        for (Map.Entry<Skill, Integer> skillRequirement : skills.entrySet()) {
+            int boostedSkillLevel = client.getBoostedSkillLevel(skillRequirement.getKey());
+            int requiredSkillLevel = skillRequirement.getValue();
+            if (boostedSkillLevel < requiredSkillLevel) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private List<ChunkTask> checkTasks(TaskType taskType, Function<ChunkTask, Boolean> taskChecker) {
+        List<ChunkTask> completedTasks = new ArrayList<>();
+        List<ChunkTask> tasksToCheck = chunkTasksManager.getActiveChunkTasksByType(taskType);
+        if (tasksToCheck.isEmpty())
+            return completedTasks;
+
+        for (ChunkTask task : tasksToCheck) {
+            if (task.isCustom) {
+                if (checkCustomTask(task.name))
+                    completedTasks.add(task);
+                continue;
+            }
+
+            if (taskChecker.apply(task))
+                completedTasks.add(task);
+        }
+        return completedTasks;
+    }
+
+    private List<String> getNewInventoryItems() {
+        List<String> inventoryItems = inventoryManager.getInventory();
+        List<String> previousItems = inventoryManager.getPreviousInventory();
+
+        if (inventoryItems == null || previousItems == null) {
+            return new ArrayList<>();
+        }
+        return inventoryItems.stream()
+                .filter(i -> !previousItems.contains(i))
+                .map(this::sanitizeItemName)
+                .collect(Collectors.toList());
+    }
+
+    private List<String> getPotentialTaskItems(ChunkTask task) {
+        List<String> potentialItems = new ArrayList<>();
+        if (task.output != null) {
+            potentialItems.add(sanitizeItemName(task.output));
+        }
+
+        int startIndex = task.name.indexOf("~|");
+        int endIndex = task.name.indexOf("|~");
+        if (startIndex >= 0 && endIndex >= 0) {
+            potentialItems.add(sanitizeItemName(task.name.substring(startIndex + 2, endIndex)));
+        }
+
+        if ((task.taskType == TaskType.OBTAIN_ITEM || task.taskType == TaskType.EQUIP_ITEM) && task.items != null) {
+            potentialItems.addAll(task.items.stream().map(this::sanitizeItemName).collect(Collectors.toList()));
+        }
+
+        return potentialItems;
+    }
+
+    private String sanitizeItemName(String itemName) {
+        return itemName
+                .toLowerCase()
+                .replace(" \\(\\d*\\)", ""); //Remove quantity at the end of item name. i.e. (3)
+    }
+
+    private boolean checkCustomTask(String taskName) {
+        switch (taskName) {
+            case "~|Dream Mentor|~ Combat skill requirement":
+                return client.getLocalPlayer().getCombatLevel() >= 85;
+            default:
+                return false;
+        }
+    }
+}
+
+package com.chunktasks.services;
+
+import com.chunktasks.ChunkTaskConstants;
+import com.chunktasks.tasks.ChunkTask;
+import com.chunktasks.managers.ChunkTasksManager;
+import com.chunktasks.panel.ChunkTasksPanel;
+import com.chunktasks.sound.Sound;
+import com.chunktasks.sound.SoundEngine;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.Varbits;
+import net.runelite.api.WidgetNode;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetModalMode;
+import net.runelite.client.callback.ClientThread;
+
+import javax.inject.Inject;
+import java.util.ArrayList;
+import java.util.List;
+
+@Slf4j
+public class ChunkTaskNotifier {
+    @Inject private Client client;
+    @Inject private ClientThread clientThread;
+    @Inject private ChunkTasksManager chunkTasksManager;
+    @Inject private ChunkTasksPanel panel;
+    @Inject private SoundEngine soundEngine;
+
+    private WidgetNode popupWidgetNode;
+    private final List<String> queuedPopups = new ArrayList<>();
+
+    public void completeTask(ChunkTask chunkTask) {
+        completeTask(chunkTask, true);
+    }
+    public void completeTask(ChunkTask chunkTask, boolean showPopup) {
+        chunkTasksManager.completeTask(chunkTask);
+        addNotificationToQueue(chunkTask.name, showPopup);
+    }
+
+    private void addNotificationToQueue(String message, boolean showPopup) {
+        String cleanMessage = message.replace("~", "").replace("|", "");
+        client.addChatMessage(ChatMessageType.PUBLICCHAT, "Chunk Tasks", "Chunk Task Complete" + ": " + cleanMessage, null);
+        if (!showPopup)
+            return;
+        queuedPopups.add(cleanMessage);
+        if (queuedPopups.size() == 1) {
+            showPopup(cleanMessage);
+        }
+    }
+
+    private void showPopup(String message) {
+        clientThread.invokeLater(() -> {
+            try {
+                int componentId = client.isResized()
+                        ? client.getVarbitValue(Varbits.SIDE_PANELS) == 1
+                        ? ChunkTaskConstants.RESIZABLE_MODERN_LAYOUT
+                        : ChunkTaskConstants.RESIZABLE_CLASSIC_LAYOUT
+                        : ChunkTaskConstants.FIXED_CLASSIC_LAYOUT;
+
+                popupWidgetNode = client.openInterface(componentId, 660, WidgetModalMode.MODAL_CLICKTHROUGH);
+                client.runScript(3343, "Chunk Task Complete", message, -1);
+
+                int gameVolume = client.getPreferences().getSoundEffectVolume();
+
+                soundEngine.playClip(Sound.CHUNK_TASK_COMPLETE, gameVolume);
+
+                clientThread.invokeLater(this::tryClearMessage);
+            } catch (IllegalStateException ex) {
+                log.debug("Failed to show popup");
+                clientThread.invokeLater(this::tryClearMessage);
+            }
+        });
+    }
+
+    private boolean tryClearMessage() {
+        Widget w = client.getWidget(660, 1);
+
+        if (w != null && w.getWidth() > 0) {
+            return false;
+        }
+
+        try {
+            client.closeInterface(popupWidgetNode, true);
+        } catch (Exception ex) {
+            log.debug("Failed to clear message");
+        }
+        popupWidgetNode = null;
+        queuedPopups.remove(0);
+
+        if (!queuedPopups.isEmpty()) {
+            clientThread.invokeLater(() -> {
+                showPopup(queuedPopups.get(0));
+                return true;
+            });
+        }
+        return true;
+    }
+}
+
+package com.chunktasks.types;
+
+public enum TaskGroup {
+    SKILL ("Skill"),
+    BIS ("Best in Slot"),
+    QUEST ("Quest"),
+    DIARY ("Diary"),
+    OTHER ("Other");
+
+    private final String displayText;
+    TaskGroup(String displayText) {
+        this.displayText = displayText;
+    }
+
+    public String displayText() {
+        return this.displayText;
+    }
+}
+
+package com.chunktasks.types;
+
+import lombok.Getter;
+import net.runelite.api.Varbits;
+
+@Getter
+public enum PatchType {
+    ALLOTMENT(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_4772,
+            Varbits.FARMING_4773,
+            Varbits.FARMING_4774
+    ),
+    TREE(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_7905
+    ),
+    FRUIT_TREE(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_4772,
+            Varbits.FARMING_7909
+    ),
+    HARDWOOD_TREE(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_4772,
+            Varbits.FARMING_4773
+    ),
+    REDWOOD(Varbits.FARMING_7907),
+    SPIRIT_TREE(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_4772,
+            Varbits.FARMING_7904
+    ),
+    BELLADONNA(Varbits.FARMING_4771),
+    MUSHROOM(Varbits.FARMING_4771),
+    HESPORI(Varbits.FARMING_7908),
+    HERB(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_4772,
+            Varbits.FARMING_4774,
+            Varbits.FARMING_4775
+    ),
+    FLOWER(
+            Varbits.FARMING_4773,
+            Varbits.FARMING_7906
+    ),
+    BUSH(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_4772
+    ),
+    HOPS(Varbits.FARMING_4771),
+    ANIMA(Varbits.FARMING_7911),
+    CACTUS(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_7904
+    ),
+    SEAWEED(
+            Varbits.FARMING_4771,
+            Varbits.FARMING_4772
+    ),
+    CALQUAT(Varbits.FARMING_4771),
+    CELASTRUS(Varbits.FARMING_7910),
+    GRAPES(
+            Varbits.GRAPES_4953,
+            Varbits.GRAPES_4954,
+            Varbits.GRAPES_4955,
+            Varbits.GRAPES_4956,
+            Varbits.GRAPES_4957,
+            Varbits.GRAPES_4958,
+            Varbits.GRAPES_4959,
+            Varbits.GRAPES_4960,
+            Varbits.GRAPES_4961,
+            Varbits.GRAPES_4962,
+            Varbits.GRAPES_4963,
+            Varbits.GRAPES_4964
+    ),
+    CRYSTAL_TREE(Varbits.FARMING_4775),
+    COMPOST(
+            Varbits.FARMING_4774,
+            Varbits.FARMING_4775
+    ),
+    BIG_COMPOST(Varbits.FARMING_7912);
+
+    private final int[] varbits;
+
+    PatchType(int... patchTypeVarbits) {
+        this.varbits = patchTypeVarbits;
+    }
+}
+
+package com.chunktasks.types;
+
+public enum TaskType {
+    UNKNOWN,
+    EQUIP_ITEM,
+    OBTAIN_ITEM,
+    SKILLING_ITEM,
+    SKILL_REQUIREMENT,
+    MOVEMENT,
+    LOCATION,
+    INTERACTION,
+    EQUIP_ITEM_ID,
+    CHAT_MESSAGE,
+    PLAYER,
+    OBTAIN_ITEM_ID,
+    XP,
+    PRAYER,
+    FARMING_PATCH
+}
+
+package com.chunktasks;
+
+public final class ChunkTaskConstants {
+    public static final int RESIZABLE_CLASSIC_LAYOUT = (161 << 16) | 13;
+    public static final int RESIZABLE_MODERN_LAYOUT = (164 << 16) | 13;
+    public static final int FIXED_CLASSIC_LAYOUT = 35913770;
+}
+
+package com.chunktasks.tasks;
+
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Skill;
+
+import java.util.HashMap;
+
+@Getter
+@Setter
+public class ChatMessageConfig {
+    private ChatMessageType chatMessageType;
+    private String message;
+    private MapBoundary location;
+    private HashMap<Skill, Integer> skills;
+    private String item;
+}
+
+package com.chunktasks.tasks;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter @Setter
+public class MapCoordinate {
+    private Integer x;
+    private Integer y;
+    private Integer z;
+
+    public MapCoordinate(Integer x, Integer y, Integer z) {
+        this.x = x;
+        this.y = y;
+        this.z = z;
+    }
+
+    public boolean equals(MapCoordinate mapCoordinate) {
+        return (this.x == null || mapCoordinate.getX() == null || this.x.equals(mapCoordinate.getX()))
+            && (this.y == null || mapCoordinate.getY() == null || this.y.equals(mapCoordinate.getY()))
+            && (this.z == null || mapCoordinate.getZ() == null || this.z.equals(mapCoordinate.getZ()));
+    }
+}
+
+package com.chunktasks.tasks;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+
+import java.util.ArrayList;
+
+@Slf4j
+@Getter @Setter
+public class MapMovement extends ArrayList<MapCoordinate> {
+
+    public MapMovement() {}
+
+    public boolean includes(MapMovement movementRequirement) {
+        if (movementRequirement.size() > this.size()) {
+            return false;
+        }
+
+        int coordinateCount = movementRequirement.size();
+        for (int i = 0; i < coordinateCount; i++) {
+            if (movementRequirement.get(coordinateCount - 1 - i).equals(this.get(this.size() - 1 - i))) {
+                continue;
+            }
+            return false;
+        }
+        return true;
+    }
+}
+
+package com.chunktasks.tasks;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Setter
+@Getter
+public class MapBoundary {
+    private int xMin;
+    private int xMax;
+    private int yMin;
+    private int yMax;
+    private Integer z;
+
+    public MapBoundary(int xMin, int xMax, int yMin, int yMax) {
+        this.xMin = xMin;
+        this.xMax = xMax;
+        this.yMin = yMin;
+        this.yMax = yMax;
+    }
+
+    public boolean contains(MapCoordinate coordinate) {
+        return coordinate.getX() >= xMin && coordinate.getX() <= xMax
+            && coordinate.getY() >= yMin && coordinate.getY() <= yMax
+            && (z == null || coordinate.getZ() == z.intValue());
+    }
+}
+
+package com.chunktasks.tasks;
+
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.Skill;
+
+@Getter
+@Setter
+public class XpTaskConfig {
+    private Skill skill;
+    private int xpMin;
+    private int xpMax;
+    private MapBoundary location;
+}
+
+package com.chunktasks.tasks;
+
+import com.chunktasks.types.TaskGroup;
+import com.chunktasks.types.TaskType;
+import net.runelite.api.Prayer;
+import net.runelite.api.Skill;
+
+import java.util.HashMap;
+import java.util.List;
+
+public class ChunkTask {
+    public String name;
+    public boolean isComplete;
+    public TaskGroup taskGroup;
+    public HashMap<Skill, Integer> skills;
+    public List<String> items;
+    public String output;
+    public String prefix;
+
+    public TaskType taskType = TaskType.UNKNOWN;
+    public boolean isCustom;
+
+    public List<MapMovement> movementRequirement;
+    public MapBoundary locationRequirement;
+    public String targetRequirement;
+    public List<Integer> itemIds;
+    public ChatMessageConfig chatMessageConfig;
+    public XpTaskConfig xpTaskConfig;
+    public Prayer prayer;
+    public FarmingPatchConfig farmingPatchConfig;
+
+    public String getNameWithPrefix() {
+        return (prefix != null ? prefix + " " : "") + name;
+    }
+}
+
+package com.chunktasks.tasks;
+
+import com.chunktasks.types.PatchType;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.List;
+
+@Getter
+@Setter
+public class FarmingPatchConfig {
+    private PatchType patchType;
+    private List<ValueRange> varbitRanges;
+}
+
+package com.chunktasks.tasks;
+
+import lombok.Setter;
+
+@Setter
+public class ValueRange {
+    private int min;
+    private int max;
+
+    public boolean contains(int value) {
+        return value >= this.min && value <= this.max;
+    }
+}
+
+package com.chunktasks;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("chunktasks")
+public interface ChunkTasksConfig extends Config
+{
+	String CONFIG_GROUP = "chunk-tasks";
+
+	@ConfigItem(
+			keyName = "allowChunkTasksDownload",
+			name = "Allow Chunk Picker connections",
+			description = "Allows tasks data to be pulled from Chunk Picker website",
+			position = 0,
+			warning = "This plugin submits your IP address to a 3rd party website not controlled or verified by the RuneLite Developers."
+	)
+	default boolean allowApiConnections() { return false; }
+
+	@ConfigItem(
+			keyName = "mapCode",
+			name = "Chunk Picker Map Code",
+			description = "https://source-chunk.github.io/chunk-picker-v2",
+			position = 1
+	)
+	default String mapCode() { return ""; }
+
+	@ConfigItem(
+			keyName = "notifyOnManualCheck",
+			name = "Notify on Manual Check",
+			description = "Show popups when manually marking tasks as complete",
+			position = 2
+	)
+	default boolean notifyOnManualCheck() { return true; }
+
+	@ConfigItem(
+			keyName = "showChunkTaskPrefix",
+			name = "Show Chunk Task Prefix",
+			description = "Shows reason for each task in the list",
+			position = 3
+	)
+	default boolean showChunkTaskPrefix() { return true; }
+}
+
+package com.chunktasks.panel;
+
+import com.chunktasks.*;
+import com.chunktasks.tasks.*;
+import com.chunktasks.managers.ChunkTasksManager;
+import com.chunktasks.services.ChunkTaskNotifier;
+import com.chunktasks.types.TaskGroup;
+import com.chunktasks.types.TaskType;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.reflect.TypeToken;
+import com.google.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Prayer;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.util.ImageUtil;
+import okhttp3.*;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
+import java.io.Reader;
+import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static net.runelite.http.api.RuneLiteAPI.GSON;
+
+@Slf4j
+public class ChunkTasksPanel extends PluginPanel
+{
+    @Inject private ChunkTasksConfig config;
+    @Inject private ChunkTasksManager chunkTasksManager;
+    @Inject private ChunkTaskNotifier chunkTaskNotifier;
+    @Inject private ClientThread clientThread;
+    @Inject private OkHttpClient okHttpClient;
+
+    private boolean isLoggedIn;
+    private JPanel tasksPanel;
+    private JPanel topPanel;
+    private JPanel topPanelButtons;
+
+    private static final ImageIcon REFRESH_ICON;
+    private static final ImageIcon REFRESH_HOVER_ICON;
+    private static final ImageIcon EYE_ICON;
+    private static final ImageIcon EYE_HOVER_ICON;
+    private static final ImageIcon EYE_SLASH_ICON;
+    private static final ImageIcon EYE_SLASH_HOVER_ICON;
+    private static final ImageIcon BROKEN_LINK_ICON;
+    private static final ImageIcon EXPANDED_ICON;
+    private static final ImageIcon EXPANDED_HOVER_ICON;
+    private static final ImageIcon COLLAPSED_ICON;
+    private static final ImageIcon COLLAPSED_HOVER_ICON;
+
+    private final List<TaskGroup> collapsedTaskGroups = new ArrayList<>();
+
+    private boolean hideCompletedTasks = false;
+
+    static
+    {
+        final BufferedImage refreshIcon = ImageUtil.loadImageResource(ChunkTasksPlugin.class, "/images/refresh_icon.png");
+        final BufferedImage eyeIcon = ImageUtil.loadImageResource(ChunkTasksPlugin.class, "/images/eye_icon.png");
+        final BufferedImage eyeSlashIcon = ImageUtil.loadImageResource(ChunkTasksPlugin.class, "/images/eye_slash_icon.png");
+        final BufferedImage brokenLinkIcon = ImageUtil.loadImageResource(ChunkTasksPlugin.class, "/images/broken_link_icon.png");
+        final BufferedImage expandedIcon = ImageUtil.loadImageResource(ChunkTasksPlugin.class, "/images/expanded_icon.png");
+        final BufferedImage collapsedIcon = ImageUtil.loadImageResource(ChunkTasksPlugin.class, "/images/collapsed_icon.png");
+        REFRESH_ICON = new ImageIcon(refreshIcon);
+        REFRESH_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(refreshIcon, 0.53f));
+        EYE_ICON = new ImageIcon(eyeIcon);
+        EYE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(eyeIcon, 0.53f));
+        EYE_SLASH_ICON = new ImageIcon(eyeSlashIcon);
+        EYE_SLASH_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(eyeSlashIcon, 0.53f));
+        BROKEN_LINK_ICON = new ImageIcon(brokenLinkIcon);
+        EXPANDED_ICON = new ImageIcon(expandedIcon);
+        EXPANDED_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(expandedIcon, 0.53f));
+        COLLAPSED_ICON = new ImageIcon(collapsedIcon);
+        COLLAPSED_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(collapsedIcon, 0.53f));
+    }
+
+    public void init(boolean isLoggedIn) {
+        this.isLoggedIn = isLoggedIn;
+        setLayout(new BoxLayout(this, BoxLayout.PAGE_AXIS));
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+        setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        addTopPanel();
+        addTasksPanel();
+
+        redrawChunkTasks();
+    }
+
+    public void setLoggedIn(boolean isLoggedIn) {
+        if (this.isLoggedIn == isLoggedIn) {
+            return;
+        }
+
+        this.isLoggedIn = isLoggedIn;
+        if (this.isLoggedIn) {
+            topPanel.add(topPanelButtons, BorderLayout.EAST);
+        } else {
+            topPanel.remove(topPanelButtons);
+        }
+        redrawChunkTasks();
+    }
+
+    private void addTopPanel() {
+        topPanel = new JPanel();
+        topPanel.setLayout(new BorderLayout());
+        topPanel.setBorder(new EmptyBorder(0,0,5,0));
+
+        JLabel titleLabel = new JLabel("Chunk Tasks");
+        titleLabel.setForeground(Color.WHITE);
+
+        topPanelButtons = new JPanel();
+        topPanelButtons.setLayout(new BoxLayout(topPanelButtons, BoxLayout.LINE_AXIS));
+        topPanelButtons.add(getShowHideButton());
+        topPanelButtons.add(getRefreshButton());
+
+        topPanel.add(titleLabel, BorderLayout.WEST);
+        if (isLoggedIn) {
+            topPanel.add(topPanelButtons, BorderLayout.EAST);
+        }
+
+        add(topPanel);
+    }
+
+    private JLabel getShowHideButton() {
+        JLabel showHideButton = new JLabel(EYE_ICON);
+        showHideButton.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    hideCompletedTasks = !hideCompletedTasks;
+                    showHideButton.setIcon(hideCompletedTasks ? EYE_SLASH_ICON : EYE_ICON);
+                    redrawChunkTasks();
+                }
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                showHideButton.setIcon(hideCompletedTasks ? EYE_SLASH_HOVER_ICON : EYE_HOVER_ICON);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e) {
+                showHideButton.setIcon(hideCompletedTasks ? EYE_SLASH_ICON : EYE_ICON);
+            }
+        });
+        return showHideButton;
+    }
+
+    private JLabel getRefreshButton() {
+        JLabel refreshButton = new JLabel(REFRESH_ICON);
+        refreshButton.setToolTipText("Import chunk tasks from Chunk Picker");
+        refreshButton.setBorder(new EmptyBorder(0,5,0,0));
+        refreshButton.addMouseListener(new MouseAdapter()
+        {
+            @Override
+            public void mousePressed(MouseEvent e) {
+                if (SwingUtilities.isLeftMouseButton(e)) {
+                    importChunkTasks();
+                }
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                refreshButton.setIcon(REFRESH_HOVER_ICON);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e) {
+                refreshButton.setIcon(REFRESH_ICON);
+            }
+        });
+        return refreshButton;
+    }
+
+    private void addTasksPanel() {
+        tasksPanel = new JPanel();
+        tasksPanel.setLayout(new BoxLayout(tasksPanel, BoxLayout.PAGE_AXIS));
+        tasksPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        add(tasksPanel);
+    }
+
+    public void redrawChunkTasks() {
+        List<ChunkTask> chunkTasks = chunkTasksManager.getChunkTasks();
+        tasksPanel.removeAll();
+
+        if (!isLoggedIn || chunkTasks == null || chunkTasks.isEmpty()) {
+            tasksPanel.add(getGeneralInfoPanel());
+        } else {
+            for (TaskGroup taskGroup : TaskGroup.values()) {
+                List<ChunkTask> taskGroupTasks = chunkTasks.stream()
+                        .filter(t -> t.taskGroup == taskGroup)
+                        .collect(Collectors.toList());
+                if (!taskGroupTasks.isEmpty()) {
+                    tasksPanel.add(getTaskGroupPanel(taskGroup, taskGroupTasks));
+                }
+            }
+        }
+
+        revalidate();
+        repaint();
+    }
+
+    private JPanel getGeneralInfoPanel() {
+        JPanel panel = new JPanel();
+        JLabel label = new JLabel("<html>Log in and enter map code in plugin"
+                + "<br/>config to load Chunk Tasks"
+                + "<br/><br/>Please submit any issues here:"
+                + "<br/>github.com/nathanreidok/chunk-tasks"
+                + "<br/><br/>For general questions, message me:"
+                + "<br/>-> In game (FortisChunk)"
+                + "<br/>-> On discord (@FortisChunk)</html>");
+        panel.add(label);
+        return panel;
+    }
+
+    private JPanel getTaskGroupPanel(TaskGroup taskGroup, List<ChunkTask> chunkTasks) {
+        JPanel taskGroupPanel = new JPanel();
+        taskGroupPanel.setLayout(new BoxLayout(taskGroupPanel, BoxLayout.PAGE_AXIS));
+        taskGroupPanel.setBorder((new EmptyBorder(10,10,10,10)));
+        taskGroupPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        taskGroupPanel.add(getTaskGroupHeader(taskGroup, chunkTasks));
+        if (!collapsedTaskGroups.contains(taskGroup)) {
+            for (ChunkTask task : chunkTasks) {
+                if (!hideCompletedTasks || !task.isComplete) {
+                    taskGroupPanel.add(getTaskPanel(task));
+                }
+            }
+        }
+
+        return taskGroupPanel;
+    }
+
+    private JPanel getTaskGroupHeader(TaskGroup taskGroup, List<ChunkTask> chunkTasks) {
+        String taskGroupText = taskGroup.displayText() + " Tasks (" + chunkTasks.stream().filter(x -> x.isComplete).count() + "/" + chunkTasks.size() + ")";
+        JLabel taskGroupLabel = new JLabel(taskGroupText);
+        taskGroupLabel.setForeground(Color.WHITE);
+        taskGroupLabel.setBorder(new EmptyBorder(0,5,0,0));
+
+        JPanel taskGroupHeaderContent = new JPanel();
+        taskGroupHeaderContent.setLayout(new BoxLayout(taskGroupHeaderContent, BoxLayout.LINE_AXIS));
+        taskGroupHeaderContent.setForeground(Color.WHITE);
+        taskGroupHeaderContent.add(getExpandCollapseButton(taskGroup));
+        taskGroupHeaderContent.add(taskGroupLabel);
+
+        JPanel taskGroupHeaderPanel = new JPanel();
+        taskGroupHeaderPanel.setLayout(new BorderLayout());
+        taskGroupHeaderPanel.add(taskGroupHeaderContent, BorderLayout.WEST);
+        taskGroupHeaderPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        return taskGroupHeaderPanel;
+    }
+
+    private JLabel getExpandCollapseButton(TaskGroup taskGroup) {
+        JLabel expandCollapseButton = new JLabel(collapsedTaskGroups.contains(taskGroup) ? COLLAPSED_ICON : EXPANDED_ICON);
+        expandCollapseButton.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent e)
+            {
+                if (SwingUtilities.isLeftMouseButton(e))
+                {
+                    if (collapsedTaskGroups.contains(taskGroup)) {
+                        collapsedTaskGroups.remove(taskGroup);
+                    } else {
+                        collapsedTaskGroups.add(taskGroup);
+                    }
+                    redrawChunkTasks();
+                }
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent e)
+            {
+                expandCollapseButton.setIcon(collapsedTaskGroups.contains(taskGroup) ? COLLAPSED_HOVER_ICON : EXPANDED_HOVER_ICON);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent e)
+            {
+                expandCollapseButton.setIcon(collapsedTaskGroups.contains(taskGroup) ? COLLAPSED_ICON : EXPANDED_ICON);
+            }
+        });
+        return expandCollapseButton;
+    }
+
+    private JPanel getTaskPanel(ChunkTask chunkTask) {
+
+        String taskName = config.showChunkTaskPrefix() ? chunkTask.getNameWithPrefix() : chunkTask.name;
+        JCheckBox checkBox = new JCheckBox();
+        checkBox.setLayout(new BorderLayout());
+        checkBox.setText(getTaskNameHtml(taskName, chunkTask.isComplete));
+        checkBox.setSelected(chunkTask.isComplete);
+        checkBox.addActionListener(e -> {
+            JCheckBox cb = (JCheckBox)e.getSource();
+            if (cb.isSelected()) {
+                cb.setText(getTaskNameHtml(taskName, true));
+                clientThread.invokeLater(() -> {
+                    chunkTaskNotifier.completeTask(chunkTask, config.notifyOnManualCheck());
+                    redrawChunkTasks();
+                });
+            } else {
+                cb.setText(getTaskNameHtml(taskName, false));
+                chunkTasksManager.uncompleteTask(chunkTask);
+                redrawChunkTasks();
+            }
+        });
+
+        JPanel taskPanel = new JPanel();
+        taskPanel.setLayout(new BoxLayout(taskPanel, BoxLayout.LINE_AXIS));
+        taskPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        taskPanel.add(checkBox);
+
+        if (chunkTask.taskType == TaskType.UNKNOWN) {
+            JLabel brokenLinkLabel = new JLabel(BROKEN_LINK_ICON);
+            brokenLinkLabel.setToolTipText("Auto-detection of this chunk task is not available");
+            taskPanel.add(brokenLinkLabel);
+        }
+
+        return taskPanel;
+    }
+
+    private String getTaskNameHtml(String taskName, boolean isComplete) {
+        String sanitizedTaskName = taskName
+                .replace("~", "")
+                .replace("|", "");
+        return isComplete
+                ? "<html><strike>" + sanitizedTaskName + "</strike></html>"
+                : "<html>" + sanitizedTaskName + "</html>";
+    }
+
+    public void importChunkTasks() {
+        if (!config.allowApiConnections()) {
+            JOptionPane.showMessageDialog(this,
+                "Please enable Chunk Picker website connections in the plugin config",
+                "API Requests not Authorized",
+                JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+        String mapCode = config.mapCode();
+
+        if (mapCode == null || mapCode.isBlank()) {
+            JOptionPane.showMessageDialog(this,
+                    "Please enter you Chunk Picker map code in the plugin config",
+                    "Missing Map Code",
+                    JOptionPane.ERROR_MESSAGE);
+            return;
+        }
+
+        String url = "https://chunkpicker.firebaseio.com/maps/" + mapCode.toLowerCase() + "/pluginOutput.json";
+
+        Request r = new Request.Builder()
+                .url(url)
+                .build();
+        okHttpClient.newCall(r).enqueue(new Callback()
+        {
+            @Override
+            public void onFailure( Call call,  IOException e) {
+                log.debug("Error retrieving chunk tasks", e);
+            }
+
+            @Override
+            public void onResponse( Call call,  Response response) {
+                if (response.isSuccessful()) {
+                    try {
+                        Type type = new TypeToken<ArrayList<ChunkTask>>() {}.getType();
+                        ResponseBody body = response.body();
+                        String tasksJson = body == null ? "" : body.string();
+                        if (tasksJson.equals("null") || tasksJson.isEmpty()) {
+                            promptUserToRefreshChunkPicker();
+                            return;
+                        }
+
+                        List<ChunkTask> chunkTasks = GSON.fromJson(tasksJson, type);
+                        matchTaskType(chunkTasks);
+                        chunkTasksManager.importTasks(chunkTasks);
+                        redrawChunkTasks();
+                    }
+                    catch (IOException | JsonSyntaxException e) {
+                        log.debug(e.getMessage());
+                    }
+                }
+                else {
+                    log.debug("Get request unsuccessful");
+                }
+            }
+        });
+    }
+
+    private void promptUserToRefreshChunkPicker() {
+        JOptionPane.showMessageDialog(this,
+                "Please refresh tasks on the Chunk Picker website and try again.",
+                "Chunk Picker Refresh Needed",
+                JOptionPane.ERROR_MESSAGE);
+    }
+
+    private void matchTaskType(List<ChunkTask> chunkTasks) {
+        //Load task triggers
+        Map<String, TaskType> taskTriggers = loadFromFile("/task-triggers.json", new TypeToken<>() {});
+        //Load interaction tasks
+        Map<String, String> interactionTasks = loadFromFile("/interaction-tasks.json", new TypeToken<>() {});
+        //Load movement tasks
+        Map<String, ArrayList<MapMovement>> movementTasks = loadFromFile("/movement-tasks.json", new TypeToken<>() {});
+        //Load location tasks
+        Map<String, MapBoundary> locationTasks = loadFromFile("/location-tasks.json", new TypeToken<>() {});
+        //Obtain Item Id tasks
+        Map<String, ArrayList<Integer>> obtainIdTasks = loadFromFile("/obtain-id-tasks.json", new TypeToken<>() {});
+        //Equip Item Id tasks
+        Map<String, ArrayList<Integer>> equipIdTasks = loadFromFile("/equip-id-tasks.json", new TypeToken<>() {});
+        //Chat message tasks
+        Map<String, ChatMessageConfig> chatMessageTasks = loadFromFile("/chat-message-tasks.json", new TypeToken<>() {});
+        //Xp tasks
+        Map<String, XpTaskConfig> xpTasks = loadFromFile("/xp-tasks.json", new TypeToken<>() {});
+        //Prayer tasks
+        Map<String, Prayer> prayerTasks = loadFromFile("/prayer-tasks.json", new TypeToken<>() {});
+        //Farming Patch tasks
+        Map<String, FarmingPatchConfig> farmingPatchTasks = loadFromFile("/farming-patch-tasks.json", new TypeToken<>() {});
+        //Custom requirement tasks
+        Map<String, TaskType> customTasks = loadFromFile("/custom-tasks.json", new TypeToken<>() {});
+        //Set task types
+        for (ChunkTask chunkTask : chunkTasks) {
+            if (interactionTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.INTERACTION;
+                chunkTask.targetRequirement = interactionTasks.get(chunkTask.name);
+                continue;
+            }
+
+            if (movementTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.MOVEMENT;
+                chunkTask.movementRequirement = movementTasks.get(chunkTask.name);
+                continue;
+            }
+
+            if (locationTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.LOCATION;
+                chunkTask.locationRequirement = locationTasks.get(chunkTask.name);
+                continue;
+            }
+
+            if (obtainIdTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.OBTAIN_ITEM_ID;
+                chunkTask.itemIds = obtainIdTasks.get(chunkTask.name);
+                continue;
+            }
+
+            if (equipIdTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.EQUIP_ITEM_ID;
+                chunkTask.itemIds = equipIdTasks.get(chunkTask.name);
+                continue;
+            }
+
+            if (chatMessageTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.CHAT_MESSAGE;
+                chunkTask.chatMessageConfig = chatMessageTasks.get(chunkTask.name);
+                continue;
+            }
+
+            if (xpTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.XP;
+                chunkTask.xpTaskConfig = xpTasks.get(chunkTask.name);
+                continue;
+            }
+
+            if (prayerTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.PRAYER;
+                chunkTask.prayer = prayerTasks.get(chunkTask.name);
+            }
+
+            if (farmingPatchTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = TaskType.FARMING_PATCH;
+                chunkTask.farmingPatchConfig = farmingPatchTasks.get(chunkTask.name);
+            }
+
+            if (customTasks.containsKey(chunkTask.name)) {
+                chunkTask.taskType = customTasks.get(chunkTask.name);
+                chunkTask.isCustom = true;
+                continue;
+            }
+
+            for (Map.Entry<String, TaskType> entry : taskTriggers.entrySet()) {
+                if (Pattern.matches(entry.getKey(), chunkTask.name)) {
+                    chunkTask.taskType = entry.getValue();
+                    break;
+                }
+            }
+        }
+    }
+
+    private <T> T loadFromFile(String resourceName, TypeToken<T> tokenType) {
+        InputStream stream = ChunkTasksPanel.class.getResourceAsStream(resourceName);
+        Reader reader = new InputStreamReader(stream, StandardCharsets.UTF_8);
+        return GSON.fromJson(reader, tokenType.getType());
+    }
+}
+
+package com.chunktasks.sound;
+
+public enum Sound {
+    CHUNK_TASK_COMPLETE("task_completion_jingle.wav");
+
+    private final String resourceName;
+
+    Sound(String resNam) {
+        resourceName = resNam;
+    }
+
+    String getResourceName() {
+        return resourceName;
+    }
+}
+
+package com.chunktasks.sound;
+
+import com.chunktasks.ChunkTasksConfig;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.sound.sampled.*;
+import java.io.BufferedInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+
+@Singleton
+@Slf4j
+public class SoundEngine {
+    @Inject
+    private ChunkTasksConfig config;
+
+    private static final long CLIP_MTIME_UNLOADED = -2;
+
+    private long lastClipMTime = CLIP_MTIME_UNLOADED;
+    private Clip clip = null;
+
+    private boolean loadClip(Sound sound) {
+        try (InputStream stream = new BufferedInputStream(SoundFileManager.getSoundStream(sound))) {
+            try (AudioInputStream audioInputStream = AudioSystem.getAudioInputStream(stream)) {
+                clip.open(audioInputStream); // liable to error with pulseaudio, works on windows, one user informs me mac works
+            }
+            return true;
+        } catch (UnsupportedAudioFileException | IOException | LineUnavailableException e) {
+            log.warn("Failed to load Chunk Tasks sound " + sound, e);
+        }
+        return false;
+    }
+
+    public void playClip(Sound sound, int gameVolume) {
+        long currentMTime = System.currentTimeMillis();
+        if (clip == null || currentMTime != lastClipMTime || !clip.isOpen()) {
+            if (clip != null && clip.isOpen()) {
+                clip.close();
+            }
+
+            try {
+                clip = AudioSystem.getClip();
+            } catch (LineUnavailableException e) {
+                lastClipMTime = CLIP_MTIME_UNLOADED;
+                log.warn("Failed to get clip for Chunk Tasks sound " + sound, e);
+                return;
+            }
+
+            lastClipMTime = currentMTime;
+            if (!loadClip(sound)) {
+                return;
+            }
+        }
+
+        // User configurable volume
+        FloatControl volume = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
+        float gain = 20f * (float) Math.log10(gameVolume / 100f);
+        gain = Math.min(gain, volume.getMaximum());
+        gain = Math.max(gain, volume.getMinimum());
+
+        volume.setValue(gain);
+
+        // From RuneLite base client Notifier class:
+        // Using loop instead of start + setFramePosition prevents the clip
+        // from not being played sometimes, presumably a race condition in the
+        // underlying line driver
+        clip.loop(0);
+    }
+}
+
+package com.chunktasks.sound;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+@Slf4j
+public abstract class SoundFileManager {
+
+    private static final File DOWNLOAD_DIR = new File(RuneLite.RUNELITE_DIR.getPath() + File.separator + "chunk-tasks-sounds");
+    private static final String DELETE_WARNING_FILENAME = "EXTRA_FILES_WILL_BE_DELETED_BUT_FOLDERS_WILL_REMAIN";
+    private static final File DELETE_WARNING_FILE = new File(DOWNLOAD_DIR, DELETE_WARNING_FILENAME);
+    private static final HttpUrl RAW_GITHUB = HttpUrl.parse("https://raw.githubusercontent.com/nathanreidok/resources/main/chunk-tasks");
+
+    @SuppressWarnings("ResultOfMethodCallIgnored")
+    public static void ensureDownloadDirectoryExists() {
+        if (!DOWNLOAD_DIR.exists()) {
+            DOWNLOAD_DIR.mkdirs();
+        }
+        try {
+            DELETE_WARNING_FILE.createNewFile();
+        } catch (IOException ignored) { }
+    }
+
+    public static void downloadAllMissingSounds(final OkHttpClient okHttpClient) {
+        File[] downloadDirFiles = DOWNLOAD_DIR.listFiles();
+
+        // Get set of existing files in our dir - existing sounds will be skipped, unexpected files (not dirs) will be deleted
+        Set<String> filesPresent = new HashSet<>();
+        if (downloadDirFiles != null && downloadDirFiles.length > 0) {
+            Arrays.stream(downloadDirFiles)
+                    .filter(file -> !file.isDirectory())
+                    .map(File::getName)
+                    .filter(filename -> !DELETE_WARNING_FILENAME.equals(filename))
+                    .forEach(filesPresent::add);
+        }
+
+        // Download any sounds that are not yet present but exist in Sound enum
+        Sound[] allSounds = Sound.values();
+        for (Sound sound : allSounds) {
+            String fileName = sound.getResourceName();
+            if (filesPresent.contains(fileName)) {
+                filesPresent.remove(fileName);
+                continue;
+            }
+
+            if (RAW_GITHUB == null) {
+                // Hush intellij, it's okay, the potential NPE can't hurt you now
+                log.debug("Chunk Tasks could not download sounds due to an unexpected null RAW_GITHUB value");
+                return;
+            }
+            HttpUrl soundUrl = RAW_GITHUB.newBuilder().addPathSegment(fileName).build();
+            Path outputPath = Paths.get(DOWNLOAD_DIR.getPath(), fileName);
+            try (Response res = okHttpClient.newCall(new Request.Builder().url(soundUrl).build()).execute()) {
+                if (res.body() != null)
+                    Files.copy(new BufferedInputStream(res.body().byteStream()), outputPath, StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                log.debug("Chunk Tasks could not download sounds", e);
+                return;
+            }
+        }
+
+        // filesPresent now contains only files in our directory that we weren't expecting
+        // (e.g. old versions of sounds)
+        // We now delete them to avoid cluttering up disk space
+        // We leave dirs behind (filesPresent filters them out early on) as we aren't creating those anyway, so they won't build up over time
+        for (String filename : filesPresent) {
+            File toDelete = new File(DOWNLOAD_DIR, filename);
+            //noinspection ResultOfMethodCallIgnored
+            toDelete.delete();
+        }
+    }
+
+    public static InputStream getSoundStream(Sound sound) throws FileNotFoundException {
+        return new FileInputStream(new File(DOWNLOAD_DIR, sound.getResourceName()));
+    }
+}
+
+package com.chunktasks.managers;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Singleton;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
+
+@Getter
+@Singleton
+@Slf4j
+public class InventoryManager {
+    private List<String> inventory = new ArrayList<>();
+    private List<String> previousInventory = new ArrayList<>();
+
+    public void setInventory(List<String> inventory) {
+        previousInventory = this.inventory;
+        this.inventory = inventory.stream().map(String::toLowerCase).collect(Collectors.toList());
+    }
+}
+
+package com.chunktasks.managers;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Skill;
+
+import javax.inject.Singleton;
+import java.util.Arrays;
+
+@Singleton
+@Slf4j
+public class SkillManager {
+    private static final int[] skillXp = new int[Skill.values().length];
+
+    public void clearSkills() {
+        Arrays.fill(skillXp, -1);
+    }
+
+    public void resetSkills(int[] newSkillXp) {
+        System.arraycopy(newSkillXp, 0, skillXp, 0, skillXp.length);
+    }
+
+    public int updateXp(Skill skill, int xp) {
+        int currentXp = skillXp[skill.ordinal()];
+        skillXp[skill.ordinal()] = xp;
+        return currentXp == -1 ? 0 : xp - currentXp;
+    }
+}
+
+package com.chunktasks.managers;
+
+import com.chunktasks.tasks.ChunkTask;
+import com.chunktasks.types.TaskType;
+import com.google.gson.reflect.TypeToken;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.client.config.ConfigManager;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.stream.Collectors;
+
+import static com.chunktasks.ChunkTasksConfig.CONFIG_GROUP;
+import static net.runelite.http.api.RuneLiteAPI.GSON;
+
+@Singleton
+@Slf4j
+public class ChunkTasksManager {
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private ConfigManager configManager;
+
+    @Getter
+    private List<ChunkTask> chunkTasks;
+
+    public void loadChunkTasksData() {
+        chunkTasks = loadChunkTasksDataFromRLProfile();
+        if (chunkTasks == null) {
+            chunkTasks = new ArrayList<>();
+        }
+    }
+
+    public void importTasks(List<ChunkTask> tasks) {
+        chunkTasks = tasks;
+        save();
+    }
+
+    public void save() {
+        String json = GSON.toJson(chunkTasks);
+        String profileName = configManager.getProfile().getName();
+        configManager.setRSProfileConfiguration(CONFIG_GROUP, profileName, json);
+    }
+
+    public List<ChunkTask> getActiveChunkTasksByType(TaskType taskType) {
+        return chunkTasks.stream().filter(t -> !t.isComplete && t.taskType == taskType).collect(Collectors.toList());
+    }
+
+    public void completeTask(ChunkTask task) {
+        task.isComplete = true;
+        this.save();
+    }
+
+    public void uncompleteTask(ChunkTask task) {
+        task.isComplete = false;
+        this.save();
+    }
+
+    private ArrayList<ChunkTask> loadChunkTasksDataFromRLProfile() {
+        String profileName = configManager.getProfile().getName();
+        String chunkTasksDataJson = configManager.getRSProfileConfiguration(CONFIG_GROUP, profileName, String.class);
+        if (chunkTasksDataJson == null) {
+            return null;
+        }
+        try {
+            return GSON.fromJson(chunkTasksDataJson, new TypeToken<ArrayList<ChunkTask>>() {}.getType());
+        } catch (Exception e) {
+            log.debug(e.getMessage());
+        }
+        return null;
+    }
+}
+
+package com.chunktasks.managers;
+
+import com.chunktasks.tasks.MapCoordinate;
+import com.chunktasks.tasks.MapMovement;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Singleton;
+
+@Singleton
+@Slf4j
+@Getter
+public class MapManager {
+    private final MapMovement movementHistory = new MapMovement();
+
+    public boolean addCoordinateToHistory(int x, int y, int z) {
+        MapCoordinate coordinate = new MapCoordinate(x, y, z);
+        if (!movementHistory.isEmpty() && getCurrentLocation().equals(coordinate)) {
+            return false;
+        }
+        movementHistory.add(coordinate);
+
+        log.debug(coordinate.getX() + "-" + coordinate.getY() + "-" + coordinate.getZ());
+
+        if (movementHistory.size() > 10) {
+            movementHistory.remove(0);
+        }
+        return true;
+    }
+
+    public MapCoordinate getCurrentLocation() {
+        if (movementHistory.isEmpty()) {
+            return null;
+        }
+        return movementHistory.get(movementHistory.size() - 1);
+    }
+}
+
+package com.chunktasks;
+
+import com.chunktasks.managers.InventoryManager;
+import com.chunktasks.managers.SkillManager;
+import com.chunktasks.tasks.ChunkTask;
+import com.chunktasks.managers.ChunkTasksManager;
+import com.chunktasks.managers.MapManager;
+import com.chunktasks.panel.ChunkTasksPanel;
+import com.chunktasks.services.ChunkTaskChecker;
+import com.chunktasks.services.ChunkTaskNotifier;
+import com.chunktasks.sound.SoundFileManager;
+import com.google.inject.Provides;
+
+import java.awt.image.BufferedImage;
+import java.util.*;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+import javax.inject.Inject;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.ProfileChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.util.ImageUtil;
+import okhttp3.OkHttpClient;
+
+@Slf4j
+@PluginDescriptor(
+		name = "Chunk Tasks"
+)
+public class ChunkTasksPlugin extends Plugin {
+	@Inject private Client client;
+	@Inject private ClientThread clientThread;
+	@Inject private ItemManager itemManager;
+	@Inject private ChunkTaskChecker chunkTaskChecker;
+	@Inject private ChunkTasksConfig config;
+	@Inject private OkHttpClient okHttpClient;
+	@Inject private ScheduledExecutorService executor;
+	@Inject private ChunkTasksManager chunkTasksManager;
+	@Inject private ClientToolbar clientToolbar;
+	@Inject private InventoryManager inventoryManager;
+	@Inject private ChunkTaskNotifier chunkTaskNotifier;
+	@Inject private MapManager mapManager;
+	@Inject private SkillManager skillManager;
+
+	private ChunkTasksPanel panel;
+	private NavigationButton navButton;
+
+//	private static final int[] previous_exp = new int[Skill.values().length];
+
+	@Override
+	protected void startUp() {
+		executor.submit(() -> {
+			SoundFileManager.ensureDownloadDirectoryExists();
+			SoundFileManager.downloadAllMissingSounds(okHttpClient);
+		});
+
+		boolean isLoggedIn = client.getGameState() == GameState.LOGGED_IN;
+		panel = injector.getInstance(ChunkTasksPanel.class);
+		panel.init(isLoggedIn);
+
+		final BufferedImage curvedBoneIcon = ImageUtil.loadImageResource(getClass(), "/images/curved_bone.png");
+		navButton = NavigationButton.builder()
+				.tooltip("Chunk Tasks")
+				.icon(curvedBoneIcon)
+				.priority(3)
+				.panel(panel)
+				.build();
+
+		clientToolbar.addNavigation(navButton);
+
+		if (client.getGameState() == GameState.LOGGED_IN) {
+			clientThread.invokeLater(() -> {
+				int[] xps = client.getSkillExperiences();
+				skillManager.resetSkills(xps);
+			});
+		} else {
+			skillManager.clearSkills();
+		}
+	}
+
+	@Override
+	protected void shutDown() {
+		if (navButton != null) {
+			clientToolbar.removeNavigation(navButton);
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged) {
+		if (Objects.equals(configChanged.getKey(), "showChunkTaskPrefix")
+				&& !Objects.equals(configChanged.getOldValue(), configChanged.getNewValue())) {
+			panel.redrawChunkTasks();
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged) {
+		panel.setLoggedIn(gameStateChanged.getGameState() == GameState.LOGGED_IN);
+		if (gameStateChanged.getGameState() == GameState.LOGGED_IN) {
+			chunkTasksManager.loadChunkTasksData();
+			panel.redrawChunkTasks();
+		}
+		if (gameStateChanged.getGameState() == GameState.LOGIN_SCREEN || gameStateChanged.getGameState() == GameState.HOPPING) {
+			skillManager.clearSkills();
+		}
+	}
+
+	@Subscribe
+	public void onProfileChanged(ProfileChanged profileChanged) {
+		if (client.getGameState() == GameState.LOGGED_IN) {
+			chunkTasksManager.loadChunkTasksData();
+			panel.redrawChunkTasks();
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick gameTick) {
+		var worldPoint = client.getLocalPlayer().getWorldLocation();
+
+		List<ChunkTask> completedTasks = chunkTaskChecker.checkPrayerTasks();
+
+		boolean isNewLocation = mapManager.addCoordinateToHistory(worldPoint.getX(), worldPoint.getY(), worldPoint.getPlane());
+		if (isNewLocation) {
+			completedTasks.addAll(chunkTaskChecker.checkMovementTasks());
+			completedTasks.addAll(chunkTaskChecker.checkLocationTasks());
+		}
+
+		if (!completedTasks.isEmpty()) {
+			completeTasks(completedTasks);
+		}
+	}
+
+	@Subscribe
+	public void onInteractingChanged(InteractingChanged interactingChanged) {
+		Actor source = interactingChanged.getSource();
+		Actor target = interactingChanged.getTarget();
+		if (source == null || target == null || !Objects.equals(source.getName(), client.getLocalPlayer().getName())) {
+			return;
+		}
+
+		log.debug("SOURCE: " + source.getName() + " | TARGET: " + target.getName());
+		List<ChunkTask> completedEquipTasks = chunkTaskChecker.checkInteractionTasks(target.getName());
+		if (!completedEquipTasks.isEmpty())
+			completeTasks(completedEquipTasks);
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged itemContainerChanged) {
+		int containerId = itemContainerChanged.getContainerId();
+		if (containerId == InventoryID.INVENTORY.getId())
+			onInventoryChanged();
+		else if (containerId == InventoryID.EQUIPMENT.getId())
+			onEquipmentChanged();
+	}
+
+	private void onInventoryChanged() {
+		final ItemContainer itemContainer = client.getItemContainer(InventoryID.INVENTORY);
+		if (itemContainer == null)
+			return;
+
+		List<String> inventory = Arrays.stream(itemContainer.getItems())
+				.map(item -> client.getItemDefinition(item.getId()).getName().toLowerCase())
+				.collect(Collectors.toList());
+		inventoryManager.setInventory(inventory);
+
+		List<ChunkTask> completedObtainItemTasks = chunkTaskChecker.checkObtainItemTasks();
+		List<ChunkTask> completedSkillingItemTasks = chunkTaskChecker.checkSkillingItemTasks();
+		List<ChunkTask> completedObtainItemIdTasks = chunkTaskChecker.checkObtainItemIdTasks();
+
+		List<ChunkTask> completedTasks = Stream.of(completedObtainItemTasks, completedSkillingItemTasks, completedObtainItemIdTasks)
+				.flatMap(Collection::stream)
+				.collect(Collectors.toList());
+		if (!completedTasks.isEmpty()) {
+			completeTasks(completedTasks);
+		}
+	}
+
+	private void onEquipmentChanged() {
+		List<ChunkTask> completedTasks = Stream.concat(
+				chunkTaskChecker.checkEquipItemTasks().stream(),
+				chunkTaskChecker.checkEquipItemIdTasks().stream()
+		).collect(Collectors.toList());
+		if (!completedTasks.isEmpty())
+			completeTasks(completedTasks);
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged statChanged) {
+		Skill skill = statChanged.getSkill();
+		int xpGained = skillManager.updateXp(skill, statChanged.getXp());
+		List<ChunkTask> completedQuestSkillRequirementTasks = chunkTaskChecker.checkQuestSkillRequirementTasks(skill);
+		List<ChunkTask> completedXpTasks = chunkTaskChecker.checkXpTasks(skill, xpGained);
+
+
+		List<ChunkTask> completedTasks = Stream.concat(
+				completedQuestSkillRequirementTasks.stream(),
+				completedXpTasks.stream()
+		).collect(Collectors.toList());
+		if (!completedTasks.isEmpty())
+			completeTasks(completedTasks);
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage chatMessage) {
+		log.debug(chatMessage.getType() + " - " + chatMessage.getMessage());
+		List<ChunkTask> completedTasks = chunkTaskChecker.checkChatMessageTasks(chatMessage);
+		if (!completedTasks.isEmpty())
+			completeTasks(completedTasks);
+	}
+
+	@Subscribe
+	public void onPlayerChanged(PlayerChanged playerChanged) {
+		List<ChunkTask> completedTasks = chunkTaskChecker.checkPlayerTasks();
+		if (!completedTasks.isEmpty())
+			completeTasks(completedTasks);
+	}
+
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged varbitChanged) {
+		int varbitId = varbitChanged.getVarbitId();
+		int varbitValue = varbitChanged.getValue();
+		List<ChunkTask> completedTasks = chunkTaskChecker.checkFarmingPatchTasks(varbitId, varbitValue);
+		if (!completedTasks.isEmpty())
+			completeTasks(completedTasks);
+	}
+
+	@Provides
+	ChunkTasksConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(ChunkTasksConfig.class);
+	}
+
+	public void completeTasks(List<ChunkTask> chunkTasks) {
+		chunkTasks.forEach(task -> chunkTaskNotifier.completeTask(task));
+		panel.redrawChunkTasks();
+	}
+}
+

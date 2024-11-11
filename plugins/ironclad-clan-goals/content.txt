@@ -1,0 +1,849 @@
+package com.ironclad.clangoals;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class IroncladClanGoalsPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(IroncladClanGoalsPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.ironclad.clangoals;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("ironcladclangoals")
+public interface IroncladClanGoalsConfig extends Config
+{
+	@ConfigItem(
+			keyName = "apiKey",
+			name = "API Key",
+			description = "The API key used to authenticate with IronClad's API",
+			position = 1
+	)
+	default String apiKey()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+			keyName = "autoJoin",
+			name = "Auto Join",
+			description = "Automatically join any in-progress goals",
+			position = 2
+	)
+	default boolean autoJoin()
+	{
+		return true;
+	}
+}
+
+package com.ironclad.clangoals.batches;
+
+import com.ironclad.clangoals.service.ApiService;
+import lombok.Setter;
+
+@Setter
+public class KillBatchQueue extends BatchQueue
+{
+    private ApiService api;
+    private long account;
+
+    @Override
+    public void flush()
+    {
+        // Extra check to limit abnormal requests.
+        if (items.isEmpty()) return;
+
+        this.api.batchUpdateKills(this.account, items);
+
+        this.resetQueue();
+    }
+}
+
+package com.ironclad.clangoals.batches;
+
+import lombok.Getter;
+
+@Getter
+public class QueueItem
+{
+    private final Object data;
+
+    public QueueItem(Object data)
+    {
+        this.data = data;
+    }
+}
+
+package com.ironclad.clangoals.batches;
+
+import com.ironclad.clangoals.PluginItem;
+import com.ironclad.clangoals.service.ApiService;
+import lombok.Setter;
+import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.stream.*;
+
+@Setter
+public class LootBatchQueue extends BatchQueue
+{
+    private ApiService api;
+    private ItemManager itemManager;
+    private long account;
+
+    @Override
+    public void flush()
+    {
+        if (items.isEmpty()) return;
+
+        // Convert list to just loot data effectively
+        // stripping away NPC data.
+        ArrayList<QueueItem> loot = items.stream().flatMap(l -> {
+            NpcLootReceived npcLootReceived = (NpcLootReceived) l.getData();
+            Collection<ItemStack> items = npcLootReceived.getItems();
+
+            return items.stream().map(i -> {
+                PluginItem pluginItem = new PluginItem(i.getId(), i.getQuantity());
+
+                // Pass down the ItemManager so that we
+                // can gather the item name.
+                pluginItem.setItemManager(itemManager);
+
+                return new QueueItem(pluginItem);
+            });
+        }).collect(Collectors.toCollection(ArrayList::new));
+
+        this.api.batchUpdateLoot(this.account, loot);
+
+        this.resetQueue();
+    }
+}
+
+package com.ironclad.clangoals.batches;
+
+import com.ironclad.clangoals.service.ApiService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.ArrayList;
+
+public abstract class BatchQueue
+{
+    protected static final Logger log = LoggerFactory.getLogger(ApiService.class);
+
+    // How many items can be batched
+    // together before flushing.
+    private final int MAX_ITEMS = 10;
+
+    // How many ticks (0.6s) can a batch
+    // have between each item being added.
+    //
+    // If cooldown is reached, items are
+    // flushed.
+    //
+    // 15*0.6=9
+    private final int TICK_COOLDOWN = 9;
+
+    // How many ticks since last item.
+    private int sinceLastItem = 0;
+
+    // Array of items to be batched together.
+    protected final ArrayList<QueueItem> items;
+
+    public BatchQueue ()
+    {
+        this.items = new ArrayList<>();
+    }
+
+    /**
+     * Flush any items by processing them.
+     */
+    public abstract void flush();
+
+    /**
+     * Clear any items in the queue
+     * and reset since last item
+     * cooldown.
+     */
+    protected void resetQueue()
+    {
+        log.debug("[ironclad-clan-goals] Resetting batch queue.");
+
+        this.items.clear();
+        this.sinceLastItem = 0;
+    }
+
+    /**
+     * Pushes an item to the queue.
+     *
+     * Once the MAX_ITEMS is hit then
+     * automatically flush items.
+     *
+     * @param item QueueItem to push to the queue.
+     */
+    public void addItem (QueueItem item)
+    {
+        log.debug("[ironclad-clan-goals] Adding item to batch queue");
+
+        items.add(item);
+        sinceLastItem = 0;
+
+        if (items.size() >= MAX_ITEMS) {
+            log.debug("[ironclad-clan-goals] Batch queue max items reached. Flushing.");
+
+            this.flush();
+        }
+    }
+
+    /**
+     * Increment the cooldown since the
+     * last item was pushed into the queue.
+     *
+     * Once the TICK_COOLDOWN is reached then
+     * automatically flush items.
+     */
+    public void incrementCooldown()
+    {
+        sinceLastItem += 1;
+
+        if (sinceLastItem >= TICK_COOLDOWN && !items.isEmpty()) {
+            log.debug("[ironclad-clan-goals] Batch queue cooldown reached. Flushing.");
+
+            this.flush();
+        }
+    }
+}
+
+package com.ironclad.clangoals.batches;
+
+import com.ironclad.clangoals.service.ApiService;
+import lombok.Setter;
+
+@Setter
+public class XpBatchQueue extends BatchQueue
+{
+    private ApiService api;
+    private long account;
+
+    @Override
+    public void flush()
+    {
+        // Extra check to limit abnormal requests.
+        if (items.isEmpty()) return;
+
+        // Pass items onto API service to deal with
+        // data transformation and request handling.
+        this.api.batchUpdateXp(
+                this.account,
+                items
+        );
+
+        this.resetQueue();
+    }
+}
+
+package com.ironclad.clangoals;
+
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.client.game.ItemManager;
+
+@Setter
+@Getter
+public class PluginItem
+{
+    private ItemManager itemManager;
+
+    public int id;
+    public int quantity;
+
+    public PluginItem(int id, int quantity)
+    {
+        this.id = id;
+        this.quantity = quantity;
+    }
+
+    public String getName()
+    {
+        try {
+            return itemManager.getItemComposition(this.id).getName();
+        } catch (Exception err) {
+            return "";
+        }
+    }
+}
+
+package com.ironclad.clangoals.service;
+
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import okhttp3.Response;
+
+public class ApiResponse
+{
+    /**
+     * Parse response text into a JSON object.
+     */
+    static public JsonObject parse(Response response)
+    {
+        return new JsonParser()
+                .parse(response.body().toString())
+                .getAsJsonObject();
+    }
+}
+
+package com.ironclad.clangoals.service;
+
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.ironclad.clangoals.PluginItem;
+import com.ironclad.clangoals.PluginNPC;
+import com.ironclad.clangoals.batches.QueueItem;
+import lombok.NonNull;
+import okhttp3.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import net.runelite.api.NPC;
+import net.runelite.api.events.StatChanged;
+import net.runelite.api.Player;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.ArrayList;
+
+public class ApiService
+{
+    private static final Logger log = LoggerFactory.getLogger(ApiService.class);
+
+    private final OkHttpClient httpClient;
+    private final String apiKey;
+
+    public boolean verified = false;
+
+    public ApiService (OkHttpClient httpClient, String apiKey)
+    {
+        this.httpClient = httpClient;
+        this.apiKey = apiKey;
+
+        Response tmp = me();
+        verified = tmp.isSuccessful();
+        tmp.close();
+    }
+
+    /**
+     * Check that the current API key is valid.
+     */
+    public Response me ()
+    {
+        try {
+            Request req = sharedRequest(makeUri("/me"))
+                .get()
+                .build();
+
+            log.debug("[ironclad-clan-goals] send get self request");
+
+            return httpClient.newCall(req).execute();
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Persist the account has with the current player name
+     * against the authenticated API key.
+     */
+    public void updatePlayer (long account, Player player)
+    {
+        JsonObject data = new JsonObject();
+
+        data.addProperty("account_hash", account);
+        data.addProperty("character_name", player.getName());
+
+        RequestBody body = RequestBody.create(
+                MediaType.parse("application/json"), data.toString()
+        );
+
+        Request req = sharedRequest(makeUri("/characters"))
+                .put(body)
+                .build();
+
+        log.debug("[ironclad-clan-goals] send update character request");
+
+        sharedClient().newCall(req).enqueue(sharedCallback(
+                "character updated",
+                "error updating character"
+        ));
+    }
+
+    /**
+     * Persist a batch of xp drops.
+     */
+    public void batchUpdateXp(long account, ArrayList<QueueItem> batch)
+    {
+        JsonArray skills = new JsonArray();
+
+        batch.forEach(item -> {
+            StatChanged event = (StatChanged) item.getData();
+
+            JsonObject tmp = new JsonObject();
+            tmp.addProperty("skill", event.getSkill().getName().toLowerCase());
+            tmp.addProperty("xp", event.getXp());
+
+            skills.add(tmp);
+        });
+
+        JsonObject data = new JsonObject();
+
+        data.addProperty("account_hash", account);
+        data.add("batch", skills);
+
+        RequestBody body = RequestBody.create(
+                MediaType.parse("application/json"), data.toString()
+        );
+
+        Request req = sharedRequest(makeUri("/batch/xp"))
+                .put(body)
+                .build();
+
+        log.debug("[ironclad-clan-goals] send batch update xp request");
+
+        sharedClient().newCall(req).enqueue(sharedCallback(
+                "batch xp updated",
+                "error updating xp"
+        ));
+    }
+
+    /**
+     * Persist a batch of loot drops.
+     */
+    public void batchUpdateLoot(long account, ArrayList<QueueItem> batch)
+    {
+        JsonArray loot = new JsonArray();
+
+        batch.forEach(item -> {
+            PluginItem event = (PluginItem) item.getData();
+
+            JsonObject tmp = new JsonObject();
+            tmp.addProperty("item_id", event.getId());
+            tmp.addProperty("quantity", event.getQuantity());
+            tmp.addProperty("name", event.getName());
+
+            loot.add(tmp);
+        });
+
+        JsonObject data = new JsonObject();
+
+        data.addProperty("account_hash", account);
+        data.add("batch", loot);
+
+        RequestBody body = RequestBody.create(
+                MediaType.parse("application/json"), data.toString()
+        );
+
+        Request req = sharedRequest(makeUri("/batch/loot"))
+                .put(body)
+                .build();
+
+        log.debug("[ironclad-clan-goals] send batch update loot request");
+
+        sharedClient().newCall(req).enqueue(sharedCallback(
+                "batch loot updated",
+                "error updating loot"
+        ));
+    }
+
+    /**
+     * Persist a batch of kill records.
+     */
+    public void batchUpdateKills(long account, ArrayList<QueueItem> batch)
+    {
+        JsonArray kills = new JsonArray();
+
+        batch.forEach(item -> {
+            PluginNPC event = (PluginNPC) item.getData();
+
+            JsonObject tmp = new JsonObject();
+            tmp.addProperty("npc_id", event.getId());
+            tmp.addProperty("name", event.getName());
+
+            kills.add(tmp);
+        });
+
+        JsonObject data = new JsonObject();
+
+        data.addProperty("account_hash", account);
+        data.add("batch", kills);
+
+        RequestBody body = RequestBody.create(
+                MediaType.parse("application/json"), data.toString()
+        );
+
+        Request req = sharedRequest(makeUri("/batch/kills"))
+                .put(body)
+                .build();
+
+        log.debug("[ironclad-clan-goals] send batch update kills request");
+
+        sharedClient().newCall(req).enqueue(sharedCallback(
+                "batch kills updated",
+                "error updating kills"
+        ));
+    }
+
+    /**
+     * Shared request headers for all requests.
+     */
+    private Request.Builder sharedRequest(URI uri)
+    {
+        return new Request
+            .Builder()
+            .url(uri.toString())
+            .header("accept", "application/json")
+            .header("content-type", "application/json")
+            .header("authorization", apiKey);
+    }
+
+    /**
+     * Shared http client for all requests.
+     */
+    private OkHttpClient sharedClient()
+    {
+        return httpClient
+            .newBuilder()
+            .build();
+    }
+
+    /**
+     * Shared client callback.
+     */
+    private Callback sharedCallback(String successMessage, String errorMessage)
+    {
+        return new Callback() {
+            @Override
+            public void onFailure(
+                    @NonNull
+                    Call call,
+                    @NonNull
+                    IOException e
+            ) {
+                log.warn("[ironclad-clan-goals] "+errorMessage);
+            }
+
+            @Override
+            public void onResponse(
+                    @NonNull
+                    Call call,
+                    @NonNull
+                    Response response
+            ) throws IOException {
+                response.close();
+
+                log.debug("[ironclad-clan-goals] "+successMessage);
+            }
+        };
+    }
+
+    /**
+     * Shared base URI for all requests.
+     */
+    private URI makeUri (String path)
+    {
+        return URI.create("https://progress.quest/api/runelite"+path);
+    }
+}
+
+package com.ironclad.clangoals;
+
+import com.google.common.collect.ImmutableSet;
+import net.runelite.api.Client;
+
+import java.util.Set;
+
+public class WorldUtils
+{
+    // @see https://github.com/runelite/runelite/blob/ab0ddd9ea48efc707be1352ec4dacb7cc93cc6fa/runelite-client/src/main/java/net/runelite/client/plugins/loottracker/LootTrackerPlugin.java#L232
+    public static final Set<Integer> LAST_MAN_STANDING_REGIONS = ImmutableSet.of(13658, 13659, 13660, 13914, 13915, 13916, 13918, 13919, 13920, 14174, 14175, 14176, 14430, 14431, 14432);
+
+    // @see https://github.com/runelite/runelite/blob/ab0ddd9ea48efc707be1352ec4dacb7cc93cc6fa/runelite-client/src/main/java/net/runelite/client/plugins/loottracker/LootTrackerPlugin.java#L271
+    public static final Set<Integer> SOUL_WARS_REGIONS = ImmutableSet.of(8493, 8749, 9005);
+
+    public static boolean isPlayerWithinMapRegion(Client client, Set<Integer> definedMapRegions)
+    {
+        final int[] mapRegions = client.getMapRegions();
+
+        for (int region : mapRegions)
+        {
+            if (definedMapRegions.contains(region))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+}
+
+package com.ironclad.clangoals;
+
+import lombok.Getter;
+import net.runelite.api.NPC;
+
+@Getter
+public class PluginNPC
+{
+    private final int id;
+    private final String name;
+
+    public PluginNPC(NPC npc)
+    {
+        id = npc.getId();
+        name = npc.getName();
+    }
+}
+
+package com.ironclad.clangoals;
+
+import com.google.inject.Provides;
+import com.ironclad.clangoals.batches.KillBatchQueue;
+import com.ironclad.clangoals.batches.LootBatchQueue;
+import com.ironclad.clangoals.batches.QueueItem;
+import com.ironclad.clangoals.batches.XpBatchQueue;
+import com.ironclad.clangoals.service.*;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.NPC;
+import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.game.ItemManager;
+import okhttp3.OkHttpClient;
+
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.Player;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.StatChanged;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+
+import javax.inject.Inject;
+import java.util.HashMap;
+import java.util.Objects;
+
+@Slf4j
+@PluginDescriptor(
+	name = "IronClad Clan Goals"
+)
+public class IroncladClanGoalsPlugin extends Plugin
+{
+	@Inject
+	private OkHttpClient httpClient;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	private IroncladClanGoalsConfig config;
+
+	public ApiService service;
+	protected XpBatchQueue xpBatchQueue;
+	protected KillBatchQueue killBatchQueue;
+	protected LootBatchQueue lootBatchQueue;
+
+	private boolean getLocalPlayer = false;
+
+	private final HashMap<String, Number> xpMap = new HashMap<>();
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		// If API key is set then attempt to validated.
+		if (!config.apiKey().isEmpty()) {
+			service = new ApiService(httpClient, config.apiKey());
+
+			xpBatchQueue = new XpBatchQueue();
+			xpBatchQueue.setApi(service);
+
+			killBatchQueue = new KillBatchQueue();
+			killBatchQueue.setApi(service);
+
+			lootBatchQueue = new LootBatchQueue();
+			lootBatchQueue.setApi(service);
+			lootBatchQueue.setItemManager(itemManager);
+		}
+	}
+
+    @Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		final GameState state = gameStateChanged.getGameState();
+
+		switch(state)
+		{
+			case LOGIN_SCREEN:
+			case HOPPING:
+			case LOGGING_IN:
+			case LOGIN_SCREEN_AUTHENTICATOR:
+				xpMap.clear();
+				xpBatchQueue.flush();
+				lootBatchQueue.flush();
+				killBatchQueue.flush();
+			case CONNECTION_LOST:
+				xpBatchQueue.flush();
+				lootBatchQueue.flush();
+				killBatchQueue.flush();
+		}
+
+		if (state == GameState.LOGGED_IN)
+		{
+			getLocalPlayer = true;
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		if (getLocalPlayer) {
+			Player player = client.getLocalPlayer();
+
+			// Get the player name and account hash on
+			// first game tick. Persist this against the
+			// API key as we want to know who helped
+			// contribute to the clan goal.
+			service.updatePlayer(client.getAccountHash(), player);
+
+			// Keep batch queues up to date with the
+			// active account hash.
+			xpBatchQueue.setAccount(client.getAccountHash());
+			lootBatchQueue.setAccount(client.getAccountHash());
+			killBatchQueue.setAccount(client.getAccountHash());
+
+			getLocalPlayer = false;
+		}
+
+		xpBatchQueue.incrementCooldown();
+		lootBatchQueue.incrementCooldown();
+		killBatchQueue.incrementCooldown();
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged event)
+	{
+		final String skill = event.getSkill().getName();
+		final int xp = event.getXp();
+
+		if (!ClanUtils.isMemberOfClan(client)) {
+			log.warn("Attempted to log xp when not a clan member.");
+		} else {
+
+			// We don't want to log skills straightaway
+			// as we get flooded with current xp on login.
+			if (xpMap.containsKey(skill)) {
+
+				// Exit early if XP hasn't actually changed.
+				if (xpMap.get(skill).equals(xp)) {
+					return;
+				}
+
+				// If the API key is valid, and auto-join is enabled
+				// then we begin to log xp after initial xp change.
+				if (service.verified && config.autoJoin()) {
+					xpBatchQueue.addItem(new QueueItem(event));
+				}
+			}
+		}
+
+		xpMap.put(skill, xp);
+	}
+
+	@Subscribe
+	public void onNpcLootReceived(NpcLootReceived npcLootReceived)
+	{
+		if (!ClanUtils.isMemberOfClan(client)) {
+			log.warn("Attempted to log npc kill when not a clan member.");
+			return;
+		}
+
+		if (service.verified && config.autoJoin()) {
+
+			// Check that at least one item was dropped from the NPC.
+			if (!npcLootReceived.getItems().isEmpty()) {
+
+				// Check that player is not within a restricted region.
+				if (
+						!WorldUtils.isPlayerWithinMapRegion(client, WorldUtils.LAST_MAN_STANDING_REGIONS) &&
+						!WorldUtils.isPlayerWithinMapRegion(client, WorldUtils.SOUL_WARS_REGIONS)
+				) {
+					lootBatchQueue.addItem(new QueueItem(npcLootReceived));
+				}
+			}
+
+			// Always track NPC kills.
+			killBatchQueue.addItem(new QueueItem(new PluginNPC(npcLootReceived.getNpc())));
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (!Objects.equals(event.getGroup(), "ironcladclangoals")) {
+			return;
+		}
+
+		String key = event.getKey();
+		String newValue = event.getNewValue();
+
+		// If the API key changes then attempt
+		// to authenticate with the API again.
+		if (Objects.equals(key, "apiKey") && !newValue.isEmpty()) {
+			service = new ApiService(httpClient, newValue);
+			xpBatchQueue.setApi(service);
+			killBatchQueue.setApi(service);
+			lootBatchQueue.setApi(service);
+		}
+	}
+
+	@Provides
+	IroncladClanGoalsConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(IroncladClanGoalsConfig.class);
+	}
+
+}
+
+package com.ironclad.clangoals;
+
+import net.runelite.api.Client;
+import net.runelite.api.clan.ClanSettings;
+
+public class ClanUtils
+{
+    // Confirm that the current character is
+    // a member of the clan.
+    public static boolean isMemberOfClan (Client client)
+    {
+        final ClanSettings clan = client.getClanSettings();
+
+        return !(clan == null || !clan.getName().equals("IronClad"));
+    }
+}
+

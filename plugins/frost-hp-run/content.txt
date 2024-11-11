@@ -1,0 +1,4470 @@
+package com.ericversteeg.frosthprun;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class HpBarPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(FrostHpRunPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.ericversteeg.frosthprun;
+
+import com.ericversteeg.frosthprun.config.BarInfo;
+import com.ericversteeg.frosthprun.config.BarType;
+import com.google.gson.Gson;
+import com.google.inject.Provides;
+import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import org.apache.commons.lang3.ArrayUtils;
+
+import javax.inject.Inject;
+import java.awt.image.BufferedImage;
+import java.time.Instant;
+import java.util.*;
+
+@PluginDescriptor(
+	name = "Frost Bars",
+	description = "Simple HP and run bars."
+)
+
+public class FrostHpRunPlugin extends Plugin
+{
+	@Inject private FrostHpRunOverlay overlay;
+	@Inject private OverlayManager overlayManager;
+	@Inject private Client client;
+	@Inject private FrostHpRunConfig config;
+	@Inject private ConfigManager configManager;
+	@Inject private Gson gson;
+
+	private static final int VENOM_THRESHOLD = 1000000;
+
+	private long lastHpChange = 0L;
+	private int lastHp = -1;
+
+	private long lastPrayerChange = 0L;
+	private int lastPrayer = -1;
+	private boolean fromActivePrayer = false;
+
+	private long lastRunChange = 0L;
+	private int lastRun = -1;
+	private boolean fromRunIncrease = false;
+
+	private long lastCombatChange = 0L;
+
+	boolean isStaminaActive = false;
+	private boolean lastStaminaActive = false;
+
+	private boolean isPoisoned = false;
+	private boolean isEnvenomed = false;
+	private boolean isDiseased = false;
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		overlayManager.add(overlay);
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		overlayManager.remove(overlay);
+	}
+
+	@Provides
+	FrostHpRunConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(FrostHpRunConfig.class);
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged)
+	{
+		if (configChanged.getGroup().equals(FrostHpRunConfig.GROUP))
+		{
+			overlay.clearHpViewInfo();
+			overlay.clearRunViewInfo();
+
+			if (configChanged.getKey().equals("smallFontScaleFactor")
+					|| configChanged.getKey().equals("secondaryFontScaleFactor")
+					|| configChanged.getKey().equals("primaryFontScaleFactor"))
+			{
+				int height = Math.min(150, Math.max(config.height(), 20));
+				overlay.setFonts(height);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged statChanged)
+	{
+		Skill skill = statChanged.getSkill();
+
+		if (skill.ordinal() == Skill.HITPOINTS.ordinal())
+		{
+			int hp = statChanged.getBoostedLevel();
+			if (lastHp >= 0 && (hp - lastHp < 0
+					|| hp - lastHp > 1))
+			{
+				lastHpChange = Instant.now().toEpochMilli();
+			}
+
+			lastHp = hp;
+		}
+		else if (skill.ordinal() == Skill.PRAYER.ordinal())
+		{
+			int prayer = statChanged.getBoostedLevel();
+			if (lastPrayer >= 0 && lastPrayer != prayer)
+			{
+				lastPrayerChange = Instant.now().toEpochMilli();
+				fromActivePrayer = false;
+			}
+
+			lastPrayer = prayer;
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		Player localPlayer = client.getLocalPlayer();
+
+		if (localPlayer != null)
+		{
+			// from Status Bars plugin
+			Actor interacting = localPlayer.getInteracting();
+
+			if ((interacting instanceof NPC && ArrayUtils.contains(((NPC) interacting).getComposition().getActions(), "Attack"))
+					|| (interacting instanceof Player && client.getVarbitValue(Varbits.PVP_SPEC_ORB) == 1))
+			{
+				lastCombatChange = Instant.now().toEpochMilli();
+			}
+		}
+
+		if (isPrayerActive())
+		{
+			lastPrayerChange = Instant.now().toEpochMilli();
+			fromActivePrayer = true;
+		}
+
+		LocalPoint currentLocation = client.getLocalPlayer().getLocalLocation();
+		LocalPoint destinationLocation = client.getLocalDestinationLocation();
+
+		if (currentLocation != null && destinationLocation != null)
+		{
+			WorldPoint worldLocation = WorldPoint.fromLocal(client, currentLocation);
+			WorldPoint worldDestination = WorldPoint.fromLocal(client, destinationLocation);
+
+			int distance = worldLocation.distanceTo(worldDestination);
+			if (distance > 2)
+			{
+				lastRunChange = Instant.now().toEpochMilli();
+				fromRunIncrease = false;
+			}
+		}
+
+		int run = client.getEnergy() / 100;
+		int runDiff = run - lastRun;
+		if (lastRun != -1 && runDiff != 0 && runDiff != 1)
+		{
+			if (runDiff > 0)
+			{
+				fromRunIncrease = true;
+				lastRunChange = Instant.now().toEpochMilli();
+			}
+		}
+		lastRun = run;
+
+		// from Poison plugin
+		final int poison = client.getVarpValue(VarPlayer.POISON);
+
+		if (poison >= VENOM_THRESHOLD)
+		{
+			isPoisoned = false;
+			isEnvenomed = true;
+		}
+		else if (poison > 0)
+		{
+			isPoisoned = true;
+			isEnvenomed = false;
+		}
+		else
+		{
+			isPoisoned = false;
+			isEnvenomed = false;
+		}
+
+		isDiseased = client.getVarpValue(VarPlayer.DISEASE_VALUE) > 0;
+	}
+
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged event)
+	{
+		// from Timers plugin
+		if (event.getVarbitId() == Varbits.RUN_SLOWED_DEPLETION_ACTIVE
+				|| event.getVarbitId() == Varbits.STAMINA_EFFECT
+				|| event.getVarbitId() == Varbits.RING_OF_ENDURANCE_EFFECT)
+		{
+			int staminaEffectActive = client.getVarbitValue(Varbits.RUN_SLOWED_DEPLETION_ACTIVE);
+			int staminaPotionEffectVarb = client.getVarbitValue(Varbits.STAMINA_EFFECT);
+			int enduranceRingEffectVarb = client.getVarbitValue(Varbits.RING_OF_ENDURANCE_EFFECT);
+
+			final int totalStaminaEffect = staminaPotionEffectVarb + enduranceRingEffectVarb;
+			if (staminaEffectActive == 1)
+			{
+				isStaminaActive = totalStaminaEffect != 0;
+				if (!lastStaminaActive && isStaminaActive)
+				{
+					lastRunChange = Instant.now().toEpochMilli();
+					fromRunIncrease = true;
+				}
+				lastStaminaActive = isStaminaActive;
+			}
+		}
+	}
+
+	public boolean isActive()
+	{
+		long lastActive = getLastActive();
+
+		long delay = 1800L;
+		if (lastActive == lastHpChange || (lastActive == lastPrayerChange && !fromActivePrayer)
+				|| (!config.showRunBar() && lastActive == lastRunChange && fromRunIncrease))
+		{
+			delay = 3600L;
+		}
+		else if (lastActive == lastCombatChange)
+		{
+			delay = (config.combatHideDelay() + 2) * 600L;
+		}
+		else if (lastActive == lastPrayerChange && fromActivePrayer)
+		{
+			delay = 1200L;
+		}
+		return Instant.now().toEpochMilli() - lastActive <= delay;
+	}
+
+	public long getLastActive()
+	{
+		long lastActive = lastCombatChange;
+
+		if (overlay.hasBarType(BarType.HITPOINTS) && lastHpChange > lastActive)
+		{
+			lastActive = lastHpChange;
+		}
+		if (overlay.hasBarType(BarType.PRAYER) && lastPrayerChange > lastActive)
+		{
+			lastActive = lastPrayerChange;
+		}
+		if (!config.showRunBar())
+		{
+			if (overlay.hasBarType(BarType.RUN_ENERGY) && lastRunChange > lastActive)
+			{
+				lastActive = lastRunChange;
+			}
+		}
+		return lastActive;
+	}
+
+	public boolean isRun()
+	{
+		long delay = 2400L;
+		if (fromRunIncrease)
+		{
+			delay = 3600L;
+		}
+		return Instant.now().toEpochMilli() - lastRunChange <= delay;
+	}
+
+	private boolean isPrayerActive()
+	{
+		Prayer [] prayers = Prayer.values();
+		for (Prayer prayer: prayers) {
+			if (client.isPrayerActive(prayer))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public Map<BarType, BarInfo> barInfo()
+	{
+		int hpHue = Math.min(360, config.hpHue());
+		if (isEnvenomed)
+		{
+			hpHue = Math.min(360, config.envenomedHue());
+		}
+		else if (isPoisoned)
+		{
+			hpHue = Math.min(360, config.poisonedHue());
+		}
+		else if (isDiseased)
+		{
+			hpHue = Math.min(360, config.diseasedHue());
+		}
+
+		BarInfo hitpoints = new BarInfo(
+				client.getBoostedSkillLevel(Skill.HITPOINTS),
+				client.getRealSkillLevel(Skill.HITPOINTS),
+				hpHue
+		);
+
+		int prayerHue = Math.min(360, config.inactivePrayerHue());
+		if (isPrayerActive())
+		{
+			prayerHue = Math.min(360, config.activePrayerHue());
+		}
+
+		BarInfo prayer = new BarInfo(
+				client.getBoostedSkillLevel(Skill.PRAYER),
+				client.getRealSkillLevel(Skill.PRAYER),
+				prayerHue
+		);
+
+		BarInfo attack = new BarInfo(
+				client.getVarpValue(VarPlayer.SPECIAL_ATTACK_PERCENT) / 10,
+				100,
+				Math.min(360, config.specialAttackHue())
+		);
+
+		int runHue = Math.min(360, config.runHue());
+		if (isStaminaActive)
+		{
+			runHue = Math.min(360, config.staminaHue());
+		}
+
+		BarInfo run = new BarInfo(
+				client.getEnergy() / 100,
+				100,
+				runHue
+		);
+
+		Map<BarType, BarInfo> barInfo = new HashMap<>();
+
+		barInfo.put(BarType.HITPOINTS, hitpoints);
+		barInfo.put(BarType.PRAYER, prayer);
+		barInfo.put(BarType.SPECIAL_ATTACK, attack);
+		barInfo.put(BarType.RUN_ENERGY, run);
+
+		return barInfo;
+	}
+}
+
+package com.ericversteeg.frosthprun;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+@Getter
+@RequiredArgsConstructor
+public enum FontWeight {
+    BOLD("Bold"),
+    BLACK("Black");
+
+    private final String name;
+};
+
+
+
+package com.ericversteeg.frosthprun.config;
+
+public enum BarStyle
+{
+    FLAT,
+    DARK,
+    ROUND
+}
+
+package com.ericversteeg.frosthprun.config;
+
+public enum TextBrightness
+{
+    BRIGHT,
+    NORMAL,
+    DARKENED
+}
+
+package com.ericversteeg.frosthprun.config;
+
+public enum BarType
+{
+    NONE,
+    HITPOINTS,
+    PRAYER,
+    RUN_ENERGY,
+    SPECIAL_ATTACK
+}
+
+package com.ericversteeg.frosthprun.config;
+
+public class BarInfo
+{
+    public int value;
+    public int maxValue;
+    public int hue;
+
+    public BarInfo(int value, int maxValue, int hue)
+    {
+        this.value = value;
+        this.maxValue = maxValue;
+        this.hue = hue;
+    }
+}
+
+package com.ericversteeg.frosthprun;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+@Getter
+@RequiredArgsConstructor
+public enum TextAlignment {
+    LEFT("Left"),
+    CENTER("Center"),
+    RIGHT("Right");
+
+    private final String name;
+};
+
+
+
+package com.ericversteeg.frosthprun;
+
+import com.ericversteeg.frosthprun.config.BarInfo;
+import com.ericversteeg.frosthprun.config.BarStyle;
+import com.ericversteeg.frosthprun.config.TextBrightness;
+import com.ericversteeg.frosthprun.config.BarType;
+import com.ericversteeg.frosthprun.view.*;
+import net.runelite.api.*;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import javax.inject.Inject;
+import java.util.*;
+import java.awt.*;
+import java.io.InputStream;
+import java.util.List;
+
+public class FrostHpRunOverlay extends RSViewOverlay {
+
+	private final Client client;
+	private final ItemManager itemManager;
+	private final FrostHpRunPlugin plugin;
+	private final FrostHpRunConfig config;
+
+	private Font primaryFont;
+	private Font secondaryFont;
+	private Font smallFont;
+
+	List<BarType> types;
+
+	private RSColumn hpColumn;
+	private RSColumn runColumn;
+
+	private RSBar primaryBar;
+	private RSTextView primaryTextView;
+
+	private RSBar secondaryBar;
+	private RSTextView secondaryTextView;
+
+	private RSBar tertiaryBar;
+	private RSTextView tertiaryTextView;
+
+	private RSBar quaternaryBar;
+	private RSTextView quaternaryTextView;
+
+	private RSBar runBar;
+	private RSTextView runTextView;
+
+	private String hpViewName = "hp_view";
+	private String runViewName = "run_view";
+
+	@Inject
+	private FrostHpRunOverlay(
+			Client client,
+			ItemManager itemManager,
+			FrostHpRunPlugin plugin,
+			FrostHpRunConfig config)
+	{
+		setPosition(OverlayPosition.DYNAMIC);
+		setLayer(OverlayLayer.ABOVE_WIDGETS);
+
+		this.client = client;
+		this.itemManager = itemManager;
+		this.plugin = plugin;
+		this.config = config;
+
+		setPosition(OverlayPosition.DYNAMIC);
+		setLayer(OverlayLayer.UNDER_WIDGETS);
+	}
+
+	void setupHpBar(boolean animate)
+	{
+		clearHpViewInfo();
+
+		Map<BarType, BarInfo> barInfo = plugin.barInfo();
+
+		int width = Math.min(800, Math.max(config.width(), 40));
+		int height = Math.min(150, Math.max(config.height(), 20));
+
+		setFonts(height);
+
+		boolean hasSecondaryText = config.hasSecondaryText();
+
+		hpColumn = new RSColumn(0,0, width, RSView.WRAP_CONTENT);
+
+		types = types();
+
+		Collections.reverse(types);
+
+		for (int i = 0; i < types.size(); i++)
+		{
+			BarInfo info = barInfo.get(types.get(i));
+
+			if (i < types.size() - 1)
+			{
+				RSBox container = new RSBox(0, 0, RSView.MATCH_PARENT, height / 3);
+				if (i == types.size() - 2 && config.isLargeSecondary())
+				{
+					container = new RSBox(0, 0, RSView.MATCH_PARENT, height / 2);
+				}
+
+                RSBar bar = new RSBar(RSView.MATCH_PARENT, RSView.MATCH_PARENT, info.maxValue, config.barStyle(), i, types.size());
+				bar.setHue(info.hue);
+				bar.setValue(info.value);
+
+				RSTextView text = new RSTextView(0, 0, RSView.WRAP_CONTENT, RSView.WRAP_CONTENT, smallFont);
+
+				if (i == types.size() - 2 && config.isLargeSecondary())
+				{
+					text = new RSTextView(0, 0, RSView.WRAP_CONTENT, RSView.WRAP_CONTENT, secondaryFont);
+
+					switch (config.secondaryFontAlignment()) {
+						case LEFT:
+							text.setLayoutGravity(RSViewGroup.Gravity.START);
+							break;
+						case CENTER:
+							text.setLayoutGravity(RSViewGroup.Gravity.CENTER);
+							break;
+						case RIGHT:
+							text.setLayoutGravity(RSViewGroup.Gravity.END);
+							break;
+					}
+
+					int configOffsetX = config.secondaryTextOffsetX();
+					if (config.isNegativeSecondaryTextOffsetX())
+					{
+						configOffsetX = -configOffsetX;
+					}
+
+					text.setOffsetX(configOffsetX);
+
+					int configOffsetY = config.secondaryTextOffsetY();
+					if (config.isNegativeSecondaryTextOffsetY())
+					{
+						configOffsetY = -configOffsetY;
+					}
+
+					text.setOffsetY(-height / 4 + configOffsetY);
+
+					Color textColor = config.secondaryTextColor().getColor();
+					if (config.barTextStyle() == TextBrightness.DARKENED)
+					{
+						textColor = darkenColor(textColor);
+					}
+					else if (config.barTextStyle() == TextBrightness.NORMAL)
+					{
+						textColor = slightlyDarkenColor(textColor);
+					}
+					text.setTextColor(textColor);
+				}
+				else {
+					text.setMarginStart(1);
+					//text.setMarginTop(-1);
+
+					int configOffsetX = config.smallTextOffsetX();
+					if (config.isNegativeSmallTextOffsetX())
+					{
+						configOffsetX = -configOffsetX;
+					}
+
+					text.setOffsetX(configOffsetX);
+
+					int configOffsetY = config.smallTextOffsetY();
+					if (config.isNegativeSmallTextOffsetY())
+					{
+						configOffsetY = -configOffsetY;
+					}
+
+					text.setOffsetY(-height / 3 + configOffsetY + 4);
+
+					switch (config.smallFontAlignment()) {
+						case LEFT:
+							text.setLayoutGravity(RSViewGroup.Gravity.START);
+							break;
+						case CENTER:
+							text.setLayoutGravity(RSViewGroup.Gravity.CENTER);
+							break;
+						case RIGHT:
+							text.setLayoutGravity(RSViewGroup.Gravity.END);
+							break;
+					}
+
+					Color textColor = config.smallTextColor().getColor();
+					if (config.barTextStyle() == TextBrightness.DARKENED)
+					{
+						textColor = darkenColor(textColor);
+					}
+					else if (config.barTextStyle() == TextBrightness.NORMAL)
+					{
+						textColor = slightlyDarkenColor(textColor);
+					}
+					text.setTextColor(textColor);
+				}
+
+				text.setText(String.valueOf(bar.getValue()));
+
+				container.addView(bar);
+
+				if (hasSecondaryText)
+				{
+					container.addView(text);
+				}
+
+				hpColumn.addView(container);
+
+				if (i == types.size() - 2)
+				{
+					secondaryBar = bar;
+					secondaryTextView = text;
+				}
+				else if (i == types.size() - 3)
+				{
+					tertiaryBar = bar;
+					tertiaryTextView = text;
+				}
+				else if (i == types.size() - 4)
+				{
+					quaternaryBar = bar;
+					quaternaryTextView = text;
+				}
+			}
+			else
+			{
+				RSBox container = new RSBox(0, 0, RSView.MATCH_PARENT, height);
+
+				RSBar bar = new RSBar(RSView.MATCH_PARENT, height, info.maxValue, config.barStyle(), i, types.size());
+				RSTextView text = new RSTextView(0, 0, RSView.WRAP_CONTENT,
+						RSView.WRAP_CONTENT, primaryFont);
+
+				bar.setValue(info.value);
+				bar.setHue(info.hue);
+
+				text.setText(String.format("%d", bar.getValue()));
+				text.setLayoutGravity(RSViewGroup.Gravity.CENTER);
+
+				int configOffsetX = config.primaryTextOffsetX();
+				if (config.isNegativePrimaryTextOffsetX())
+				{
+					configOffsetX = -configOffsetX;
+				}
+
+				text.setOffsetX(configOffsetX);
+
+				int configOffsetY = config.primaryTextOffsetY();
+				if (config.isNegativePrimaryTextOffsetY())
+				{
+					configOffsetY = -configOffsetY;
+				}
+
+				int textOffsetY = -height / 4 + configOffsetY;
+				if (config.barStyle() != BarStyle.ROUND)
+				{
+					textOffsetY += height / 16;
+				}
+				text.setOffsetY(textOffsetY);
+
+				switch (config.primaryFontAlignment()) {
+					case LEFT:
+						text.setLayoutGravity(RSViewGroup.Gravity.START);
+						break;
+					case CENTER:
+						text.setLayoutGravity(RSViewGroup.Gravity.CENTER);
+						break;
+					case RIGHT:
+						text.setLayoutGravity(RSViewGroup.Gravity.END);
+						break;
+				}
+
+				Color textColor = config.primaryTextColor().getColor();
+				if (config.barTextStyle() == TextBrightness.DARKENED)
+				{
+					textColor = darkenColor(textColor);
+				}
+				else if (config.barTextStyle() == TextBrightness.NORMAL)
+				{
+					textColor = slightlyDarkenColor(textColor);
+				}
+				text.setTextColor(textColor);
+
+				container.addView(bar);
+				if (config.hasPrimaryText())
+				{
+					container.addView(text);
+				}
+
+				hpColumn.addView(container);
+
+				primaryBar = bar;
+				primaryTextView = text;
+			}
+		}
+
+		hpColumn.setRenderReverse(false);
+
+		hpColumn.setOpacity(Math.max(20, Math.min(100,
+				config.barOpacity())) / 100f);
+
+		if (animate)
+		{
+			hpColumn.animate()
+					.duration(0.1f)
+					.fadeIn()
+					.start();
+		}
+
+		ViewInfo hpViewInfo = new ViewInfo(client, hpColumn, config.anchorType(), config.anchorX(), config.anchorY());
+
+		addViewInfo(hpViewName, hpViewInfo);
+	}
+
+	private void updateHpBar()
+	{
+		Map<BarType, BarInfo> barInfo = plugin.barInfo();
+
+		for (int i = 0; i < types.size(); i++)
+		{
+			BarInfo info = barInfo.get(types.get(i));
+
+			if (i < types.size() - 1)
+			{
+				if (i == types.size() - 2)
+				{
+					int value = info.value;
+					if (config.extendBars())
+					{
+						secondaryBar.setValue(value);
+					}
+					else
+					{
+						secondaryBar.setValue(Math.min(info.maxValue, value));
+					}
+					secondaryBar.setHue(info.hue);
+					secondaryTextView.setText(String.valueOf(value));
+				}
+				else if (i == types.size() - 3)
+				{
+					int value = info.value;
+					if (config.extendBars())
+					{
+						tertiaryBar.setValue(value);
+					}
+					else
+					{
+						tertiaryBar.setValue(Math.min(info.maxValue, value));
+					}
+					tertiaryBar.setHue(info.hue);
+					tertiaryTextView.setText(String.valueOf(value));
+				}
+				else if (i == types.size() - 4)
+				{
+					int value = info.value;
+					if (config.extendBars())
+					{
+						quaternaryBar.setValue(value);
+					}
+					else
+					{
+						quaternaryBar.setValue(Math.min(info.maxValue, value));
+					}
+					quaternaryBar.setHue(info.hue);
+					quaternaryTextView.setText(String.valueOf(value));
+				}
+			}
+			else
+			{
+				int value = info.value;
+				if (config.extendBars())
+				{
+					primaryBar.setValue(value);
+				}
+				else
+				{
+					primaryBar.setValue(Math.min(info.maxValue, value));
+				}
+				primaryBar.setHue(info.hue);
+				primaryTextView.setText(String.valueOf(value));
+			}
+		}
+	}
+
+	void setupRunBar(boolean animate)
+	{
+		clearRunViewInfo();
+
+		Map<BarType, BarInfo> barInfo = plugin.barInfo();
+
+		int width = Math.min(800, Math.max(config.runWidth(), 40));
+		int height = Math.min(150, Math.max(config.runHeight(), 20));
+
+		setFonts(height);
+
+		runColumn = new RSColumn(0,0, width, RSView.WRAP_CONTENT);
+
+		BarInfo info = barInfo.get(BarType.RUN_ENERGY);
+
+		RSBox container = new RSBox(0, 0, RSView.MATCH_PARENT, height);
+
+		RSBar bar = new RSBar(RSView.MATCH_PARENT, height, info.maxValue, config.barStyle(), 0, 1);
+		RSTextView text = new RSTextView(0, 0, RSView.WRAP_CONTENT,
+				RSView.WRAP_CONTENT, primaryFont);
+
+		bar.setValue(info.value);
+		bar.setHue(info.hue);
+
+		text.setText(String.format("%d", bar.getValue()));
+		text.setLayoutGravity(RSViewGroup.Gravity.CENTER);
+
+		int configOffsetX = config.primaryTextOffsetX();
+		if (config.isNegativePrimaryTextOffsetX())
+		{
+			configOffsetX = -configOffsetX;
+		}
+
+		int runOffsetX = config.runBarTextOffsetX();
+		if (config.isNegativeRunTextOffsetX())
+		{
+			runOffsetX = -runOffsetX;
+		}
+
+		configOffsetX += runOffsetX;
+
+		text.setOffsetX(configOffsetX);
+
+		int configOffsetY = config.primaryTextOffsetY();
+		if (config.isNegativePrimaryTextOffsetY())
+		{
+			configOffsetY = -configOffsetY;
+		}
+
+		int runOffsetY = config.runBarTextOffsetY();
+		if (config.isNegativeRunTextOffsetY())
+		{
+			runOffsetY = -runOffsetY;
+		}
+
+		configOffsetY += runOffsetY;
+
+		text.setOffsetY(-height / 4 + configOffsetY + 1);
+
+		switch (config.primaryFontAlignment()) {
+			case LEFT:
+				text.setLayoutGravity(RSViewGroup.Gravity.START);
+				break;
+			case CENTER:
+				text.setLayoutGravity(RSViewGroup.Gravity.CENTER);
+				break;
+			case RIGHT:
+				text.setLayoutGravity(RSViewGroup.Gravity.END);
+				break;
+		}
+
+		Color textColor = config.runTextColor().getColor();
+		if (config.barTextStyle() == TextBrightness.DARKENED)
+		{
+			textColor = darkenColor(textColor);
+		}
+		else if (config.barTextStyle() == TextBrightness.NORMAL)
+		{
+			textColor = slightlyDarkenColor(textColor);
+		}
+		text.setTextColor(textColor);
+
+		container.addView(bar);
+
+		if (config.hasRunPrimaryText())
+		{
+			container.addView(text);
+		}
+
+		runColumn.addView(container);
+
+		runBar = bar;
+		runTextView = text;
+
+		runColumn.setOpacity(Math.max(20, Math.min(100,
+				config.runBarOpacity())) / 100f);
+
+		if (animate)
+		{
+			runColumn.animate()
+					.duration(0.1f)
+					.fadeIn()
+					.start();
+		}
+
+		ViewInfo runViewInfo = new ViewInfo(client, runColumn, config.runAnchorType(),
+				config.runAnchorX(), config.runAnchorY());
+
+		addViewInfo(runViewName, runViewInfo);
+	}
+
+	private void updateRunBar()
+	{
+		Map<BarType, BarInfo> barInfo = plugin.barInfo();
+		BarInfo info = barInfo.get(BarType.RUN_ENERGY);
+
+		int value = info.value;
+		runBar.setValue(Math.min(info.maxValue, value));
+		runBar.setHue(info.hue);
+		runTextView.setText(String.valueOf(value));
+	}
+
+	void setFonts(int height)
+	{
+		try {
+			GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+			InputStream inputStream = FrostHpRunOverlay.class.getResourceAsStream(
+					"NotoSansJP-" + config.primaryFontWeight().getName()
+							.replace(" ", "") + ".ttf"
+			);
+			Font font = Font.createFont(Font.TRUETYPE_FONT, inputStream)
+					.deriveFont(Font.PLAIN,  (int) Math.ceil((double) height * 0.55f) * (config.primaryFontScaleFactor() / 100f));
+			ge.registerFont(font);
+			primaryFont = font;
+		}
+		catch (Exception e)
+		{
+			primaryFont = FontManager.getRunescapeBoldFont();
+		}
+
+		try {
+			GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+			InputStream inputStream = FrostHpRunOverlay.class.getResourceAsStream(
+					"NotoSansJP-" + config.secondaryFontWeight().getName()
+							.replace(" ", "") + ".ttf"
+			);
+			Font font = Font.createFont(Font.TRUETYPE_FONT, inputStream)
+					.deriveFont(Font.PLAIN,  (int) Math.ceil((double) height / 2) * (config.secondaryFontScaleFactor() / 100f));
+			ge.registerFont(font);
+			secondaryFont = font;
+		}
+		catch (Exception e)
+		{
+			secondaryFont = FontManager.getRunescapeSmallFont();
+		}
+
+		try {
+			GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+			InputStream inputStream = FrostHpRunOverlay.class.getResourceAsStream(
+					"NotoSansJP-" + config.smallFontWeight().getName()
+							.replace(" ", "") + ".ttf"
+			);
+			Font font = Font.createFont(Font.TRUETYPE_FONT, inputStream)
+					.deriveFont(Font.PLAIN,  (int) Math.ceil((double) height / 3) * (config.smallFontScaleFactor() / 100f));
+			ge.registerFont(font);
+			smallFont = font;
+		}
+		catch (Exception e)
+		{
+			smallFont = FontManager.getRunescapeSmallFont();
+		}
+	}
+
+	private boolean isFadeOut = false;
+	private boolean isFadeOutRun = false;
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (!config.isSmartHide() && config.showHpBar() && !containsViewInfo(hpViewName))
+		{
+			//System.out.println("Always visible, view info not there, setup hp bar, fade in false");
+			setupHpBar(false);
+		}
+		else if (!config.isSmartHide() && config.showHpBar())
+		{
+			//System.out.println("Always visible, update hp bar");
+			updateHpBar();
+		}
+		else if (config.showHpBar())
+		{
+			if (plugin.isActive() && !containsViewInfo(hpViewName))
+			{
+				//System.out.println("Sometimes visible, view info not there, setup hp bar, fade in true");
+				setupHpBar(true);
+			}
+			else if (plugin.isActive())
+			{
+				//System.out.println("Sometimes visible, update hp bar");
+				updateHpBar();
+			}
+			else if (containsViewInfo(hpViewName))
+			{
+				//System.out.println("Hp is fade out is " + isFadeOut);
+				if (!isFadeOut)
+				{
+					//System.out.println("Fade out hp bar start");
+					hpColumn.animate()
+							.fadeOut()
+							.duration(0.10f)
+							.onComplete(() -> {
+								removeViewInfo(hpViewName, false);
+								isFadeOut = false;
+								//System.out.println("fade out hp bar done");
+							})
+							.start();
+
+					isFadeOut = true;
+				}
+			}
+		}
+
+		if (!config.isRunSmartHide() && config.showRunBar() && !containsViewInfo(runViewName))
+		{
+			//System.out.println("Always visible, view info not there, setup run bar, fade in false");
+			setupRunBar(false);
+		}
+		else if (!config.isRunSmartHide() && config.showRunBar())
+		{
+			//System.out.println("Always visible, update run bar");
+			updateRunBar();
+		}
+		else if (config.showRunBar())
+		{
+			if (plugin.isRun() && !containsViewInfo(runViewName))
+			{
+				//System.out.println("Sometimes visible, view info not there, setup run bar, fade in true");
+				setupRunBar(true);
+			}
+			else if (plugin.isRun())
+			{
+				//System.out.println("Sometimes visible, update run bar");
+				updateRunBar();
+			}
+			else if (containsViewInfo(runViewName))
+			{
+				//System.out.println("Run is fade out is " + isFadeOut);
+				if (!isFadeOutRun)
+				{
+					//System.out.println("Fade out run bar start");
+					runColumn.animate()
+							.fadeOut()
+							.duration(0.10f)
+							.onComplete(() -> {
+								removeViewInfo(runViewName, false);
+								isFadeOutRun = false;
+								//System.out.println("fade out run bar done");
+							})
+							.start();
+
+					isFadeOutRun = true;
+				}
+			}
+		}
+
+		return super.render(graphics);
+	}
+
+	private List<BarType> types()
+	{
+		BarType primary = config.primaryBarType();
+		BarType secondary = config.secondaryBarType();
+		BarType tertiary = config.tertiaryBarType();
+		BarType quaternary = config.quaternaryBarType();
+
+		List<BarType> barTypes = new ArrayList<>();
+
+		if (primary != BarType.NONE)
+		{
+			barTypes.add(primary);
+		}
+
+		if (!barTypes.contains(secondary)
+				&& secondary != BarType.NONE)
+		{
+			barTypes.add(secondary);
+		}
+
+		if (!barTypes.contains(tertiary)
+				&& tertiary != BarType.NONE)
+		{
+			barTypes.add(tertiary);
+		}
+
+		if (!barTypes.contains(quaternary)
+				&& quaternary != BarType.NONE)
+		{
+			barTypes.add(quaternary);
+		}
+
+		return barTypes;
+	}
+
+	boolean hasBarType(BarType barType) {
+		for (BarType type: types()) {
+			if (barType == type) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	public void clearHpViewInfo()
+	{
+		removeViewInfo(hpViewName, true);
+		isFadeOut = false;
+	}
+
+	public void clearRunViewInfo()
+	{
+		removeViewInfo(runViewName, true);
+		isFadeOutRun = false;
+	}
+
+	private Color slightlyDarkenColor(Color color)
+	{
+		float [] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
+		return Color.getHSBColor(hsb[0], hsb[1], hsb[2] * 0.8f);
+	}
+
+	private Color darkenColor(Color color)
+	{
+		float [] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
+		return Color.getHSBColor(hsb[0], hsb[1], hsb[2] * 0.6f);
+	}
+}
+
+package com.ericversteeg.frosthprun;
+
+import com.ericversteeg.frosthprun.config.BarStyle;
+import com.ericversteeg.frosthprun.config.TextBrightness;
+import com.ericversteeg.frosthprun.config.BarType;
+import com.ericversteeg.frosthprun.view.RSAnchorType;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+@ConfigGroup(FrostHpRunConfig.GROUP)
+public interface FrostHpRunConfig extends Config
+{
+    @ConfigItem(
+            position = -1,
+            keyName = "style",
+            name = "Bar Style",
+            description = "Configures the bar style."
+    )
+    default BarStyle barStyle() { return BarStyle.DARK; }
+
+    @ConfigItem(
+            position = -1,
+            keyName = "textStyle",
+            name = "Bar Text Style",
+            description = "Configures the bar text brightness."
+    )
+    default TextBrightness barTextStyle() { return TextBrightness.DARKENED; }
+
+    String GROUP = "hpbar";
+
+    @ConfigSection(
+            position = 0,
+            name = "Hp Bar",
+            description = "Hp and associated bars."
+    )
+    String hpBarSection = "hpBar";
+
+    @ConfigItem(
+            position = 0,
+            keyName = "primaryBar",
+            name = "Primary",
+            description = "Configures what the primary bar is.",
+            section = hpBarSection
+    )
+    default BarType primaryBarType() { return BarType.HITPOINTS; }
+
+    @ConfigItem(
+            position = 1,
+            keyName = "secondaryBar",
+            name = "Secondary",
+            description = "Configures what the secondary bar is.",
+            section = hpBarSection
+    )
+    default BarType secondaryBarType() { return BarType.PRAYER; }
+
+    @ConfigItem(
+            position = 2,
+            keyName = "tertiaryBar",
+            name = "Tertiary",
+            description = "Configures what the tertiary bar is.",
+            section = hpBarSection
+    )
+    default BarType tertiaryBarType() { return BarType.NONE; }
+
+    @ConfigItem(
+            position = 3,
+            keyName = "quaternaryBar",
+            name = "Quaternary",
+            description = "Configures what the quaternary bar is.",
+            section = hpBarSection
+    )
+    default BarType quaternaryBarType() { return BarType.NONE; }
+
+    @ConfigItem(
+            position = 13,
+            keyName = "enableHp",
+            name = "Enable",
+            description = "Configures whether to enable.",
+            section = hpBarSection
+    )
+    default boolean showHpBar() { return true; }
+
+    @ConfigItem(
+            position = 14,
+            keyName = "smartHide",
+            name = "Smart Hide",
+            description = "Configures whether or not smart hide is enabled.",
+            section = hpBarSection
+    )
+    default boolean isSmartHide() { return false; }
+
+    @ConfigItem(
+            position = 15,
+            keyName = "combatDelay",
+            name = "Combat Hide Delay",
+            description = "Configures how many ticks after combat the bar hides.",
+            section = hpBarSection
+    )
+    default int combatHideDelay() { return 5; }
+
+    @ConfigItem(
+            position = 16,
+            keyName = "barOpacity",
+            name = "Opacity",
+            description = "Configures the opacity of the bar (20-100).",
+            section = hpBarSection
+    )
+    default int barOpacity() { return 100; }
+
+    @ConfigItem(
+            position = 17,
+            keyName = "extendBars",
+            name = "Extend Bars",
+            description = "Configures whether or not bars extend beyond full size.",
+            section = additionalConfigSection
+    )
+    default boolean extendBars() {
+        return false;
+    }
+
+    @ConfigItem(
+            position = 18,
+            keyName = "largeSecondary",
+            name = "Large Secondary",
+            description = "Configures whether or not the secondary bar is large.",
+            section = hpBarSection
+    )
+    default boolean isLargeSecondary() { return false; }
+
+    @ConfigItem(
+            position = 19,
+            keyName = "primaryText",
+            name = "Text",
+            description = "Configures whether or not to show text.",
+            section = hpBarSection
+    )
+    default boolean hasPrimaryText() { return true; }
+
+    @ConfigItem(
+            position = 20,
+            keyName = "smallText",
+            name = "Small Text",
+            description = "Configures whether or not to show small text.",
+            section = hpBarSection
+    )
+    default boolean hasSecondaryText() { return false; }
+
+    @ConfigItem(
+            position = 21,
+            keyName = "anchorType",
+            name = "Anchor",
+            description = "Configures view anchor.",
+            section = hpBarSection
+    )
+    default RSAnchorType anchorType() {
+        return RSAnchorType.BOTTOM_CENTER;
+    }
+
+    @ConfigItem(
+            position = 22,
+            keyName = "anchorX",
+            name = "Offset X",
+            description = "Configures x offset.",
+            section = hpBarSection
+    )
+    default int anchorX() {
+        return 0;
+    }
+
+    @ConfigItem(
+            position = 23,
+            keyName = "anchorY",
+            name = "Offset Y",
+            description = "Configures y offset.",
+            section = hpBarSection
+    )
+    default int anchorY() {
+        return 180;
+    }
+
+    @ConfigItem(
+            position = 24,
+            keyName = "width",
+            name = "Width",
+            description = "Configures the width.",
+            section = hpBarSection
+    )
+    default int width() {
+        return 180;
+    }
+
+    @ConfigItem(
+            position = 25,
+            keyName = "height",
+            name = "Height",
+            description = "Configures the height.",
+            section = hpBarSection
+    )
+    default int height() {
+        return 25;
+    }
+
+    @ConfigSection(
+            position = 1,
+            name = "Run Bar",
+            description = "Run bar."
+    )
+    String runBarSection = "runBar";
+
+    @ConfigItem(
+            position = 14,
+            keyName = "enableRun",
+            name = "Enable",
+            description = "Configures whether or not to enable.",
+            section = runBarSection
+    )
+    default boolean showRunBar() { return true; }
+
+    @ConfigItem(
+            position = 15,
+            keyName = "runSmartHide",
+            name = "Smart Hide",
+            description = "Configures whether or not smart hide is enabled.",
+            section = runBarSection
+    )
+    default boolean isRunSmartHide() { return false; }
+
+    @ConfigItem(
+            position = 15,
+            keyName = "runBarOpacity",
+            name = "Opacity",
+            description = "Configures the opacity of the bar (20-100).",
+            section = runBarSection
+    )
+    default int runBarOpacity() { return 100; }
+
+    @ConfigItem(
+            position = 15,
+            keyName = "runPrimaryText",
+            name = "Text",
+            description = "Configures whether or not to show text.",
+            section = runBarSection
+    )
+    default boolean hasRunPrimaryText() { return true; }
+
+    @ConfigItem(
+            position = 16,
+            keyName = "runTextOffsetX",
+            name = "Text Offset X",
+            description = "Configures the run bar text x offset.",
+            section = runBarSection
+    )
+    default int runBarTextOffsetX() { return 0; }
+
+    @ConfigItem(
+            position = 17,
+            keyName = "negativeRunTextOffsetX",
+            name = "Negative Text Offset X",
+            description = "Configures the run bar text x offset is negative.",
+            section = runBarSection
+    )
+    default boolean isNegativeRunTextOffsetX() { return false; }
+
+    @ConfigItem(
+            position = 18,
+            keyName = "runTextOffsetY",
+            name = "Text Offset Y",
+            description = "Configures the run bar text y offset.",
+            section = runBarSection
+    )
+    default int runBarTextOffsetY() { return 0; }
+
+    @ConfigItem(
+            position = 19,
+            keyName = "negativeRunTextOffsetY",
+            name = "Negative Text Offset Y",
+            description = "Configures the run bar text y offset is negative.",
+            section = runBarSection
+    )
+    default boolean isNegativeRunTextOffsetY() { return false; }
+
+    @ConfigItem(
+            position = 20,
+            keyName = "runAnchorType",
+            name = "Anchor",
+            description = "Configures view anchor.",
+            section = runBarSection
+    )
+    default RSAnchorType runAnchorType() {
+        return RSAnchorType.BOTTOM_CENTER;
+    }
+
+    @ConfigItem(
+            position = 21,
+            keyName = "runAnchorX",
+            name = "Offset X",
+            description = "Configure x offset.",
+            section = runBarSection
+    )
+    default int runAnchorX() {
+        return 0;
+    }
+
+    @ConfigItem(
+            position = 22,
+            keyName = "runAnchorY",
+            name = "Offset Y",
+            description = "Configures y offset.",
+            section = runBarSection
+    )
+    default int runAnchorY() {
+        return 230;
+    }
+
+    @ConfigItem(
+            position = 23,
+            keyName = "runWidth",
+            name = "Width",
+            description = "Configures width.",
+            section = runBarSection
+    )
+    default int runWidth() {
+        return 180;
+    }
+
+    @ConfigItem(
+            position = 24,
+            keyName = "runHeight",
+            name = "Height",
+            description = "Configures height.",
+            section = runBarSection
+    )
+    default int runHeight() {
+        return 25;
+    }
+
+    @ConfigSection(
+            position = 2,
+            name = "Hues",
+            description = "Bar colors."
+    )
+    String huesSection = "huesSection";
+
+    @ConfigItem(
+            position = 4,
+            keyName = "hitpointsHue",
+            name = "Hitpoints Hue",
+            description = "Configures what hue hitpoints is (0-360).",
+            section = huesSection
+    )
+    default int hpHue() { return 0; }
+
+    @ConfigItem(
+            position = 5,
+            keyName = "diseasedHue",
+            name = "Diseased Hue",
+            description = "Configures what hue diseased is (0-360).",
+            section = huesSection
+    )
+    default int diseasedHue() { return 75; }
+
+    @ConfigItem(
+            position = 6,
+            keyName = "poisonedHue",
+            name = "Poisoned Hue",
+            description = "Configures what hue poisoned is (0-360).",
+            section = huesSection
+    )
+    default int poisonedHue() { return 95; }
+
+    @ConfigItem(
+            position = 7,
+            keyName = "envenomedHue",
+            name = "Envenomed Hue",
+            description = "Configures what hue envenomed is (0-360).",
+            section = huesSection
+    )
+    default int envenomedHue() { return 145; }
+
+    @ConfigItem(
+            position = 8,
+            keyName = "activePrayerHue",
+            name = "Active Prayer Hue",
+            description = "Configures what hue prayer is when active (0-360).",
+            section = huesSection
+    )
+    default int activePrayerHue() { return 270; }
+
+    @ConfigItem(
+            position = 9,
+            keyName = "inactivePrayerHue",
+            name = "Inactive Prayer Hue",
+            description = "Configures what hue prayer is when inactive (0-360).",
+            section = huesSection
+    )
+    default int inactivePrayerHue() { return 259; }
+
+    @ConfigItem(
+            position = 10,
+            keyName = "specialAttackHue",
+            name = "Special Attack Hue",
+            description = "Configures what hue special attack is when inactive (0-360).",
+            section = huesSection
+    )
+    default int specialAttackHue() { return 186; }
+
+    @ConfigItem(
+            position = 11,
+            keyName = "runHue",
+            name = "Run Hue",
+            description = "Configures what hue run is (0-360).",
+            section = huesSection
+    )
+    default int runHue() { return 60; }
+
+    @ConfigItem(
+            position = 12,
+            keyName = "staminaHue",
+            name = "Stamina Hue",
+            description = "Configures what hue run is with stamina potion (0-360).",
+            section = huesSection
+    )
+    default int staminaHue() { return 25; }
+
+    @ConfigSection(
+            position = 3,
+            name = "Text Colors",
+            description = "Text colors."
+    )
+    String textColorsSection = "textColorsSection";
+
+    @ConfigItem(
+            position = 0,
+            keyName = "smallTextColor",
+            name = "Small Text Color",
+            description = "Configures thin bar text color.",
+            section = textColorsSection
+    )
+    default TextColor smallTextColor() {
+        return TextColor.WHITE;
+    }
+
+    @ConfigItem(
+            position = 1,
+            keyName = "secondaryTextColor",
+            name = "Secondary Text Color",
+            description = "Configures secondary bar text color.",
+            section = textColorsSection
+    )
+    default TextColor secondaryTextColor() {
+        return TextColor.WHITE;
+    }
+
+    @ConfigItem(
+            position = 2,
+            keyName = "primaryTextColor",
+            name = "Primary Text Color",
+            description = "Configures primary bar text color.",
+            section = textColorsSection
+    )
+    default TextColor primaryTextColor() {
+        return TextColor.WHITE;
+    }
+
+    @ConfigItem(
+            position = 3,
+            keyName = "runTextColor",
+            name = "Run Text Color",
+            description = "Configures run bar text color.",
+            section = textColorsSection
+    )
+    default TextColor runTextColor() {
+        return TextColor.WHITE;
+    }
+
+    @ConfigSection(
+            position = 4,
+            name = "Additional Configuration",
+            description = ""
+    )
+    String additionalConfigSection = "additionalConfig";
+
+    @ConfigItem(
+            position = 21,
+            keyName = "smallTextOffsetX",
+            name = "Small Text Offset X",
+            description = "Configures text offset x for thin bars.",
+            section = additionalConfigSection
+    )
+    default int smallTextOffsetX() {
+        return 0;
+    }
+
+    @ConfigItem(
+            position = 22,
+            keyName = "negativeSmallTextOffsetX",
+            name = "Negative Small Text Offset X",
+            description = "Configures whether or not the small text offset x number is negative.",
+            section = additionalConfigSection
+    )
+    default boolean isNegativeSmallTextOffsetX() {
+        return false;
+    }
+
+    @ConfigItem(
+            position = 23,
+            keyName = "smallTextOffsetY",
+            name = "Small Text Offset Y",
+            description = "Configures text offset y for thin bars.",
+            section = additionalConfigSection
+    )
+    default int smallTextOffsetY() {
+        return 0;
+    }
+
+    @ConfigItem(
+            position = 24,
+            keyName = "negativeSmallTextOffsetY",
+            name = "Negative Small Text Offset Y",
+            description = "Configures whether or not the small text offset y number is negative.",
+            section = additionalConfigSection
+    )
+    default boolean isNegativeSmallTextOffsetY() {
+        return false;
+    }
+
+    @ConfigItem(
+            position = 25,
+            keyName = "secondaryTextOffsetX",
+            name = "Secondary Text Offset X",
+            description = "Configures text offset x for secondary bar.",
+            section = additionalConfigSection
+    )
+    default int secondaryTextOffsetX() {
+        return 0;
+    }
+
+    @ConfigItem(
+            position = 26,
+            keyName = "negativeSecondaryTextOffsetX",
+            name = "Negative Secondary Text Offset X",
+            description = "Configures whether or not the secondary text offset x number is negative.",
+            section = additionalConfigSection
+    )
+    default boolean isNegativeSecondaryTextOffsetX() {
+        return false;
+    }
+
+    @ConfigItem(
+            position = 27,
+            keyName = "secondaryTextOffsetY",
+            name = "Secondary Text Offset Y",
+            description = "Configures text offset y for secondary bars.",
+            section = additionalConfigSection
+    )
+    default int secondaryTextOffsetY() {
+        return 3;
+    }
+
+    @ConfigItem(
+            position = 28,
+            keyName = "negativeSecondaryTextOffsetY",
+            name = "Negative Secondary Text Offset Y",
+            description = "Configures whether or not the secondary text offset y number is negative.",
+            section = additionalConfigSection
+    )
+    default boolean isNegativeSecondaryTextOffsetY() {
+        return false;
+    }
+
+    @ConfigItem(
+            position = 29,
+            keyName = "primaryTextOffsetX",
+            name = "Primary Text Offset X",
+            description = "Configures text offset x for primary bar.",
+            section = additionalConfigSection
+    )
+    default int primaryTextOffsetX() {
+        return 0;
+    }
+
+    @ConfigItem(
+            position = 30,
+            keyName = "negativePrimaryTextOffsetX",
+            name = "Negative Primary Text Offset X",
+            description = "Configures whether or not the primary text offset x number is negative.",
+            section = additionalConfigSection
+    )
+    default boolean isNegativePrimaryTextOffsetX() {
+        return false;
+    }
+
+    @ConfigItem(
+            position = 31,
+            keyName = "primaryTextOffsetY",
+            name = "Primary Text Offset Y",
+            description = "Configures text offset y for primary bars.",
+            section = additionalConfigSection
+    )
+    default int primaryTextOffsetY() {
+        return 0;
+    }
+
+    @ConfigItem(
+            position = 32,
+            keyName = "negativePrimaryTextOffsetY",
+            name = "Negative Primary Text Offset Y",
+            description = "Configures whether or not the primary text offset y number is negative.",
+            section = additionalConfigSection
+    )
+    default boolean isNegativePrimaryTextOffsetY() {
+        return false;
+    }
+
+    @ConfigItem(
+            position = 33,
+            keyName = "smallFontScaleFactor",
+            name = "Small Font Scale Factor %",
+            description = "Configures small font scale factor.",
+            section = additionalConfigSection
+    )
+    default int smallFontScaleFactor() {
+        return 100;
+    }
+
+    @ConfigItem(
+            position = 34,
+            keyName = "secondaryFontScaleFactor",
+            name = "Secondary Font Scale Factor %",
+            description = "Configures secondary font scale factor.",
+            section = additionalConfigSection
+    )
+    default int secondaryFontScaleFactor() {
+        return 100;
+    }
+
+    @ConfigItem(
+            position = 35,
+            keyName = "primaryFontScaleFactor",
+            name = "Primary Font Scale Factor %",
+            description = "Configures primary font scale factor.",
+            section = additionalConfigSection
+    )
+    default int primaryFontScaleFactor() {
+        return 100;
+    }
+
+    @ConfigItem(
+            position = 36,
+            keyName = "smallFontAlignment",
+            name = "Small Font Alignment",
+            description = "Configures small font alignment.",
+            section = additionalConfigSection
+    )
+    default TextAlignment smallFontAlignment() {
+        return TextAlignment.LEFT;
+    }
+
+    @ConfigItem(
+            position = 37,
+            keyName = "secondaryFontAlignment",
+            name = "Secondary Font Alignment",
+            description = "Configures secondary font alignment.",
+            section = additionalConfigSection
+    )
+    default TextAlignment secondaryFontAlignment() {
+        return TextAlignment.LEFT;
+    }
+
+    @ConfigItem(
+            position = 38,
+            keyName = "primaryFontAlignment",
+            name = "Primary Font Alignment",
+            description = "Configures primary font alignment.",
+            section = additionalConfigSection
+    )
+    default TextAlignment primaryFontAlignment() {
+        return TextAlignment.CENTER;
+    }
+
+    @ConfigItem(
+            position = 39,
+            keyName = "smallFontWeight",
+            name = "Small Font Weight",
+            description = "Configures small font weight.",
+            section = additionalConfigSection
+    )
+    default FontWeight smallFontWeight() {
+        return FontWeight.BOLD;
+    }
+
+    @ConfigItem(
+            position = 40,
+            keyName = "secondaryFontWeight",
+            name = "Secondary Font Weight",
+            description = "Configures secondary font weight.",
+            section = additionalConfigSection
+    )
+    default FontWeight secondaryFontWeight() {
+        return FontWeight.BOLD;
+    }
+
+    @ConfigItem(
+            position = 41,
+            keyName = "primaryFontWeight",
+            name = "Primary Font Weight",
+            description = "Configures primary font weight.",
+            section = additionalConfigSection
+    )
+    default FontWeight primaryFontWeight() {
+        return FontWeight.BLACK;
+    }
+}
+package com.ericversteeg.frosthprun;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+import java.awt.*;
+
+@Getter
+@RequiredArgsConstructor
+public enum TextColor {
+    WHITE("White", Color.WHITE),
+    YELLOW("Yellow", Color.YELLOW),
+    RED("Red", Color.RED),
+    GREEN("Green", Color.GREEN),
+    BLUE("Blue", Color.BLUE),
+    CYAN("Cyan", Color.CYAN),
+    MAGENTA("Magenta", Color.MAGENTA),
+    PINK("Pink", Color.PINK);
+
+    private final String name;
+    private final Color color;
+};
+
+
+
+package com.ericversteeg.frosthprun.view;
+
+import java.awt.*;
+import java.util.HashMap;
+import java.util.Map;
+
+public class RSView implements RSRenderable
+{
+    class DimensionParams
+    {
+        private int w;
+        private int h;
+        public DimensionParams(int w, int h)
+        {
+            this.w = w;
+            this.h = h;
+        }
+
+        public int getW()
+        {
+            return w;
+        }
+
+        public void setW(int w)
+        {
+            this.w = w;
+        }
+
+        public int getH()
+        {
+            return h;
+        }
+
+        public void setH(int h)
+        {
+            this.h = h;
+        }
+    }
+
+    class WeightParams
+    {
+        private Float weight;
+
+        public WeightParams(Float weight)
+        {
+            this.weight = weight;
+        }
+
+        public Float getWeight()
+        {
+            return weight;
+        }
+
+        public void setWeight(Float weight)
+        {
+            this.weight = weight;
+        }
+    }
+
+    protected DimensionParams dimensionParams;
+
+    public static int MATCH_PARENT = -1;
+    public static int WRAP_CONTENT = -2;
+
+    protected RSViewGroup.Gravity layoutGravity = null;
+
+    protected int x;
+    protected int y;
+    protected int w;
+    protected int h;
+
+    protected int offsetX;
+    protected int offsetY;
+
+    private Float weight = null;
+    private WeightParams weightParams = null;
+
+    protected int marginStart = 0;
+    protected int marginTop = 0;
+    protected int marginEnd = 0;
+    protected int marginBottom = 0;
+
+    protected int paddingStart = 0;
+    protected int paddingTop = 0;
+    protected int paddingEnd = 0;
+    protected int paddingBottom = 0;
+
+    protected Color bgColor = new Color(0, 0, 0, 0);
+    protected RSViewBorder border;
+
+    protected float opacity = 1f;
+
+    protected Map<RSAnimation.Type, RSAnimation> animations = new HashMap<>();
+
+    protected RSViewGroup parent = null;
+
+    public RSView(int x, int y, int w, int h)
+    {
+        this.dimensionParams = new DimensionParams(w, h);
+        this.x = x;
+        this.y = y;
+    }
+
+    public void addBorder(Color color)
+    {
+        border = new RSViewBorder(this, color);
+    }
+
+    public void addBorder(Color innerColor, Color outerColor)
+    {
+        border = new RSViewBorder(this, innerColor, outerColor);
+    }
+
+    public void setLayoutGravity(RSViewGroup.Gravity layoutGravity)
+    {
+        this.layoutGravity = layoutGravity;
+    }
+
+    public void setX(int x)
+    {
+        this.x = x;
+    }
+
+    public int getX()
+    {
+        return x;
+    }
+
+    public void setY(int y)
+    {
+        this.y = y;
+    }
+
+    public int getY()
+    {
+        return y;
+    }
+
+    public int getW()
+    {
+        return w;
+    }
+
+    public void setW(int w)
+    {
+        this.w = w;
+    }
+
+    public int getH()
+    {
+        return h;
+    }
+
+    public void setH(int h)
+    {
+        this.h = h;
+    }
+
+    public void setOffsetX(int offsetX)
+    {
+        this.offsetX = offsetX;
+    }
+
+    public int getOffsetX()
+    {
+        return offsetX;
+    }
+
+    public void setOffsetY(int offsetY)
+    {
+        this.offsetY = offsetY;
+    }
+
+    public int getOffsetY()
+    {
+        return offsetY;
+    }
+
+    public Float getWeight()
+    {
+        return weight;
+    }
+
+    public void setWeight(Float weight)
+    {
+        this.weight = weight;
+        weightParams = new WeightParams(weight);
+    }
+
+    public WeightParams getWeightParams() { return weightParams; }
+
+    public int getMarginStart()
+    {
+        return marginStart;
+    }
+
+    public int getMarginTop()
+    {
+        return marginTop;
+    }
+
+    public int getMarginEnd()
+    {
+        return marginEnd;
+    }
+
+    public int getMarginBottom()
+    {
+        return marginBottom;
+    }
+
+    public void setParent(RSViewGroup parent)
+    {
+        this.parent = parent;
+    }
+
+    public void setBgColor(Color bgColor)
+    {
+        this.bgColor = bgColor;
+    }
+
+    public void setMarginStart(int marginStart)
+    {
+        this.marginStart = marginStart;
+    }
+
+    public void setMarginTop(int marginTop)
+    {
+        this.marginTop = marginTop;
+    }
+
+    public void setMarginEnd(int marginEnd)
+    {
+        this.marginEnd = marginEnd;
+    }
+
+    public void setMarginBottom(int marginBottom)
+    {
+        this.marginBottom = marginBottom;
+    }
+
+    public void setOpacity(float opacity)
+    {
+        this.opacity = opacity;
+    }
+
+    public float getOpacity()
+    {
+        return opacity;
+    }
+
+    public void addAnimation(RSAnimation.Type type, RSAnimation animation)
+    {
+        animations.put(type, animation);
+    }
+
+    public void removeAnimation(RSAnimation.Type type)
+    {
+        animations.remove(type);
+    }
+
+    public RSView getParent()
+    {
+        return parent;
+    }
+
+    protected Dimension applyDimension(Map<RSLayoutGuide, Integer> guides)
+    {
+        w = measureWidth(guides);
+        h = measureHeight(guides);
+
+        if (guides.containsKey(RSLayoutGuide.MAX_WIDTH))
+        {
+            int wGuide = guides.get(RSLayoutGuide.MAX_WIDTH);
+            if (dimensionParams.getW() == MATCH_PARENT)
+            {
+                w = wGuide;
+            }
+        }
+
+        if (guides.containsKey(RSLayoutGuide.MAX_HEIGHT))
+        {
+            int hGuide = guides.get(RSLayoutGuide.MAX_HEIGHT);
+            if (dimensionParams.getH() == MATCH_PARENT)
+            {
+                h = hGuide;
+            }
+        }
+
+        return new Dimension(w, h);
+    }
+
+    public int measureWidth(Map<RSLayoutGuide, Integer> guides)
+    {
+        return dimensionParams.getW();
+    }
+
+    public int measureHeight(Map<RSLayoutGuide, Integer> guides)
+    {
+        return dimensionParams.getH();
+    }
+
+    protected void applyPosition(Map<RSLayoutGuide, Integer> guides)
+    {
+        // x
+        switch (getLayoutGravity())
+        {
+            case START:
+            case TOP_START:
+            case BOTTOM_START:
+                x = guideOrThrow(RSLayoutGuide.START, guides);
+                break;
+            case CENTER:
+            case TOP:
+            case BOTTOM:
+                int wGuide =  guideOrThrow(RSLayoutGuide.MAX_WIDTH, guides);
+                x = (wGuide - w) / 2;
+                break;
+            case END:
+            case TOP_END:
+            case BOTTOM_END:
+                x = guideOrThrow(RSLayoutGuide.END, guides) - w;
+                break;
+        }
+
+        // y
+        switch (getLayoutGravity())
+        {
+            case TOP_START:
+            case TOP:
+            case TOP_END:
+                y = guideOrThrow(RSLayoutGuide.TOP, guides);
+                break;
+            case START:
+            case CENTER:
+            case END:
+                int hGuide =  guideOrThrow(RSLayoutGuide.MAX_HEIGHT, guides);
+                y = (hGuide - h) / 2;
+                break;
+            case BOTTOM_START:
+            case BOTTOM:
+            case BOTTOM_END:
+                y = guideOrThrow(RSLayoutGuide.BOTTOM, guides) - h;
+                break;
+        }
+    }
+
+    public int guideOrThrow(RSLayoutGuide guide, Map<RSLayoutGuide, Integer> guides)
+    {
+        Integer val = guides.get(guide);
+        if (val == null) throw new IllegalStateException("Must include a " + guide.toString() + " guide.");
+        return val;
+    }
+
+    public RSViewGroup.Gravity getLayoutGravity()
+    {
+        if (layoutGravity == null)
+        {
+            return parent.getGravity();
+        }
+        return layoutGravity;
+    }
+
+    @Override
+    public void render(Graphics2D graphics, Point origin)
+    {
+        RSAnimation fadeIn = animations.get(RSAnimation.Type.FADE_IN);
+        RSAnimation fadeOut = animations.get(RSAnimation.Type.FADE_OUT);
+
+        if (fadeIn != null)
+        {
+            //System.out.println("Animating opacity");
+            setOpacity(fadeIn.getValue());
+        }
+        else if (fadeOut != null)
+        {
+            //System.out.println("Animating opacity");
+            setOpacity(fadeOut.getValue());
+        }
+
+        graphics.setColor(colorWithOpacity(bgColor));
+        graphics.fillRect(origin.x + x + offsetX, origin.y + y + offsetY, w, h);
+
+        if (border != null)
+        {
+            border.render(graphics, origin);
+        }
+    }
+
+    protected Color colorWithOpacity(Color color)
+    {
+        return new Color(color.getRed() / 255f, color.getGreen() / 255f,
+                color.getBlue() / 255f, (opacity * color.getAlpha()) / 255f);
+    }
+
+    public RSAnimation animate()
+    {
+        return new RSAnimation(this);
+    }
+}
+package com.ericversteeg.frosthprun.view;
+
+import java.util.Map;
+
+public class RSRow extends RSViewGroup
+{
+    public RSRow(int x, int y, int w, int h)
+    {
+        super(x, y, w, h);
+    }
+
+    @Override
+    protected Map<RSLayoutGuide, Integer> layoutSubviews(Map<RSLayoutGuide, Integer> guides)
+    {
+        h = measureHeight(guides);
+
+        int startGuide = paddingTop;
+        for (RSView view: subviews)
+        {
+            if (view.getWeightParams() != null
+                    && view.getWeightParams().getWeight() != null)
+            {
+                view.setW(0);
+            }
+
+            startGuide += view.getMarginStart();
+            view.applyPosition(
+                    new RSLayoutGuide.Builder()
+                            .maxHeight(h)
+                            .start(startGuide)
+                            .top(paddingTop + view.getMarginTop())
+                            .bottom(paddingBottom + view.getMarginBottom())
+                            .build()
+            );
+            startGuide += view.getW();
+            startGuide += view.getMarginEnd();
+        }
+
+        int endGuide = startGuide + paddingEnd;
+
+        return new RSLayoutGuide.Builder().end(endGuide).build();
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.time.Instant;
+
+public class RSAnimation
+{
+    enum Type
+    {
+        FADE_IN,
+        FADE_OUT,
+        INTERPOLATE
+    }
+
+    private RSView view;
+    private Type type;
+    private float duration;
+    private long start;
+    private float startOpacity;
+    private float from;
+    private float to;
+    private OnComplete onComplete;
+    private boolean easeOut = false;
+
+    public RSAnimation(RSView view)
+    {
+        this.view = view;
+    }
+
+    public RSAnimation fadeIn()
+    {
+        type = Type.FADE_IN;
+        this.startOpacity = view.opacity;
+        return this;
+    }
+
+    public RSAnimation fadeOut()
+    {
+        type = Type.FADE_OUT;
+        this.startOpacity = view.opacity;
+        return this;
+    }
+
+    public RSAnimation interpolate(float from, float to)
+    {
+        type = Type.INTERPOLATE;
+        //System.out.println("Type set to " + type);
+        this.from = from;
+        this.to = to;
+        return this;
+    }
+
+    public RSAnimation duration(float duration)
+    {
+        this.duration = duration;
+        return this;
+    }
+
+    public RSAnimation easeOut()
+    {
+        easeOut = true;
+        return this;
+    }
+
+    public RSAnimation start()
+    {
+        view.addAnimation(type, this);
+        this.start = Instant.now().toEpochMilli();
+        //System.out.println("Start called");
+        return this;
+    }
+
+    public RSAnimation onComplete(OnComplete onComplete)
+    {
+        this.onComplete = onComplete;
+        return this;
+    }
+
+    public Type getType()
+    {
+        return type;
+    }
+
+    public float getValue()
+    {
+        float t = Math.min((Instant.now().toEpochMilli() - start) / 1000f / duration, 1f);
+        if (easeOut)
+        {
+            t = easeOut(t);
+        }
+
+        float value = 0f;
+
+        //System.out.println("T is " + t);
+
+        switch (type)
+        {
+            case FADE_IN:
+                value = t * startOpacity;
+                break;
+            case FADE_OUT:
+                value = (1 - t) * startOpacity;
+                break;
+            case INTERPOLATE:
+                value = (to - from) * t + from;
+                break;
+        }
+
+        if (t >= 1f)
+        {
+            //System.out.println("Finished animating, type is " + getType());
+            view.removeAnimation(type);
+            if (onComplete != null)
+            {
+                onComplete.onComplete();
+            }
+        }
+
+        return value;
+    }
+
+    private float easeOut(float t)
+    {
+        return (float) (1 - Math.pow(1 - t, 3));
+    }
+
+    public interface OnComplete
+    {
+        void onComplete();
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import com.ericversteeg.frosthprun.config.BarStyle;
+
+import java.awt.*;
+
+public class RSBar extends RSView {
+
+    // prayer 155
+    // hp 0
+    // run 50
+    // special attack 180
+
+    private Color topColorOuter = Color.decode("#0d8f0f");
+    //private Color topColorInner = Color.decode("#14d512");
+    private Color topColorInner = Color.decode("#11D614");
+    private Color darkColor = Color.decode("#0B780D");
+    private Color bottomColor = Color.decode("#0F7311");
+    //private float [] stops = new float [] {0f, 0.325f, 0.65f, 0.7f, 1.0f};
+    private float [] stops = new float [] {0f, 0.275f, 0.55f, 0.65f, 1.0f};
+    private Color [] colors = new Color [] {topColorOuter, topColorInner, topColorOuter, darkColor, bottomColor};
+
+    private Color overlayStart = new Color(150, 150, 150, 0);
+    private Color  overlayEnd = new Color(247, 247, 143, 30);
+    private float [] overlayStops = new float [] {0f, 1f};
+    private Color [] overlayColors = new Color [] {overlayStart, overlayEnd};
+
+    private Color outerBorderColor = new Color(57, 41, 13, 200);
+    private Color innerBorderColor = new Color(147, 141, 130, 120);
+
+    private float maxValue;
+    private int value;
+
+    private BarStyle barStyle;
+    private int index;
+    private int groupSize;
+
+    public RSBar(int w, int h, int maxValue, BarStyle barStyle, int index, int groupSize)
+    {
+        super(0, 0, w, h);
+
+        this.maxValue = maxValue;
+        this.barStyle = barStyle;
+        this.index = index;
+        this.groupSize = groupSize;
+    }
+
+    public int getValue()
+    {
+        return value;
+    }
+
+    public void setValue(int value)
+    {
+        int oldValue = this.value;
+        this.value = value;
+
+        if (oldValue != value)
+        {
+            //System.out.println("Starting animation");
+            float pixelsPerValue = w / maxValue;
+
+            float pixels = Math.abs((oldValue - value) * pixelsPerValue);
+
+            if (pixels >= 5)
+            {
+                this.animate()
+                        .interpolate(oldValue, value)
+                        .duration(0.2f)
+                        .easeOut()
+                        .start();
+            }
+        }
+    }
+
+    public int getMaxValue()
+    {
+        return (int) maxValue;
+    }
+
+    public void setHue(float hue)
+    {
+        topColorOuter = hueColor(topColorOuter, hue);
+        topColorInner = hueColor(topColorInner, hue);
+        darkColor = hueColor(darkColor, hue);
+        bottomColor = hueColor(bottomColor, hue);
+    }
+
+    @Override
+    public void render(Graphics2D graphics, Point origin) {
+        super.render(graphics, origin);
+
+        if (maxValue == 0) return;
+
+        colors = new Color [] {
+                colorWithOpacity(topColorOuter),
+                colorWithOpacity(topColorInner),
+                colorWithOpacity(topColorOuter),
+                colorWithOpacity(darkColor),
+                colorWithOpacity(bottomColor)
+        };
+
+        graphics.setPaint(colorWithOpacity(new Color(0, 0, 0, 156)));
+        int backgroundHeight = h;
+        if (index == groupSize - 1)
+        {
+            backgroundHeight += 1;
+        }
+
+        graphics.fillRect(origin.x, origin.y, w, backgroundHeight);
+        //graphics.fillRect(origin.x + x - 1, origin.y - 1, w + 2, h + 2);
+
+        if (barStyle == BarStyle.ROUND)
+        {
+            LinearGradientPaint gradientPaint = new LinearGradientPaint(origin.x + x, origin.y + y,
+                    origin.x + x, origin.y + y + h, stops, colors);
+            graphics.setPaint(gradientPaint);
+        }
+        else if (barStyle == BarStyle.FLAT)
+        {
+            graphics.setColor(topColorInner);
+        }
+        else
+        {
+            graphics.setColor(darkColor);
+        }
+
+        int barSize = (int) (w * (value / maxValue));
+        RSAnimation animation = animations.get(RSAnimation.Type.INTERPOLATE);
+        if (animation != null)
+        {
+            //float aValue = animation.getValue();
+            //System.out.println("Animation value is " + aValue);
+            barSize = (int) (w * (animation.getValue() / maxValue));
+            //System.out.println("Bar size is " + barSize);
+        }
+
+        graphics.fillRect(origin.x + x, origin.y + y, barSize, h);
+
+        LinearGradientPaint gradientPaint = new LinearGradientPaint(origin.x + x, h, origin.x + x + w, h, overlayStops, overlayColors);
+        graphics.setPaint(gradientPaint);
+        graphics.fillRect(origin.x + x, origin.y + y, barSize, h);
+
+        if (barSize > 0)
+        {
+            graphics.setColor(outerBorderColor);
+            if (index == 0)
+            {
+                graphics.drawLine(origin.x + x - 2, origin.y + y - 2, origin.x + x + barSize + 1, origin.y + y - 2);
+                graphics.drawLine(origin.x + x - 2, origin.y + y - 1, origin.x + x + barSize + 1, origin.y + y - 1);
+            }
+            if (index == groupSize - 1)
+            {
+                graphics.drawLine(origin.x + x - 2, origin.y + y + h, origin.x + x + barSize + 1, origin.y + y + h);
+                graphics.drawLine(origin.x + x - 2, origin.y + y + h + 1, origin.x + x + barSize + 1, origin.y + y + h + 1);
+                graphics.drawLine(origin.x + x - 2, origin.y + y + h + 2, origin.x + x + barSize + 1, origin.y + y + h + 2);
+            }
+
+            graphics.drawLine(origin.x + x - 2, origin.y + y, origin.x + x - 2, origin.y + y + h - 1);
+            graphics.drawLine(origin.x + x - 1, origin.y + y, origin.x + x - 1, origin.y + y + h - 1);
+
+            graphics.drawLine(origin.x + x + barSize, origin.y + y, origin.x + x + barSize, origin.y + y + h - 1);
+            graphics.drawLine(origin.x + x + barSize + 1, origin.y + y, origin.x + x + barSize + 1, origin.y + y + h - 1);
+
+            graphics.setColor(innerBorderColor);
+            graphics.drawLine(origin.x + x, origin.y + y, origin.x + x + barSize - 1, origin.y + y);
+            if (index == groupSize - 1)
+            {
+                graphics.drawLine(origin.x + x, origin.y + y + h, origin.x + x + barSize - 1, origin.y + y + h);
+            }
+            graphics.drawLine(origin.x + x, origin.y + y + 1, origin.x + x, origin.y + y + h - 1);
+            graphics.drawLine(origin.x + x + barSize - 1, origin.y + y + 1, origin.x + x + barSize - 1, origin.y + y + h - 1);
+        }
+    }
+
+    private Color hueColor(Color color, float hue)
+    {
+        float [] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
+        return Color.getHSBColor(hue / 360f, hsb[1], hsb[2]);
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.awt.*;
+
+public class RSViewBorder implements RSRenderable
+{
+    private RSView view;
+    private Color innerColor;
+    private Color outerColor;
+    private float opacity = 1f;
+
+    public RSViewBorder(RSView view, Color color)
+    {
+        this.view = view;
+
+        innerColor = color;
+    }
+
+    public RSViewBorder(RSView view, Color innerColor, Color outerColor)
+    {
+        this.view = view;
+
+        this.innerColor = innerColor;
+        this.outerColor = outerColor;
+    }
+
+    public float getOpacity()
+    {
+        return opacity;
+    }
+
+    public void setOpacity(float opacity)
+    {
+        this.opacity = opacity;
+    }
+
+    @Override
+    public void render(Graphics2D graphics, Point origin)
+    {
+        if (outerColor != null)
+        {
+            graphics.setColor(colorWithOpacity(outerColor));
+            graphics.drawRect(origin.x + view.getX(), origin.y + view.getY(), view.getW(), view.getH());
+
+            graphics.setColor(colorWithOpacity(outerColor));
+            graphics.drawRect(origin.x + view.getX() - 1, origin.y + view.getY() - 1, view.getW() + 2, view.getH() + 2);
+        }
+
+        if (innerColor != null)
+        {
+            graphics.setColor(colorWithOpacity(innerColor));
+            graphics.drawRect(origin.x + view.getX() + 1, origin.y + view.getY() + 1, view.getW() - 2, view.getH() - 2);
+        }
+    }
+
+    protected Color colorWithOpacity(Color color)
+    {
+        return new Color(color.getRed() / 255f, color.getGreen() / 255f,
+                color.getBlue() / 255f, (opacity * color.getAlpha()) / 255f);
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.util.Map;
+
+public class RSBox extends RSViewGroup
+{
+    public RSBox(int x, int y, int w, int h)
+    {
+        super(x, y, w, h);
+    }
+
+    @Override
+    protected Map<RSLayoutGuide, Integer> layoutSubviews(Map<RSLayoutGuide, Integer> guides)
+    {
+        w = measureWidth(guides);
+        h = measureHeight(guides);
+
+        for (RSView view: subviews)
+        {
+            view.applyPosition(
+                    new RSLayoutGuide.Builder()
+                            .maxWidth(w)
+                            .maxHeight(h)
+                            .start(paddingStart + view.getMarginStart())
+                            .top(paddingTop + view.getMarginTop())
+                            .end(w - paddingEnd - view.getMarginEnd())
+                            .bottom(h - paddingBottom - view.getMarginBottom())
+                            .build()
+            );
+        }
+
+        return new RSLayoutGuide.Builder().build();
+    }
+}
+
+/*
+ * Copyright (c) 2017, Tomas Slusny <slusnucky@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.ericversteeg.frosthprun.view;
+
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.Point;
+import java.util.regex.Pattern;
+import javax.annotation.Nullable;
+import lombok.Setter;
+import net.runelite.client.ui.overlay.RenderableEntity;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.Text;
+
+@Setter
+public class TextComponentWOpacity implements RenderableEntity
+{
+    private static final String COL_TAG_REGEX = "(<col=([0-9a-fA-F]){2,6}>)";
+    private static final Pattern COL_TAG_PATTERN_W_LOOKAHEAD = Pattern.compile("(?=" + COL_TAG_REGEX + ")");
+
+    private String text;
+    private Point position = new Point();
+    private Color color = Color.WHITE;
+    private boolean outline;
+    /**
+     * The text font.
+     */
+    @Nullable
+    private Font font;
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        Font originalFont = null;
+        if (font != null)
+        {
+            originalFont = graphics.getFont();
+            graphics.setFont(font);
+        }
+
+        final FontMetrics fontMetrics = graphics.getFontMetrics();
+
+        if (COL_TAG_PATTERN_W_LOOKAHEAD.matcher(text).find())
+        {
+            final String[] parts = COL_TAG_PATTERN_W_LOOKAHEAD.split(text);
+            int x = position.x;
+
+            for (String textSplitOnCol : parts)
+            {
+                final String textWithoutCol = Text.removeTags(textSplitOnCol);
+                final String colColor = textSplitOnCol.substring(textSplitOnCol.indexOf("=") + 1, textSplitOnCol.indexOf(">"));
+
+                graphics.setColor(new Color(0, 0, 0, color.getAlpha() / 255f));
+
+                if (outline)
+                {
+                    graphics.drawString(textWithoutCol, x, position.y + 1);
+                    graphics.drawString(textWithoutCol, x, position.y - 1);
+                    graphics.drawString(textWithoutCol, x + 1, position.y);
+                    graphics.drawString(textWithoutCol, x - 1, position.y);
+                }
+                else
+                {
+                    // shadow
+                    graphics.drawString(textWithoutCol, x + 1, position.y + 1);
+                }
+
+                // actual text
+                graphics.setColor(Color.decode("#" + colColor));
+                graphics.drawString(textWithoutCol, x, position.y);
+
+                x += fontMetrics.stringWidth(textWithoutCol);
+            }
+        }
+        else
+        {
+            graphics.setColor(new Color(0, 0, 0, color.getAlpha() / 255f));
+
+            if (outline)
+            {
+                graphics.drawString(text, position.x, position.y + 1);
+                graphics.drawString(text, position.x, position.y - 1);
+                graphics.drawString(text, position.x + 1, position.y);
+                graphics.drawString(text, position.x - 1, position.y);
+            }
+            else
+            {
+                // shadow
+                graphics.drawString(text, position.x + 1, position.y + 1);
+            }
+
+            // actual text
+            graphics.setColor(color);
+            graphics.drawString(text, position.x, position.y);
+        }
+
+        int width = fontMetrics.stringWidth(text);
+        int height = fontMetrics.getHeight();
+
+        if (originalFont != null)
+        {
+            graphics.setFont(originalFont);
+        }
+
+        return new Dimension(width, height);
+    }
+}
+
+
+package com.ericversteeg.frosthprun.view;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.util.Map;
+
+public class RSImageView extends RSView
+{
+    private BufferedImage image;
+    private int offset;
+    private boolean offsetNegative = false;
+
+    public RSImageView(int w, int h) {
+        super(0, 0, w, h);
+    }
+
+    public void setImage(BufferedImage image)
+    {
+        this.image = image;
+    }
+
+    public void setOffset(int offset, boolean negative)
+    {
+        this.offset = offset;
+        this.offsetNegative = negative;
+    }
+
+    @Override
+    public int measureWidth(Map<RSLayoutGuide, Integer> guides)
+    {
+        if (image == null) return 0;
+
+        return paddingStart + image.getWidth() + paddingEnd;
+    }
+
+    @Override
+    public int measureHeight(Map<RSLayoutGuide, Integer> guides)
+    {
+        if (image == null) return 0;
+
+        return paddingTop + image.getHeight() + paddingBottom;
+    }
+
+    @Override
+    public void render(Graphics2D graphics, Point origin)
+    {
+        super.render(graphics, origin);
+
+        int signedOffset = offset;
+        if (offsetNegative)
+        {
+            signedOffset *= -1;
+        }
+
+        graphics.drawImage(image, origin.x + x + paddingStart,
+                origin.y + y + paddingTop + signedOffset, null);
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.regex.Pattern;
+
+public class RSTextView extends RSView
+{
+    private TextComponentWOpacity textComponent = new TextComponentWOpacity();
+    private FontMetrics fontMetrics;
+    private Font font;
+    private String text = "";
+    private Color textColor = Color.WHITE;
+    private int numLines = 1;
+    private int lineHeight = 0;
+    private boolean hasImage = false;
+    private BufferedImage image;
+    private Color imageBgColor = new Color(0, 0, 0, 0);
+    private int imageX = 0;
+    private int imageY = 0;
+    private int imageW = 0;
+    private int imageH = 0;
+    private int imageOffset = 0;
+    private boolean imageOffsetNegative = false;
+    private RSViewGroup.Gravity imageGravity;
+    private boolean animatesColor = false;
+    private long animationCycleMillis = 2000L;
+
+    public RSTextView(int x, int y, int w, int h, Font font) {
+        super(x, y, w, h);
+
+        this.font = font;
+    }
+
+    public void setFontMetrics(Graphics2D graphics)
+    {
+        if (font == null) return;
+
+        graphics.setFont(font);
+        this.fontMetrics = graphics.getFontMetrics();
+    }
+
+    public void setText(String text)
+    {
+        this.text = text;
+        textComponent.setText(text);
+    }
+
+    public void setTextColor(Color color)
+    {
+        textColor = color;
+    }
+
+    public void setImage(BufferedImage image, int width, int height, RSViewGroup.Gravity gravity)
+    {
+        this.image = image;
+        imageW = width;
+        imageH = height;
+        imageGravity = gravity;
+        hasImage = true;
+    }
+
+    public void setImageBgColor(Color imageBgColor)
+    {
+        this.imageBgColor = imageBgColor;
+    }
+
+    public void setImageOffset(int imageOffset, boolean negative)
+    {
+        this.imageOffset = imageOffset;
+        this.imageOffsetNegative = negative;
+    }
+
+    private int imageX(int imageW, RSViewGroup.Gravity gravity)
+    {
+        switch (gravity)
+        {
+            case TOP_START:
+            case START:
+            case BOTTOM_START:
+                return 0;
+            case TOP:
+            case CENTER:
+            case BOTTOM:
+                return (w - paddingStart - paddingEnd - imageW) / 2;
+            case TOP_END:
+            case END:
+            case BOTTOM_END:
+                return w - paddingStart - paddingEnd - imageW;
+        }
+        return 0;
+    }
+
+    private int imageY(int imageH, RSViewGroup.Gravity gravity)
+    {
+        switch (gravity)
+        {
+            case TOP_START:
+            case TOP:
+            case TOP_END:
+                return 0;
+            case START:
+            case CENTER:
+            case END:
+                return (h - paddingTop - paddingBottom - imageH) / 2;
+            case BOTTOM_START:
+            case BOTTOM:
+            case BOTTOM_END:
+                return h - paddingTop - paddingBottom - imageH;
+        }
+        return 0;
+    }
+
+    public void setAnimatesColor(boolean animatesColor)
+    {
+        this.animatesColor = animatesColor;
+    }
+
+    public void setAnimationCycleDuration(int duration)
+    {
+        animationCycleMillis = duration * 1000L;
+    }
+
+    private int lineWidth = 0;
+
+    @Override
+    public int measureWidth(Map<RSLayoutGuide, Integer> guides)
+    {
+        int strWidth = fontMetrics.stringWidth(text);
+        Integer guide = guides.get(RSLayoutGuide.MAX_WIDTH);
+
+        if (dimensionParams.getW() != WRAP_CONTENT)
+        {
+            if (guide != null && dimensionParams.getW() == MATCH_PARENT)
+            {
+                lineWidth = guide - paddingStart - paddingEnd;
+                return lineWidth;
+            }
+
+            lineWidth = dimensionParams.getW() - paddingStart - paddingEnd;
+        }
+        else
+        {
+
+            String str = Pattern.compile("\\^\\w").matcher(text).replaceAll("");
+            lineWidth = fontMetrics.stringWidth(str);
+        }
+
+        return paddingStart + lineWidth + paddingEnd;
+    }
+
+    @Override
+    public int measureHeight(Map<RSLayoutGuide, Integer> guides)
+    {
+        lineHeight = fontMetrics.getHeight();
+
+        if (dimensionParams.getW() == WRAP_CONTENT)
+        {
+            return lineHeight;
+        }
+
+        if (hasImage)
+        {
+            numLines = getNumLinesImage(lineWidth);
+        }
+        else
+        {
+            numLines = getNumLines(lineWidth);
+        }
+
+        int height = lineHeight * numLines;
+
+        return paddingTop + height + paddingBottom;
+    }
+
+    @Override
+    public void render(Graphics2D graphics, Point origin)
+    {
+        super.render(graphics, origin);
+
+        graphics.setFont(font);
+
+        if (hasImage)
+        {
+            charRenderLinesImage(graphics, lineWidth, new Point(origin.x + x + offsetX + paddingStart,
+                    origin.y + y + offsetY + paddingTop));
+
+            graphics.setColor(imageBgColor);
+
+            graphics.fillRect(origin.x + x + offsetX + paddingStart + imageX,
+                    origin.y + y + offsetY + paddingTop + imageY, imageW, imageH);
+
+            int offset = imageOffset;
+            if (imageOffsetNegative)
+            {
+                offset *= -1;
+            }
+
+            graphics.drawImage(image, origin.x + x + offsetX + paddingStart + imageX,
+                    origin.y + y + offsetY + paddingTop + imageY + offset, null);
+        }
+        else
+        {
+            charRenderLines(graphics, lineWidth, new Point(origin.x + x + offsetX + paddingStart,
+                    origin.y + y + offsetY + paddingTop));
+        }
+    }
+
+    private void charRenderLines(Graphics2D graphics, int maxWidth, Point start)
+    {
+        char [] chars = text.replace("\\s+", " ").toCharArray();
+
+        int rx = 0;
+        int ry = lineHeight;
+
+        int cIndex = 0;
+        int rIndex = 0;
+
+        int spaceWidth = fontMetrics.stringWidth(" ");
+
+        StringBuilder sb = new StringBuilder();
+
+        boolean readColor = false;
+        Map<Integer, Color> colorPositions = new HashMap<>();
+
+        setColor(textColor);
+
+        for (int i = 0; i < chars.length; i++)
+        {
+            char c = chars[i];
+            boolean lastChar = i == chars.length - 1;
+
+            if (readColor)
+            {
+               colorPositions.put(cIndex, getColor(c));
+               readColor = false;
+
+               continue;
+            }
+
+            if (c != ' ' && !lastChar)
+            {
+                if (c == '^')
+                {
+                    readColor = true;
+
+                    continue;
+                }
+
+                sb.append(c);
+                cIndex += 1;
+            }
+            else
+            {
+                if (c != ' ')
+                {
+                    sb.append(c);
+                    cIndex += 1;
+                }
+
+                String word = sb.toString();
+
+                int sw = fontMetrics.stringWidth(word);
+
+                if (rx + sw > maxWidth)
+                {
+                    rx = 0;
+                    ry += lineHeight;
+                }
+
+                for (char sc: word.toCharArray())
+                {
+                    Color color = colorPositions.get(rIndex);
+                    if (color != null)
+                    {
+                        setColor(color);
+                    }
+
+                    textComponent.setPosition(new Point(start.x + rx,start.y + ry));
+                    textComponent.setText(String.valueOf(sc));
+                    textComponent.render(graphics);
+
+                    rx += fontMetrics.stringWidth(String.valueOf(sc));
+                    rIndex += 1;
+                }
+                rx += spaceWidth;
+
+                Color color = colorPositions.get(rIndex);
+                if (color != null)
+                {
+                    setColor(color);
+                }
+
+                cIndex += 1;
+                rIndex += 1;
+
+                sb = new StringBuilder();
+            }
+        }
+    }
+
+    private void charRenderLinesImage(Graphics2D graphics, int maxWidth, Point start)
+    {
+        char [] chars = text.replace("\\s+", " ").toCharArray();
+
+        int rx = 0;
+        int ry = lineHeight;
+
+        int cIndex = 0;
+        int rIndex = 0;
+
+        int spaceWidth = fontMetrics.stringWidth(" ");
+
+        StringBuilder sb = new StringBuilder();
+
+        boolean readColor = false;
+        Map<Integer, Color> colorPositions = new HashMap<>();
+
+        RSViewGroup.Gravity horizontalGravity = getHorizontalGravity(imageGravity);
+
+        int imageStart = (maxWidth - imageW) / 2;
+
+        imageX = imageX(imageW, imageGravity);
+        imageY = imageY(imageH, imageGravity);
+
+        setColor(textColor);
+
+        for (int i = 0; i < chars.length; i++)
+        {
+            char c = chars[i];
+            boolean lastChar = i == chars.length - 1;
+
+            if (readColor)
+            {
+                colorPositions.put(cIndex, getColor(c));
+                readColor = false;
+
+                continue;
+            }
+
+            if (c != ' ' && !lastChar)
+            {
+                if (c == '^')
+                {
+                    readColor = true;
+
+                    continue;
+                }
+
+                sb.append(c);
+                cIndex += 1;
+            }
+            else
+            {
+                if (c != ' ')
+                {
+                    sb.append(c);
+                    cIndex += 1;
+                }
+
+                String word = sb.toString();
+
+                int sw = fontMetrics.stringWidth(word);
+
+                boolean isHeightRange = isImageHeightRange(ry - lineHeight);
+                if (isHeightRange)
+                {
+                    if (horizontalGravity == RSViewGroup.Gravity.START)
+                    {
+                        if (rx < imageW)
+                        {
+                            rx = imageW + 3;
+                        }
+                    }
+                    else if (horizontalGravity == RSViewGroup.Gravity.CENTER)
+                    {
+                        if (rx + sw > imageStart - 3)
+                        {
+                            rx = imageX + imageW + 3;
+                        }
+                    }
+                    else if (horizontalGravity == RSViewGroup.Gravity.END)
+                    {
+                        if (rx + sw > maxWidth - imageW - 3)
+                        {
+                            rx = 0;
+                            ry += lineHeight;
+                        }
+                    }
+                }
+
+                if (rx + sw > maxWidth)
+                {
+                    ry += lineHeight;
+                    isHeightRange = isImageHeightRange(ry - lineHeight);
+
+                    rx = 0;
+                    if (isHeightRange && horizontalGravity == RSViewGroup.Gravity.START)
+                    {
+                        rx = imageW + 3;
+                    }
+                }
+
+                for (char sc: word.toCharArray())
+                {
+                    Color color = colorPositions.get(rIndex);
+                    if (color != null)
+                    {
+                        setColor(color);
+                    }
+
+                    textComponent.setPosition(new Point(start.x + rx,start.y + ry));
+                    textComponent.setText(String.valueOf(sc));
+                    textComponent.render(graphics);
+
+                    rx += fontMetrics.stringWidth(String.valueOf(sc));
+                    rIndex += 1;
+                }
+                rx += spaceWidth;
+
+                Color color = colorPositions.get(rIndex);
+                if (color != null)
+                {
+                    setColor(color);
+                }
+
+                cIndex += 1;
+                rIndex += 1;
+
+                sb = new StringBuilder();
+            }
+        }
+    }
+
+    private void setColor(Color color)
+    {
+        if (color.getAlpha() < 5)
+        {
+            float percent = (Instant.now().toEpochMilli() % animationCycleMillis) / ((float) animationCycleMillis);
+
+            Color [] colors;
+            if (color.getAlpha() == 0)
+            {
+                colors = getTriadicColors(color);
+            }
+            else
+            {
+                colors = new Color [] { Color.WHITE, Color.BLACK };
+            }
+
+            Color animatedColor = getInterpolatedColor(getColorPair(colors, percent), colors.length, percent);
+            textComponent.setColor(colorWithOpacity(animatedColor));
+        }
+        else
+        {
+            textComponent.setColor(colorWithOpacity(color));
+        }
+    }
+
+    private boolean isImageHeightRange(int y)
+    {
+        switch (imageGravity)
+        {
+            case TOP_START:
+            case TOP:
+            case TOP_END:
+                return y < imageH;
+            case START:
+            case CENTER:
+            case END:
+                int imageTop = (h - paddingTop - paddingBottom - imageH) / 2;
+                return y >= imageTop && y < imageTop + imageH;
+            case BOTTOM_START:
+            case BOTTOM:
+            case BOTTOM_END:
+                return y >= h - paddingTop - paddingBottom - imageH;
+        }
+        return false;
+    }
+
+    private RSViewGroup.Gravity getHorizontalGravity(RSViewGroup.Gravity gravity)
+    {
+        switch (gravity)
+        {
+            case TOP_START:
+            case START:
+            case BOTTOM_START:
+                return RSViewGroup.Gravity.START;
+            case TOP:
+            case CENTER:
+            case BOTTOM:
+                return RSViewGroup.Gravity.CENTER;
+            case TOP_END:
+            case END:
+            case BOTTOM_END:
+                return RSViewGroup.Gravity.END;
+        }
+        return RSViewGroup.Gravity.START;
+    }
+
+    private int getNumLines(int maxWidth)
+    {
+        String str = Pattern.compile("\\^\\w").matcher(text).replaceAll("");
+
+        char [] chars = str.replace("\\s+", " ").toCharArray();
+
+        int rx = 0;
+        int lines = 1;
+
+        int spaceWidth = fontMetrics.stringWidth(" ");
+
+        StringBuilder sb = new StringBuilder();
+
+        for (int i = 0; i < chars.length; i++)
+        {
+            char c = chars[i];
+            boolean lastChar = i == chars.length - 1;
+
+            if (c != ' ' && !lastChar)
+            {
+                sb.append(c);
+            }
+            else
+            {
+                if (c != ' ')
+                {
+                    sb.append(c);
+                }
+
+                String word = sb.toString();
+
+                int sw = fontMetrics.stringWidth(word);
+
+                if (rx + sw > maxWidth)
+                {
+                    lines += 1;
+
+                    rx = 0;
+                }
+
+                for (char sc: word.toCharArray())
+                {
+                    rx += fontMetrics.stringWidth(String.valueOf(sc));
+                }
+                rx += spaceWidth;
+
+                sb = new StringBuilder();
+            }
+        }
+        return lines;
+    }
+
+    private int getNumLinesImage(int maxWidth)
+    {
+        String str = Pattern.compile("\\^\\w").matcher(text).replaceAll("");
+
+        char [] chars = str.replace("\\s+", " ").toCharArray();
+
+        int rx = 0;
+        int ry = lineHeight;
+
+        int spaceWidth = fontMetrics.stringWidth(" ");
+
+        StringBuilder sb = new StringBuilder();
+
+        RSViewGroup.Gravity horizontalGravity = getHorizontalGravity(imageGravity);
+
+        int imageStart = (maxWidth - imageW) / 2;
+
+        imageX = imageX(imageW, imageGravity);
+        imageY = imageY(imageH, imageGravity);
+
+        for (int i = 0; i < chars.length; i++)
+        {
+            char c = chars[i];
+            boolean lastChar = i == chars.length - 1;
+
+            if (c != ' ' && !lastChar)
+            {
+                sb.append(c);
+            }
+            else
+            {
+                if (c != ' ')
+                {
+                    sb.append(c);
+                }
+
+                String word = sb.toString();
+
+                int sw = fontMetrics.stringWidth(word);
+
+                boolean isHeightRange = isImageHeightRange(ry - lineHeight);
+                if (isHeightRange)
+                {
+                    if (horizontalGravity == RSViewGroup.Gravity.START)
+                    {
+                        if (rx < imageW)
+                        {
+                            rx = imageW + 3;
+                        }
+                    }
+                    else if (horizontalGravity == RSViewGroup.Gravity.CENTER)
+                    {
+                        if (rx + sw > imageStart - 3)
+                        {
+                            rx = imageX + imageW + 3;
+                        }
+                    }
+                    else if (horizontalGravity == RSViewGroup.Gravity.END)
+                    {
+                        if (rx + sw > maxWidth - imageW - 3)
+                        {
+                            rx = 0;
+                            ry += lineHeight;
+                        }
+                    }
+                }
+
+                if (rx + sw > maxWidth)
+                {
+                    ry += lineHeight;
+                    isHeightRange = isImageHeightRange(ry - lineHeight);
+
+                    rx = 0;
+                    if (isHeightRange && horizontalGravity == RSViewGroup.Gravity.START)
+                    {
+                        rx = imageW + 3;
+                    }
+                }
+
+                for (char sc: word.toCharArray())
+                {
+                    rx += fontMetrics.stringWidth(String.valueOf(sc));
+                }
+                rx += spaceWidth;
+
+                sb = new StringBuilder();
+            }
+        }
+
+        if (hasImage)
+        {
+            return Math.max(ry / lineHeight, 2);
+        }
+        else
+        {
+            return ry / lineHeight;
+        }
+    }
+
+    Color getColor(char c)
+    {
+        if (c == 'w')
+        {
+            return Color.WHITE;
+        }
+        else if (c == 'b')
+        {
+            return Color.BLACK;
+        }
+        else if (c == 'g')
+        {
+            return Color.GREEN;
+        }
+        else if (c == 'p')
+        {
+            return Color.PINK;
+        }
+        else if (c == 'u')
+        {
+            return Color.BLUE;
+        }
+        else if (c == 'c')
+        {
+            return Color.CYAN;
+        }
+        else if (c == 'm')
+        {
+            return Color.MAGENTA;
+        }
+        else if (c == 'y')
+        {
+            return Color.YELLOW;
+        }
+        else if (c == 'r')
+        {
+            return Color.RED;
+        }
+        else if (c == 'o')
+        {
+            return new Color(252, 154, 78);
+        }
+        else if (c == '0')
+        {
+            return textColor;
+        }
+        else if (c == 'a')
+        {
+            return new Color(255, 0, 0, 0);
+        }
+        else if (c == 'l')
+        {
+            return new Color(107, 242, 73);
+        }
+        else if (c == 'd')
+        {
+            return new Color(107, 41, 242);
+        }
+        else if (c == 'e')
+        {
+            return new Color(122, 75, 28);
+        }
+        else if (c == 'f')
+        {
+            return new Color(35, 94, 49);
+        }
+        else if (c == 'h')
+        {
+            return new Color(177, 184, 222);
+        }
+        else if (c == 'i')
+        {
+            return new Color(255, 191, 135);
+        }
+        else if (c == 'j')
+        {
+            return new Color(165, 11, 94);
+        }
+        else if (c == 'k')
+        {
+            return new Color(66, 12, 3);
+        }
+        else if (c == 'n')
+        {
+            return new Color(226, 255, 167);
+        }
+        else if (c == 'q')
+        {
+            return new Color(0, 0, 0, 1);
+        }
+        return Color.WHITE;
+    }
+
+    private Color [] getTriadicColors(Color color)
+    {
+        float [] hsb = Color.RGBtoHSB(color.getRed(), color.getGreen(), color.getBlue(), null);
+
+        float hue = hsb[0];
+
+        float triHue = (hue + 120f) % 360f;
+        float triHue2 = (hue + 240f) % 360f;
+
+        Color triColor = Color.getHSBColor(triHue / 360f, hsb[1], hsb[2]);
+        Color triColor2 = Color.getHSBColor(triHue2 / 360f, hsb[1], hsb[2]);
+
+        return new Color [] {color, triColor, triColor2};
+    }
+
+    private Color [] getColorPair(Color [] colors, float percent)
+    {
+        int count = colors.length;
+
+        int index = (int) (percent / (1f / colors.length));
+        int index2 = (index + 1) % count;
+
+        return new Color [] {colors[index], colors[index2]};
+    }
+
+    private Color getInterpolatedColor(Color [] colorPair, int colorCount, float percent)
+    {
+        float t = (percent % (1f / colorCount) / (1f / colorCount));
+
+        Color sColor = colorPair[0];
+        Color eColor = colorPair[1];
+
+        int r = (int) (sColor.getRed() * (1 - t) + eColor.getRed() * t);
+        int g = (int) (sColor.getGreen() * (1 - t) + eColor.getGreen() * t);
+        int b = (int) (sColor.getBlue() * (1 - t) + eColor.getBlue() * t);
+
+        return new Color(r, g, b);
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+@Getter
+@RequiredArgsConstructor
+public enum RSAnchorType
+{
+    TOP_LEFT,
+    TOP_CENTER,
+    TOP_RIGHT,
+    BOTTOM_LEFT,
+    BOTTOM_CENTER,
+    BOTTOM_RIGHT,
+    NONE
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.util.Map;
+
+public class RSColumn extends RSViewGroup
+{
+    public RSColumn(int x, int y, int w, int h)
+    {
+        super(x, y, w, h);
+    }
+
+    @Override
+    protected Map<RSLayoutGuide, Integer> layoutSubviews(Map<RSLayoutGuide, Integer> guides)
+    {
+        w = measureWidth(guides);
+
+        int topGuide = paddingTop;
+        for (RSView view: subviews)
+        {
+            if (view.getWeightParams() != null
+                    && view.getWeightParams().getWeight() != null)
+            {
+                view.setH(0);
+            }
+
+            topGuide += view.getMarginTop();
+            view.applyPosition(
+                    new RSLayoutGuide.Builder()
+                            .maxWidth(w)
+                            .top(topGuide)
+                            .start(paddingStart + view.getMarginStart())
+                            .end(paddingEnd + view.getMarginEnd())
+                            .build()
+            );
+
+            topGuide += view.getH();
+            topGuide += view.getMarginBottom();
+        }
+
+        int bottomGuide = topGuide + paddingBottom;
+
+        return new RSLayoutGuide.Builder().bottom(bottomGuide).build();
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.awt.*;
+
+public interface RSRenderable
+{
+    public void render(Graphics2D graphics, Point origin);
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import net.runelite.api.Client;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.ui.overlay.Overlay;
+
+import java.awt.*;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+public class RSViewOverlay extends Overlay
+{
+    private Map<String, ViewInfo> viewInfo = new HashMap<>();
+    private Set<String> pendingRemoves = new HashSet<>();
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        removePending();
+
+        long start = Instant.now().toEpochMilli();
+
+        int numInfo = 0;
+        for (String name: viewInfo.keySet())
+        {
+            ViewInfo info = viewInfo.get(name);
+            Client client = info.getClient();
+
+            Widget viewportWidget = getViewportWidget(client);
+            if (viewportWidget.isHidden())
+            {
+                return null;
+            }
+
+            RSViewGroup view = info.getView();
+            RSAnchorType anchorType = info.getAnchorType();
+            int anchorX = info.getAnchorX();
+            int anchorY = info.getAnchorY();
+
+            applyFonts(view, graphics);
+
+            view.layout();
+
+            if (anchorType != null)
+            {
+                view.setX(anchorX);
+                view.setY(anchorY);
+
+                if (anchorType == RSAnchorType.TOP_RIGHT || anchorType == RSAnchorType.BOTTOM_RIGHT)
+                {
+                    view.setX(viewportWidget.getCanvasLocation().getX() + viewportWidget.getWidth() + 28 - anchorX - view.getW());
+                }
+
+                if (anchorType == RSAnchorType.BOTTOM_LEFT || anchorType == RSAnchorType.BOTTOM_RIGHT)
+                {
+                    view.setY(viewportWidget.getCanvasLocation().getY() + viewportWidget.getHeight() + 41 - anchorY - view.getH());
+                }
+
+                if (anchorType == RSAnchorType.TOP_CENTER)
+                {
+                    view.setX((viewportWidget.getCanvasLocation().getX() + viewportWidget.getWidth() + 28 - view.getW()) / 2 + anchorX);
+                }
+
+                if (anchorType == RSAnchorType.BOTTOM_CENTER)
+                {
+                    view.setX((viewportWidget.getCanvasLocation().getX() + viewportWidget.getWidth() + 28 - view.getW()) / 2 + anchorX);
+                    view.setY(viewportWidget.getCanvasLocation().getY() + viewportWidget.getHeight() + 41 - anchorY - view.getH());
+                }
+            }
+
+            view.render(graphics, new Point(0, 0));
+
+            numInfo += 1 ;
+        }
+
+        //System.out.println(numInfo);
+
+        //System.out.println("Render in " + (Instant.now().toEpochMilli() - start) + "ms");
+
+        return new Dimension(0, 0);
+    }
+
+    public Map<String, ViewInfo> getViewInfo()
+    {
+        return viewInfo;
+    }
+
+    public void addViewInfo(String name, ViewInfo viewInfo) {
+        this.viewInfo.put(name, viewInfo);
+    }
+
+    public void removeViewInfo(String name, boolean immediate)
+    {
+        if (immediate)
+        {
+            viewInfo.remove(name);
+        }
+        else
+        {
+            pendingRemoves.add(name);
+        }
+    }
+
+    private void removePending()
+    {
+        for (String name: pendingRemoves)
+        {
+            viewInfo.remove(name);
+        }
+        pendingRemoves.clear();
+    }
+
+    public boolean containsViewInfo(String name)
+    {
+        return viewInfo.containsKey(name) && !pendingRemoves.contains(name);
+    }
+    
+    public void clearViewInfo()
+    {
+        viewInfo.clear();
+    }
+
+    private void applyFonts(RSView view, Graphics2D graphics)
+    {
+        if (view instanceof RSViewGroup)
+        {
+            for (RSView sView: ((RSViewGroup) view).subviews)
+            {
+                applyFonts(sView, graphics);
+            }
+        }
+
+        if (view instanceof RSTextView)
+        {
+            ((RSTextView) view).setFontMetrics(graphics);
+        }
+    }
+
+    private Widget getViewportWidget(Client client)
+    {
+        Widget widget;
+
+        widget = client.getWidget(ComponentID.RESIZABLE_VIEWPORT_INTERFACE_CONTAINER);
+        if (widget != null) return widget;
+
+        widget = client.getWidget(ComponentID.RESIZABLE_VIEWPORT_BOTTOM_LINE_INTERFACE_CONTAINER);
+        if (widget != null) return widget;
+
+        widget = client.getWidget(ComponentID.FIXED_VIEWPORT_INTERFACE_CONTAINER);
+        if (widget != null) return widget;
+
+        return client.getWidget(ComponentID.BANK_INVENTORY_ITEM_CONTAINER);
+    }
+
+    public static class ViewInfo {
+
+        private Client client;
+        private RSViewGroup view;
+        private RSAnchorType anchorType;
+        private int anchorX;
+        private int anchorY;
+
+        public ViewInfo(Client client, RSViewGroup view, RSAnchorType anchorType, int anchorX, int anchorY)
+        {
+            this.client = client;
+            this.view = view;
+            this.anchorType = anchorType;
+            this.anchorX = anchorX;
+            this.anchorY = anchorY;
+        }
+
+        public Client getClient()
+        {
+            return client;
+        }
+
+        public RSViewGroup getView()
+        {
+            return view;
+        }
+
+        public RSAnchorType getAnchorType()
+        {
+            return anchorType;
+        }
+
+        public int getAnchorX()
+        {
+            return anchorX;
+        }
+
+        public int getAnchorY()
+        {
+            return anchorY;
+        }
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public enum RSLayoutGuide {
+    MAX_WIDTH,
+    MAX_HEIGHT,
+    START,
+    TOP,
+    END,
+    BOTTOM;
+
+    static class Builder
+    {
+        private Map<RSLayoutGuide, Integer> guides = new HashMap<>();
+
+        public Builder maxWidth(int w)
+        {
+            guides.put(MAX_WIDTH, w);
+
+            return this;
+        }
+
+        public Builder maxHeight(int h)
+        {
+            guides.put(MAX_HEIGHT, h);
+
+            return this;
+        }
+
+        public Builder start(int s)
+        {
+            guides.put(START, s);
+
+            return this;
+        }
+
+        public Builder top(int t)
+        {
+            guides.put(TOP, t);
+
+            return this;
+        }
+
+        public Builder end(int e)
+        {
+            guides.put(END, e);
+
+            return this;
+        }
+
+        public Builder bottom(int b)
+        {
+            guides.put(BOTTOM, b);
+
+            return this;
+        }
+
+        public Map<RSLayoutGuide, Integer> build()
+        {
+            return guides;
+        }
+    }
+}
+
+package com.ericversteeg.frosthprun.view;
+
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+
+public abstract class RSViewGroup extends RSView
+{
+    public enum Gravity
+    {
+        START,
+        TOP_START,
+        TOP,
+        TOP_END,
+        END,
+        BOTTOM_END,
+        BOTTOM,
+        BOTTOM_START,
+        CENTER
+    }
+
+    protected Gravity gravity = Gravity.TOP_START;
+
+    protected List<RSView> subviews = new ArrayList<>();
+
+    private boolean renderReverse = false;
+
+    public RSViewGroup(int x, int y, int w, int h)
+    {
+        super(x, y, w, h);
+    }
+
+    public void setGravity(Gravity gravity)
+    {
+        this.gravity = gravity;
+    }
+
+    public void addView(RSView view)
+    {
+        subviews.add(view);
+        view.setParent(this);
+    }
+
+    public void setRenderReverse(boolean renderReverse)
+    {
+        this.renderReverse = renderReverse;
+    }
+
+    @Override
+    public void render(Graphics2D graphics, Point origin)
+    {
+        super.render(graphics, origin);
+
+        List<RSView> subviewsCopy = new LinkedList<>(subviews);
+
+        if (renderReverse)
+        {
+            Collections.reverse(subviewsCopy);
+        }
+
+        for (RSView view: subviewsCopy)
+        {
+            view.setOpacity(getOpacity());
+            view.render(graphics, new Point(origin.x + x, origin.y + y));
+        }
+    }
+
+    public Gravity getGravity()
+    {
+        return gravity;
+    }
+
+    public int getPaddingStart()
+    {
+        return paddingStart;
+    }
+
+    public int getPaddingTop()
+    {
+        return paddingTop;
+    }
+
+    public int getPaddingEnd()
+    {
+        return paddingEnd;
+    }
+
+    public int getPaddingBottom()
+    {
+        return paddingBottom;
+    }
+
+    public void setPadding(int padding)
+    {
+        paddingStart = padding;
+        paddingTop = padding;
+        paddingEnd = padding;
+        paddingBottom = padding;
+    }
+
+    public Dimension layout()
+    {
+        return applyDimension(new RSLayoutGuide.Builder()
+                .maxWidth(w)
+                .build()
+        );
+    }
+
+    abstract protected Map<RSLayoutGuide, Integer> layoutSubviews(Map<RSLayoutGuide, Integer> guides);
+
+    @Override
+    protected Dimension applyDimension(Map<RSLayoutGuide, Integer> guides) {
+        // calculate width and height for all subviews before layout
+        for (RSView view: subviews)
+        {
+            view.applyDimension(
+                    subviewMaxDimensionGuides(guides, view)
+            );
+        }
+
+        // layout subviews (x, y)
+        Map<RSLayoutGuide, Integer> layoutGuides = layoutSubviewsAndResize(guides);
+
+        boolean appliedWeight = false;
+
+        // apply width weights
+        if (dimensionParams.getW() != WRAP_CONTENT)
+        {
+            Integer endGuide = layoutGuides.get(RSLayoutGuide.END);
+            if (endGuide != null)
+            {
+                float totalWeight = 0;
+                int totalAddedWidth = 0;
+                int weightWidth = measureWidth(guides) - endGuide;
+
+                for (RSView view: subviews)
+                {
+                    if (view.getWeight() != null)
+                    {
+                        totalWeight += view.getWeight();
+                    }
+                }
+
+                if (totalWeight > 0)
+                {
+                    for (RSView view: subviews)
+                    {
+                        view.setX(view.getX() + totalAddedWidth);
+
+                        Float weight = view.getWeight();
+                        if (weight != null)
+                        {
+                            int width = (int) (weight / totalWeight * weightWidth);
+                            view.setW(width);
+
+                            view.dimensionParams.setW(width);
+                            view.applyDimension(subviewMaxDimensionGuides(guides, view));
+                            view.getWeightParams().setWeight(null);
+
+                            appliedWeight = true;
+
+                            totalAddedWidth += width;
+                        }
+                    }
+
+                    int truncatedWidth = weightWidth - totalAddedWidth;
+                    boolean foundView = false;
+
+                    for (RSView view: subviews)
+                    {
+                        if (getWeight() != null && !foundView)
+                        {
+                            view.setW(view.getW()
+                                    + truncatedWidth);
+
+                            view.dimensionParams.setW(view.getW());
+                            view.applyDimension(subviewMaxDimensionGuides(guides, view));
+
+                            foundView = true;
+                        }
+
+                        if (foundView)
+                        {
+                            view.setX(view.getX() + truncatedWidth);
+                        }
+                    }
+                }
+            }
+        }
+
+        // apply height weights
+        if (dimensionParams.getH() != WRAP_CONTENT)
+        {
+            Integer bottomGuide = layoutGuides.get(RSLayoutGuide.BOTTOM);
+            if (bottomGuide != null)
+            {
+                float totalWeight = 0;
+                int totalAddedHeight = 0;
+                int weightHeight = measureHeight(guides) - bottomGuide;
+
+                for (RSView view: subviews)
+                {
+                    if (view.getWeight() != null)
+                    {
+                        totalWeight += view.getWeight();
+                    }
+                }
+
+                if (totalWeight > 0)
+                {
+                    for (RSView view: subviews)
+                    {
+                        view.setY(view.getY() + totalAddedHeight);
+
+                        Float weight = view.getWeight();
+                        if (weight != null)
+                        {
+                            int height = (int) (weight / totalWeight * weightHeight);
+                            view.setH(height);
+
+                            view.dimensionParams.setH(view.getH());
+                            view.applyDimension(subviewMaxDimensionGuides(guides, view));
+                            view.getWeightParams().setWeight(null);
+
+                            appliedWeight = true;
+
+                            totalAddedHeight += height;
+                        }
+                    }
+
+                    int truncatedHeight = weightHeight - totalAddedHeight;
+                    boolean foundView = false;
+
+                    for (RSView view: subviews)
+                    {
+                        if (getWeight() != null && !foundView)
+                        {
+                            view.setH(view.getH()
+                                    + truncatedHeight);
+
+                            view.dimensionParams.setH(view.getH());
+                            view.applyDimension(subviewMaxDimensionGuides(guides, view));
+
+                            foundView = true;
+                        }
+
+                        if (foundView)
+                        {
+                            view.setY(view.getY() + truncatedHeight);
+                        }
+                    }
+                }
+            }
+        }
+
+        // if weight was applied
+        // layout subviews again
+        if (appliedWeight)
+        {
+            layoutSubviewsAndResize(guides);
+        }
+
+        return new Dimension(w, h);
+    }
+
+    private Map<RSLayoutGuide, Integer> layoutSubviewsAndResize(Map<RSLayoutGuide, Integer> guides)
+    {
+        Map<RSLayoutGuide, Integer> layoutGuides = layoutSubviews(guides);
+
+        // measure (w, h)
+        if (dimensionParams.getW() == WRAP_CONTENT
+                && layoutGuides.containsKey(RSLayoutGuide.END))
+        {
+            w = layoutGuides.get(RSLayoutGuide.END);
+        }
+        else
+        {
+            w = measureWidth(guides);
+        }
+
+        if (dimensionParams.getH() == WRAP_CONTENT
+                && layoutGuides.containsKey(RSLayoutGuide.BOTTOM))
+        {
+            h = layoutGuides.get(RSLayoutGuide.BOTTOM);
+        }
+        else
+        {
+            h = measureHeight(guides);
+        }
+
+        return layoutGuides;
+    }
+
+    @Override
+    public int measureWidth(Map<RSLayoutGuide, Integer> guides)
+    {
+        if (dimensionParams.getW() == MATCH_PARENT)
+        {
+            return guides.get(RSLayoutGuide.MAX_WIDTH);
+        }
+        else if (dimensionParams.getW() == WRAP_CONTENT)
+        {
+            return getMaxSubviewWidth();
+        }
+        else
+        {
+            return dimensionParams.getW();
+        }
+    }
+
+    protected int getMaxSubviewWidth()
+    {
+        int max = 0;
+        for (RSView view: subviews)
+        {
+            int sw = view.getW() + view.getMarginStart()
+                    + view.getMarginEnd() + paddingStart
+                    + paddingEnd;
+            if (sw > max)
+            {
+                max = sw;
+            }
+        }
+        return max;
+    }
+
+    @Override
+    public int measureHeight(Map<RSLayoutGuide, Integer> guides)
+    {
+        if (dimensionParams.getH() == MATCH_PARENT)
+        {
+            return guides.get(RSLayoutGuide.MAX_HEIGHT);
+        }
+        else if (dimensionParams.getH() == WRAP_CONTENT)
+        {
+            return getMaxSubviewHeight();
+        }
+        else
+        {
+            return dimensionParams.getH();
+        }
+    }
+
+    protected int getMaxSubviewHeight()
+    {
+        int max = 0;
+        for (RSView view: subviews)
+        {
+            int sw = view.getH() + view.getMarginTop()
+                    + view.getMarginBottom() + paddingTop
+                    + paddingBottom;
+            if (sw > max)
+            {
+                max = sw;
+            }
+        }
+        return max;
+    }
+
+    protected Map<RSLayoutGuide, Integer> subviewMaxDimensionGuides(
+            Map<RSLayoutGuide, Integer> guides, RSView view)
+    {
+        Map<RSLayoutGuide, Integer> subviewGuides = new HashMap<>();
+
+        if (dimensionParams.getW() != WRAP_CONTENT)
+        {
+            int wGuide = dimensionParams.getW();
+            if (dimensionParams.getW() == MATCH_PARENT
+                    && guides.containsKey(RSLayoutGuide.MAX_WIDTH))
+            {
+                wGuide = guides.get(RSLayoutGuide.MAX_WIDTH);
+            }
+
+            subviewGuides.put(RSLayoutGuide.MAX_WIDTH, wGuide
+                    - view.getMarginStart() - view.getMarginEnd()
+                    - getPaddingStart() - getPaddingEnd());
+        }
+
+        if (dimensionParams.getH() != WRAP_CONTENT)
+        {
+            int hGuide = dimensionParams.getH();
+            if (dimensionParams.getH() == MATCH_PARENT
+                    && guides.containsKey(RSLayoutGuide.MAX_HEIGHT))
+            {
+                hGuide = guides.get(RSLayoutGuide.MAX_HEIGHT);
+            }
+
+            subviewGuides.put(RSLayoutGuide.MAX_HEIGHT, hGuide
+                    - view.getMarginTop() - view.getMarginBottom()
+                    - getPaddingTop() - getPaddingBottom());
+        }
+
+        return subviewGuides;
+    }
+}
+

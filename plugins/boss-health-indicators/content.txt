@@ -1,0 +1,1239 @@
+package com.boss.health.indicator;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class BossHealthIndicatorTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(com.boss.health.indicator.BossHealthIndicatorPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.boss.health.indicator;
+
+@FunctionalInterface
+public interface SelfRunnable<T> {
+    void run(T self);
+}
+
+package com.boss.health.indicator;
+
+import java.text.DecimalFormat;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
+import javax.inject.Inject;
+
+import com.boss.health.indicator.model.BossIndicators;
+import com.boss.health.indicator.model.Indicator;
+import com.boss.health.indicator.ui.BossIndicatorCreator;
+import com.google.common.reflect.TypeToken;
+import com.google.gson.Gson;
+import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.widgets.*;
+import net.runelite.client.Notifier;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.WorldService;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.components.colorpicker.ColorPickerManager;
+import net.runelite.client.util.ImageUtil;
+
+import java.awt.*;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.StringSelection;
+import java.awt.image.BufferedImage;
+import java.lang.reflect.Type;
+import java.math.BigDecimal;
+import java.text.NumberFormat;
+import java.util.*;
+import java.util.List;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Boss Health Indicators",
+	description = "Shows indicators for certain health percentages on boss health bars.",
+	tags = {"Health Bar"}
+)
+public class BossHealthIndicatorPlugin extends Plugin
+{
+	@Inject private Client client;
+	@Inject private ClientToolbar clientToolbar;
+	@Inject private WorldService worldService;
+	@Inject private ClientThread clientThread;
+	@Inject private ConfigManager configManager;
+	@Inject private Gson gson;
+	@Inject private ColorPickerManager colorPickerManager;
+	@Inject private BossHealthIndicatorConfig config;
+	@Inject private Notifier notifier;
+
+	private static final DecimalFormat percentageFormat = new DecimalFormat("##.##%");
+	private static final String CONFIG_GROUP = "bosshealthindicators";
+	private static final String CONFIG_KEY = "indicators";
+
+	private NavigationButton navButton;
+	private BossHealthIndicatorPanel panel;
+
+	public ColorPickerManager getColorPickerManager() {
+		return colorPickerManager;
+	}
+
+	private List<BossIndicators> bossDatabase;
+	Map<String, BossIndicators> mapping;
+
+	// The health of the boss on the last tick of execution
+	private Double lastBossHealthPercentage;
+
+	List<Widget> activeBars;
+	List<BossIndicators> activeBoss;
+
+	@Provides
+	BossHealthIndicatorConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(BossHealthIndicatorConfig.class);
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if(config.showPanel()) {
+			clientToolbar.addNavigation(navButton);
+		} else {
+			clientToolbar.removeNavigation(navButton);
+		}
+	}
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		loadFromConfig();
+		makeDatabaseMap();
+
+		activeBars = new ArrayList<Widget>();
+		activeBoss = null;
+		lastBossHealthPercentage = null;
+
+		// Set up side panel
+		BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/bosshealthindicator_icon.png");
+		panel = new BossHealthIndicatorPanel(this);
+		navButton = NavigationButton.builder()
+			.tooltip("Boss Health Indicators")
+			.icon(icon)
+			.priority(6)
+			.panel(panel)
+			.build();
+		if(config.showPanel()) {
+			clientToolbar.addNavigation(navButton);
+		}
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		clientToolbar.removeNavigation(navButton);
+		activeBoss = null;
+		clientThread.invoke(() -> clearBars());
+	}
+
+	private void handleHealthNotification() {
+		if(activeBoss == null) {
+			return;
+		}
+		Widget healthBarHealthTextWidget = client.getWidget(303, 20);
+		if(healthBarHealthTextWidget == null ) { return; }
+		if(!healthBarHealthTextWidget.isHidden()) {
+			String bossHealthText = healthBarHealthTextWidget.getText();
+			String[] numbers = bossHealthText.split(" / ");
+			try {
+				int numerator = Integer.parseInt(numbers[0]);
+				int denominator = Integer.parseInt(numbers[1].contains("%") ? (numbers[1].split(" "))[0] : numbers[1]);
+				double percentHealth = ((double)numerator) / denominator;
+				final boolean forceCheck = lastBossHealthPercentage == null || percentHealth > lastBossHealthPercentage;
+				if (forceCheck) {
+					lastBossHealthPercentage = percentHealth;
+				}
+
+				activeBoss.forEach((indicatorSet -> {
+					indicatorSet.getEntries().forEach(indicator -> {
+						if(!indicator.getNotify()) {
+							return;
+						}
+						if(
+							((forceCheck) && percentHealth == indicator.getPercentage()) ||
+								(percentHealth <= indicator.getPercentage() && indicator.getPercentage() < lastBossHealthPercentage))
+						{
+							notifier.notify(String.format("%s's health has reached %s!", indicatorSet.getBossName(), percentageFormat.format(indicator.getPercentage())));
+						}
+					});
+				}));
+
+
+				lastBossHealthPercentage = percentHealth;
+			} catch (NumberFormatException e) {
+				// Couldn't get health numbers
+			}
+		}
+	}
+
+	private List<BossIndicators> getMatchingIndicators(String bossName) {
+		ArrayList<BossIndicators> returnList = new ArrayList<>();
+		mapping.forEach((name, indicator) -> {
+			try {
+				// Turn the database boss name into a regular expression to compare against provided boss name
+				Pattern pattern = Pattern.compile(name);
+				Matcher matcher = pattern.matcher(bossName);
+				if (matcher.matches()) {
+					returnList.add(indicator);
+				} else {
+					// Nothing
+				}
+			} catch(PatternSyntaxException e) {
+				// Pattern was invalid, do nothing.
+			}
+		});
+		return returnList;
+	}
+
+	private boolean areBossListsIdentical(List<BossIndicators> a, List<BossIndicators> b) {
+		if(a.size() != b.size()) {
+			return false;
+		}
+		for(int i = 0; i < a.size(); i++) {
+			BossIndicators elementA = a.get(i);
+			BossIndicators elementB = b.get(i);
+			if(!a.equals(b)) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		Widget healthBarNameTextWidget = client.getWidget(303, 9);
+		// TODO: this might not be necessary
+		if(healthBarNameTextWidget != null) {
+			// TODO: this will loop on null over and over again
+			// Get current boss, if there is any
+			String bossName = healthBarNameTextWidget.getText();
+			List<BossIndicators> newIndicators = getMatchingIndicators(bossName);
+			if(activeBoss == null || !areBossListsIdentical(activeBoss, newIndicators)) {
+				clearBars();
+				if(newIndicators.size() > 0) {
+					BossIndicators data = mapping.get(bossName);
+					activeBoss = newIndicators;
+					createBars();
+				} else {
+					activeBoss = null;
+				}
+			}
+			handleHealthNotification();
+		}
+	}
+
+	// Deletes all active bar widgets
+	void clearBars() {
+		for(Widget widget : activeBars) {
+			widget.setHidden(true);
+			widget.revalidate();
+		}
+		activeBars.clear();
+	}
+
+	// Creates the appropriate indicator bars as children of the healthbar widget
+	// Assumes activeBoss is set and not null
+	void createBars() {
+		//Widget parent = client.getWidget(303, 10);
+		Widget parent = client.getWidget(303, 12);
+		int height = client.getWidget(303, 10).getOriginalHeight();
+
+		for(BossIndicators bossIndicators : activeBoss) {
+			for(Indicator indicator : bossIndicators.getEntries()) {
+				Widget bar = createBarWidget(parent, indicator.getColor(), indicator.getPercentage(), height);
+				activeBars.add(bar);
+			}
+		}
+	}
+
+	// Creates a bar widget, does not add to parent
+	private Widget createBarWidget(Widget parent, Color color, double percent, int height) {
+		Widget bar = parent.createChild(WidgetType.RECTANGLE);
+		bar.setOriginalWidth(2);
+		bar.setWidthMode(WidgetSizeMode.ABSOLUTE);
+
+		bar.setOriginalHeight(height);
+		bar.setHeightMode(WidgetSizeMode.ABSOLUTE);
+
+		bar.setOriginalX((int) (parent.getWidth() * percent));
+		bar.setXPositionMode(WidgetPositionMode.ABSOLUTE_LEFT);
+
+		bar.setTextColor(color.getRGB());
+		bar.setOpacity(color.getTransparency());
+		//bar.setOpacity(127);
+
+		bar.revalidate();
+
+		return bar;
+	}
+
+	// Lodas config, merges by boss name, and saves to bossDatabase
+	private void loadFromConfig() {
+		String json = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY);
+		bossDatabase = stringToBossIndicators(json);
+		saveToConfig();
+	}
+
+	// Saves the current bossDatabase to config
+	private void saveToConfig() {
+		configManager.unsetConfiguration(CONFIG_GROUP, CONFIG_KEY);
+		String json = gson.toJson(bossDatabase);
+		configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY, json);
+	}
+
+	private void makeDatabaseMap() {
+		List<BossIndicators> mergedIndicators = mergeIndicatorList(bossDatabase);
+
+		mapping = new HashMap<String, BossIndicators>();
+		for(BossIndicators data : mergedIndicators) {
+			mapping.put(data.getBossName(), data);
+		}
+	}
+
+	private ArrayList<BossIndicators> stringToBossIndicators(String string) {
+		ArrayList<BossIndicators> returnList = new ArrayList<>();
+		try {
+			Type type = new TypeToken<List<BossIndicators>>() {}.getType();
+			returnList = gson.fromJson(string, type);
+			boolean hasNull = false;
+			for(int i = 0; i < returnList.size() && !hasNull; i++) {
+				if(returnList.get(i).hasAnyNull()) {
+					hasNull = true;
+				}
+			}
+			if(hasNull) {
+				returnList = null;
+			}
+		} catch (Exception e) {
+			// If there was any error, we really don't care what it was.
+			// Keep the plugin going and return null.
+			returnList = null;
+		} finally {
+			if(returnList == null) {
+				returnList = new ArrayList<BossIndicators>();
+			}
+		}
+		return returnList;
+	}
+
+	public void updateFromPanel() {
+		bossDatabase = panel.getBossDatabase();
+		saveToConfig();
+
+		makeDatabaseMap();
+		activeBoss = null;
+	}
+
+	// Merges entries of bossDatabase where the name is the same into a single entry
+	// Be careful not to save merged data into config
+	private List<BossIndicators> mergeIndicatorList(List<BossIndicators> indicators) {
+		// Incase the user made multiple entries with the same name, we will squash that into one entry here.
+		HashMap<String, BossIndicators> mergeMap = new HashMap<>();
+		for(BossIndicators indicator : indicators) {
+			String bossName = indicator.getBossName();
+			if(!mergeMap.containsKey(bossName)) {
+				// Not in table
+				mergeMap.put(bossName, indicator);
+			} else {
+				// Already exists
+				BossIndicators oldIndicator = mergeMap.get(bossName);
+				ArrayList<Indicator> mergedIndicators = new ArrayList<>();
+				mergedIndicators.addAll(oldIndicator.getEntries());
+				mergedIndicators.addAll(indicator.getEntries());
+				mergeMap.put(bossName, new BossIndicators(bossName, mergedIndicators));
+			}
+		}
+		return new ArrayList<BossIndicators>(mergeMap.values());
+	}
+
+	public List<BossIndicators> getBossDatabase() {
+		return bossDatabase;
+	}
+
+	public void exportToClipboard() {
+		String json = gson.toJson(bossDatabase);
+		Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+		StringSelection selection = new StringSelection(json);
+		clipboard.setContents(selection, null);
+	}
+
+	public void importFromClipboard() {
+		String clipboardText = getClipboard();
+
+		ArrayList<BossIndicators> originalIndicators = stringToBossIndicators(configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY));
+		ArrayList<BossIndicators> newIndicators = stringToBossIndicators(clipboardText);
+
+		ArrayList<BossIndicators> combined = new ArrayList<>();
+		combined.addAll(originalIndicators);
+		combined.addAll(newIndicators);
+
+		bossDatabase = combined;
+		makeDatabaseMap();
+		panel.rebuild();
+
+		saveToConfig();
+		activeBoss = null;
+	}
+
+	private String getClipboard() {
+		Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+		if (clipboard.isDataFlavorAvailable(DataFlavor.stringFlavor)) {
+			try {
+				String text = (String) clipboard.getData(DataFlavor.stringFlavor);
+				return text;
+			} catch (Exception e) {
+				return "";
+			}
+		} else {
+			return "";
+		}
+	}
+
+	public void moveCreator(BossIndicatorCreator creator, int amount) {
+		panel.moveCreator(creator, amount);
+	}
+}
+package com.boss.health.indicator;
+
+import com.boss.health.indicator.model.BossIndicators;
+import com.boss.health.indicator.ui.*;
+import net.runelite.client.ui.DynamicGridLayout;
+import net.runelite.client.ui.PluginPanel;
+
+import javax.swing.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class BossHealthIndicatorPanel extends PluginPanel  {
+
+    private BossHealthIndicatorPlugin plugin;
+    private List<BossIndicatorCreator> bossIndicatorCreators;
+
+    IconButton expandIcon;
+    IconButton collapseIcon;
+    JPanel panel;
+
+    BossHealthIndicatorPanel(BossHealthIndicatorPlugin plugin)
+    {
+        this.plugin = plugin;
+
+        bossIndicatorCreators = new ArrayList<BossIndicatorCreator>();
+
+        setBorder(null);
+        setLayout(new DynamicGridLayout(0, 1));
+
+        panel = createPanel();
+        fixCollapseButton();
+        add(panel);
+    }
+
+    public JPanel createPanel() {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+
+        Runnable onChanged = () -> {
+            fixCollapseButton();
+            plugin.updateFromPanel();
+        };
+        SelfRunnable<BossIndicatorCreator> onDelete = (self) -> {
+            bossIndicatorCreators.remove(self);
+            panel.remove(self.getComponent());
+            panel.revalidate();
+            onChanged.run();
+        };
+
+        JPanel topPanel = new JPanel();
+        topPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        topPanel.setLayout(new BoxLayout(topPanel, BoxLayout.X_AXIS));
+
+        JLabel titleLabel = new JLabel("Boss Health Indicators");
+        IconButton importButton = new IconButton(Icons.IMPORT_ICON, Icons.IMPORT_ICON_HOVER, "Import markers from clipboard", () -> {
+            plugin.importFromClipboard();
+        });
+        IconButton exportButton = new IconButton(Icons.EXPORT_ICON, Icons.EXPORT_ICON_HOVER, "Export markers to clipboard", () -> {
+            plugin.exportToClipboard();
+        });
+        IconButton addButton = new IconButton(Icons.ADD_ICON, Icons.ADD_ICON_HOVER, "Add a new boss", () -> {
+            createEmptyBossIndicatorCreator(panel, onChanged, onDelete);
+            plugin.updateFromPanel();
+        });
+        expandIcon = new IconButton(Icons.RIGHT_ARROW_ICON, Icons.RIGHT_ARROW_ICON_HOVER, "Expand all", () -> {
+            setAllCollapsed(false);
+        });
+        collapseIcon = new IconButton(Icons.DOWN_ARROW_ICON, Icons.DOWN_ARROW_ICON_HOVER, "Collapse all", () -> {
+            setAllCollapsed(true);
+        });
+
+        topPanel.add(titleLabel);
+        topPanel.add(Box.createHorizontalGlue());
+        topPanel.add(Box.createHorizontalStrut(5));
+        topPanel.add(importButton);
+        topPanel.add(Box.createHorizontalStrut(10));
+        topPanel.add(exportButton);
+        topPanel.add(Box.createHorizontalStrut(10));
+        topPanel.add(addButton);
+        topPanel.add(Box.createHorizontalStrut(10));
+        topPanel.add(collapseIcon);
+        topPanel.add(expandIcon);
+        panel.add(topPanel);
+
+        List<BossIndicators> database = plugin.getBossDatabase();
+        for(BossIndicators bossIndicator : database) {
+            BossIndicatorCreator creator = new BossIndicatorCreator(
+                bossIndicator,
+                onChanged,
+                plugin,
+                onDelete
+            );
+            bossIndicatorCreators.add(creator);
+            panel.add(creator.getComponent());
+        }
+
+        return panel;
+    }
+
+    private void createEmptyBossIndicatorCreator(JPanel panel, Runnable onChanged, SelfRunnable<BossIndicatorCreator> onDelete) {
+        BossIndicatorCreator creator = new BossIndicatorCreator(
+                onChanged,
+                plugin,
+                onDelete
+        );
+        bossIndicatorCreators.add(creator);
+        panel.add(creator.getComponent());
+        panel.revalidate();
+    }
+
+    public List<BossIndicators> getBossDatabase() {
+        List<BossIndicators> returnList = new ArrayList<BossIndicators>();
+        for(BossIndicatorCreator creator : bossIndicatorCreators) {
+            returnList.add(creator.getBossIndicators());
+        }
+        return returnList;
+    }
+
+    public void rebuild() {
+        removeAll();
+        bossIndicatorCreators.clear();
+        JPanel panel = createPanel();
+        add(panel);
+        fixCollapseButton();
+        revalidate();
+    }
+
+    private void fixCollapseButton() {
+        boolean anyAreExpanded = false;
+        for(BossIndicatorCreator creator : bossIndicatorCreators) {
+            if(!creator.isCollapsed()) {
+                anyAreExpanded = true;
+            }
+        }
+        expandIcon.setVisible(!anyAreExpanded);
+        collapseIcon.setVisible(anyAreExpanded);
+        panel.revalidate();
+    }
+
+    private void setAllCollapsed(boolean isCollapsed) {
+        for(BossIndicatorCreator creator : bossIndicatorCreators) {
+            creator.setCollapsed(isCollapsed);
+        }
+    }
+
+    public void moveCreator(BossIndicatorCreator creator, int amount) {
+        int creatorIndex = -1;
+        for(int i = 0; i < bossIndicatorCreators.size() && creatorIndex == -1; i++) {
+            if(bossIndicatorCreators.get(i) == creator) {
+                creatorIndex = i;
+            }
+        }
+        if(creatorIndex == -1) {
+            return;
+        }
+        int goalIndex = creatorIndex + amount;
+        goalIndex = Math.max(0, goalIndex);
+        goalIndex = Math.min(bossIndicatorCreators.size() - 1, goalIndex);
+        bossIndicatorCreators.remove(creatorIndex);
+        bossIndicatorCreators.add(goalIndex, creator);
+        plugin.updateFromPanel();
+        remove(creator.getComponent());
+        panel.add(creator.getComponent(), goalIndex + 1); // +1 because the top bar is also a child
+        revalidate();
+    }
+}
+
+package com.boss.health.indicator.model;
+
+import java.util.List;
+
+public class BossIndicators {
+    private String bossName;
+    private List<Indicator> entries;
+
+    public BossIndicators(String bossName, List<Indicator> entries) {
+        this.bossName = bossName;
+        this.entries = entries;
+    }
+
+    public String getBossName() {
+        return bossName;
+    }
+
+    public List<Indicator> getEntries() {
+        return entries;
+    }
+
+    public boolean hasAnyNull() {
+        boolean hasNull = false;
+        for(int i = 0; i < entries.size() && !hasNull; i++) {
+            if(entries.get(i).hasAnyNull()) {
+                hasNull = true;
+            }
+        }
+        return (bossName == null) || hasNull;
+    }
+}
+
+package com.boss.health.indicator.model;
+
+import java.awt.*;
+
+public class Indicator {
+    private double percentage;
+    private Color color;
+    boolean notify;
+
+    public Indicator(double percentage, Color color, boolean notify) {
+        this.percentage = percentage;
+        this.color = color;
+        this.notify = notify;
+    }
+
+    public double getPercentage() {
+        return percentage;
+    }
+
+    public Color getColor() {
+        return color;
+    }
+
+    public boolean getNotify() {
+        return notify;
+    }
+
+    public boolean hasAnyNull() {
+        return color == null;
+    }
+}
+package com.boss.health.indicator;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("bosshealthindicator")
+public interface BossHealthIndicatorConfig extends Config {
+    @ConfigItem(
+            keyName = "showPanel",
+            name = "Show panel",
+            description = "Enable or disable the side panel",
+            position = 0
+    )
+    default boolean showPanel() { return true; }
+}
+
+package com.boss.health.indicator.ui;
+
+import com.boss.health.indicator.BossHealthIndicatorPlugin;
+import net.runelite.client.util.ImageUtil;
+
+import javax.swing.*;
+import java.awt.image.BufferedImage;
+
+public class Icons {
+    public static final ImageIcon ADD_ICON;
+    public static final ImageIcon ADD_ICON_HOVER;
+    public static final ImageIcon REMOVE_ICON;
+    public static final ImageIcon REMOVE_ICON_HOVER;
+    public static final ImageIcon IMPORT_ICON;
+    public static final ImageIcon IMPORT_ICON_HOVER;
+    public static final ImageIcon EXPORT_ICON;
+    public static final ImageIcon EXPORT_ICON_HOVER;
+    public static final ImageIcon RIGHT_ARROW_ICON;
+    public static final ImageIcon RIGHT_ARROW_ICON_HOVER;
+    public static final ImageIcon LEFT_ARROW_ICON;
+    public static final ImageIcon LEFT_ARROW_ICON_HOVER;
+    public static final ImageIcon DOWN_ARROW_ICON;
+    public static final ImageIcon DOWN_ARROW_ICON_HOVER;
+    public static final ImageIcon UP_ARROW_ICON;
+    public static final ImageIcon UP_ARROW_ICON_HOVER;
+    public static final ImageIcon BELL_ENABLED;
+    public static final ImageIcon BELL_ENABLED_HOVER;
+    public static final ImageIcon BELL_DISABLED;
+    public static final ImageIcon BELL_DISABLED_HOVER;
+
+
+    static
+    {
+        final BufferedImage addIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/add_icon.png");
+        ADD_ICON = new ImageIcon(addIconImage);
+        ADD_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(addIconImage, 0.53f));;
+
+        final BufferedImage removeIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/remove_icon.png");
+        REMOVE_ICON = new ImageIcon(removeIconImage);
+        REMOVE_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(removeIconImage, 0.53f));
+
+        final BufferedImage importIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/import_icon.png");
+        IMPORT_ICON = new ImageIcon(importIconImage);
+        IMPORT_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(importIconImage, 0.53f));
+
+        final BufferedImage exportIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/export_icon.png");
+        EXPORT_ICON = new ImageIcon(exportIconImage);
+        EXPORT_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(exportIconImage, 0.53f));
+
+        final BufferedImage rightArrowIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/arrow_right.png");
+        RIGHT_ARROW_ICON = new ImageIcon(rightArrowIconImage);
+        RIGHT_ARROW_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(rightArrowIconImage, 0.53f));
+
+        final BufferedImage leftArrowIconImage = ImageUtil.flipImage(rightArrowIconImage, true, true);
+        LEFT_ARROW_ICON = new ImageIcon(leftArrowIconImage);
+        LEFT_ARROW_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(leftArrowIconImage, 0.53f));
+
+        final BufferedImage downArrowIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/arrow_down.png");
+        DOWN_ARROW_ICON = new ImageIcon(downArrowIconImage);
+        DOWN_ARROW_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(downArrowIconImage, 0.53f));
+
+        final BufferedImage upArrowIconImage = ImageUtil.flipImage(downArrowIconImage, true, true);
+        UP_ARROW_ICON = new ImageIcon(upArrowIconImage);
+        UP_ARROW_ICON_HOVER = new ImageIcon(ImageUtil.alphaOffset(upArrowIconImage, 0.53f));
+
+        final BufferedImage bellEnabledIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/bell_icon_enabled.png");
+        BELL_ENABLED = new ImageIcon(bellEnabledIconImage);
+        BELL_ENABLED_HOVER = new ImageIcon(ImageUtil.alphaOffset(bellEnabledIconImage, 0.53f));
+
+        final BufferedImage bellDisabledIconImage = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/bell_icon_disabled.png");
+        BELL_DISABLED = new ImageIcon(bellDisabledIconImage);
+        BELL_DISABLED_HOVER = new ImageIcon(ImageUtil.alphaOffset(bellDisabledIconImage, 0.53f));
+
+    }
+}
+
+package com.boss.health.indicator.ui;
+
+import java.text.DecimalFormat;
+import java.text.ParseException;
+import javax.swing.*;
+import javax.swing.text.DefaultFormatterFactory;
+import javax.swing.text.NumberFormatter;
+
+public class PercentSpinner extends JSpinner {
+
+    public PercentSpinner(double initialValue, double minValue, double maxValue, double stepSize) {
+        super(new SpinnerNumberModel(initialValue, minValue, maxValue, stepSize));
+
+        DecimalFormat percentFormat = new DecimalFormat("0.##%");
+        NumberFormatter formatter = new NumberFormatter(percentFormat);
+        formatter.setValueClass(Double.class);
+        formatter.setMinimum(minValue);
+        formatter.setMaximum(maxValue);
+        formatter.setAllowsInvalid(true);
+
+        JFormattedTextField textField = ((JSpinner.DefaultEditor) this.getEditor()).getTextField();
+
+        JFormattedTextField.AbstractFormatter f = new JFormattedTextField.AbstractFormatter() {
+            public String valueToString(Object value) throws ParseException {
+                if (value == null) {
+                    return "";
+                }
+                double percentValue = ((Number) value).doubleValue();
+                return percentFormat.format(percentValue);
+            }
+
+            public Object stringToValue(String text) throws ParseException {
+                if (!text.endsWith("%")) {
+                    text += "%";
+                }
+                if (text == null || text.isEmpty()) {
+                    return null;
+                }
+                double percentValue = percentFormat.parse(text).doubleValue();
+                return percentValue;
+            }
+        };
+
+        textField.setFormatterFactory(new DefaultFormatterFactory(f));
+    }
+}
+package com.boss.health.indicator.ui;
+
+import com.boss.health.indicator.BossHealthIndicatorPlugin;
+import net.runelite.client.ui.components.colorpicker.RuneliteColorPicker;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.ImageUtil;
+
+import javax.swing.*;
+import javax.swing.border.MatteBorder;
+import java.awt.*;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+
+public class ColorPicker {
+    private static final ImageIcon FILL_COLOR_ICON;
+    private static final ImageIcon FILL_COLOR_HOVER_ICON;
+    private static final ImageIcon NO_FILL_COLOR_ICON;
+    private static final ImageIcon NO_FILL_COLOR_HOVER_ICON;
+    private static final int DEFAULT_FILL_OPACITY = 75;
+
+    static {
+        final BufferedImage fillImg = ImageUtil.loadImageResource(BossHealthIndicatorPlugin.class, "/color_icon.png");
+        final BufferedImage fillImgHover = ImageUtil.luminanceOffset(fillImg, -150);
+        FILL_COLOR_ICON = new ImageIcon(fillImg);
+        FILL_COLOR_HOVER_ICON = new ImageIcon(fillImgHover);
+
+        NO_FILL_COLOR_ICON = new ImageIcon(fillImgHover);
+        NO_FILL_COLOR_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(fillImgHover, -100));
+    }
+
+    private Color color;
+    private Runnable onChanged;
+    private BossHealthIndicatorPlugin plugin;
+    private JLabel label;
+
+    public ColorPicker(Color color, BossHealthIndicatorPlugin plugin, Runnable onChanged) {
+        this.color = color;
+        this.onChanged = onChanged;
+        this.plugin = plugin;
+
+        label = new JLabel(FILL_COLOR_ICON);
+        label.addMouseListener(new MouseAdapter()
+        {
+            @Override
+            public void mousePressed(MouseEvent mouseEvent)
+            {
+                openColorPicker(label.getLocationOnScreen());
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent mouseEvent)
+            {
+                label.setIcon(color.getAlpha() == 0 ? NO_FILL_COLOR_HOVER_ICON : FILL_COLOR_HOVER_ICON);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent mouseEvent)
+            {
+                label.setIcon(color.getAlpha() == 0 ? NO_FILL_COLOR_ICON : FILL_COLOR_ICON);
+            }
+        });
+        updateColor();
+    }
+
+    private void openColorPicker(Point location)
+    {
+        RuneliteColorPicker colorPicker = plugin.getColorPickerManager().create(
+                SwingUtilities.windowForComponent(label),
+                color.getAlpha() == 0 ? ColorUtil.colorWithAlpha(color, DEFAULT_FILL_OPACITY) : color,
+                "",
+                false);
+        colorPicker.setLocation(location);
+        colorPicker.setOnColorChange(c ->
+        {
+            color = c;
+            updateColor();
+            onChanged.run();
+        });
+        //colorPicker.setOnClose(c -> plugin.updateConfig());
+        colorPicker.setVisible(true);
+    }
+
+    private void updateColor() {
+        final boolean isFullyTransparent = color.getAlpha() == 0;
+        if (isFullyTransparent)
+        {
+            label.setBorder(null);
+        }
+        else
+        {
+            Color fullColor = new Color(color.getRed(), color.getGreen(), color.getBlue());
+            label.setBorder(new MatteBorder(0, 0, 3, 0, fullColor));
+        }
+        label.setIcon(isFullyTransparent ? NO_FILL_COLOR_ICON : FILL_COLOR_ICON);
+    }
+
+    public Color getColor() {
+        return color;
+    }
+
+    public JComponent getComponent() {
+        return label;
+    }
+}
+
+package com.boss.health.indicator.ui;
+
+import javax.swing.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+
+public class IconButton extends JLabel {
+    public IconButton(ImageIcon icon, ImageIcon hoverIcon, String tooltip, Runnable onPressed) {
+        super(icon);
+        setToolTipText(tooltip);
+        addMouseListener(new MouseAdapter()
+        {
+            @Override
+            public void mousePressed(MouseEvent mouseEvent)
+            {
+                onPressed.run();
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent mouseEvent)
+            {
+                setIcon(hoverIcon);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent mouseEvent)
+            {
+                setIcon(icon);
+            }
+        });
+    }
+
+}
+
+package com.boss.health.indicator.ui;
+
+import javax.swing.*;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+public class TextPicker {
+    private JTextField textField;
+
+    public TextPicker(String startingText, Runnable onChanged) {
+        textField = new JTextField();
+        textField.setText(startingText);
+        textField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                onChanged.run();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                onChanged.run();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                onChanged.run();
+            }
+        });
+    }
+
+    public String getText() {
+        return textField.getText();
+    }
+
+    public JComponent getComponent() {
+        return textField;
+    }
+}
+
+package com.boss.health.indicator.ui;
+
+import javax.swing.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+
+// Creates a picker that returns a boolean, has two sets of icons for true/false
+public class BooleanPicker extends JLabel {
+    private final ImageIcon iconTrue;
+    private final ImageIcon iconTrueHover;
+    private final ImageIcon iconFalse;
+    private final ImageIcon iconFalseHover;
+
+    private boolean selected;
+
+    public BooleanPicker(ImageIcon iconTrue, ImageIcon iconTrueHover, ImageIcon iconFalse, ImageIcon iconFalseHover, boolean initialValue, String tooltip, Runnable onChanged) {
+        super(initialValue ? iconTrue : iconFalse);
+        this.selected = initialValue;
+        this.iconTrue = iconTrue;
+        this.iconTrueHover = iconTrueHover;
+        this.iconFalse = iconFalse;
+        this.iconFalseHover = iconFalseHover;
+        setToolTipText(tooltip);
+        addMouseListener(new MouseAdapter() {
+            @Override
+            public void mousePressed(MouseEvent mouseEvent)
+            {
+                selected = !selected;
+                setIcon(selected ? iconTrueHover : iconFalseHover);
+                onChanged.run();
+            }
+
+            @Override
+            public void mouseEntered(MouseEvent mouseEvent)
+            {
+                setIcon(selected ? iconTrueHover : iconFalseHover);
+            }
+
+            @Override
+            public void mouseExited(MouseEvent mouseEvent)
+            {
+                setIcon(selected ?  iconTrue: iconFalse);
+            }
+        });
+    }
+
+    public boolean getValue() {
+        return selected;
+    }
+}
+
+package com.boss.health.indicator.ui;
+
+import javax.swing.*;
+import javax.swing.event.ChangeEvent;
+import javax.swing.event.ChangeListener;
+import java.awt.*;
+import java.text.NumberFormat;
+
+public class PercentagePicker {
+    private JSpinner spinner;
+
+    public PercentagePicker(double percent, Runnable onChanged) {
+        this.spinner = new PercentSpinner(percent, 0, 1, 0.01);
+        this.spinner.addChangeListener((e) -> {
+            onChanged.run();
+        });
+        this.spinner.setMaximumSize(new Dimension(72, spinner.getPreferredSize().height));
+
+    }
+
+    public JComponent getComponent() {
+        return this.spinner;
+    }
+
+    public double getPercent() {
+        return (double) spinner.getValue();
+    }
+}
+
+package com.boss.health.indicator.ui;
+
+import com.boss.health.indicator.BossHealthIndicatorPanel;
+import com.boss.health.indicator.BossHealthIndicatorPlugin;
+import com.boss.health.indicator.SelfRunnable;
+import com.boss.health.indicator.model.BossIndicators;
+import com.boss.health.indicator.model.Indicator;
+import net.runelite.client.events.ConfigChanged;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class BossIndicatorCreator {
+    private TextPicker bossNamePicker;
+    private List<IndicatorPicker> indicatorPickers;
+    private JPanel indicatorsPanel;
+    private Runnable onChanged;
+    private BossHealthIndicatorPlugin plugin;
+    private SelfRunnable<BossIndicatorCreator> onDelete;
+    private JPanel panel;
+
+    private boolean collapsed = false;
+    private IconButton collapseButton;
+    private IconButton expandButton;
+
+    public BossIndicatorCreator(BossIndicators bossIndicators, Runnable onChanged, BossHealthIndicatorPlugin plugin, SelfRunnable<BossIndicatorCreator> onDelete) {
+        this.onChanged = onChanged;
+        this.plugin = plugin;
+        this.onDelete = onDelete;
+        this.bossNamePicker = new TextPicker(bossIndicators.getBossName(), onChanged);
+        this.indicatorPickers = new ArrayList<IndicatorPicker>();
+        this.indicatorsPanel = new JPanel();
+        for(Indicator indicator : bossIndicators.getEntries()) {
+            indicatorPickers.add(new IndicatorPicker(
+                indicator,
+                onChanged,
+                plugin,
+                (self) -> {
+                    indicatorPickers.remove(self);
+                    indicatorsPanel.remove(self.getComponent());
+                    indicatorsPanel.revalidate();
+                    onChanged.run();
+                }));
+        }
+        createPanel();
+    }
+
+    public BossIndicatorCreator(Runnable onChanged, BossHealthIndicatorPlugin plugin, SelfRunnable<BossIndicatorCreator> onDelete) {
+        this.onChanged = onChanged;
+        this.plugin = plugin;
+        this.onDelete = onDelete;
+        this.bossNamePicker = new TextPicker("", onChanged);
+        this.indicatorPickers = new ArrayList<IndicatorPicker>();
+        this.indicatorsPanel = new JPanel();
+        createPanel();
+    }
+
+    private void createPanel() {
+        this.panel = new JPanel(new BorderLayout());
+        panel.removeAll();
+        panel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 2));
+
+        JPanel topPanel = new JPanel();
+        topPanel.setBorder(BorderFactory.createEmptyBorder(0, 0, 0, 10));
+        topPanel.setLayout(new BoxLayout(topPanel, BoxLayout.X_AXIS));
+        expandButton = new IconButton(Icons.RIGHT_ARROW_ICON, Icons.RIGHT_ARROW_ICON_HOVER, "Expand", () -> { setCollapsed(false); });
+        collapseButton = new IconButton(Icons.DOWN_ARROW_ICON, Icons.DOWN_ARROW_ICON_HOVER, "Collapse", () -> { setCollapsed(true); });
+        expandButton.setVisible(collapsed);
+        collapseButton.setVisible(!collapsed);
+        topPanel.add(expandButton);
+        topPanel.add(collapseButton);
+        topPanel.add(Box.createHorizontalStrut(5));
+        topPanel.add(bossNamePicker.getComponent());
+        topPanel.add(Box.createHorizontalStrut(5));
+        topPanel.add(new IconButton(Icons.ADD_ICON, Icons.ADD_ICON_HOVER, "Add a new marker", () -> {
+            setCollapsed(false);
+            IndicatorPicker newIndicatorPicker = new IndicatorPicker(
+                onChanged,
+                plugin,
+                (self) -> {
+                    indicatorPickers.remove(self);
+                    JComponent component = self.getComponent();
+                    component.setAlignmentX(Component.LEFT_ALIGNMENT);
+                    indicatorsPanel.remove(component);
+                    indicatorsPanel.revalidate();
+                    onChanged.run();
+                });
+            indicatorPickers.add(newIndicatorPicker);
+            newIndicatorPicker.getComponent().setAlignmentX(Component.LEFT_ALIGNMENT);
+            indicatorsPanel.add(newIndicatorPicker.getComponent());
+            indicatorsPanel.revalidate();
+            onChanged.run();
+        }));
+        topPanel.add(Box.createHorizontalStrut(5));
+        topPanel.add(new IconButton(Icons.REMOVE_ICON, Icons.REMOVE_ICON_HOVER, "Remove boss", () -> { onDelete.run(this); }));
+        topPanel.add(Box.createHorizontalStrut(5));
+        topPanel.add(new IconButton(Icons.UP_ARROW_ICON, Icons.UP_ARROW_ICON_HOVER, "Move up", () -> {
+            plugin.moveCreator(this, -1);
+        }));
+        topPanel.add(Box.createHorizontalStrut(5));
+        topPanel.add(new IconButton(Icons.DOWN_ARROW_ICON, Icons.DOWN_ARROW_ICON_HOVER, "Move down", () -> {
+            plugin.moveCreator(this, 1);
+        }));
+        panel.add(topPanel, BorderLayout.NORTH);
+
+        indicatorsPanel.setLayout(new BoxLayout(indicatorsPanel, BoxLayout.Y_AXIS));
+        for(IndicatorPicker picker : indicatorPickers) {
+            JComponent component = picker.getComponent();
+            component.setAlignmentX(Component.LEFT_ALIGNMENT);
+            indicatorsPanel.add(picker.getComponent());
+        }
+        panel.add(indicatorsPanel);
+    }
+
+    public JComponent getComponent() {
+        return panel;
+    }
+
+    public BossIndicators getBossIndicators() {
+        ArrayList<Indicator> indicators = new ArrayList<Indicator>();
+        for(IndicatorPicker indicatorPicker : indicatorPickers) {
+            Indicator indicator = indicatorPicker.getIndicator();
+            indicators.add(indicator);
+        }
+        return new BossIndicators(bossNamePicker.getText(), indicators);
+    }
+
+    public boolean isCollapsed() {
+        return collapsed;
+    }
+
+    public void setCollapsed(boolean isCollapsed) {
+        collapsed = isCollapsed;
+        expandButton.setVisible(isCollapsed);
+        collapseButton.setVisible(!isCollapsed);
+        indicatorsPanel.setVisible(!isCollapsed);
+        panel.revalidate();
+        onChanged.run();
+    }
+}
+
+package com.boss.health.indicator.ui;
+
+import com.boss.health.indicator.BossHealthIndicatorPlugin;
+import com.boss.health.indicator.SelfRunnable;
+import com.boss.health.indicator.model.Indicator;
+
+import javax.swing.*;
+import java.awt.*;
+
+public class IndicatorPicker {
+    private JPanel panel;
+    private Runnable onChanged;
+
+    private PercentagePicker percentagePicker;
+    private ColorPicker colorPicker;
+    private BooleanPicker notificationPicker;
+
+    public IndicatorPicker(Indicator indicator, Runnable onChanged, BossHealthIndicatorPlugin plugin, SelfRunnable<IndicatorPicker> onDelete) {
+        this.onChanged = onChanged;
+
+        panel = new JPanel();
+        percentagePicker = new PercentagePicker(indicator.getPercentage(), onChanged);
+        colorPicker = new ColorPicker(indicator.getColor(), plugin, onChanged);
+        notificationPicker = new BooleanPicker(Icons.BELL_ENABLED, Icons.BELL_ENABLED_HOVER, Icons.BELL_DISABLED, Icons.BELL_DISABLED_HOVER, indicator.getNotify(), "Display notification when threshold reached", onChanged);
+
+        panel.setLayout(new BoxLayout(panel, BoxLayout.X_AXIS));
+        panel.add(colorPicker.getComponent());
+        panel.add(Box.createHorizontalStrut(10));
+        panel.add(percentagePicker.getComponent());
+        panel.add(Box.createHorizontalStrut(10));
+        panel.add(new IconButton(Icons.REMOVE_ICON, Icons.REMOVE_ICON_HOVER, "Remove Indicator", () -> { onDelete.run(this); }));
+        panel.add(notificationPicker);
+    }
+
+    public IndicatorPicker(Runnable onChanged, BossHealthIndicatorPlugin plugin, SelfRunnable<IndicatorPicker> onDelete) {
+        this(new Indicator(0, Color.WHITE, false), onChanged, plugin, onDelete);
+    }
+
+    public JComponent getComponent() {
+        return this.panel;
+    }
+
+    public Indicator getIndicator() {
+        return new Indicator(percentagePicker.getPercent(), colorPicker.getColor(), notificationPicker.getValue());
+    }
+}
+

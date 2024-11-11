@@ -1,0 +1,578 @@
+package com.marksofgracecooldown;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ArkMarksPluginCanafisTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(MarksOfGraceCDPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.marksofgracecooldown;
+
+import com.marksofgracecooldown.ntp.NtpClient;
+import com.marksofgracecooldown.ntp.NtpSyncState;
+import com.google.inject.Provides;
+import java.util.Arrays;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.client.Notifier;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import java.time.Instant;
+
+import static net.runelite.api.Skill.AGILITY;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Marks of Grace Cooldown",
+	description = "Tracks the cooldown for Marks of Grace on Agility Courses, allowing you to time your laps, AFK or do other activities",
+	tags = {"mark", "of", "grace", "afk", "cooldown", "tracker", "canifis", "agility"},
+	configName = "AfkMarksCanafisPlugin" // Old name from when it was canifis only
+)
+public class MarksOfGraceCDPlugin extends Plugin
+{
+	public static final long MILLIS_PER_MINUTE = 60_000;
+	private static final int MARK_COOLDOWN_MINUTES = 3;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private MarksOfGraceCDConfig config;
+
+	@Inject
+	private Notifier notifier;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private MarksOfGraceCDOverlay agilityOverlay;
+
+	public long lastCompleteMarkTimeMillis;
+	public long lastCompleteTimeMillis;
+
+	public boolean isOnCooldown = false;
+	public Courses currentCourse;
+	public boolean hasReducedCooldown = false;
+
+	@Provides
+	MarksOfGraceCDConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(MarksOfGraceCDConfig.class);
+	}
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		overlayManager.add(agilityOverlay);
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		overlayManager.remove(agilityOverlay);
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged statChanged)
+	{
+		if (statChanged.getSkill() != AGILITY)
+			return;
+
+		Courses course = Courses.getCourse(this.client.getLocalPlayer().getWorldLocation().getRegionID());
+
+		if (course != null && Arrays.stream(course.getCourseEndWorldPoints()).anyMatch((wp) ->
+			wp.equals(this.client.getLocalPlayer().getWorldLocation())))
+		{
+			currentCourse = course;
+			lastCompleteTimeMillis = Instant.now().toEpochMilli();
+			CheckNtpSync();
+
+			hasReducedCooldown = currentCourse == Courses.ARDOUGNE &&
+				client.getVarbitValue(net.runelite.api.Varbits.DIARY_ARDOUGNE_ELITE) == 1;
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		if (isOnCooldown)
+		{
+			if (lastCompleteMarkTimeMillis == 0)
+			{
+				isOnCooldown = false;
+				return;
+			}
+
+			long cooldownTimestamp = getCooldownTimestamp(true);
+
+			if (Instant.now().toEpochMilli() >= cooldownTimestamp)
+			{
+				isOnCooldown = false;
+				client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Marks of grace cooldown has finished, run until you find your next mark.", null);
+
+				if (config.sendNotification())
+				{
+					notifier.notify("Marks of grace cooldown has finished.");
+				}
+			}
+		}
+	}
+
+	@Subscribe
+	public void onItemSpawned(ItemSpawned itemSpawned)
+	{
+		if (currentCourse == null)
+			return;
+
+		final TileItem item = itemSpawned.getItem();
+
+		if (item.getId() == ItemID.MARK_OF_GRACE)
+		{
+			lastCompleteMarkTimeMillis = lastCompleteTimeMillis;
+			isOnCooldown = true;
+		}
+	}
+
+	@Subscribe
+	public void onMenuEntryAdded(MenuEntryAdded e)
+	{
+		if (!isOnCooldown || currentCourse == null)
+			return;
+
+		if (config.swapLeftClickOnWait() && e.getIdentifier() == currentCourse.getLastObstacleId())
+		{
+			long millisLeft = getCooldownTimestamp(true) - Instant.now().toEpochMilli();
+			if (millisLeft > 0 && millisLeft / 1000 < config.swapLeftClickTimeLeft())
+			{
+				e.getMenuEntry().setDeprioritized(true);
+			}
+		}
+	}
+
+	public long getCooldownTimestamp(boolean checkForReduced)
+	{
+		if (lastCompleteMarkTimeMillis == 0)
+			return lastCompleteMarkTimeMillis;
+
+		// First convert to server timestamp to get the correct minute
+		long offsetMillis = lastCompleteMarkTimeMillis + NtpClient.SyncedOffsetMillis;
+		long minuteTruncatedMillis = offsetMillis - (offsetMillis % MILLIS_PER_MINUTE);
+		long localCooldownMillis = minuteTruncatedMillis + (MARK_COOLDOWN_MINUTES * MILLIS_PER_MINUTE);
+		long leewayAdjusted = localCooldownMillis + ((long)config.leewaySeconds() * 1000);
+		// We revert the ntp offset to get back to a local time that we locally wait for
+		long ntpAdjusted = leewayAdjusted - NtpClient.SyncedOffsetMillis;
+
+		if (checkForReduced && hasReducedCooldown && config.useShortArdougneTimer())
+			ntpAdjusted -= MILLIS_PER_MINUTE;
+
+		return ntpAdjusted;
+	}
+
+	private void CheckNtpSync()
+	{
+		if (NtpClient.SyncState == NtpSyncState.NOT_SYNCED)
+			NtpClient.startSync();
+	}
+}
+
+package com.marksofgracecooldown.ntp;
+
+import java.net.DatagramPacket;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.time.Instant;
+import java.util.concurrent.TimeUnit;
+import org.apache.commons.lang3.time.StopWatch;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public class NtpClient
+{
+	private static final Logger log = LoggerFactory.getLogger(NtpClient.class);
+	private static final String NTP_HOST_ADDRESS = "pool.ntp.org";
+	private static final int SYNC_ATTEMPTS = 5;
+
+	private static final long MILLISECONDS_PER_SECOND = 1000L;
+	private static final long UNIX_OFFSET_SECONDS = 2208988800L;
+	private static final long CYCLE_TIME_SECONDS = Integer.toUnsignedLong(0xffffffff) + 1; // 2^32
+	private static final long CYCLE_TIME_MILLIS = CYCLE_TIME_SECONDS * MILLISECONDS_PER_SECOND;
+	private static final long HALF_CYCLE_TIME_MILLIS = CYCLE_TIME_MILLIS / 2;
+
+	public static long SyncedOffsetMillis = 0;
+	public static NtpSyncState SyncState = NtpSyncState.NOT_SYNCED;
+
+	public static void startSync()
+	{
+		if (SyncState == NtpSyncState.SYNCING)
+			return;
+
+		new Thread(NtpClient::syncTime).start();
+	}
+
+	private static void syncTime()
+	{
+		SyncState = NtpSyncState.SYNCING;
+
+		for (int i = 0; i < SYNC_ATTEMPTS; i++)
+		{
+			try (DatagramSocket socket = new DatagramSocket())
+			{
+				socket.setSoTimeout(5000);
+				InetAddress address = InetAddress.getByName(NTP_HOST_ADDRESS);
+
+				byte[] ntpData = new byte[48];
+				ntpData[0] = 0x1B; // LeapIndicator = 0 (no warning), VersionNum = 3 (IPv4 only), Mode = 3 (Client Mode)
+
+				DatagramPacket packet = new DatagramPacket(ntpData, ntpData.length, address, 123);
+
+				// Use stopwatch to estimate ping
+				StopWatch stopWatch = new StopWatch();
+				stopWatch.start();
+
+				socket.send(packet);
+				packet = new DatagramPacket(ntpData, ntpData.length);
+				socket.receive(packet);
+				socket.close();
+
+				stopWatch.stop();
+				Instant now = Instant.now();
+
+				// Reading 32 bit ntp parts (seconds since 1900 and fraction of a second)
+				long intPart =
+						Byte.toUnsignedLong(ntpData[40]) << 24 |
+						Byte.toUnsignedLong(ntpData[41]) << 16 |
+						Byte.toUnsignedLong(ntpData[42]) << 8 |
+						Byte.toUnsignedLong(ntpData[43]);
+				long fractPart =
+						Byte.toUnsignedLong(ntpData[44]) << 24 |
+						Byte.toUnsignedLong(ntpData[45]) << 16 |
+						Byte.toUnsignedLong(ntpData[46]) << 8 |
+						Byte.toUnsignedLong(ntpData[47]);
+
+				long localNtpMillis = now.plusSeconds(UNIX_OFFSET_SECONDS).toEpochMilli();
+				long serverNtpMillis = intPart * MILLISECONDS_PER_SECOND + (fractPart * MILLISECONDS_PER_SECOND >> 32);
+
+				long difference = serverNtpMillis - localNtpMillis;
+				long offset = difference;
+
+				// Adjust for 2036 ntp roll over problem, if people are somehow still using it then
+				if (Math.abs(difference) > HALF_CYCLE_TIME_MILLIS)
+					offset = difference < 0 ? difference + CYCLE_TIME_MILLIS : difference - CYCLE_TIME_MILLIS;
+
+				long pingOffset = (stopWatch.getTime(TimeUnit.MILLISECONDS) / 2);
+
+				SyncedOffsetMillis = offset - pingOffset;
+				SyncState = NtpSyncState.SYNCED;
+				break; // Break when we had a successful sync, only retry on fails
+			}
+			catch(Exception e)
+			{
+				log.info("Failed to sync ntp time with exception: {}", e.getMessage());
+
+				if (i >= SYNC_ATTEMPTS - 1)
+				{
+					SyncState = NtpSyncState.FAILED;
+					break;
+				}
+
+				try
+				{
+					Thread.sleep(5000);
+				}
+				catch (InterruptedException ignored)
+				{
+				}
+			}
+		}
+	}
+}
+
+package com.marksofgracecooldown.ntp;
+
+public enum NtpSyncState
+{
+	NOT_SYNCED,
+	SYNCING,
+	SYNCED,
+	FAILED
+}
+
+package com.marksofgracecooldown;
+
+import com.marksofgracecooldown.ntp.NtpClient;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.time.Instant;
+
+class MarksOfGraceCDOverlay extends OverlayPanel
+{
+	private static final int TIMEOUT_MINUTES = 5;
+	private static final long TIMEOUT_MILLIS = TIMEOUT_MINUTES * MarksOfGraceCDPlugin.MILLIS_PER_MINUTE;
+
+	private final MarksOfGraceCDPlugin plugin;
+
+	@Inject
+	private MarksOfGraceCDConfig config;
+
+	@Inject
+	public MarksOfGraceCDOverlay(MarksOfGraceCDPlugin plugin) {
+		super(plugin);
+		setPosition(OverlayPosition.TOP_LEFT);
+		this.plugin = plugin;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (plugin.lastCompleteMarkTimeMillis == 0)
+		{
+			return null;
+		}
+
+		long currentMillis = Instant.now().toEpochMilli();
+		long millisSinceLastComplete = currentMillis - plugin.lastCompleteTimeMillis;
+
+		if (millisSinceLastComplete > TIMEOUT_MILLIS)
+		{
+			plugin.lastCompleteMarkTimeMillis = 0;
+			plugin.lastCompleteTimeMillis = 0;
+			plugin.currentCourse = null;
+			return null;
+		}
+
+		if (plugin.isOnCooldown)
+		{
+			panelComponent.getChildren().add(TitleComponent.builder()
+				.text("Wait")
+				.color(Color.RED)
+				.build());
+		}
+		else
+		{
+			panelComponent.getChildren().add(TitleComponent.builder()
+				.text("Run")
+				.color(Color.GREEN)
+				.build());
+		}
+
+		long millisLeft = Math.max(plugin.getCooldownTimestamp(false) - currentMillis, 0);
+		long secondsLeft = (long)Math.ceil((double)millisLeft / 1000);
+		panelComponent.getChildren().add(LineComponent.builder()
+				.left("Time until run:")
+				.right(String.format("%d:%02d", (secondsLeft % 3600) / 60, (secondsLeft % 60)))
+				.build());
+
+		if (plugin.hasReducedCooldown)
+		{
+			long shortTimeSecondsLeft = Math.max(secondsLeft - 60, 0);
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Reduced time:")
+				.right(String.format("%d:%02d", (shortTimeSecondsLeft % 3600) / 60, (shortTimeSecondsLeft % 60)))
+				.build());
+		}
+
+		if (config.showDebugValues())
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("NTP State:")
+				.right(String.valueOf(NtpClient.SyncState))
+				.build());
+
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Time offset:")
+				.right(getReadableOffset(NtpClient.SyncedOffsetMillis))
+				.build());
+		}
+
+		return super.render(graphics);
+	}
+
+	private String getReadableOffset(long offset)
+	{
+		if (Math.abs(offset) < 1000)
+			return offset + "ms";
+
+		offset /= 1000; // Seconds
+
+		if (Math.abs(offset) < 1000)
+			return offset + "s";
+
+		offset /= 60; // Minutes
+
+		if (Math.abs(offset) < 1000)
+			return offset + "m";
+
+		offset /= 60; // Hours
+
+		if (Math.abs(offset) < 1000)
+			return offset + "h";
+
+		return "LOTS";
+	}
+}
+
+package com.marksofgracecooldown;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Units;
+
+@ConfigGroup("AfkMarksCanafis")  // Old name from when it was canifis only
+public interface MarksOfGraceCDConfig extends Config
+{
+	@ConfigItem(
+		keyName = "sendNotification",
+		name = "Send notification",
+		description = "Should a notification be send when the cooldown has expired",
+		position = 0
+	)
+	default boolean sendNotification()
+	{
+		return true;
+	}
+
+    @ConfigItem(
+            keyName = "swapLeftClickOnWait",
+            name = "Swap left click on wait",
+            description = "Swaps left click of last obstacle while wait is on to prevent accidental lap completion",
+            position = 1
+    )
+    default boolean swapLeftClickOnWait()
+    {
+        return false;
+    }
+
+	@ConfigItem(
+		keyName = "swapLeftClickTimeLeft",
+		name = "Swap left click on time left",
+		description = "Only swap left click when the cooldown time remaining is below this number.",
+		position = 2
+	)
+	@Units(Units.SECONDS)
+	default int swapLeftClickTimeLeft()
+	{
+		return 180;
+	}
+
+    @ConfigItem(
+            keyName = "leewaySeconds",
+            name = "Seconds of leeway",
+            description = "Grace period for when timer is triggered, increase if timings are off.",
+            position = 3
+    )
+    @Units(Units.SECONDS)
+    default int leewaySeconds()
+    {
+        return 1;
+    }
+
+	@ConfigItem(
+		keyName = "useShortArdougneTimer",
+		name = "Use short Ardougne timer",
+		description = "When having the elite Ardougne diary, there is a 50% chance to reduce the Ardougne cooldown to 2 min. Would you want to be notified after the reduced time or normal time?",
+		position = 4
+	)
+	default boolean useShortArdougneTimer()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "showDebugValues",
+		name = "Show debug values",
+		description = "Displays plugin debug values like ntp offset and state",
+		position = 5
+	)
+	default boolean showDebugValues()
+	{
+		return false;
+	}
+}
+
+package com.marksofgracecooldown;
+
+import com.google.common.collect.ImmutableMap;
+import java.util.Map;
+import net.runelite.api.coords.WorldPoint;
+
+enum Courses
+{
+	GNOME(23139, 9781, new WorldPoint(2484, 3437, 0), new WorldPoint(2487, 3437, 0)), // Gnome course has 2 last obstacles but we just use one
+	SHAYZIEN_BASIC(42216, 6200, new WorldPoint(1554, 3640, 0)),
+	DRAYNOR(11632, 12338, new WorldPoint(3103, 3261, 0)),
+	AL_KHARID(14399, 13105, new WorldPoint(3299, 3194, 0)),
+	VARROCK(14841, 12853, new WorldPoint(3236, 3417, 0)),
+	BARBARIAN(1948, 10039, new WorldPoint(2543, 3553, 0)),
+	CANIFIS(14897, 13878, new WorldPoint(3510, 3485, 0)),
+	APE_ATOLL(16062, 11050, new WorldPoint(2770, 2747, 0)),
+	SHAYZIEN_ADVANCED(42221, 5944, new WorldPoint(1522, 3625, 0)),
+	FALADOR(14925, 12084, new WorldPoint(3029, 3332, 0), new WorldPoint(3029, 3333, 0), new WorldPoint(3029, 3334, 0), new WorldPoint(3029, 3335, 0)),
+	WEREWOLF(11646, 14234, new WorldPoint(3528, 9873, 0)),
+	SEERS(14931, 10806, new WorldPoint(2704, 3464, 0)),
+	POLLNIVNEACH(14945, 13358, new WorldPoint(3363, 2998, 0)),
+	RELLEKA(14994, 10553, new WorldPoint(2653, 3676, 0)),
+	ARDOUGNE(15612, 10547, new WorldPoint(2668, 3297, 0));
+
+	private static final Map<Integer, Courses> coursesByRegion;
+	private final int lastObstacleId;
+	private final int regionId;
+	private final WorldPoint[] courseEndWorldPoints;
+
+	Courses(int lastObstacleId, int regionId, WorldPoint... courseEndWorldPoints)
+	{
+		this.lastObstacleId = lastObstacleId;
+		this.regionId = regionId;
+		this.courseEndWorldPoints = courseEndWorldPoints;
+	}
+
+	static Courses getCourse(int regionId)
+	{
+		return coursesByRegion.get(regionId);
+	}
+
+	public double getLastObstacleId()
+	{
+		return this.lastObstacleId;
+	}
+
+	public int getRegionId()
+	{
+		return this.regionId;
+	}
+
+	public WorldPoint[] getCourseEndWorldPoints()
+	{
+		return this.courseEndWorldPoints;
+	}
+
+	static
+	{
+		ImmutableMap.Builder<Integer, Courses> builder = new ImmutableMap.Builder<>();
+
+		for (Courses course : values())
+		{
+			builder.put(course.regionId, course);
+		}
+
+		coursesByRegion = builder.build();
+	}
+}
+

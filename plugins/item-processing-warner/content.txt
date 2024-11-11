@@ -1,0 +1,640 @@
+package itemprocessingwarner;
+
+import com.aeimo.itemprocessingwarner.ItemProcessingWarnerPlugin;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ItemProcessingWarnerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ItemProcessingWarnerPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.aeimo.itemprocessingwarner;
+
+import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.events.*;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.util.List;
+import java.util.*;
+import java.util.function.IntPredicate;
+import java.util.stream.Collectors;
+
+@Slf4j
+@PluginDescriptor(name = "Item Processing Warner", description = "Alerts and Advance Warnings 0for Item Processing Tasks (e.g. Crafting)", tags = {"item", "items", "processing", "completion", "warn", "warning", "alert", "skilling", "cooking", "crafting", "smithing", "smelting", "fletching", "prayer", "herblore"})
+public class ItemProcessingWarnerPlugin extends Plugin {
+    // @formatter:off
+    //<editor-fold desc=attributes>
+    //== attributes ===================================================================================================================
+
+    @Inject
+    private ItemProcessingWarnerConfig config;
+    @Inject
+    private ItemProcessingWarnerOverlay overlay;
+    @Inject
+    private Client client;
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Provides
+    ItemProcessingWarnerConfig getConfig(ConfigManager configManager) {
+        return configManager.getConfig(ItemProcessingWarnerConfig.class);
+    }
+
+    private PreviousAndCurrent<LocalPoint> playerLocationMemory;
+
+    // Inventory info
+    private final Map<Integer, PreviousAndCurrentInt> itemCountMemory = new HashMap<>();
+
+    private boolean strongAlert;
+
+    private boolean weakAlert;
+    private Integer lastItemIncrease;
+    private Integer lastItemDecrease;
+    private int ticksSinceLastItemChange = 0;
+
+    private LocalDateTime processingCompletedTime;
+
+    private int[] inventoryAtTimeOfProcessingComplete;
+
+    private LocalDateTime predictionThresholdBreachedTime;
+
+    //</editor-fold>
+    // @formatter:on
+
+    //<editor-fold desc=subscriptions>
+    //== subscriptions ===============================================================================================================
+
+    @Override
+    protected void shutDown() {
+        overlayManager.remove(overlay);
+        clearState();
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick gameTick) {
+        Widget bankContainer = client.getWidget(ComponentID.BANK_ITEM_CONTAINER);
+        if (bankContainer != null && !bankContainer.isSelfHidden()) {
+            // Do nothing and avoid tracking any events if the bank is open, this can trigger false positives.
+            inventoryAtTimeOfProcessingComplete = null;
+            predictionThresholdBreachedTime = null;
+            processingCompletedTime = null;
+            return;
+        }
+
+        updateCountsOfItems();
+        updatePlayerLocation();
+
+        if (lastItemDecrease != null && countOfItem(lastItemDecrease) == 0) {
+            int[] currentInventory = getInventoryArray();
+            if (!Arrays.equals(currentInventory, inventoryAtTimeOfProcessingComplete)) {
+                processingCompletedTime = LocalDateTime.now();
+                inventoryAtTimeOfProcessingComplete = currentInventory;
+            }
+        } else {
+            inventoryAtTimeOfProcessingComplete = null;
+            predictionThresholdBreachedTime = null;
+            processingCompletedTime = null;
+        }
+
+        strongAlert = shouldDoAlertStrong();
+        weakAlert = shouldDoAlertWeak();
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked click) {
+        onUserInteractionEvent();
+    }
+
+    @Subscribe
+    public void onMenuOpened(MenuOpened click) {
+        onUserInteractionEvent();
+    }
+
+    private void onUserInteractionEvent() {
+        strongAlert = false;
+        weakAlert = false;
+        lastItemIncrease = null;
+        lastItemDecrease = null;
+    }
+    //</editor-fold>
+
+    //<editor-fold desc=core>
+    //== core ========================================================================================================================
+
+    @Override
+    protected void startUp() {
+        overlayManager.add(overlay);
+        updatePlayerLocation();
+    }
+
+    private void clearState() {
+        itemCountMemory.clear();
+
+        playerLocationMemory = null;
+        lastItemDecrease = null;
+        lastItemIncrease = null;
+        ticksSinceLastItemChange = 0;
+    }
+
+    protected boolean shouldDoAlertWeak() {
+        if (!config.usePreEmptiveAlerts()) {
+            return false;
+        }
+
+        if (userInteractingWithClient()) {
+            return false;
+        }
+
+        if (predictionThresholdBreachedTime != null && client.getMouseLastPressedMillis() >= timeSinceEpoch(predictionThresholdBreachedTime)) {
+            return false;
+        }
+
+        if (lastItemDecrease != null && meetsThresholdWithRemainderDelayOrExceeds(getItemCount(lastItemDecrease))) {
+            predictionThresholdBreachedTime = LocalDateTime.now();
+            return true;
+        }
+
+        // If we were already alerting, keep alerting. Otherwise, we have no reason to start an alert.
+        return weakAlert;
+    }
+
+    private boolean meetsThresholdWithRemainderDelayOrExceeds(int subject) {
+        int thresholdTicks = secondsToTicksRoundNearest(config.preEmptiveDelayMs() / 1000f);
+
+        // Unsuccessful actions pad ticksSinceLastItemChange, get around this by figuring out when the last action (successful
+        // or otherwise) must have occurred.
+        int ticksSinceLastAction = ticksSinceLastItemChange % config.ticksPerAction();
+
+        int estimatedTicksLeft = ((config.ticksPerAction() * subject) - ticksSinceLastAction);
+        return thresholdTicks >= estimatedTicksLeft;
+    }
+
+    private boolean shouldDoAlertStrong() {
+        if (userInteractingWithClient()) {
+            return false;
+        }
+
+        if (processingCompletedTime == null) {
+            // The client hasn't seen the user finish processing a set of items this session.
+            return false;
+        }
+
+        // Only alert if the user hasn't clicked since the last set of items finished processing.
+        return client.getMouseLastPressedMillis() < timeSinceEpoch(processingCompletedTime);
+    }
+
+    private static long timeSinceEpoch(LocalDateTime localDateTime) {
+        ZoneId zoneId = ZoneId.systemDefault();
+        ZonedDateTime zonedDateTime = localDateTime.atZone(zoneId);
+        Instant instant = zonedDateTime.toInstant();
+        return instant.toEpochMilli();
+    }
+
+    private void updateCountsOfItems() {
+        ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
+        if (inventory == null) {
+            return;
+        }
+
+        Arrays.stream(inventory.getItems())
+                .filter(Objects::nonNull)
+                .map(Item::getId)
+                .distinct()
+                // Empty inventory slot
+                .filter(i -> i != -1)
+                .forEach(this::updateCountOfItem);
+
+        Integer maybeItemIncreased = determineLastItemChange(this::anyItemsIncreased);
+        Integer maybeItemDecreased = determineLastItemChange(this::anyItemsDecreased);
+        if (maybeItemIncreased == null && maybeItemDecreased == null) {
+            ticksSinceLastItemChange++;
+        } else {
+            ticksSinceLastItemChange = 0;
+        }
+        lastItemIncrease = orDefault(maybeItemIncreased, lastItemIncrease);
+        lastItemDecrease = orDefault(maybeItemDecreased, lastItemDecrease);
+    }
+
+    private <T> T orDefault(T maybe, T defaultValue) {
+        return maybe == null ? defaultValue : maybe;
+    }
+
+    private Integer determineLastItemChange(IntPredicate handler) {
+        List<Integer> changedCountItems = itemCountMemory.keySet().stream()
+                .filter(handler::test)
+                .collect(Collectors.toList());
+        if (!changedCountItems.isEmpty()) {
+            if (changedCountItems.size() > 1) {
+                log.error("Multiple tracked items changed in the same way: {}", changedCountItems);
+            } else {
+                return changedCountItems.get(0);
+            }
+        }
+        return null;
+    }
+
+    private void updatePlayerLocation() {
+        LocalPoint playerLocation = client.getLocalDestinationLocation();
+        if (playerLocationMemory == null) {
+            playerLocationMemory = new PreviousAndCurrent<>(playerLocation);
+        } else {
+            playerLocationMemory.newData(playerLocation);
+        }
+    }
+    //</editor-fold>
+
+    //<editor-fold desc=helpers (alerts)>
+    //== helpers (alerts) ===========================================================================================================================
+
+    private boolean userInteractingWithClient() {
+        // `client.getKeyboardIdleTicks() < 10` used to be included here
+        return client.getGameState() != GameState.LOGGED_IN
+                || client.getLocalPlayer() == null
+                // If user has clicked in the last second then they're not idle so don't send idle notification
+                || System.currentTimeMillis() - client.getMouseLastPressedMillis() < 1000
+                || client.getKeyboardIdleTicks() < 10;
+    }
+
+    private int getItemCount(int itemId) {
+        return itemCountMemory.get(itemId).current;
+    }
+
+    private static int secondsToTicksRoundNearest(float seconds) {
+        return (int) Math.round(seconds / 0.6);
+    }
+
+    public int getGlowBreathePeriod() {
+        return config.glowSpeedMs();
+    }
+
+    public int getMaxBreatheIntensityPercent() {
+        return config.maxBreatheIntensityPercent();
+    }
+
+    public int getWeakGlowBreathePeriod() {
+        return config.weakGlowSpeedMs();
+    }
+
+    public int getWeakMaxBreatheIntensityPercent() {
+        return config.weakMaxBreatheIntensityPercent();
+    }
+
+    public Color getGlowColor() {
+        return config.glowColor();
+    }
+
+    public Color getWeakGlowColor() {
+        return config.weakGlowColor();
+    }
+
+    public boolean isDoAlertWeak() {
+        return weakAlert;
+    }
+
+    public boolean isDoAlertStrong() {
+        return strongAlert;
+    }
+    //</editor-fold>
+
+    //<editor-fold desc=helpers (item management)>
+    //== helpers (item management) ==================================================================================================================
+
+    private int[] getInventoryArray() {
+        ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
+
+        int[] inventoryArray = new int[28];
+
+        if (inventory != null && inventory.size() == 28) {
+            for (int i = 0; i < 28; i++) {
+                inventoryArray[i] = inventory.getItems()[i].getId();
+            }
+        }
+
+        return inventoryArray;
+    }
+
+    private int countOfItem(int itemId) {
+        ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
+        if (inventory == null) {
+            return 0;
+        }
+
+        return (int) Arrays.stream(inventory.getItems())
+                .filter(Objects::nonNull)
+                // Empty inventory slot
+                .filter(i -> i.getId() == itemId)
+                .count();
+    }
+
+    private void updateCountOfItem(int itemId) {
+        int count = countOfItem(itemId);
+        if (itemCountMemory.containsKey(itemId)) {
+            itemCountMemory.get(itemId).newData(count);
+        } else {
+            itemCountMemory.put(itemId, new PreviousAndCurrentInt(count));
+        }
+    }
+
+    private boolean anyItemsIncreased(int... itemIds) {
+        return Arrays.stream(itemIds)
+                .mapToObj(itemCountMemory::get)
+                .anyMatch(PreviousAndCurrentInt::increased);
+    }
+
+    private boolean anyItemsDecreased(int... itemIds) {
+        return Arrays.stream(itemIds)
+                .mapToObj(itemCountMemory::get)
+                .anyMatch(PreviousAndCurrentInt::decreased);
+    }
+    //</editor-fold>
+
+    //<editor-fold desc=types>
+    //== types ======================================================================================================================================
+
+    static class PreviousAndCurrent<T> {
+        T previous;
+
+        T current;
+
+        PreviousAndCurrent(T initialValue) {
+            current = initialValue;
+        }
+
+        void newData(T data) {
+            previous = current;
+            current = data;
+        }
+    }
+
+    static class PreviousAndCurrentInt extends PreviousAndCurrent<Integer> {
+        PreviousAndCurrentInt(Integer initialValue) {
+            super(initialValue);
+        }
+
+        boolean increased() {
+            return current != null && previous != null && current > previous;
+        }
+
+        boolean decreased() {
+            return current != null && previous != null && previous > current;
+        }
+    }
+    //</editor-fold>
+}
+
+package com.aeimo.itemprocessingwarner;
+
+import java.awt.Color;
+import net.runelite.client.config.*;
+
+@ConfigGroup("itemprocessingwarner")
+public interface ItemProcessingWarnerConfig extends Config {
+    int DEFAULT_GLOW_BREATHE_PERIOD_MS = 1_000;
+
+    int DEFAULT_PRE_EMPTIVE_DELAY_MS = 1_200;
+
+    int DEFAULT_MAX_GLOW_BREATHE_INTENSITY = 60;
+
+    int TICKS_PER_ACTION = 3;
+
+    Color DEFAULT_GLOW_COLOR = new Color(255, 0, 0);
+
+    Color DEFAULT_WEAK_GLOW_COLOR = new Color(255, 192, 0);
+
+    @ConfigSection(
+            name = "Immediate alerts",
+            description = "Configuration for immediate alerts",
+            position = 98
+    )
+    String immediateAlertsSection = "immediateAlerts";
+
+    @ConfigSection(
+            name = "Pre-emptive alerts",
+            description = "Configuration for pre-emptive alerts",
+            position = 99
+    )
+    String preEmptiveAlertsSection = "preEmptiveAlerts";
+
+    @ConfigItem(
+            keyName = "glowSpeedMs",
+            name = "Glow speed (ms)",
+            description = "How long between cycles of min and max brightness of the glow effect",
+            section = immediateAlertsSection,
+            position = 1
+    )
+    @Units(Units.MILLISECONDS)
+    default int glowSpeedMs() {
+        return DEFAULT_GLOW_BREATHE_PERIOD_MS;
+    }
+
+    @ConfigItem(
+            keyName = "maxBreatheIntensityPercent",
+            name = "Peak glow intensity",
+            description = "Peak intensity of glow effect (100% is opaque)",
+            section = immediateAlertsSection,
+            position = 2
+    )
+    @Units(Units.PERCENT)
+    @Range(min = 10, max = 100)
+    default int maxBreatheIntensityPercent() {
+        return DEFAULT_MAX_GLOW_BREATHE_INTENSITY;
+    }
+
+    @Alpha
+    @ConfigItem(
+            keyName = "glowColor",
+            name = "Alert glow color",
+            description = "The color of the main glow effect",
+            section = immediateAlertsSection,
+            position = 3
+    )
+    default Color glowColor() {
+        return DEFAULT_GLOW_COLOR;
+    }
+
+    @ConfigItem(
+            keyName = "usePreEmptiveAlerts",
+            name = "Use pre-emptive alerts",
+            description = "If enabled, will give a weaker alert right before a task is complete",
+            section = preEmptiveAlertsSection,
+            position = 4
+    )
+    default boolean usePreEmptiveAlerts() {
+        return false;
+    }
+
+    @ConfigItem(
+            keyName = "ticksPerAction",
+            name = "Ticks per action",
+            description = "How many ticks does it take to process each item, for whatever activity being done?",
+            section = preEmptiveAlertsSection,
+            position = 5
+    )
+    @Units(Units.TICKS)
+    default int ticksPerAction() {
+        return TICKS_PER_ACTION;
+    }
+
+    @ConfigItem(
+            keyName = "preEmptiveDelayMs",
+            name = "Alert advance warning",
+            description = "How long before a task is done to start the pre-emptive alert (ms)",
+            section = preEmptiveAlertsSection,
+            position = 6
+    )
+    @Units(Units.MILLISECONDS)
+    default int preEmptiveDelayMs() {
+        return DEFAULT_PRE_EMPTIVE_DELAY_MS;
+    }
+
+    @ConfigItem(
+            keyName = "weakGlowSpeedMs",
+            name = "Glow speed (ms)",
+            description = "How long between cycles of min and max brightness of the glow effect for the pre-emptive alert",
+            section = preEmptiveAlertsSection,
+            position = 7
+    )
+    @Units(Units.MILLISECONDS)
+    default int weakGlowSpeedMs() {
+        return DEFAULT_GLOW_BREATHE_PERIOD_MS;
+    }
+
+    @ConfigItem(
+            keyName = "weakMaxBreatheIntensityPercent",
+            name = "Peak glow intensity",
+            description = "Peak intensity of the glow effect for the pre-emptive alert (100% is opaque)",
+            section = preEmptiveAlertsSection,
+            position = 8
+    )
+    @Units(Units.PERCENT)
+    @Range(min = 10, max = 100)
+    default int weakMaxBreatheIntensityPercent() {
+        return DEFAULT_MAX_GLOW_BREATHE_INTENSITY;
+    }
+
+    @Alpha
+    @ConfigItem(
+            keyName = "weakGlowColor",
+            name = "Alert glow color",
+            description = "The color of the glow effect used in pre-emptive alerts",
+            section = preEmptiveAlertsSection,
+            position = 9
+    )
+    default Color weakGlowColor() {
+        return DEFAULT_WEAK_GLOW_COLOR;
+    }
+}
+
+package com.aeimo.itemprocessingwarner;
+
+import java.awt.*;
+import javax.inject.Inject;
+import net.runelite.api.Client;
+import net.runelite.client.ui.overlay.*;
+
+public class ItemProcessingWarnerOverlay extends Overlay {
+    private static final int MAX_BRIGHTNESS_ALPHA_LEVEL = 255;
+
+    @Inject
+    private ItemProcessingWarnerPlugin plugin;
+
+    @Inject
+    private Client client;
+
+    private boolean isRenderingAlertAnimation = false;
+
+    @Inject
+    private ItemProcessingWarnerOverlay(Client client, ItemProcessingWarnerPlugin plugin) {
+        this.client = client;
+        this.plugin = plugin;
+        setPosition(OverlayPosition.DYNAMIC);
+        setPriority(0f);
+        setLayer(OverlayLayer.ABOVE_SCENE);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        if (plugin.isDoAlertStrong()) {
+            glowGameWindowRectangle(
+                    graphics,
+                    plugin.getGlowColor(),
+                    plugin.getGlowBreathePeriod(),
+                    plugin.getMaxBreatheIntensityPercent(),
+                    1.0f);
+
+        } else if (plugin.isDoAlertWeak()) {
+            glowGameWindowRectangle(
+                    graphics,
+                    plugin.getWeakGlowColor(),
+                    plugin.getWeakGlowBreathePeriod(),
+                    plugin.getWeakMaxBreatheIntensityPercent(),
+                    0.5f);
+
+        } else {
+            isRenderingAlertAnimation = false;
+        }
+
+        return null;
+    }
+
+    private void glowGameWindowRectangle(
+            Graphics2D graphics,
+            Color glowColor,
+            int glowPeriod,
+            int maxIntensityBreathePercent,
+            float intensityModifier) {
+
+        graphics.setColor(new Color(
+                glowColor.getRed(),
+                glowColor.getGreen(),
+                glowColor.getBlue(),
+                getBreathingAlpha(glowPeriod, maxIntensityBreathePercent, intensityModifier))
+        );
+        graphics.fill(getGameWindowRectangle());
+    }
+
+    private Rectangle getGameWindowRectangle() {
+        Dimension clientCanvasSize = client.getCanvas().getSize();
+        Point clientCanvasLocation = client.getCanvas().getLocation();
+        // Need to adjust rectangle position slightly to cover whole game window perfectly (x: -5, y: -20)
+        Point adjustedLocation = new Point(clientCanvasLocation.x - 5, clientCanvasLocation.y - 20);
+
+        return new Rectangle(adjustedLocation, clientCanvasSize);
+    }
+
+    private int getBreathingAlpha(int breathePeriodMillis, int maxIntensityBreathePercent, float intensityModifier) {
+        double currentMillisOffset = System.currentTimeMillis() % breathePeriodMillis;
+        double fractionCycleComplete = currentMillisOffset / breathePeriodMillis;
+
+        int maxIntensityPc = (int) ((float) maxIntensityBreathePercent * intensityModifier);
+        double fractionAlpha = Math.sin(fractionCycleComplete * 2 * Math.PI);
+        double fractionAlphaPositive = (fractionAlpha + 1) / 2;
+
+        // This check forces the animation to start near the dimmest point of the wave (gives a fade-in effect)
+        if (isRenderingAlertAnimation || fractionAlphaPositive < 0.025) {
+            isRenderingAlertAnimation = true;
+            return ((int) (fractionAlphaPositive * MAX_BRIGHTNESS_ALPHA_LEVEL * (maxIntensityPc / 100.0)));
+        }
+        return 0;
+    }
+}
+

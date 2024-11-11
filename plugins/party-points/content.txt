@@ -1,0 +1,910 @@
+package com.partypoints;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PartyPointsPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(PartyPointsPlugin.class);
+		RuneLite.main(args);
+	}
+}
+package com.partypoints;
+
+import com.google.common.base.Strings;
+import com.google.inject.Provides;
+import com.partypoints.data.PartyData;
+import com.partypoints.data.StatUpdate;
+import java.awt.Color;
+import java.awt.image.BufferedImage;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import javax.swing.SwingUtilities;
+import lombok.Getter;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.Player;
+import net.runelite.api.Varbits;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.PartyChanged;
+import net.runelite.client.events.PartyMemberAvatar;
+import net.runelite.client.party.PartyMember;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.party.WSClient;
+import net.runelite.client.party.events.UserJoin;
+import net.runelite.client.party.events.UserPart;
+import net.runelite.client.party.messages.UserSync;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.Text;
+
+@PluginDescriptor(
+	name = "PartyPoints"
+)
+public class PartyPointsPlugin extends Plugin
+{
+	@Getter
+	private final Map<Long, PartyData> partyDataMap = Collections.synchronizedMap(new HashMap<>());
+	@Inject
+	private Client client;
+	@Inject
+	private PartyService party;
+	@Inject
+	private WSClient wsClient;
+	@Inject
+	private PartyPointsConfig config;
+	@Inject
+	private ClientThread clientThread;
+	@Inject
+	private ClientToolbar clientToolbar;
+	@Inject
+	private OverlayManager overlayManager;
+	private PartyPointsPanel panel;
+	private NavigationButton navButton;
+
+	private StatUpdate lastStatus;
+
+	private PartyPointsOverlay partyPointsOverlay = null;
+	private boolean button = false;
+
+	private static int messageFreq(int partySize)
+	{
+		return Math.max(1, partySize - 6);
+	}
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		panel = injector.getInstance(PartyPointsPanel.class);
+
+		// Load icon for the Panel
+		final BufferedImage icon = ImageUtil.loadImageResource(PartyPointsPlugin.class, "/peepoPurple.png");
+
+		// Build Panel
+		navButton = NavigationButton.builder()
+			.tooltip("PartyPoints")
+			.priority(9)
+			.icon(icon)
+			.panel(panel)
+			.build();
+
+		// Add Panel to Sidebar
+		if (config.AlwaysShowIcon())
+		{
+			button = true;
+			clientToolbar.addNavigation(navButton);
+		}
+
+		wsClient.registerMessage(StatUpdate.class);
+		SwingUtilities.invokeLater(this::requestSync);
+
+		partyPointsOverlay = new PartyPointsOverlay(this, config);
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		updateOverlay(client.getLocalPlayer().getName(),-1);
+		// Remove Panel from Sidebar
+		clientToolbar.removeNavigation(navButton);
+
+		wsClient.unregisterMessage(StatUpdate.class);
+
+		// Clear out all data
+		partyDataMap.clear();
+		panel = null;
+		lastStatus = null;
+		button = false;
+		overlayManager.remove(partyPointsOverlay);
+	}
+
+	@Provides
+	public PartyPointsConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(PartyPointsConfig.class);
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (event.getGroup().equals(PartyPointsConfig.GROUP))
+		{
+			SwingUtilities.invokeLater(panel::updateAll);
+		}
+		if (config.AlwaysShowIcon())
+		{
+			if (!button)
+			{
+				clientToolbar.addNavigation(navButton);
+				button = false;
+			}
+		}
+		else if (button && !party.isInParty())
+		{
+			clientToolbar.removeNavigation(navButton);
+			button = true;
+		}
+		button = config.AlwaysShowIcon();
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		checkStateChanged(false);
+	}
+
+	@Subscribe
+	public void onGameTick(final GameTick tick)
+	{
+		checkStateChanged(false);
+		overlayManager.remove(partyPointsOverlay);
+		if (party.isInParty() && config.ShowOverlay())
+		{
+			overlayManager.add(partyPointsOverlay);
+		}
+	}
+
+	@Subscribe
+	public void onStatUpdate(final StatUpdate event)
+	{
+		final PartyData partyData = getPartyData(event.getMemberId());
+		if (partyData == null)
+		{
+			return;
+		}
+
+		if (event.getCurrentPersonalPoints() != null)
+		{
+			partyData.setPersonalPoints(event.getCurrentPersonalPoints());
+		}
+
+		final PartyMember member = party.getMemberById(event.getMemberId());
+		if (event.getCName() != null)
+		{
+			final String name = Text.removeTags(Text.toJagexName(event.getCName()));
+			if (!name.isEmpty())
+			{
+				member.setDisplayName(name);
+				member.setLoggedIn(true);
+				partyData.setColor(ColorUtil.fromObject(name));
+			}
+			else
+			{
+				member.setLoggedIn(false);
+				partyData.setColor(Color.WHITE);
+			}
+		}
+		SwingUtilities.invokeLater(() -> panel.updateMember(event.getMemberId()));
+	}
+
+	@Subscribe
+	public void onUserJoin(final UserJoin event)
+	{
+		getPartyData(event.getMemberId());
+	}
+
+	@Subscribe
+	public void onUserSync(final UserSync event)
+	{
+		if (!button)
+		{
+			clientToolbar.addNavigation(navButton);
+			button = true;
+		}
+		clientThread.invokeLater(() -> checkStateChanged(true));
+	}
+
+	@Subscribe
+	public void onUserPart(final UserPart event)
+	{
+		final PartyData removed = partyDataMap.remove(event.getMemberId());
+		if (removed != null)
+		{
+			SwingUtilities.invokeLater(() -> panel.removeMember(event.getMemberId()));
+		}
+		if (button && (!party.isInParty() || party.getMembers().size() == 0) && !config.AlwaysShowIcon())
+		{
+			clientToolbar.removeNavigation(navButton);
+			button = false;
+		}
+	}
+
+	@Subscribe
+	public void onPartyChanged(final PartyChanged event)
+	{
+		// Reset party
+		partyDataMap.clear();
+		if (event.getPartyId() != null)
+		{
+			config.setPreviousPartyId(event.getPassphrase());
+		}
+		SwingUtilities.invokeLater(panel::removeAllMembers);
+	}
+
+	@Subscribe
+	public void onPartyMemberAvatar(PartyMemberAvatar event)
+	{
+		SwingUtilities.invokeLater(() -> panel.updateMember(event.getMemberId()));
+	}
+
+	@Nullable
+	PartyData getPartyData(final long uuid)
+	{
+		final PartyMember memberById = party.getMemberById(uuid);
+
+		if (memberById == null)
+		{
+			return null;
+		}
+		return partyDataMap.computeIfAbsent(uuid, (u) -> {
+			PartyMember partyMember = party.getLocalMember();
+
+			PartyData partyData = new PartyData(uuid);
+
+			SwingUtilities.invokeLater(() -> panel.addMember(partyData));
+			return partyData;
+		});
+	}
+
+	void requestSync()
+	{
+		if (party.isInParty())
+		{
+			// Request sync
+			final UserSync userSync = new UserSync();
+			party.send(userSync);
+		}
+	}
+
+	void leaveParty()
+	{
+		resetParty();
+		party.changeParty(null);
+		overlayManager.remove(partyPointsOverlay);
+	}
+
+	private void checkStateChanged(boolean forceSend)
+	{
+		if (lastStatus == null)
+		{
+			forceSend = true;
+		}
+		if (!party.isInParty())
+		{
+			return;
+		}
+		if (!forceSend && client.getTickCount() % messageFreq(party.getMembers().size()) != 0)
+		{
+			return;
+		}
+
+		final int CurrentPersonalPoints = client.getVarbitValue(Varbits.PERSONAL_POINTS);
+
+		final Player localPlayer = client.getLocalPlayer();
+		final String characterName = Strings.nullToEmpty(localPlayer != null && client.getGameState().getState() >= GameState.LOADING.getState() ? localPlayer.getName() : null);
+
+		boolean shouldSend = false;
+		final StatUpdate statUpdate = new StatUpdate();
+
+		if (forceSend || !characterName.equals(lastStatus.getCName()))
+		{
+			shouldSend = true;
+			statUpdate.setCName(characterName);
+		}
+
+		if (forceSend || CurrentPersonalPoints != lastStatus.getCurrentPersonalPoints())
+		{
+			shouldSend = true;
+			statUpdate.setCurrentPersonalPoints(CurrentPersonalPoints);
+		}
+
+		if (shouldSend)
+		{
+			party.send(statUpdate);
+			lastStatus = new StatUpdate(characterName, CurrentPersonalPoints);
+		}
+
+	}
+
+	protected void updateOverlay(String Name, int points)
+	{
+		partyPointsOverlay.PartyData.put(Name, points);
+	}
+
+	protected void resetParty()
+	{
+		partyPointsOverlay.PartyData.clear();
+	}
+}
+
+package com.partypoints;
+
+import com.google.inject.Inject;
+import com.partypoints.data.PartyData;
+import java.awt.BorderLayout;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
+import java.awt.Insets;
+import java.awt.Toolkit;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.StringSelection;
+import java.util.HashMap;
+import java.util.Map;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JComponent;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.border.EmptyBorder;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.DragAndDropReorderPane;
+import net.runelite.client.ui.components.PluginErrorPanel;
+
+public class PartyPointsPanel extends PluginPanel
+{
+	private static final String BTN_CREATE_TEXT = "Create Party";
+	private static final String BTN_LEAVE_TEXT = "Leave";
+
+	private final PartyPointsPlugin plugin;
+	private final PartyService party;
+	private final PartyPointsConfig config;
+
+	private final Map<Long, PartyPointsMembers> membersMap = new HashMap<>();
+
+	private final JButton startButton = new JButton();
+	private final JButton joinPartyButton = new JButton();
+	private final JButton rejoinPartyButton = new JButton();
+	private final JButton copyPartyIdButton = new JButton();
+	private final JButton refreshPartyButton = new JButton();
+
+	private final PluginErrorPanel noPartyPanel = new PluginErrorPanel();
+	private final PluginErrorPanel emptyPartyPanel = new PluginErrorPanel();
+	private final JComponent memberBoxPanel = new DragAndDropReorderPane();
+
+	@Inject
+	PartyPointsPanel(final ClientThread clientThread, final PartyPointsPlugin plugin, final PartyPointsConfig config, final PartyService party)
+	{
+		this.plugin = plugin;
+		this.party = party;
+		this.config = config;
+
+		setBorder(new EmptyBorder(10, 10, 10, 10));
+		setBackground(ColorScheme.DARK_GRAY_COLOR);
+		setLayout(new BorderLayout());
+
+		final JPanel layoutPanel = new JPanel();
+		BoxLayout boxLayout = new BoxLayout(layoutPanel, BoxLayout.Y_AXIS);
+		layoutPanel.setLayout(boxLayout);
+		add(layoutPanel, BorderLayout.NORTH);
+
+		final JPanel topPanel = new JPanel();
+
+		topPanel.setBorder(new EmptyBorder(0, 0, 4, 0));
+		topPanel.setLayout(new GridBagLayout());
+
+		GridBagConstraints constraints = new GridBagConstraints();
+		constraints.fill = GridBagConstraints.HORIZONTAL;
+		constraints.insets = new Insets(0, 2, 4, 2);
+
+		constraints.gridx = 0;
+		constraints.gridy = 0;
+		topPanel.add(startButton, constraints);
+
+		constraints.gridx = 1;
+		constraints.gridy = 0;
+		topPanel.add(joinPartyButton, constraints);
+
+		constraints.gridx = 1;
+		constraints.gridy = 0;
+		topPanel.add(copyPartyIdButton, constraints);
+
+		constraints.gridx = 0;
+		constraints.gridy = 1;
+		constraints.gridwidth = 2;
+		topPanel.add(rejoinPartyButton, constraints);
+
+		constraints.gridx = 0;
+		constraints.gridy = 2;
+		constraints.gridwidth = 2;
+		topPanel.add(refreshPartyButton, constraints);
+
+		layoutPanel.add(topPanel);
+		layoutPanel.add(memberBoxPanel);
+
+		startButton.setText(party.isInParty() ? BTN_LEAVE_TEXT : BTN_CREATE_TEXT);
+		startButton.setFocusable(false);
+
+		joinPartyButton.setText("Join party");
+		joinPartyButton.setFocusable(false);
+
+		rejoinPartyButton.setText("Join previous party");
+		rejoinPartyButton.setFocusable(false);
+
+		copyPartyIdButton.setText("Copy passphrase");
+		copyPartyIdButton.setFocusable(false);
+
+		refreshPartyButton.setText("Refresh the Overlay");
+		refreshPartyButton.setFocusable(false);
+
+		startButton.addActionListener(e ->
+		{
+			if (party.isInParty())
+			{
+				// Leave party
+				final int result = JOptionPane.showOptionDialog(startButton,
+					"Are you sure you want to leave the party?",
+					"Leave party?", JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE,
+					null, new String[]{"Yes", "No"}, "No");
+
+				if (result == JOptionPane.YES_OPTION)
+				{
+					plugin.leaveParty();
+				}
+			}
+			else
+			{
+				// Create party
+				clientThread.invokeLater(() -> party.changeParty(party.generatePassphrase()));
+			}
+		});
+
+		joinPartyButton.addActionListener(e ->
+		{
+			if (!party.isInParty())
+			{
+				String s = (String) JOptionPane.showInputDialog(
+					joinPartyButton,
+					"Please enter the party passphrase:",
+					"Party Passphrase",
+					JOptionPane.PLAIN_MESSAGE,
+					null,
+					null,
+					"");
+
+				if (s == null)
+				{
+					return;
+				}
+
+				for (int i = 0; i < s.length(); ++i)
+				{
+					char ch = s.charAt(i);
+					if (!Character.isLetter(ch) && !Character.isDigit(ch) && ch != '-')
+					{
+						JOptionPane.showMessageDialog(joinPartyButton,
+							"Party passphrase must be a combination of alphanumeric or hyphen characters.",
+							"Invalid party passphrase",
+							JOptionPane.ERROR_MESSAGE);
+						return;
+					}
+				}
+
+				party.changeParty(s);
+			}
+		});
+
+		rejoinPartyButton.addActionListener(e ->
+		{
+			if (!party.isInParty())
+			{
+				party.changeParty(config.previousPartyId());
+			}
+		});
+
+		copyPartyIdButton.addActionListener(e ->
+		{
+			if (party.isInParty())
+			{
+				Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
+				clipboard.setContents(new StringSelection(party.getPartyPassphrase()), null);
+			}
+		});
+
+		refreshPartyButton.addActionListener(e ->
+		{
+			if (party.isInParty())
+			{
+				plugin.leaveParty();
+				try
+				{
+					Thread.sleep(600);
+				}
+				catch (InterruptedException ignored)
+				{
+				}
+				party.changeParty(config.previousPartyId());
+			}
+		});
+
+		noPartyPanel.setContent("Not in a party", "Create a party to begin");
+
+		updateParty();
+	}
+
+	void updateParty()
+	{
+		remove(noPartyPanel);
+		remove(emptyPartyPanel);
+
+		startButton.setText(party.isInParty() ? BTN_LEAVE_TEXT : BTN_CREATE_TEXT);
+		joinPartyButton.setVisible(!party.isInParty());
+		rejoinPartyButton.setVisible(!party.isInParty());
+		copyPartyIdButton.setVisible(party.isInParty());
+		refreshPartyButton.setVisible(party.isInParty());
+
+		if (!party.isInParty())
+		{
+			add(noPartyPanel);
+		}
+		else if (plugin.getPartyDataMap().size() <= 1)
+		{
+			emptyPartyPanel.setContent("Party Created", "Your Party Passphrase is: " + party.getPartyPassphrase() + ".");
+			add(emptyPartyPanel);
+		}
+	}
+
+	void addMember(PartyData partyData)
+	{
+		if (!membersMap.containsKey(partyData.getMemberId()))
+		{
+			PartyPointsMembers partyMember = new PartyPointsMembers(plugin, config, memberBoxPanel, partyData, party);
+			membersMap.put(partyData.getMemberId(), partyMember);
+			memberBoxPanel.add(partyMember);
+			memberBoxPanel.revalidate();
+		}
+		updateParty();
+	}
+
+	void removeAllMembers()
+	{
+		membersMap.forEach((key, value) -> memberBoxPanel.remove(value));
+		memberBoxPanel.revalidate();
+		membersMap.clear();
+		updateParty();
+	}
+
+	void removeMember(long memberId)
+	{
+		final PartyPointsMembers members = membersMap.remove(memberId);
+
+		if (members != null)
+		{
+			memberBoxPanel.remove(members);
+			memberBoxPanel.revalidate();
+		}
+		updateParty();
+	}
+
+	void updateMember(long userId)
+	{
+		final PartyPointsMembers members = membersMap.get(userId);
+		if (members != null)
+		{
+			members.update(this.plugin);
+		}
+	}
+
+	void updateAll()
+	{
+		membersMap.forEach((key, value) -> value.update(this.plugin));
+	}
+}
+
+package com.partypoints;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup(PartyPointsConfig.GROUP)
+public interface PartyPointsConfig extends Config
+{
+	String GROUP = "PartyPoints";
+
+	@ConfigItem(
+		keyName = "AlwaysShowIcon",
+		name = "Always show sidebar",
+		description = "Controls whether the sidebar icon is always shown or only shown while in a party "
+	)
+	default boolean AlwaysShowIcon()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "ShowPartyPassphrase",
+		name = "Show Party Passphrase",
+		description = "Controls whether the party passphrase is displayed within the UI"
+	)
+	default boolean ShowPartyPassphrase()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "Overlay",
+		name = "Show Overlay",
+		description = "Controls whether the overlay is displayed"
+	)
+	default boolean ShowOverlay()
+	{
+		return true;
+	}
+
+
+	@ConfigItem(
+		keyName = "previousPartyId",
+		name = "",
+		description = "",
+		hidden = true
+	)
+	default String previousPartyId()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "previousPartyId",
+		name = "",
+		description = "",
+		hidden = true
+	)
+	void setPreviousPartyId(String id);
+
+	@ConfigItem(
+		keyName = "overlayThreshold",
+		name = "Overlay Threshold",
+		description = "Set the mininmum points needed to be displayed on the overlay"
+	)
+	default int overlayThreshold()
+	{
+		return 1000;
+	}
+}
+
+package com.partypoints;
+
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.util.HashMap;
+import java.util.Map;
+import javax.inject.Inject;
+import static net.runelite.api.MenuAction.RUNELITE_OVERLAY_CONFIG;
+import static net.runelite.client.ui.overlay.OverlayManager.OPTION_CONFIGURE;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+public class PartyPointsOverlay extends OverlayPanel
+{
+	private final PartyPointsPlugin plugin;
+	@Inject
+	private final PartyPointsConfig config;
+	public Map<String, Integer> PartyData = new HashMap<>();
+	PartyPointsOverlay(PartyPointsPlugin plugin, PartyPointsConfig config)
+	{
+		super(plugin);
+		this.plugin = plugin;
+		this.config = config;
+		setPriority(OverlayPriority.MED);
+		addMenuEntry(RUNELITE_OVERLAY_CONFIG,OPTION_CONFIGURE,"PartyPoints Overlay");
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		panelComponent.getChildren().clear();
+		PartyData.remove("<unknown>");
+		if (!PartyData.isEmpty())
+		{
+			for (Map.Entry<String, Integer> Entry : PartyData.entrySet())
+			{
+				if (config.overlayThreshold()< Entry.getValue())
+				{
+					panelComponent.getChildren().add(LineComponent.builder().left(Entry.getKey() + ": ").right(String.valueOf(Entry.getValue())).build());
+				}
+			}
+		}
+		return super.render(graphics);
+
+	}
+}
+
+package com.partypoints.data;
+
+import java.awt.Color;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+import lombok.Setter;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+
+@Setter
+@Getter
+@RequiredArgsConstructor
+public class PartyData
+{
+	private final long memberId;
+	private final PanelComponent panelComponent = new PanelComponent();
+	private Color color = Color.white;
+
+	private int PersonalPoints;
+}
+
+package com.partypoints.data;
+
+import com.google.gson.annotations.SerializedName;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+@EqualsAndHashCode(callSuper = true)
+public class StatUpdate extends PartyMemberMessage
+{
+	@SerializedName("n")
+	private String cName;
+
+	@SerializedName("pp")
+	private Integer CurrentPersonalPoints;
+
+}
+
+package com.partypoints;
+
+import com.partypoints.data.PartyData;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Dimension;
+import javax.swing.BorderFactory;
+import javax.swing.ImageIcon;
+import javax.swing.JComponent;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.SwingConstants;
+import javax.swing.border.Border;
+import javax.swing.border.EmptyBorder;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.party.PartyMember;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.components.MouseDragEventForwarder;
+import net.runelite.client.util.ImageUtil;
+
+public class PartyPointsMembers extends JPanel
+{
+	private final PartyData memberPartyData;
+	private final PartyService partyService;
+
+	private final JLabel name = new JLabel();
+	private final JLabel avatar = new JLabel();
+
+	private final JLabel PP = new JLabel();
+
+	private final PartyPointsConfig config;
+
+	private boolean avatarSet;
+
+	private PartyPointsPlugin plugin;
+
+	PartyPointsMembers(final PartyPointsPlugin plugin, final PartyPointsConfig config, final JComponent panel, final PartyData memberPartyData, final PartyService partyService)
+	{
+		this.plugin = plugin;
+		this.config = config;
+		this.memberPartyData = memberPartyData;
+		this.partyService = partyService;
+
+		setLayout(new BorderLayout());
+		setBorder(new EmptyBorder(5, 0, 0, 0));
+
+		final JPanel container = new JPanel();
+		container.setLayout(new BorderLayout());
+		container.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		container.setBorder(new EmptyBorder(5, 5, 5, 5));
+
+		Border border = BorderFactory.createLineBorder(ColorScheme.DARKER_GRAY_COLOR, 1);
+		avatar.setBorder(border);
+
+		avatar.setHorizontalAlignment(SwingConstants.CENTER);
+		avatar.setVerticalAlignment(SwingConstants.CENTER);
+		avatar.setPreferredSize(new Dimension(35, 35));
+
+		final JPanel headerPanel = new JPanel();
+		headerPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		headerPanel.setLayout(new BorderLayout());
+		headerPanel.setBorder(new EmptyBorder(0, 0, 3, 0));
+
+		final JPanel namesPanel = new JPanel();
+		namesPanel.setLayout(new BorderLayout());
+		namesPanel.setBorder(new EmptyBorder(0, 0, 3, 0));
+		namesPanel.setBorder(new EmptyBorder(2, 5, 2, 5));
+
+		final JPanel PPPanel = new JPanel();
+		PPPanel.setLayout(new BorderLayout());
+		PPPanel.setBorder(new EmptyBorder(0, 0, 3, 0));
+		PPPanel.setBorder(new EmptyBorder(2, 5, 2, 5));
+
+		name.setFont(FontManager.getRunescapeFont());
+		name.putClientProperty("html.disable", Boolean.TRUE);
+
+		PP.setFont(FontManager.getRunescapeFont());
+		PP.putClientProperty("html.disable", Boolean.TRUE);
+
+		namesPanel.add(name);
+
+		PPPanel.add(PP);
+
+		headerPanel.add(avatar, BorderLayout.WEST);
+		headerPanel.add(namesPanel, BorderLayout.CENTER);
+		headerPanel.add(PPPanel, BorderLayout.EAST);
+
+		container.add(headerPanel, BorderLayout.NORTH);
+		MouseDragEventForwarder mouseDragEventForwarder = new MouseDragEventForwarder(panel);
+		container.addMouseListener(mouseDragEventForwarder);
+		container.addMouseMotionListener(mouseDragEventForwarder);
+
+		add(container, BorderLayout.NORTH);
+
+		update(plugin);
+	}
+
+	void update(final PartyPointsPlugin plugin)
+	{
+		PartyPointsOverlay partyPointsOverlay = new PartyPointsOverlay(this.plugin, config);
+		final PartyMember member = partyService.getMemberById(memberPartyData.getMemberId());
+		if (!avatarSet && member.getAvatar() != null)
+		{
+			ImageIcon icon = new ImageIcon(ImageUtil.resizeImage(member.getAvatar(), 32, 32));
+			icon.getImage().flush();
+			avatar.setIcon(icon);
+			avatarSet = true;
+		}
+
+		name.setForeground(member.isLoggedIn() ? Color.white : ColorScheme.DARKER_GRAY_COLOR);
+		name.setText(member.getDisplayName());
+		PP.setText(String.valueOf(memberPartyData.getPersonalPoints()));
+		plugin.updateOverlay(member.getDisplayName(), memberPartyData.getPersonalPoints());
+	}
+}
+
