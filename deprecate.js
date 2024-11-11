@@ -220,7 +220,7 @@ class AutoMap extends Map {
 			},
 			template: `
 <div class="search">
-	<input v-model="entry.regex" placeholder="^Lnet/runelite/foo" @focus="entry.focused=true" @blur="entry.focused=false">
+	<input v-model="entry.regex" placeholder="Toa Keris Cam" @focus="entry.focused=true" @blur="entry.focused=false">
 	<div v-if="entry.error" class="error">{{entry.error}}</div>
 	<div v-if="!entry.error">
 		<List v-if="entry.groups" v-for="grouping of entry.groups" :list="grouping[1]" :name="'groups by ' + grouping[0]" :active="true" v-slot="{item}">
@@ -253,7 +253,7 @@ class AutoMap extends Map {
 				console.log("loading hash:", e);
 			}
 			return {
-				entries: entries || [new Search("^Lnet/runelite/api/events/(?<name>.*Object)Spawned")],
+				entries: entries || [new Search("Toa Keris Cam")],
 			}
 		},
 		template: `
