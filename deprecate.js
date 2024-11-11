@@ -22,16 +22,20 @@ let fileContent = [];
 
 async function readPluginApi(manifest) {
 	fileContent = [];
-	await list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName)
 	let text = [];
+
+	if (manifest.internalName.indexOf('zom') > 0)
+	{
+	list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName)
 	for (let i = 0; i < fileContent.length; i++)
 	{
 		text.push(fileContent[i].split("\n"));
 	}
+	}
 	return text;
 }
 
-async function list_directory(user, repo, directory) {
+function list_directory(user, repo, directory) {
   if (directory.indexOf("\.") > 0) 
   {
 	console.log(directory);
