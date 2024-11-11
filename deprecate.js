@@ -39,7 +39,7 @@ async function list_directory(user, repo, directory, internalName) {
   if (directory.indexOf("\.") > 0) 
   {
 	console.log(directory);
-	let res = await fetch(directory),
+	let res = await fetch(`https://raw.githubusercontent.com/${user}/${repo}/refs/heads/main/` + directory),
     		ret = await res.text(); 
 	fileContent.get(internalName).push(ret);
 	return;
