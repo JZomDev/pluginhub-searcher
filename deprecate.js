@@ -22,7 +22,7 @@ let fileContent = [];
 
 async function readPluginApi(manifest) {
 	fileContent = [];
-	list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName)
+	await list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName)
 	let text = [];
 	for (let i = 0; i < fileContent.length; i++)
 	{
