@@ -18,40 +18,35 @@ const installs = (async() => {
 	let req = await fetch(`https://api.runelite.net/runelite-${await version}/pluginhub`);
 	return await req.json();
 })();
-let fileContent = [];
-
+let fileContent = new Map();
 async function readPluginApi(manifest) {
-	fileContent = [];
+	out.fileContent(manifest.internalName, [])
+
 	let text = [];
 
 	if (manifest.internalName.indexOf('zom') > 0)
 	{
-	list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName)
-	for (let i = 0; i < fileContent.length; i++)
-	{
-		text.push(fileContent[i].split("\n"));
-	}
+		list_directory('JZomDev', 'pluginhub-searcher','plugins/' + manifest.internalName, manifest.internalName)
+		for (let i = 0; i < fileContent.get(manifest.internalName).length; i++)
+		{
+			text.push(fileContent.get(manifest.internalName)[i].split("\n"));
+		}
 	}
 	return text;
 }
 
-function list_directory(user, repo, directory) {
+async function list_directory(user, repo, directory, internalName) {
   if (directory.indexOf("\.") > 0) 
   {
 	console.log(directory);
 	let res = await fetch(directory),
     ret = await res.text(); 
-	fileContent.push(ret);
+	fileContent.get(internalName).push(ret);
 	return;
   }
-  const url = `https://api.github.com/repos/${user}/${repo}/git/trees/main`;
-  let directory2 = directory.split('/').filter(Boolean);
-  const dir = await directory2.reduce(async (acc, dir) => {
-      const { url } = await acc;
-      const list = await fetch(url).then(res => res.json());
-      return list.tree.find(node => node.path === dir);
-  }, { url });
-  if (dir) {
+  const url = `https://api.github.com/repos/${user}/${repo}/git/trees/main/` + directory;
+  
+  if (directory) {
      const list = await fetch(dir.url).then(res => res.json());
 	 const loopThis = list.tree.map(node => node.path);
 	 for (let i = 0; i < loopThis.length; i++) {
