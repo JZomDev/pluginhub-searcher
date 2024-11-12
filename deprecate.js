@@ -4,7 +4,7 @@ const version = (async() => {
 	return version.trim();
 })();
 
-const root = "https://repo.runelite.net/plugins/" // testing
+const root = "https://repo.runelite.net/plugins/"
 
 const manifest = (async() => {
 	let req = await fetch(`${root}manifest/${await version}_full.js`);
