@@ -24,16 +24,12 @@ async function readPluginApi(manifest) {
 
 	let text = [];
 
-	//if (manifest.internalName.indexOf('zom-afk-gotr') != -1)
-	//{
-		let result = await getConent('JZomDev', 'pluginhub-searcher', manifest.internalName);
+	let result = await getConent('JZomDev', 'pluginhub-searcher', manifest.internalName);
 		
-		for (let i = 0; i < fileContent.get(manifest.internalName).length; i++)
-		{
-			text = text.concat(fileContent.get(manifest.internalName)[i].split("\n"));
-		}
-		console.log('added text for: ' + manifest.internalName);
-	//}
+	for (let i = 0; i < fileContent.get(manifest.internalName).length; i++)
+	{
+		text = text.concat(fileContent.get(manifest.internalName)[i].split("\n"));
+	}
 	return text;
 }
 
@@ -231,7 +227,7 @@ class AutoMap extends Map {
 		<List :list="entry.allMatches" :active="!entry.groups" name="plugins" v-slot="{item}">
 			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
 		</List>
-		<List :list="entry.symbols" name="symbols" v-slot="{item}">
+		<List :list="entry.symbols" name="lines of text" v-slot="{item}">
 			<code>{{item}}</code>
 		</List>
 	</div>
