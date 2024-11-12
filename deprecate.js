@@ -35,7 +35,7 @@ async function readPluginApi(manifest) {
 
 async function getConent(user, repo, internalName) {
   
-	let res = await fetch(`https://raw.githubusercontent.com/${user}/${repo}/refs/heads/main/plugins/` + internalName + '/content.txt'),
+	let res = await fetch(`plugins/` + internalName + '/content.txt'),
     		ret = await res.text(); 
 	fileContent.get(internalName).push(ret);
 	return true;
