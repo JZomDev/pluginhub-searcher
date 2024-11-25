@@ -22,15 +22,26 @@ import javax.inject.Inject;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Graphics2D;
+import java.util.Set;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.Point;
 import net.runelite.api.Perspective;
+import net.runelite.api.GameState;
+import net.runelite.api.GameObject;
+import net.runelite.api.Tile;
+import net.runelite.api.Scene;
+import com.google.common.collect.ImmutableSet;
+import net.runelite.api.coords.WorldPoint;
+import lombok.extern.slf4j.Slf4j;
 
+@Slf4j
 public class ObeliskProtectionGroundOverlay extends Overlay
 {
     private final Client client;
     private final ObeliskProtectionPlugin plugin;
     private final ObeliskProtectionConfig config;
+
+    private static final Set<Integer> POH_REGIONS = ImmutableSet.of(7257, 7513, 7514, 7769, 7770, 8025, 8026);
 
     @Inject
     private ObeliskProtectionGroundOverlay(Client client, ObeliskProtectionPlugin plugin, ObeliskProtectionConfig config)
@@ -45,28 +56,75 @@ public class ObeliskProtectionGroundOverlay extends Overlay
     @Override
     public Dimension render(Graphics2D graphics)
     {
-        if (!config.showGroundMarker() || !plugin.isProtectionActive() || plugin.getObeliskLocation() == null)
+        if (!config.showGroundMarker())
         {
+            log.debug("Ground marker disabled in config");
+            return null;
+        }
+        
+        if (!plugin.isProtectionActive())
+        {
+            log.debug("Protection not active in plugin");
+            return null;
+        }
+        
+        LocalPoint loc = plugin.getObeliskLocation();
+        if (loc == null)
+        {
+            log.debug("Obelisk location is null in plugin");
             return null;
         }
 
-        LocalPoint loc = plugin.getObeliskLocation();
-        if (loc != null)
+        if (!isInPOH())
         {
-            Point canvasPoint = Perspective.getCanvasTextLocation(
-                client,
-                graphics,
-                loc,
-                "Protection Active",
-                0);
-            
-            if (canvasPoint != null)
-            {
-                OverlayUtil.renderTextLocation(graphics, canvasPoint, "Protection Active", config.markerColor());
-            }
+            log.debug("Not in POH - Region ID: {}", client.getLocalPlayer().getWorldLocation().getRegionID());
+            return null;
+        }
+
+        if (client.getGameState() != GameState.LOGGED_IN)
+        {
+            log.debug("Not logged in - Game state: {}", client.getGameState());
+            return null;
+        }
+
+        Point canvasPoint = Perspective.getCanvasTextLocation(
+            client,
+            graphics,
+            loc,
+            "Protection Active",
+            0);
+        
+        if (canvasPoint != null)
+        {
+            OverlayUtil.renderTextLocation(graphics, canvasPoint, "Protection Active", config.markerColor());
+            log.debug("Rendered 'Protection Active' at {} for location {}", canvasPoint, loc);
+        }
+        else
+        {
+            log.debug("Could not get canvas point for location {}", loc);
         }
 
         return null;
+    }
+
+    private boolean isInPOH()
+    {
+        if (!client.isInInstancedRegion())
+        {
+            log.debug("Not in instanced region");
+            return false;
+        }
+
+        WorldPoint worldPoint = client.getLocalPlayer().getWorldLocation();
+        WorldPoint instancePoint = WorldPoint.fromLocalInstance(client, client.getLocalPlayer().getLocalLocation());
+        
+        int regionId = worldPoint.getRegionID();
+        int instanceRegionId = instancePoint != null ? instancePoint.getRegionID() : -1;
+        
+        log.debug("Region check - World Region: {}, Instance Region: {}, POH Regions: {}", 
+            regionId, instanceRegionId, POH_REGIONS);
+        
+        return instancePoint != null && POH_REGIONS.contains(instanceRegionId);
     }
 } 
 package com.obeliskprotection;
@@ -91,6 +149,10 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Arrays;
 import lombok.Getter;
+import com.google.common.collect.ImmutableSet;
+import java.util.Set;
+import net.runelite.api.events.GameObjectSpawned;
+import net.runelite.api.events.GameObjectDespawned;
 
 @Slf4j
 @PluginDescriptor(
@@ -122,11 +184,16 @@ public class ObeliskProtectionPlugin extends Plugin
     private LocalPoint obeliskLocation = null;
 
     // POH Wilderness Obelisk object ID
-    private static final int POH_OBELISK_ID = 31554;
+    public static final int POH_OBELISK_ID = 31554;
 
     private static final int[] WILDERNESS_OBELISK_IDS = {
         14826, 14827, 14828, 14829, 14830, 14831  // Wilderness obelisks to ignore
     };
+
+    private static final Set<Integer> POH_REGIONS = ImmutableSet.of(7257, 7513, 7514, 7769, 7770, 8025, 8026);
+
+    @Getter
+    private GameObject pohObelisk = null;
 
     @Override
     protected void startUp()
@@ -147,46 +214,109 @@ public class ObeliskProtectionPlugin extends Plugin
     @Subscribe
     public void onMenuEntryAdded(MenuEntryAdded event)
     {
-        // Debug every menu entry
-        log.debug("Menu Entry - ID: {}, Option: '{}', Target: '{}'", 
-            event.getIdentifier(), event.getOption(), event.getTarget());
+        // Debug all menu entries and current state
+        log.debug("Menu Entry - Option: '{}', Target: '{}', ID: {}, Type: {}, Protection Active: {}, Location: {}", 
+            event.getOption(), 
+            event.getTarget(),
+            event.getIdentifier(),
+            event.getType(),
+            protectionActive, 
+            obeliskLocation);
 
-        // Check if this is an obelisk interaction
-        if (!event.getTarget().contains("Obelisk"))
+        if (!isInPOH())
         {
+            log.debug("Not in POH");
+            protectionActive = false;
+            obeliskLocation = null;
             return;
         }
 
-        // Check if this is a teleport-related option
-        String option = event.getOption();
-        if (shouldBlockOption(option))
+        // Get all current menu entries to check context
+        MenuEntry[] currentEntries = client.getMenuEntries();
+        log.debug("All menu entries: {}", Arrays.toString(currentEntries));
+
+        // Check if this is an obelisk interaction - more lenient check
+        String target = event.getTarget().toLowerCase();
+        if (!target.contains("obelisk") && !target.contains("wilderness portal"))
         {
-            int riskValue = calculateRiskValue();
-            log.debug("Risk check - Value: {}, Threshold: {}", riskValue, config.wealthThreshold());
+            // Only clear protection if we're not processing an obelisk-related entry
+            if (currentEntries.length == 1) {
+                log.debug("Not an obelisk target and no other entries: '{}'", target);
+                protectionActive = false;
+                obeliskLocation = null;
+            }
+            return;
+        }
+
+        // Check if we have a tracked POH obelisk
+        if (pohObelisk == null)
+        {
+            log.debug("No POH obelisk tracked");
+            protectionActive = false;
+            obeliskLocation = null;
+            return;
+        }
+
+        // Calculate risk value regardless of menu option
+        int riskValue = calculateRiskValue();
+        log.debug("Risk check - Value: {}, Threshold: {}", riskValue, config.wealthThreshold());
+        
+        if (riskValue > config.wealthThreshold())
+        {
+            log.debug("Setting protection active - Risk value {} exceeds threshold {}", 
+                riskValue, config.wealthThreshold());
+            protectionActive = true;
+            obeliskLocation = pohObelisk.getLocalLocation();
+            log.debug("Obelisk location set to: {}", obeliskLocation);
             
-            if (riskValue > config.wealthThreshold())
+            // Only remove menu entries for teleport-related options
+            String option = event.getOption().toLowerCase();
+            if (shouldBlockOption(option))
             {
-                protectionActive = true;
-                // Store the obelisk location
-                GameObject obelisk = findObelisk();
-                if (obelisk != null)
-                {
-                    obeliskLocation = obelisk.getLocalLocation();
-                }
                 // Remove the current entry
-                MenuEntry[] entries = client.getMenuEntries();
-                if (entries.length > 0)
+                MenuEntry[] updatedEntries = client.getMenuEntries();
+                if (updatedEntries.length > 0)
                 {
-                    // Remove the last entry which is the one that was just added
-                    client.setMenuEntries(Arrays.copyOf(entries, entries.length - 1));
+                    client.setMenuEntries(Arrays.copyOf(updatedEntries, updatedEntries.length - 1));
                     log.debug("Removed menu option: '{}'", option);
                 }
             }
             else
             {
-                protectionActive = false;
-                obeliskLocation = null;
+                log.debug("Option '{}' not blocked", option);
             }
+        }
+        else
+        {
+            log.debug("Protection not active - Risk value {} below threshold {}", 
+                riskValue, config.wealthThreshold());
+            protectionActive = false;
+            obeliskLocation = null;
+        }
+    }
+
+    @Subscribe
+    public void onGameObjectSpawned(GameObjectSpawned event)
+    {
+        GameObject obj = event.getGameObject();
+        if (obj.getId() == POH_OBELISK_ID && isInPOH())
+        {
+            log.debug("POH Obelisk spawned");
+            pohObelisk = obj;
+            obeliskLocation = obj.getLocalLocation();
+        }
+    }
+
+    @Subscribe
+    public void onGameObjectDespawned(GameObjectDespawned event)
+    {
+        GameObject obj = event.getGameObject();
+        if (obj.getId() == POH_OBELISK_ID && obj == pohObelisk)
+        {
+            log.debug("POH Obelisk despawned");
+            pohObelisk = null;
+            obeliskLocation = null;
+            protectionActive = false;
         }
     }
 
@@ -197,10 +327,10 @@ public class ObeliskProtectionPlugin extends Plugin
             return false;
         }
 
-        // Match the exact menu options we want to block
-        return option.equals("Teleport to destination") ||
-               option.equals("Activate") ||
-               option.equals("Set destination");
+        option = option.toLowerCase();
+        return option.equals("teleport to destination") ||
+               option.equals("activate") ||
+               option.equals("set destination");
     }
 
     private int calculateRiskValue()
@@ -208,7 +338,8 @@ public class ObeliskProtectionPlugin extends Plugin
         ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
         ItemContainer equipment = client.getItemContainer(InventoryID.EQUIPMENT);
         
-        List<Integer> allValues = new ArrayList<>();
+        List<Integer> protectedValues = new ArrayList<>();
+        int totalRiskValue = 0;
         
         if (inventory != null)
         {
@@ -217,9 +348,23 @@ public class ObeliskProtectionPlugin extends Plugin
                 if (item.getId() != -1)
                 {
                     int gePrice = itemManager.getItemPrice(item.getId());
-                    allValues.add(gePrice * item.getQuantity());
+                    ItemComposition itemComp = itemManager.getItemComposition(item.getId());
+                    
+                    if (itemComp.isStackable() && item.getQuantity() > 3)
+                    {
+                        // For stackable items, treat the whole stack minus 3 as risk
+                        totalRiskValue += gePrice * (item.getQuantity() - 3);
+                        // Add single item value to protected values list
+                        protectedValues.add(gePrice);
+                    }
+                    else
+                    {
+                        // For non-stackable items, add full value to protected values list
+                        protectedValues.add(gePrice * item.getQuantity());
+                    }
+                    
                     log.debug("Inventory item: {} x{} = {}", 
-                        itemManager.getItemComposition(item.getId()).getName(),
+                        itemComp.getName(),
                         item.getQuantity(), 
                         gePrice * item.getQuantity());
                 }
@@ -233,67 +378,60 @@ public class ObeliskProtectionPlugin extends Plugin
                 if (item.getId() != -1)
                 {
                     int gePrice = itemManager.getItemPrice(item.getId());
-                    allValues.add(gePrice * item.getQuantity());
+                    ItemComposition itemComp = itemManager.getItemComposition(item.getId());
+                    
+                    if (itemComp.isStackable() && item.getQuantity() > 3)
+                    {
+                        // For stackable items, treat the whole stack minus 3 as risk
+                        totalRiskValue += gePrice * (item.getQuantity() - 3);
+                        // Add single item value to protected values list
+                        protectedValues.add(gePrice);
+                    }
+                    else
+                    {
+                        // For non-stackable items, add full value to protected values list
+                        protectedValues.add(gePrice * item.getQuantity());
+                    }
+                    
                     log.debug("Equipment item: {} x{} = {}", 
-                        itemManager.getItemComposition(item.getId()).getName(),
+                        itemComp.getName(),
                         item.getQuantity(), 
                         gePrice * item.getQuantity());
                 }
             }
         }
         
-        Collections.sort(allValues, Collections.reverseOrder());
+        // Sort protected values to find the 3 most valuable items
+        Collections.sort(protectedValues, Collections.reverseOrder());
         
-        // Log the top 3 items being excluded
-        for (int i = 0; i < Math.min(3, allValues.size()); i++)
+        // Add any remaining non-protected items to risk value
+        for (int i = 3; i < protectedValues.size(); i++)
         {
-            log.debug("Protected value #{}: {}", i + 1, allValues.get(i));
+            totalRiskValue += protectedValues.get(i);
         }
         
-        int totalValue = 0;
-        for (int i = 3; i < allValues.size(); i++)
-        {
-            totalValue += allValues.get(i);
-        }
-        
-        log.debug("Final risk value: {}, Threshold: {}", totalValue, config.wealthThreshold());
-        return totalValue;
+        log.debug("Final risk value: {}, Threshold: {}", totalRiskValue, config.wealthThreshold());
+        return totalRiskValue;
     }
 
-    private GameObject findObelisk()
+    private boolean isInPOH()
     {
-        Scene scene = client.getScene();
-        Tile[][][] tiles = scene.getTiles();
-
-        for (int z = 0; z < tiles.length; z++)
+        if (!client.isInInstancedRegion())
         {
-            for (int x = 0; x < tiles[z].length; x++)
-            {
-                for (int y = 0; y < tiles[z][x].length; y++)
-                {
-                    Tile tile = tiles[z][x][y];
-                    if (tile == null)
-                    {
-                        continue;
-                    }
-
-                    GameObject[] gameObjects = tile.getGameObjects();
-                    if (gameObjects == null)
-                    {
-                        continue;
-                    }
-
-                    for (GameObject obj : gameObjects)
-                    {
-                        if (obj != null && obj.getId() == POH_OBELISK_ID)
-                        {
-                            return obj;
-                        }
-                    }
-                }
-            }
+            log.debug("Not in instanced region");
+            return false;
         }
-        return null;
+
+        WorldPoint worldPoint = client.getLocalPlayer().getWorldLocation();
+        WorldPoint instancePoint = WorldPoint.fromLocalInstance(client, client.getLocalPlayer().getLocalLocation());
+        
+        int regionId = worldPoint.getRegionID();
+        int instanceRegionId = instancePoint != null ? instancePoint.getRegionID() : -1;
+        
+        log.debug("Region check - World Region: {}, Instance Region: {}, POH Regions: {}", 
+            regionId, instanceRegionId, POH_REGIONS);
+        
+        return instancePoint != null && POH_REGIONS.contains(instanceRegionId);
     }
 
     @Provides
