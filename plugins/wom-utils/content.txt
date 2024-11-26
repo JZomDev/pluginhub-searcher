@@ -657,6 +657,7 @@ import com.google.gson.Gson;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonSyntaxException;
 import com.google.inject.Binder;
 import com.google.inject.Provides;
 import java.util.stream.Collectors;
@@ -690,12 +691,14 @@ import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
 import java.time.temporal.ChronoUnit;
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Properties;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ScheduledExecutorService;
@@ -940,16 +943,30 @@ public class WomUtilsPlugin extends Plugin
 
 	private final Map<Skill, Integer> previousSkillLevels = new EnumMap<>(Skill.class);
 
+	@Getter
+	private static String pluginVersion = "0.0.0";
+
 	static
 	{
 		WORKING_DIR = new File(RuneLite.RUNELITE_DIR, "wom-utils");
 		WORKING_DIR.mkdirs();
+
+		try (InputStream inputStream = WomUtilsPlugin.class.getResourceAsStream("/version.ini"))
+		{
+			Properties props = new Properties();
+			props.load(inputStream);
+			pluginVersion = props.getProperty("pluginVersion");
+		}
+		catch (IOException e)
+		{
+			log.error("Failed to read version.ini", e);
+		}
 	}
 
 	@Override
 	protected void startUp() throws Exception
 	{
-		log.info("Wise Old Man started!");
+		log.info("Wise Old Man started! (v{})", pluginVersion);
 
 		// This will work, idk why really, but ok
 		womPanel = injector.getInstance(WomPanel.class);
@@ -1123,6 +1140,14 @@ public class WomUtilsPlugin extends Plugin
 		womClient.commandLookup(player, command, chatMessage);
 	}
 
+	private boolean isValidNameChange(String prev, String curr)
+	{
+		return !(Strings.isNullOrEmpty(prev)
+			|| curr.equals(prev)
+			|| prev.startsWith("[#")
+			|| curr.startsWith("[#"));
+	}
+
 	@Subscribe
 	public void onNameableNameChanged(NameableNameChanged nameableNameChanged)
 	{
@@ -1131,10 +1156,7 @@ public class WomUtilsPlugin extends Plugin
 		String name = nameable.getName();
 		String prev = nameable.getPrevName();
 
-		if (Strings.isNullOrEmpty(prev)
-			|| name.equals(prev)
-			|| prev.startsWith("[#")
-			|| name.startsWith("[#"))
+		if (!isValidNameChange(prev, name))
 		{
 			return;
 		}
@@ -1179,6 +1201,27 @@ public class WomUtilsPlugin extends Plugin
 			return;
 		}
 
+		List<Nameable> friendIgnore = new ArrayList<>();
+		friendIgnore.addAll(Arrays.asList(client.getFriendContainer().getMembers()));
+		friendIgnore.addAll(Arrays.asList(client.getIgnoreContainer().getMembers()));
+
+		// List of current valid name changes in our friends/ignore list.
+		List<NameChangeEntry> validNameChanges = friendIgnore.stream()
+			.filter(nameable -> isValidNameChange(nameable.getPrevName(), nameable.getName()))
+			.map(nameable -> new NameChangeEntry(Text.toJagexName(nameable.getPrevName()), Text.toJagexName(nameable.getName())))
+			.collect(Collectors.toList());
+
+		// Remove a name change from the queue if it is no longer in our friends/ignore list at the time
+		// of submission.
+		queue.removeIf(entry -> {
+			if (!validNameChanges.contains(entry))
+			{
+				nameChanges.remove(entry.getNewName(), entry.getOldName());
+				return true;
+			}
+			return false;
+		});
+
 		womClient.submitNameChanges(queue.toArray(new NameChangeEntry[0]));
 		clientThread.invoke(queue::clear);
 
@@ -1203,12 +1246,20 @@ public class WomUtilsPlugin extends Plugin
 		File file = new File(WORKING_DIR, NAME_CHANGES);
 		if (file.exists())
 		{
-			String json = Files.asCharSource(file, Charsets.UTF_8).read();
-			JsonObject jsonObject = jsonParser.parse(json).getAsJsonObject();
-
-			for (Map.Entry<String, JsonElement> entry : jsonObject.entrySet())
+			try
 			{
-				nameChanges.put(entry.getKey(), entry.getValue().getAsString());
+				String json = Files.asCharSource(file, Charsets.UTF_8).read();
+				JsonObject jsonObject = jsonParser.parse(json).getAsJsonObject();
+
+				for (Map.Entry<String, JsonElement> entry : jsonObject.entrySet())
+				{
+					nameChanges.put(entry.getKey(), entry.getValue().getAsString());
+				}
+			}
+			catch (JsonSyntaxException | IllegalStateException e)
+			{
+				nameChanges.clear();
+				log.debug("name-changes.json file was malformed");
 			}
 		}
 	}
@@ -4506,7 +4557,10 @@ public enum HttpMethod
 package net.wiseoldman.web;
 
 import com.google.gson.Gson;
+
 import java.util.Set;
+
+import net.runelite.client.RuneLiteProperties;
 import net.wiseoldman.WomUtilsPlugin;
 import net.wiseoldman.beans.GroupInfoWithMemberships;
 import net.wiseoldman.beans.NameChangeEntry;
@@ -4534,6 +4588,7 @@ import java.util.ArrayList;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 import javax.inject.Inject;
+
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
@@ -4587,6 +4642,8 @@ public class WomClient
 	private final WomUtilsPlugin plugin;
 	private final String leagueError = " You are currently in a League world. Your group configurations might be for the main game.";
 
+	private final String userAgent;
+
 	@Inject
 	public WomClient(Gson gson, WomUtilsPlugin plugin)
 	{
@@ -4595,6 +4652,12 @@ public class WomClient
 			.create();
 
 		this.plugin = plugin;
+
+		String pluginVersion = WomUtilsPlugin.getPluginVersion();
+		String runeliteVersion = RuneLiteProperties.getVersion();
+
+		userAgent = "WiseOldManRuneLitePlugin/" + pluginVersion + " " +
+			"RuneLite/" + runeliteVersion;
 	}
 
 	public void submitNameChanges(NameChangeEntry[] changes)
@@ -4639,7 +4702,7 @@ public class WomClient
 		);
 
 		Request.Builder requestBuilder = new Request.Builder()
-			.header("User-Agent", "WiseOldMan RuneLite Plugin")
+			.header("User-Agent", userAgent)
 			.url(url);
 
 		if (httpMethod == HttpMethod.PUT)
@@ -4659,7 +4722,7 @@ public class WomClient
 	{
 		HttpUrl url = buildUrl(pathSegments);
 		return new Request.Builder()
-			.header("User-Agent", "WiseOldMan RuneLite Plugin")
+			.header("User-Agent", userAgent)
 			.url(url)
 			.build();
 	}
