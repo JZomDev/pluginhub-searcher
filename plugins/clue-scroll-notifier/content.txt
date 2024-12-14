@@ -1,18 +1,5 @@
 package com.cluescrollnotifier;
 
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
-
-public class ClueScrollNotifierPluginTest
-{
-	public static void main(String[] args) throws Exception
-	{
-		ExternalPluginManager.loadBuiltin(ClueScrollNotifierPlugin.class);
-		RuneLite.main(args);
-	}
-}
-package com.cluescrollnotifier;
-
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
@@ -45,6 +32,17 @@ public interface ClueScrollNotifierConfig extends Config {
 	)
 	default boolean playSound() {
 		return true;
+	}
+
+	@ConfigItem(
+			keyName = "customSoundFile",
+			name = "Custom Sound File",
+			description = "Select a custom sound file to play for notifications",
+			position = 1,
+			section = generalSettings
+	)
+	default Sound customSoundFile() {
+		return Sound.CLUE1;
 	}
 
 	@Range(min = 0, max = 200)
@@ -124,6 +122,17 @@ public interface ClueScrollNotifierConfig extends Config {
 	default boolean notifyMining() {
 		return true;
 	}
+
+	@ConfigItem(
+			keyName = "notifyScrollBoxDrops",
+			name = "Notify on Scroll Box Drops",
+			description = "Toggle to notify on scroll box drops. (Leagues Only). Untradeable loot notifications must be turned on.",
+			position = 5,
+			section = notificationSettings
+	)
+	default boolean notifyScrollBoxDrops() {
+		return false;
+	}
 }
 package com.cluescrollnotifier;
 
@@ -142,64 +151,172 @@ public class SoundEngine {
     @Inject
     private ClueScrollNotifierConfig config;
 
+    private static final long CLIP_MTIME_UNLOADED = -2;
+    private long lastClipMTime = CLIP_MTIME_UNLOADED;
     private Clip clip = null;
 
-    private boolean loadClip() {
-        try (InputStream stream = new BufferedInputStream(FileManager.getSoundStream());
-             AudioInputStream audioInputStream = AudioSystem.getAudioInputStream(stream)) {
-            clip = AudioSystem.getClip();
-            clip.open(audioInputStream);
+    private boolean loadClip(Sound sound) {
+        try (InputStream stream = new BufferedInputStream(FileManager.getSoundStream(sound))) {
+            try (AudioInputStream audioInputStream = AudioSystem.getAudioInputStream(stream)) {
+                clip.open(audioInputStream);
+            }
             return true;
-        } catch (UnsupportedAudioFileException e) {
-            log.warn("Failed to load sound file: Unsupported format", e);
-        } catch (IOException e) {
-            log.warn("Failed to load sound file: IO Exception", e);
-        } catch (LineUnavailableException e) {
-            log.warn("Failed to load sound file: Line unavailable", e);
+        } catch (UnsupportedAudioFileException | IOException | LineUnavailableException e) {
+            log.warn("Failed to load sound file: {}", sound.getFileName(), e);
         }
         return false;
     }
 
-    public void playClip() {
-        if (clip == null || !clip.isOpen()) {
-            if (clip != null) {
-                clip.close();
+    public void playClip(Sound sound) {
+        try {
+            long currentMTime = System.currentTimeMillis();
+
+            if (clip == null || currentMTime != lastClipMTime || !clip.isOpen()) {
+                if (clip != null && clip.isOpen()) {
+                    clip.close();
+                }
+
+                try {
+                    clip = AudioSystem.getClip();
+                } catch (LineUnavailableException e) {
+                    lastClipMTime = CLIP_MTIME_UNLOADED;
+                    log.warn("Failed to get audio clip for sound: {}", sound.getFileName(), e);
+                    return;
+                }
+                lastClipMTime = currentMTime;
+                if (!loadClip(sound)) {
+                    return;
+                }
             }
 
-            if (!loadClip()) {
-                return;
-            }
+            // User configurable volume
+            FloatControl volume = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
+            float gain = 20f * (float) Math.log10(config.announcementVolume() / 100f);
+            gain = Math.min(gain, volume.getMaximum());
+            gain = Math.max(gain, volume.getMinimum());
+            volume.setValue(gain);
+
+            // Using loop instead of start + setFramePosition to avoid race condition
+            clip.loop(0);
+        } catch (Exception e) {
+            log.error("Error playing sound clip: {}", sound.getFileName(), e);
         }
-
-        if (clip.isRunning()) {
-            clip.stop();
-        }
-
-        clip.setFramePosition(0);  // Rewind to the beginning
-        setVolume(config.announcementVolume());
-
-        log.debug("Playing sound");
-        clip.start();  // Start the clip
-    }
-
-    private void setVolume(int volumePercentage) {
-        if (clip != null) {
-            FloatControl volumeControl = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
-            float gain = calculateGain(volumeControl, volumePercentage);
-            volumeControl.setValue(gain);
-        }
-    }
-
-    private float calculateGain(FloatControl volumeControl, int volumePercentage) {
-        float range = volumeControl.getMaximum() - volumeControl.getMinimum();
-        float gain = (range * volumePercentage / 100f) + volumeControl.getMinimum();
-        return Math.min(Math.max(gain, volumeControl.getMinimum()), volumeControl.getMaximum());
     }
 
     public void close() {
         if (clip != null && clip.isOpen()) {
             clip.close();
         }
+    }
+}
+package com.cluescrollnotifier;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+import java.io.FileInputStream;
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+@Slf4j
+public class FileManager {
+    private static final Path DOWNLOAD_DIR = Paths.get(RuneLite.RUNELITE_DIR.getPath(), "clue-scroll-notifier");
+
+    public static void initialize() {
+        createDownloadDirectory();
+        Set<String> filesPresent = getFilesPresent();
+        Set<String> desiredFiles = getDesiredSoundList().stream()
+                .map(Sound::getFileName)
+                .collect(Collectors.toSet());
+
+        copyMissingFiles(filesPresent, desiredFiles);
+        deleteExtraFiles(filesPresent);
+    }
+
+    private static void createDownloadDirectory() {
+        try {
+            Files.createDirectories(DOWNLOAD_DIR);
+        } catch (IOException e) {
+            log.error("Could not create download directory", e);
+        }
+    }
+
+    private static Set<String> getFilesPresent() {
+        try (Stream<Path> paths = Files.list(DOWNLOAD_DIR)) {
+            return paths
+                    .filter(Files::isRegularFile)
+                    .map(path -> path.getFileName().toString())
+                    .collect(Collectors.toSet());
+        } catch (IOException e) {
+            log.error("Error listing files in download directory", e);
+            return new HashSet<>();
+        }
+    }
+
+    private static Set<Sound> getDesiredSoundList() {
+        return Arrays.stream(Sound.values()).collect(Collectors.toSet());
+    }
+
+    private static void copyMissingFiles(Set<String> filesPresent, Set<String> desiredFiles) {
+        for (String fileName : desiredFiles) {
+            Path outputPath = DOWNLOAD_DIR.resolve(fileName);
+            if (Files.exists(outputPath)) {
+                filesPresent.remove(fileName);
+                continue;
+            }
+
+            try (InputStream resourceStream = FileManager.class.getResourceAsStream("/" + fileName)) {
+                if (resourceStream != null) {
+                    Files.copy(resourceStream, outputPath, StandardCopyOption.REPLACE_EXISTING);
+                } else {
+                    log.error("Clue Scroll Notifier could not find resource: {}", fileName);
+                }
+            } catch (IOException e) {
+                log.error("Clue Scroll Notifier could not copy sound: {}", fileName, e);
+            }
+        }
+    }
+
+    private static void deleteExtraFiles(Set<String> filesPresent) {
+        for (String filename : filesPresent) {
+            try {
+                Files.delete(DOWNLOAD_DIR.resolve(filename));
+            } catch (IOException e) {
+                log.warn("Failed to delete file: {}", filename, e);
+            }
+        }
+    }
+
+    public static InputStream getSoundStream(Sound sound) throws FileNotFoundException {
+        return new FileInputStream(DOWNLOAD_DIR.resolve(sound.getFileName()).toFile());
+    }
+}
+package com.cluescrollnotifier;
+
+public enum Sound {
+    CLUE1("clue1.wav"),
+    CLUE2("clue2.wav"),
+    CLUE3("clue3.wav"),
+    CLUE4("clue4.wav"),
+    CLUE5("clue5.wav");
+
+    private final String fileName;
+
+    Sound(String fileName) {
+        this.fileName = fileName;
+    }
+
+    public String getFileName() {
+        return fileName;
     }
 }
 package com.cluescrollnotifier;
@@ -220,6 +337,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import java.util.List;
 import java.util.Arrays;
+import java.util.concurrent.ScheduledExecutorService;
 
 @Slf4j
 @PluginDescriptor(
@@ -229,13 +347,12 @@ public class ClueScrollNotifierPlugin extends Plugin {
 
 	@Inject
 	private Client client;
-
 	@Inject
 	private ClueScrollNotifierConfig config;
-
 	@Inject
 	private SoundEngine soundEngine;
-
+	@Inject
+	private ScheduledExecutorService executor;
 	@Inject
 	private Notifier notifier;
 
@@ -249,6 +366,7 @@ public class ClueScrollNotifierPlugin extends Plugin {
 
 	@Override
 	protected void startUp() throws Exception {
+		executor.submit(FileManager::initialize);
 		log.info("ClueScrollNotifier started!");
 	}
 
@@ -286,6 +404,12 @@ public class ClueScrollNotifierPlugin extends Plugin {
 				notify("You found a clue geode!");
 			}
 		}
+
+		if (type == ChatMessageType.GAMEMESSAGE && message.contains("untradeable drop: scroll box")) {
+			if (config.notifyScrollBoxDrops()) {
+				notify("Got a scroll box drop!");
+			}
+		}
 	}
 
 	@Subscribe
@@ -298,7 +422,7 @@ public class ClueScrollNotifierPlugin extends Plugin {
 
 	private void notify(String message) {
 		if (config.playSound()) {
-			soundEngine.playClip();
+			soundEngine.playClip(config.customSoundFile());
 		}
 		if (config.showNotification()) {
 			notifier.notify(message);
@@ -312,21 +436,14 @@ public class ClueScrollNotifierPlugin extends Plugin {
 }
 package com.cluescrollnotifier;
 
-import java.io.InputStream;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
 
-public final class FileManager {
-
-    private static final String SOUND_FILE = "/clue.wav";
-
-    private FileManager() {
-        // Private constructor to prevent instantiation
-    }
-
-    public static InputStream getSoundStream() {
-        InputStream stream = FileManager.class.getResourceAsStream(SOUND_FILE);
-        if (stream == null) {
-            throw new IllegalArgumentException("Sound file not found: " + SOUND_FILE);
-        }
-        return stream;
-    }
+public class ClueScrollNotifierPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ClueScrollNotifierPlugin.class);
+		RuneLite.main(args);
+	}
 }
