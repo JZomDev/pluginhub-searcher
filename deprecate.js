@@ -163,7 +163,7 @@ class AutoMap extends Map {
 					for (let [sym, plugins] of usages) {
 						let match = re.exec(sym);
 						if (match) {
-							symbols.push(sym);
+							symbols.push(sym + " --- " + plugins[0]);
 							for (let plugin of plugins) {
 								allMatches.add(plugin)
 							}
