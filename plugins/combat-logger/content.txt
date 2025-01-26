@@ -1,16 +1,1552 @@
 package com.combatlogger;
 
+import com.combatlogger.messages.BaseCombatStatsMessage;
+import com.combatlogger.messages.BoostedCombatStatsMessage;
+import com.combatlogger.messages.DamageMessage;
+import com.combatlogger.messages.EquipmentMessage;
+import com.combatlogger.messages.PrayerMessage;
+import com.combatlogger.model.Fight;
+import com.combatlogger.model.TrackedGraphicObject;
+import com.combatlogger.model.TrackedNpc;
+import com.combatlogger.model.TrackedPartyMember;
+import com.combatlogger.model.logs.*;
+import com.combatlogger.overlay.DamageOverlay;
+import com.combatlogger.panel.CombatLoggerPanel;
+import com.combatlogger.util.AnimationIds;
+import com.combatlogger.util.BoundedQueue;
+import com.combatlogger.util.CombatStats;
+import com.google.inject.Provides;
+import lombok.Getter;
+import net.runelite.api.Deque;
+import net.runelite.api.Menu;
+import net.runelite.api.Point;
+import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
+import net.runelite.api.kit.KitType;
 import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.party.PartyMember;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.party.WSClient;
+import net.runelite.client.party.messages.UserSync;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDependency;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.party.PartyPlugin;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ImageUtil;
+import org.apache.commons.lang3.ArrayUtils;
 
-public class CombatLoggerPluginTest
+import javax.inject.Inject;
+import java.awt.*;
+import java.io.File;
+import java.io.IOException;
+import java.text.SimpleDateFormat;
+import java.util.List;
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static com.combatlogger.util.GameObjectIdsToTrack.GAME_OBJECT_IDS_TO_TRACK;
+import static com.combatlogger.util.GraphicsObjectIdsToTrack.GRAPHICS_OBJECT_IDS_TO_TRACK;
+import static com.combatlogger.util.GroundObjectIdsToTrack.GROUND_OBJECT_IDS_TO_TRACK;
+import static com.combatlogger.util.HitSplatUtil.getHitsplatName;
+import static com.combatlogger.util.NpcIdsToTrack.NPC_IDS_TO_TRACK;
+import static com.combatlogger.util.OverheadToPrayer.HEADICON_TO_PRAYER_VARBIT;
+
+@PluginDependency(PartyPlugin.class)
+
+@PluginDescriptor(
+		name = "Combat Logger",
+		description = "Damage meter and logs combat events to a text file - Upload and analyze your logs at runelogs.com.",
+		tags = {"damage", "dps", "pvm", "tob", "theatre of blood", "toa", "tombs of amascut", "meter", "counter", "tick"}
+)
+
+public class CombatLoggerPlugin extends Plugin
 {
-	public static void main(String[] args) throws Exception
+	public static final String DIRECTORY_NAME = "combat_log";
+	public static final File DIRECTORY;
+	private static final String LOG_FILE_NAME = "combat_log";
+	public static File LOG_FILE;
+
+	private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("MM-dd-yyyy HH:mm:ss", Locale.ENGLISH);
+	private static final Pattern ENCOUNTER_PATTERN = Pattern.compile("(Wave|Duration|Challenge)", Pattern.CASE_INSENSITIVE);
+
+	private static final List<Integer> TOB_ORBS_VARBITS = Arrays.asList(
+			Varbits.THEATRE_OF_BLOOD_ORB1,
+			Varbits.THEATRE_OF_BLOOD_ORB2,
+			Varbits.THEATRE_OF_BLOOD_ORB3,
+			Varbits.THEATRE_OF_BLOOD_ORB4,
+			Varbits.THEATRE_OF_BLOOD_ORB5
+	);
+
+	private static final List<Integer> TOA_ORBS_VARBITS = Arrays.asList(
+			Varbits.TOA_MEMBER_0_HEALTH,
+			Varbits.TOA_MEMBER_1_HEALTH,
+			Varbits.TOA_MEMBER_2_HEALTH,
+			Varbits.TOA_MEMBER_3_HEALTH,
+			Varbits.TOA_MEMBER_4_HEALTH,
+			Varbits.TOA_MEMBER_5_HEALTH,
+			Varbits.TOA_MEMBER_6_HEALTH,
+			Varbits.TOA_MEMBER_7_HEALTH
+	);
+
+	static
 	{
-		ExternalPluginManager.loadBuiltin(CombatLoggerPlugin.class);
-		RuneLite.main(args);
+		DIRECTORY = new File(RuneLite.RUNELITE_DIR, DIRECTORY_NAME);
+	}
+
+	private boolean checkPlayerName = false;
+
+	private Map<String, TrackedPartyMember> trackedPartyMembers = new HashMap<>();
+	private Map<String, TrackedNpc> trackedNpcs = new HashMap<>();
+	private Map<String, TrackedGraphicObject> trackedGraphicObjects = new HashMap<>();
+	private List<Integer> previousBaseStats;
+	private boolean baseStatChangeLogScheduled;
+	private List<Integer> previousBoostedStats;
+	private boolean boostedStatChangeLogScheduled;
+	private int hitpointsXpLastUpdated = -1;
+	private List<Integer> previousPrayers;
+	private List<Integer> previousItemIds;
+	private Set<Integer> playerAnimationChanges = new HashSet<>();
+	private int regionId = -1;
+
+	private boolean inFight = false;
+	private javax.swing.Timer overlayTimeout = null;
+	@Getter
+	private Boolean overlayVisible = false;
+
+	@Inject
+	private Client client;
+
+	@Getter
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private EventBus eventBus;
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
+	@Inject
+	private LogQueueManager logQueueManager;
+
+	@Inject
+	private FightManager fightManager;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	private CombatLoggerConfig config;
+
+	@Inject
+	private WSClient wsClient;
+
+	@Inject
+	private PartyService party;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private DamageOverlay damageOverlay;
+
+	private CombatLoggerPanel panel;
+
+	private NavigationButton navButton;
+
+	@Provides
+	CombatLoggerConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(CombatLoggerConfig.class);
+	}
+
+	@Override
+	protected void startUp()
+	{
+		panel = injector.getInstance(CombatLoggerPanel.class);
+		logQueueManager.startUp(eventBus);
+
+		navButton = NavigationButton.builder()
+				.tooltip("Combat Logger")
+				.icon(ImageUtil.loadImageResource(getClass(), "/panel_icon.png"))
+				.priority(10)
+				.panel(panel)
+				.build();
+		clientToolbar.addNavigation(navButton);
+
+		DIRECTORY.mkdirs();
+		sendReminderMessage();
+		createLogFile();
+		wsClient.registerMessage(DamageMessage.class);
+		wsClient.registerMessage(BaseCombatStatsMessage.class);
+		wsClient.registerMessage(BoostedCombatStatsMessage.class);
+		wsClient.registerMessage(EquipmentMessage.class);
+		wsClient.registerMessage(PrayerMessage.class);
+
+		if (config.enableOverlay())
+		{
+			setOverlayVisible(true);
+			resetOverlayTimeout();
+		}
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		previousBaseStats = null;
+		previousBoostedStats = null;
+		previousPrayers = null;
+		previousItemIds = null;
+		playerAnimationChanges.clear();
+		trackedPartyMembers.clear();
+		trackedNpcs.clear();
+		trackedGraphicObjects.clear();
+		regionId = -1;
+		wsClient.unregisterMessage(DamageMessage.class);
+		wsClient.unregisterMessage(BaseCombatStatsMessage.class);
+		wsClient.unregisterMessage(BoostedCombatStatsMessage.class);
+		wsClient.unregisterMessage(EquipmentMessage.class);
+		wsClient.unregisterMessage(PrayerMessage.class);
+		clientToolbar.removeNavigation(navButton);
+		panel = null;
+		logQueueManager.shutDown(eventBus);
+		fightManager.shutDown();
+		setOverlayVisible(false);
+	}
+
+
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted commandExecuted)
+	{
+		if (!commandExecuted.getCommand().equals("newlog"))
+		{
+			return;
+		}
+
+		createLogFile();
+		chatMessageManager
+				.queue(QueuedMessage.builder()
+						.type(ChatMessageType.GAMEMESSAGE)
+						.runeLiteFormattedMessage(String.format("<col=cc0000>New combat log created: %s</col>", LOG_FILE.getName()))
+						.build());
+		logEquipment(true); // Normally ItemContainerChanged is fired on startup, so it's not necessary in createLogFile()
+		logPrayers(true);
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		if (gameStateChanged.getGameState() == GameState.LOGGING_IN)
+		{
+			checkPlayerName = true;
+		}
+	}
+
+	@Subscribe
+	public void onNpcDespawned(NpcDespawned event)
+	{
+		int npcId = event.getNpc().getId();
+		if (!NPC_IDS_TO_TRACK.contains(npcId))
+		{
+			return;
+		}
+		String key = npcId + "-" + event.getNpc().getIndex();
+		trackedNpcs.remove(key);
+		logQueueManager.queue(String.format("%s\tDESPAWNED", key));
+	}
+
+	@Subscribe
+	public void onNpcChanged(NpcChanged event)
+	{
+		int oldNpcId = event.getOld().getId();
+		if (!NPC_IDS_TO_TRACK.contains(oldNpcId))
+		{
+			return;
+		}
+		String key = oldNpcId + "-" + event.getNpc().getIndex();
+		trackedNpcs.remove(key);
+		logQueueManager.queue(String.format("%s\tDESPAWNED", key));
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		Fight currentFight = fightManager.getLastFight();
+		boolean fightOngoing = currentFight != null && !currentFight.isOver();
+
+		if (fightOngoing && !inFight)
+		{
+			// Fight has just started
+			inFight = true;
+			setOverlayVisible(true);
+			stopOverlayTimeout();
+		}
+		else if (!fightOngoing && inFight)
+		{
+			// Fight has just ended
+			inFight = false;
+			resetOverlayTimeout();
+		}
+
+		if (fightOngoing)
+		{
+			currentFight.setFightLengthTicks(currentFight.getFightLengthTicks() + 1);
+
+			if ((currentFight.getLastActivityTick() + 100 < client.getTickCount() && !currentFight.getFightName().startsWith("Path of"))
+					|| (currentFight.getLastActivityTick() + 500 < client.getTickCount() && currentFight.getFightName().startsWith("Path of")))
+			{
+				// It's been 1 minute (or 5 minutes in a ToA path) without any activity. End the fight
+				currentFight.setOver(true);
+				damageOverlay.updateOverlay();
+			}
+		}
+
+		panel.updatePanel();
+
+		if (checkPlayerName && client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
+		{
+			logPlayerName();
+			clientThread.invokeLater(this::sendReminderMessage); // Delay so it's at bottom of chat
+			checkPlayerName = false;
+		}
+
+		Player local = client.getLocalPlayer();
+		if (local == null)
+		{
+			return;
+		}
+
+		logPrayers(false);
+
+		List<Player> players = client.getPlayers();
+		players.forEach(player -> {
+			this.checkBlowpipe(player);
+			this.logPosition(player);
+			this.logMemberEquipment(player);
+			this.logMemberOverhead(player);
+		});
+
+		for (int playerId : playerAnimationChanges)
+		{
+			Player player = players.stream()
+					.filter(p -> p.getId() == playerId)
+					.findFirst()
+					.orElse(null);
+			if (player != null)
+			{
+				int animationId = player.getAnimation();
+				checkAttackAnimation(player, animationId);
+			}
+		}
+		playerAnimationChanges.clear();
+
+		checkPlayerRegion();
+		validatePartyMembers();
+
+		List<NPC> npcs = client.getNpcs();
+		npcs.forEach(npc -> {
+			this.logPosition(npc);
+		});
+
+		checkGraphicsObjectDespawns();
+	}
+
+	private void logPrayers(boolean forceLogging)
+	{
+		Player player = client.getLocalPlayer();
+		List<Integer> currentPrayers = new ArrayList<>();
+		for (Prayer prayer : Prayer.values())
+		{
+			if (client.isPrayerActive(prayer))
+			{
+				currentPrayers.add(prayer.getVarbit());
+			}
+		}
+		if (forceLogging || !Objects.equals(currentPrayers, previousPrayers))
+		{
+			if (party.isInParty())
+			{
+				PrayerMessage prayerMessage = new PrayerMessage(currentPrayers);
+				clientThread.invokeLater(() -> party.send(prayerMessage));
+			}
+			logQueueManager.queue(String.format("%s\tPRAYERS\t%s", player.getName(), currentPrayers));
+			previousPrayers = currentPrayers;
+		}
+	}
+
+	private void checkBlowpipe(Player player)
+	{
+		int animationId = player.getAnimation();
+
+		if ((animationId == 5061 || animationId == 10656) && player.getAnimationFrame() == 0 && player.getInteracting() != null)
+		{
+			// Blowpipes will restart their attack animation (at frame 0) without sending an AnimationChanged event
+			// So we just check every player if they have the blowpipe animation at frame 0
+			logAttackAnimation(animationId, player);
+		}
+	}
+
+	private void logPosition(Player player)
+	{
+		if (party.getMemberByDisplayName(player.getName()) == null && !client.getLocalPlayer().getName().equals(player.getName()))
+		{
+			return;
+		}
+
+		TrackedPartyMember trackedPartyMember = trackedPartyMembers.getOrDefault(player.getName(), new TrackedPartyMember());
+		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, LocalPoint.fromWorld(client, player.getWorldLocation()));
+
+		if (currentWorldPoint.equals(trackedPartyMember.getWorldPoint()))
+		{
+			// Only log if their position has changed
+			return;
+		}
+
+		trackedPartyMember.setWorldPoint(currentWorldPoint);
+		if (player.getName().equals(client.getLocalPlayer().getName()))
+		{
+			trackedPartyMember.setUsingCombatLoggerPlugin(true);
+		}
+		trackedPartyMembers.put(player.getName(), trackedPartyMember);
+		logQueueManager.queue(String.format("%s\tPOSITION\t(%d, %d, %d)", player.getName(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
+	}
+
+	private void logMemberEquipment(Player player)
+	{
+		TrackedPartyMember trackedPartyMember = trackedPartyMembers.get(player.getName());
+
+		if (trackedPartyMember == null || trackedPartyMember.isUsingCombatLoggerPlugin())
+		{
+			return;
+		}
+
+		PlayerComposition composition = player.getPlayerComposition();
+		if (composition != null)
+		{
+			int[] compositionEquipmentIds = composition.getEquipmentIds();
+			List<Integer> currentEquipment = new ArrayList<>();
+			for (int i = 0; i < compositionEquipmentIds.length; i++)
+			{
+				currentEquipment.add(compositionEquipmentIds[i] > PlayerComposition.ITEM_OFFSET ? compositionEquipmentIds[i] - PlayerComposition.ITEM_OFFSET : -1); // Convert to item ID
+			}
+			for (int i = 0; i < 3; i++)
+			{
+				// Add slots we can't see as -2 to indicate unknown
+				currentEquipment.add(-2);
+			}
+			if (compositionEquipmentIds != null)
+			{
+				// Compare with previous equipment
+				if (!Objects.equals(currentEquipment, trackedPartyMember.getPreviousEquipment()))
+				{
+					logQueueManager.queue(String.format("%s\tEQUIPMENT\t%s", player.getName(), currentEquipment));
+					trackedPartyMember.setPreviousEquipment(currentEquipment);
+					trackedPartyMembers.put(player.getName(), trackedPartyMember);
+				}
+			}
+		}
+	}
+
+	private void logMemberOverhead(Player player)
+	{
+		TrackedPartyMember trackedPartyMember = trackedPartyMembers.get(player.getName());
+
+		if (trackedPartyMember == null || trackedPartyMember.isUsingCombatLoggerPlugin())
+		{
+			return;
+		}
+
+		int currentOverheadPrayerId = -1; // -1 represents none
+		if (player.getOverheadIcon() != null)
+		{
+			currentOverheadPrayerId = HEADICON_TO_PRAYER_VARBIT.get(player.getOverheadIcon());
+		}
+		if (currentOverheadPrayerId != trackedPartyMember.getPreviousOverheadPrayerId())
+		{
+			logQueueManager.queue(String.format("%s\tOVERHEAD\t%s", player.getName(), currentOverheadPrayerId));
+			trackedPartyMember.setPreviousOverheadPrayerId(currentOverheadPrayerId);
+			trackedPartyMembers.put(player.getName(), trackedPartyMember);
+		}
+	}
+
+	private void logPosition(NPC npc)
+	{
+		if (!NPC_IDS_TO_TRACK.contains(npc.getId()))
+		{
+			return;
+		}
+
+		TrackedNpc trackedNpc = trackedNpcs.getOrDefault(npc.getId() + "-" + npc.getIndex(), new TrackedNpc());
+		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, LocalPoint.fromWorld(client, npc.getWorldLocation()));
+
+		if (currentWorldPoint.equals(trackedNpc.getWorldPoint()))
+		{
+			// Only log if their position has changed
+			return;
+		}
+
+		trackedNpc.setWorldPoint(currentWorldPoint);
+		trackedNpcs.put(npc.getId() + "-" + npc.getIndex(), trackedNpc);
+		logQueueManager.queue(String.format("%d-%d\tPOSITION\t(%d, %d, %d)", npc.getId(), npc.getIndex(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
+	}
+
+	@Subscribe
+	protected void onGraphicsObjectCreated(GraphicsObjectCreated event)
+	{
+		GraphicsObject graphicsObject = event.getGraphicsObject();
+		if (!GRAPHICS_OBJECT_IDS_TO_TRACK.contains(graphicsObject.getId()))
+		{
+			return;
+		}
+
+		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, graphicsObject.getLocation());
+
+		String key = graphicsObject.getId() + "-" + currentWorldPoint.getX() + "-" + currentWorldPoint.getY() + "-" + currentWorldPoint.getPlane();
+
+		if (trackedGraphicObjects.get(key) != null)
+		{
+			// Sometimes the same graphics object is recreated before it's gone (I think to loop the animation?)
+			// We don't need to log it again
+			return;
+		}
+
+		TrackedGraphicObject trackedGraphicObject = new TrackedGraphicObject();
+		trackedGraphicObject.setId(graphicsObject.getId());
+		trackedGraphicObject.setWorldPoint(currentWorldPoint);
+		trackedGraphicObjects.put(key, trackedGraphicObject);
+		logQueueManager.queue(String.format("%d\tGRAPHICS_OBJECT_SPAWNED\t(%d, %d, %d)", graphicsObject.getId(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
+	}
+
+	private void checkGraphicsObjectDespawns()
+	{
+		Deque<GraphicsObject> graphicsObjects = client.getGraphicsObjects();
+		Set<String> activeKeys = new HashSet<>();
+		for (GraphicsObject graphicsObject : graphicsObjects)
+		{
+			if (GRAPHICS_OBJECT_IDS_TO_TRACK.contains(graphicsObject.getId()))
+			{
+				WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, graphicsObject.getLocation());
+				activeKeys.add(graphicsObject.getId() + "-" + currentWorldPoint.getX() + "-" + currentWorldPoint.getY() + "-" + currentWorldPoint.getPlane());
+			}
+		}
+
+		trackedGraphicObjects.entrySet().removeIf(trackedGraphicObjectEntry -> {
+					if (!activeKeys.contains(trackedGraphicObjectEntry.getKey()))
+					{
+						logQueueManager.queue(String.format(
+								"%d\tGRAPHICS_OBJECT_DESPAWNED\t(%d, %d, %d)",
+								trackedGraphicObjectEntry.getValue().getId(),
+								trackedGraphicObjectEntry.getValue().getWorldPoint().getX(),
+								trackedGraphicObjectEntry.getValue().getWorldPoint().getY(),
+								trackedGraphicObjectEntry.getValue().getWorldPoint().getPlane()
+						));
+						return true;
+					}
+					return false;
+				}
+		);
+	}
+
+	@Subscribe
+	protected void onGameObjectSpawned(GameObjectSpawned event)
+	{
+		GameObject gameObject = event.getGameObject();
+		if (!GAME_OBJECT_IDS_TO_TRACK.contains(gameObject.getId()))
+		{
+			return;
+		}
+		LocalPoint localPoint = LocalPoint.fromWorld(client, gameObject.getWorldLocation());
+		if (localPoint == null)
+		{
+			return;
+		}
+
+		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, localPoint);
+
+		logQueueManager.queue(String.format("%d\tGAME_OBJECT_SPAWNED\t(%d, %d, %d)", gameObject.getId(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
+	}
+
+	@Subscribe
+	protected void onGameObjectDespawned(GameObjectDespawned event)
+	{
+		GameObject gameObject = event.getGameObject();
+		if (!GAME_OBJECT_IDS_TO_TRACK.contains(gameObject.getId()))
+		{
+			return;
+		}
+
+		LocalPoint localPoint = LocalPoint.fromWorld(client, gameObject.getWorldLocation());
+		if (localPoint == null)
+		{
+			return;
+		}
+
+		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, localPoint);
+		logQueueManager.queue(String.format("%d\tGAME_OBJECT_DESPAWNED\t(%d, %d, %d)", gameObject.getId(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
+	}
+
+	@Subscribe
+	protected void onGroundObjectSpawned(GroundObjectSpawned event)
+	{
+		GroundObject groundObject = event.getGroundObject();
+
+		if (!GROUND_OBJECT_IDS_TO_TRACK.contains(groundObject.getId()))
+		{
+			return;
+		}
+
+		LocalPoint localPoint = LocalPoint.fromWorld(client, groundObject.getWorldLocation());
+		if (localPoint == null)
+		{
+			return;
+		}
+		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, localPoint);
+
+		logQueueManager.queue(String.format("%d\tGROUND_OBJECT_SPAWNED\t(%d, %d, %d)", groundObject.getId(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
+	}
+
+	@Subscribe
+	protected void onGroundObjectDespawned(GroundObjectDespawned event)
+	{
+		GroundObject groundObject = event.getGroundObject();
+		if (!GROUND_OBJECT_IDS_TO_TRACK.contains(groundObject.getId()))
+		{
+			return;
+		}
+		LocalPoint localPoint = LocalPoint.fromWorld(client, groundObject.getWorldLocation());
+		if (localPoint == null)
+		{
+			return;
+		}
+
+		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, localPoint);
+		logQueueManager.queue(String.format("%d\tGROUND_OBJECT_DESPAWNED\t(%d, %d, %d)", groundObject.getId(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
+	}
+
+	/**
+	 * Remove any trackedPartyMembers that are no longer in the party
+	 */
+	private void validatePartyMembers()
+	{
+		List<String> partyMemberNames = party.getMembers().stream().map(PartyMember::getDisplayName).collect(Collectors.toList());
+		trackedPartyMembers.keySet().removeIf(name -> !partyMemberNames.contains(name) && !client.getLocalPlayer().getName().equals(name));
+	}
+
+	private void logAttackAnimation(int animationId, Player player)
+	{
+		int weaponId = -1;
+		if (player.getPlayerComposition() != null)
+		{
+			weaponId = player.getPlayerComposition().getEquipmentId(KitType.WEAPON);
+		}
+
+		logQueueManager.queue(
+				new AttackAnimationLog(
+						client.getTickCount(),
+						getCurrentTimestamp(),
+						String.format("%s attack animation %d\t%s", player.getName(), animationId, getIdOrName(player.getInteracting())),
+						player.getName(),
+						getIdOrName(player.getInteracting()),
+						player.getInteracting().getName(),
+						animationId,
+						weaponId
+				)
+		);
+	}
+
+	private void checkAttackAnimation(Player player, int animationId)
+	{
+		if (player.getInteracting() == null)
+		{
+			// It's possible we see a player interacting, but their interacting target is outside our visibility range
+			// Just not going to count those for now
+			return;
+		}
+
+		if (animationId == 5061 || animationId == 10656)
+		{
+			// Blowpipe animations are handled in checkBlowpipe
+			return;
+		}
+
+		if (AnimationIds.MELEE_IDS.contains(animationId) ||
+				AnimationIds.RANGED_IDS.contains(animationId) ||
+				AnimationIds.MAGE_IDS.contains(animationId))
+		{
+			logAttackAnimation(animationId, player);
+		}
+
+		Player local = client.getLocalPlayer();
+		if (local != null && local.getId() == player.getId() && AnimationIds.MAGE_IDS.contains(animationId))
+		{
+			checkSplash(local);
+		}
+	}
+
+	private void checkPlayerRegion()
+	{
+		if (client.getLocalPlayer() != null)
+		{
+			LocalPoint localPoint = client.getLocalPlayer().getLocalLocation();
+			int currentRegionId = localPoint == null ? -1 : WorldPoint.fromLocalInstance(client, localPoint).getRegionID();
+			if (currentRegionId != regionId)
+			{
+				regionId = currentRegionId;
+				logQueueManager.queue(String.format("Player region %d", regionId));
+			}
+
+		}
+	}
+
+	@Subscribe
+	public void onStatChanged(StatChanged statChanged)
+	{
+		List<Integer> currentBaseStats = CombatStats.getBaseStats(client);
+		if (!Objects.equals(currentBaseStats, previousBaseStats))
+		{
+			previousBaseStats = currentBaseStats;
+			// Many StatChanged events are fired on login
+			// So we group them together to just get a single log message
+			if (!baseStatChangeLogScheduled)
+			{
+				baseStatChangeLogScheduled = true;
+				clientThread.invokeLater(() ->
+				{
+					if (party.isInParty())
+					{
+						BaseCombatStatsMessage baseCombatStatsMessage = new BaseCombatStatsMessage(previousBaseStats);
+						clientThread.invokeLater(() -> party.send(baseCombatStatsMessage));
+					}
+					logQueueManager.queue(String.format("%s\tBASE_STATS\t%s", client.getLocalPlayer().getName(), previousBaseStats));
+					baseStatChangeLogScheduled = false;
+				});
+			}
+		}
+
+		List<Integer> currentBoostedStats = CombatStats.getBoostedStats(client);
+		if (!Objects.equals(currentBoostedStats, previousBoostedStats))
+		{
+			previousBoostedStats = currentBoostedStats;
+			// Many StatChanged events are fired on login and some boosts effect multiple stats (like brews)
+			// So we group them together to just get a single log message
+			if (!boostedStatChangeLogScheduled)
+			{
+				boostedStatChangeLogScheduled = true;
+				clientThread.invokeLater(() ->
+				{
+					if (party.isInParty())
+					{
+						BoostedCombatStatsMessage boostedCombatStatsMessage = new BoostedCombatStatsMessage(previousBoostedStats);
+						clientThread.invokeLater(() -> party.send(boostedCombatStatsMessage));
+					}
+					logQueueManager.queue(String.format("%s\tBOOSTED_STATS\t%s", client.getLocalPlayer().getName(), previousBoostedStats));
+					boostedStatChangeLogScheduled = false;
+				});
+			}
+		}
+
+		if (statChanged.getSkill() == Skill.HITPOINTS)
+		{
+			hitpointsXpLastUpdated = client.getTickCount();
+		}
+	}
+
+	@Subscribe
+	public void onAnimationChanged(AnimationChanged event)
+	{
+		if (!(event.getActor() instanceof Player))
+		{
+			return;
+		}
+
+		// If we are standing right next to our target, the AnimationChanged event can fire before we are interacting
+		// So flag that it happened, but let onGameTick handle it, because it always fires last
+		playerAnimationChanges.add(((Player) event.getActor()).getId());
+	}
+
+	private void checkSplash(Player local)
+	{
+		int currentTick = client.getTickCount();
+		Actor target = local.getInteracting();
+		if (currentTick - hitpointsXpLastUpdated > 1 && !target.getName().toLowerCase().contains("dummy"))
+		{
+			// We used a spell attack animation, but it's been more than 1 tick since we gained hitpoints xp
+			// Assuming that is either a 0 or a miss (splash)
+
+			if (target.hasSpotAnim(GraphicID.SPLASH))
+			{
+				// I think technically you may have hit a 0 at the same time someone else splashed, but unlikely
+				logQueueManager.queue(String.format("%s\t%s\t%d", getIdOrName(target), "SPLASH_ME", 0));
+			}
+		}
+	}
+
+	@Subscribe
+	public void onGraphicChanged(GraphicChanged event)
+	{
+		Player local = client.getLocalPlayer();
+
+		if (event.getActor() != local)
+		{
+			return;
+		}
+
+		if (local.hasSpotAnim(GraphicID.SPLASH))
+		{
+			logQueueManager.queue(String.format("%s\t%s\t%d", getIdOrName(local), "SPLASH_ME", 0));
+		}
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged itemContainerChanged)
+	{
+		if (itemContainerChanged.getContainerId() == InventoryID.EQUIPMENT.getId())
+		{
+			logEquipment(false);
+		}
+	}
+
+	private void logEquipment(boolean forceLogging)
+	{
+		ItemContainer equipContainer = client.getItemContainer(InventoryID.EQUIPMENT);
+		if (equipContainer == null)
+		{
+			return;
+		}
+		List<Integer> currentItemIds = Arrays.stream(equipContainer.getItems())
+				.map(Item::getId)
+				.collect(Collectors.toList());
+
+		final int quiverAmmoId = client.getVarpValue(VarPlayer.DIZANAS_QUIVER_ITEM_ID);
+		currentItemIds.add(quiverAmmoId);
+
+		if (forceLogging || !Objects.equals(currentItemIds, previousItemIds))
+		{
+			if (party.isInParty())
+			{
+				EquipmentMessage equipmentMessage = new EquipmentMessage(currentItemIds);
+				clientThread.invokeLater(() -> party.send(equipmentMessage));
+			}
+
+			previousItemIds = currentItemIds;
+			logQueueManager.queue(String.format("%s\tEQUIPMENT\t%s", client.getLocalPlayer().getName(), currentItemIds));
+		}
+	}
+
+	@Subscribe
+	public void onUserSync(final UserSync event)
+	{
+		clientThread.invokeAtTickEnd(() -> {
+			EquipmentMessage equipmentMessage = new EquipmentMessage(previousItemIds);
+			party.send(equipmentMessage);
+
+			PrayerMessage prayerMessage = new PrayerMessage(previousPrayers);
+			party.send(prayerMessage);
+
+			BaseCombatStatsMessage baseCombatStatsMessage = new BaseCombatStatsMessage(previousBaseStats);
+			party.send(baseCombatStatsMessage);
+
+			BoostedCombatStatsMessage boostedCombatStatsMessage = new BoostedCombatStatsMessage(previousBoostedStats);
+			party.send(boostedCombatStatsMessage);
+		});
+	}
+
+	@Subscribe
+	public void onEquipmentMessage(EquipmentMessage event)
+	{
+		PartyMember localMember = party.getLocalMember();
+		if (localMember == null || localMember.getMemberId() == event.getMemberId())
+		{
+			// Don't need to update logs from ourselves
+			return;
+		}
+
+		markMemberHasPlugin(event.getMemberId());
+		PartyMember eventMember = party.getMemberById(event.getMemberId());
+
+		logQueueManager.queue(String.format("%s\tEQUIPMENT\t%s", eventMember.getDisplayName(), event.getItemIds()));
+	}
+
+	@Subscribe
+	public void onPrayerMessage(PrayerMessage event)
+	{
+		PartyMember localMember = party.getLocalMember();
+		if (localMember == null || localMember.getMemberId() == event.getMemberId())
+		{
+			// Don't need to update logs from ourselves
+			return;
+		}
+
+		markMemberHasPlugin(event.getMemberId());
+		PartyMember eventMember = party.getMemberById(event.getMemberId());
+
+		logQueueManager.queue(String.format("%s\tPRAYERS\t%s", eventMember.getDisplayName(), event.getPrayerIds()));
+	}
+
+	@Subscribe
+	public void onBaseCombatStatsMessage(BaseCombatStatsMessage event)
+	{
+		PartyMember localMember = party.getLocalMember();
+		if (localMember == null || localMember.getMemberId() == event.getMemberId())
+		{
+			// Don't need to update logs from ourselves
+			return;
+		}
+
+		markMemberHasPlugin(event.getMemberId());
+		PartyMember eventMember = party.getMemberById(event.getMemberId());
+
+		logQueueManager.queue(String.format("%s\tBASE_STATS\t%s", eventMember.getDisplayName(), event.getStats()));
+	}
+
+	@Subscribe
+	public void onBoostedCombatStatsMessage(BoostedCombatStatsMessage event)
+	{
+		PartyMember localMember = party.getLocalMember();
+		if (localMember == null || localMember.getMemberId() == event.getMemberId())
+		{
+			// Don't need to update logs from ourselves
+			return;
+		}
+
+		markMemberHasPlugin(event.getMemberId());
+		PartyMember eventMember = party.getMemberById(event.getMemberId());
+
+		logQueueManager.queue(String.format("%s\tBOOSTED_STATS\t%s", eventMember.getDisplayName(), event.getStats()));
+	}
+
+	private void markMemberHasPlugin(long memberId)
+	{
+		PartyMember eventMember = party.getMemberById(memberId);
+		if (eventMember == null)
+		{
+			return;
+		}
+
+		TrackedPartyMember trackedMember = trackedPartyMembers.getOrDefault(eventMember.getDisplayName(), new TrackedPartyMember());
+		trackedMember.setUsingCombatLoggerPlugin(true);
+		// I guess if they turn the plugin off without leaving and rejoining the party we just won't have logs for them anymore
+		trackedPartyMembers.put(eventMember.getDisplayName(), trackedMember);
+	}
+
+
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied hitsplatApplied)
+	{
+		Actor actor = hitsplatApplied.getActor();
+		Hitsplat hitsplat = hitsplatApplied.getHitsplat();
+
+		int damageAmount = hitsplat.getAmount();
+		String target = getIdOrName(actor);
+		String hitsplatName = getHitsplatName(hitsplat.getHitsplatType());
+		String source = "Unknown";
+		String myName = client.getLocalPlayer().getName();
+
+		if (hitsplat.isMine() && !target.equals(myName))
+		{
+			source = myName;
+		}
+
+		logQueueManager.queue(
+				new DamageLog(
+						client.getTickCount(),
+						getCurrentTimestamp(),
+						(String.format("%s\t%s\t%s\t%d", source, hitsplatName, target, damageAmount)),
+						source,
+						getIdOrName(actor),
+						actor.getName(),
+						damageAmount,
+						hitsplatName
+				)
+		);
+
+		if (party.isInParty() && hitsplat.isMine() && !target.equals(myName))
+		{
+			DamageMessage damageMessage = new DamageMessage(target, actor.getName(), hitsplatName, damageAmount);
+			clientThread.invokeLater(() -> party.send(damageMessage));
+		}
+	}
+
+	@Subscribe
+	public void onInteractingChanged(InteractingChanged event)
+	{
+		Actor source = event.getSource();
+		if (event.getTarget() != null &&
+				!event.getSource().isDead() &&
+				(event.getTarget() instanceof Player || event.getTarget() instanceof NPC))
+		{
+			Actor target = event.getTarget();
+			logQueueManager.queue(
+					new TargetChangeLog(
+							client.getTickCount(),
+							getCurrentTimestamp(),
+							String.format("%s changes target to %s", getIdOrName(source), getIdOrName(target)),
+							getIdOrName(source),
+							source.getName(),
+							getIdOrName(target)
+					)
+			);
+		}
+	}
+
+	@Subscribe
+	public void onActorDeath(ActorDeath actorDeath)
+	{
+		logQueueManager.queue(
+				new DeathLog(
+						client.getTickCount(),
+						getCurrentTimestamp(),
+						String.format("%s dies", getIdOrName(actorDeath.getActor())),
+						getIdOrName(actorDeath.getActor())
+				)
+		);
+	}
+
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged varbitChanged)
+	{
+		if (varbitChanged.getVarpId() == VarPlayer.DIZANAS_QUIVER_ITEM_ID)
+		{
+			logEquipment(false);
+		}
+
+		if (varbitChanged.getValue() != 30)
+		{
+			return;
+		}
+
+		if (TOB_ORBS_VARBITS.contains(varbitChanged.getVarbitId()) && isWipe(TOB_ORBS_VARBITS))
+		{
+			logQueueManager.queue("Theatre of Blood Wipe");
+		}
+		else if (TOA_ORBS_VARBITS.contains(varbitChanged.getVarbitId()) && isWipe(TOA_ORBS_VARBITS))
+		{
+			logQueueManager.queue("Tombs of Amascut Wipe");
+		}
+	}
+
+	private boolean isWipe(List<Integer> orbVarbits)
+	{
+		return orbVarbits.stream()
+				.allMatch(varbit -> {
+					int value = client.getVarbitValue(varbit);
+					// 0 = hidden
+					// 30 = dead
+					return value == 0 || value == 30;
+				});
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+
+		if (event.getType() != ChatMessageType.GAMEMESSAGE || "combat-logger".equals(event.getSender()))
+		{
+			return;
+		}
+
+		String message = event.getMessage();
+		if (ENCOUNTER_PATTERN.matcher(message).find())
+		{
+			logQueueManager.queue(
+					new GameMessageLog(
+							client.getTickCount(),
+							getCurrentTimestamp(),
+							message
+
+					)
+			);
+		}
+	}
+
+	/**
+	 * Sets the overlay visibility based on the provided parameter.
+	 *
+	 * @param visible If true, the overlay is shown; if false, it is hidden.
+	 */
+	public void setOverlayVisible(boolean visible)
+	{
+		if (visible && config.enableOverlay())
+		{
+			if (!overlayVisible)
+			{
+				overlayVisible = true;
+				overlayManager.add(damageOverlay);
+			}
+			resetOverlayTimeout();
+		}
+		else
+		{
+			if (overlayVisible)
+			{
+				overlayVisible = false;
+				overlayManager.remove(damageOverlay);
+			}
+			stopOverlayTimeout();
+		}
+	}
+
+	/**
+	 * Shows the overlay by setting its visibility to true.
+	 */
+	public void showOverlay()
+	{
+		setOverlayVisible(true);
+	}
+
+	/**
+	 * Hides the overlay by setting its visibility to false.
+	 */
+	public void hideOverlay()
+	{
+		setOverlayVisible(false);
+	}
+
+
+	/**
+	 * Stops and nullifies the existing overlay timer.
+	 */
+	public void stopOverlayTimeout()
+	{
+		if (overlayTimeout != null)
+		{
+			overlayTimeout.stop();
+			overlayTimeout = null;
+		}
+	}
+
+	/**
+	 * Resets the overlay timer to hide the overlay after the configured timeout.
+	 */
+	public void resetOverlayTimeout()
+	{
+		stopOverlayTimeout(); // Ensure no existing timer is running
+		if (config.enableOverlay())
+		{
+			var timeoutMS = config.overlayTimeout() * 60 * 1000; // Convert minutes to milliseconds
+			overlayTimeout = new javax.swing.Timer(timeoutMS, _ev -> setOverlayVisible(false));
+			overlayTimeout.setRepeats(false); // Ensure the timer only runs once
+			overlayTimeout.start();
+		}
+	}
+
+
+	@Subscribe
+	public void onMenuOpened(MenuOpened event)
+	{
+		Point mousePosition = client.getMouseCanvasPosition();
+		Rectangle overlayBounds = damageOverlay.getBounds();
+
+		if (overlayVisible && overlayBounds.contains(mousePosition.getX(), mousePosition.getY()))
+		{
+			// Get existing menu entries
+			MenuEntry[] existingEntries = event.getMenuEntries();
+
+			// Use a dynamic list to hold new entries
+			List<MenuEntry> newEntries = new ArrayList<>();
+
+			// Retrieve the current fights
+			BoundedQueue<Fight> fights = fightManager.getFights();
+
+			// Only add the "Select Fight" entry if there are active fights
+			if (fights != null && !fights.isEmpty())
+			{
+				// Create the main "Select Fight" menu entry
+				MenuEntry selectFightEntry = client.createMenuEntry(-3)
+						.setOption("Select Fight")
+						.setTarget("")
+						.setType(MenuAction.RUNELITE)
+						.setDeprioritized(true);
+
+				// Create a submenu for selecting a fight
+				Menu submenu = selectFightEntry.createSubMenu();
+				Iterator<Fight> iterator = fights.descendingIterator();
+
+				int i = -1;
+				while (iterator.hasNext())
+				{
+					Fight fight = iterator.next();
+					submenu.createMenuEntry(i)
+							.setOption(fight.getFightName() + " (" + Fight.formatTime(fight.getFightLengthTicks()) + ")")
+							.setTarget("")
+							.setType(MenuAction.RUNELITE)
+							.onClick((e) -> fightManager.setSelectedFight(fight));
+					i--;
+				}
+
+				// Add the "Select Fight" entry to the new entries list first
+				newEntries.add(selectFightEntry);
+			}
+
+			// Add "Clear All Fights" entry next
+			newEntries.add(client.createMenuEntry(-4)
+					.setOption("Clear All Fights")
+					.setTarget("")
+					.setType(MenuAction.RUNELITE)
+					.onClick((me) -> fightManager.clearFights()));
+
+			// Add "End Current Fight" entry last
+			newEntries.add(client.createMenuEntry(-5)
+					.setOption("End Current Fight")
+					.setTarget("")
+					.setType(MenuAction.RUNELITE)
+					.onClick((me) -> fightManager.endCurrentFight()));
+
+			// Convert the new entries list to an array
+			MenuEntry[] newEntriesArray = newEntries.toArray(new MenuEntry[0]);
+
+			// Combine existing entries with new entries and set the menu
+			client.setMenuEntries(ArrayUtils.addAll(existingEntries, newEntriesArray));
+		}
+	}
+
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (!event.getGroup().equals("combatlogger"))
+		{
+			return;
+		}
+
+		switch (event.getKey())
+		{
+			case "secondaryMetric":
+				panel.updatePanel();
+				break;
+
+			case "selfDamageMeterColor":
+				fightManager.clearPlayerColors();
+				panel.updatePanel();
+				break;
+
+			case "enableOverlay":
+				if (config.enableOverlay())
+				{
+					showOverlay();
+				}
+				else
+				{
+					hideOverlay();
+				}
+				break;
+
+			case "showOverlayAvatar":
+				damageOverlay.clearAvatarCache();
+				break;
+
+			case "overlayTimeout":
+				resetOverlayTimeout();
+				break;
+
+			case "overlayOpacity":
+				damageOverlay.setOpacity(config.overlayOpacity());
+				break;
+		}
+	}
+
+	protected static String getCurrentTimestamp()
+	{
+		return DATE_FORMAT.format(new Date());
+	}
+
+	private static String getIdOrName(Actor actor)
+	{
+		if (actor instanceof NPC)
+		{
+			return ((NPC) actor).getId() + "-" + ((NPC) actor).getIndex();
+		}
+		else
+		{
+			return actor.getName();
+		}
+	}
+
+	private void createLogFile()
+	{
+		try
+		{
+			LOG_FILE = new File(DIRECTORY, LOG_FILE_NAME + "-" + System.currentTimeMillis() + ".txt");
+			LOG_FILE.createNewFile();
+			logQueueManager.queue("Log Version 1.3.1");
+			if (client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
+			{
+				logPlayerName();
+				logQueueManager.queue(String.format("%s\tBASE_STATS\t%s", client.getLocalPlayer().getName(), previousBaseStats));
+				logQueueManager.queue(String.format("%s\tBOOSTED_STATS\t%s", client.getLocalPlayer().getName(), previousBoostedStats));
+			}
+		}
+		catch (IOException e)
+		{
+			e.printStackTrace();
+		}
+	}
+
+	private void logPlayerName()
+	{
+		logQueueManager.queue(String.format("Logged in player is %s", client.getLocalPlayer().getName()));
+	}
+
+	private void sendReminderMessage()
+	{
+		chatMessageManager
+				.queue(QueuedMessage.builder()
+						.type(ChatMessageType.GAMEMESSAGE)
+						.runeLiteFormattedMessage("<col=cc0000>Combat Logger plugin is logging to .runelite\\combat_log</col>")
+						.build());
 	}
 }
+
+package com.combatlogger.util;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+public class GameObjectIdsToTrack
+{
+	public static final Set<Integer> GAME_OBJECT_IDS_TO_TRACK = new HashSet<>(Arrays.asList(
+			32734, // Verzik web
+			32984, // Maiden of Sugadinti blood trail
+			45570, // Zebak poison
+			45571, // Zebak poison
+			45572, // Zebak poison
+			45573, // Zebak poison
+			45574, // Zebak poison
+			45575, // Zebak poison
+			45576 // Zebak poison
+	));
+}
+
+package com.combatlogger.util;
+
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+public class GroundObjectIdsToTrack
+{
+	public static final Set<Integer> GROUND_OBJECT_IDS_TO_TRACK = new HashSet<>(Arrays.asList(
+			32743, // Xarpus exhume
+			32744 // Xarpus acidic miasma
+	));
+}
+
+package com.combatlogger.util;
+
+import net.runelite.api.HeadIcon;
+import net.runelite.api.Varbits;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class OverheadToPrayer
+{
+	public static final Map<HeadIcon, Integer> HEADICON_TO_PRAYER_VARBIT = new HashMap<>();
+
+	static
+	{
+		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.MELEE, Varbits.PRAYER_PROTECT_FROM_MELEE);
+		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.RANGED, Varbits.PRAYER_PROTECT_FROM_MISSILES);
+		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.MAGIC, Varbits.PRAYER_PROTECT_FROM_MAGIC);
+		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.RETRIBUTION, Varbits.PRAYER_RETRIBUTION);
+		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.SMITE, Varbits.PRAYER_SMITE);
+		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.REDEMPTION, Varbits.PRAYER_REDEMPTION);
+	}
+
+}
+
+package com.combatlogger.util;
+
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+public class HitSplatUtil
+{
+	private static final Map<Integer, String> hitsplatNames = initializeHitsplatNames();
+
+	private static Map<Integer, String> initializeHitsplatNames()
+	{
+		Map<Integer, String> names = new HashMap<>();
+
+		names.put(0, "CORRUPTION");
+		names.put(4, "DISEASE");
+		names.put(5, "VENOM");
+		names.put(6, "HEAL");
+		names.put(11, "CYAN_UP");
+		names.put(12, "BLOCK_ME");
+		names.put(13, "BLOCK_OTHER");
+		names.put(15, "CYAN_DOWN");
+		names.put(16, "DAMAGE_ME");
+		names.put(17, "DAMAGE_OTHER");
+		names.put(18, "DAMAGE_ME_CYAN");
+		names.put(19, "DAMAGE_OTHER_CYAN");
+		names.put(20, "DAMAGE_ME_ORANGE");
+		names.put(21, "DAMAGE_OTHER_ORANGE");
+		names.put(22, "DAMAGE_ME_YELLOW");
+		names.put(23, "DAMAGE_OTHER_YELLOW");
+		names.put(24, "DAMAGE_ME_WHITE");
+		names.put(25, "DAMAGE_OTHER_WHITE");
+		names.put(43, "DAMAGE_MAX_ME");
+		names.put(44, "DAMAGE_MAX_ME_CYAN");
+		names.put(45, "DAMAGE_MAX_ME_ORANGE");
+		names.put(46, "DAMAGE_MAX_ME_YELLOW");
+		names.put(47, "DAMAGE_MAX_ME_WHITE");
+		names.put(53, "DAMAGE_ME_POISE");
+		names.put(54, "DAMAGE_OTHER_POISE");
+		names.put(55, "DAMAGE_MAX_ME_POISE");
+		names.put(60, "PRAYER_DRAIN");
+		names.put(65, "POISON");
+		names.put(67, "BLEED");
+		names.put(71, "SANITY_DRAIN");
+		names.put(72, "SANITY_RESTORE");
+		names.put(73, "DOOM");
+		names.put(74, "BURN");
+
+		return names;
+	}
+
+	public static final List<String> NON_DAMAGE_HITSPLATS = Arrays.asList(
+			"CORRUPTION",
+			"DISEASE",
+			"HEAL",
+			"CYAN_UP",
+			"PRAYER_DRAIN",
+			"SANITY_DRAIN",
+			"SANITY_RESTORE"
+	);
+
+	public static String getHitsplatName(int hitsplatType)
+	{
+		return hitsplatNames.getOrDefault(hitsplatType, "Unknown_" + hitsplatType);
+	}
+
+	/**
+	 * Convert a "ME" hitsplat from another player into an "OTHER" hitsplat
+	 * Only results in hitsplat names that already exist for lookup purposes
+	 * e.g. DAMAGE_MAX_ME -> DAMAGE_OTHER
+	 */
+	public static String replaceMeWithExistingOther(String hitsplatName)
+	{
+		return hitsplatName.replace("MAX_ME", "OTHER").replace("ME", "OTHER");
+	}
+
+	/**
+	 * Convert a "ME" hitsplat from another player into an "OTHER" hitsplat
+	 * Can result in hitsplat names that don't normally exist
+	 * e.g. DAMAGE_MAX_ME -> DAMAGE_MAX_OTHER
+	 */
+	public static String replaceMeWithNewOther(String hitsplatName)
+	{
+		return hitsplatName.replace("ME", "OTHER");
+	}
+}
+
+package com.combatlogger.util;
+
+import com.google.common.collect.ImmutableSet;
+
+import java.util.*;
+import java.util.stream.Collectors;
+
+import static net.runelite.api.NpcID.*;
+
+public class BossNames
+{
+	public static final ImmutableSet<Integer> VERZIK_P1_END = ImmutableSet.of(
+			VERZIK_VITUR_10832, // entry mode
+			VERZIK_VITUR_8371, // normal mode
+			VERZIK_VITUR_10849 // hard mode
+	);
+	public static final List<String> BOSS_NAMES = Arrays.asList(
+			"Scurrius",
+			"Kree'arra",
+			"Commander Zilyana",
+			"General Graardor",
+			"K'ril Tsutsaroth",
+			"Nex",
+			"Kalphite Queen",
+			"Sarachnis",
+			"Scorpia",
+			"Abyssal Sire",
+			"The Leviathan",
+			"The Whisperer",
+			"Vardorvis",
+			"Duke Sucellus",
+			"Tekton",
+			"Ice demon",
+			"Vanguard",
+			"Vespula",
+			"Vasa Nistirio",
+			"Muttadile",
+			"Great Olm",
+			"The Maiden of Sugadinti",
+			"Pestilent Bloat",
+			"Nylocas Vasilias",
+			"Sotetseg",
+			"Xarpus",
+			"Verzik Vitur",
+			"Ba-Ba",
+			"Akkha",
+			"Kephri",
+			"Zebak",
+			"Obelisk",
+			"Tumeken's Warden",
+			"Corporeal Beast",
+			"King Black Dragon",
+			"Vorkath",
+			"Zulrah",
+			"Fragment of Seren",
+			"Alchemical Hydra",
+			"Bryophyta",
+			"Callisto",
+			"Cerberus",
+			"Crystalline Hunllef",
+			"Corrupted Hunllef",
+			"Giant Mole",
+			"Hespori",
+			"The Mimic",
+			"The Nightmare",
+			"Obor",
+			"Phantom Muspah",
+			"Skotizo",
+			"TzKal-Zuk",
+			"TzTok-Jad",
+			"Venenatis",
+			"Vet'ion",
+			"Sol Heredit"
+	);
+
+	public static final Map<String, List<String>> BOSS_TO_MINIONS;
+	public static final Map<String, String> MINION_TO_BOSS;
+
+	static
+	{
+		BOSS_TO_MINIONS = Map.of(
+				"Nylocas Vasilias", List.of("Nylocas Hagios", "Nylocas Ischyros", "Nylocas Toxobolos")
+		);
+
+		MINION_TO_BOSS = BOSS_TO_MINIONS.entrySet().stream()
+				.flatMap(entry -> entry.getValue().stream().map(minion -> Map.entry(minion, entry.getKey())))
+				.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+	}
+}
+
 package com.combatlogger.util;
 
 import java.util.Arrays;
@@ -422,284 +1958,6 @@ public class AnimationIds
 				break;
 		}
 		return ticks;
-	}
-}
-
-package com.combatlogger.util;
-
-import net.runelite.api.Client;
-import net.runelite.api.Skill;
-
-import java.util.List;
-
-public class CombatStats
-{
-	public static List<Integer> getBaseStats(Client client)
-	{
-		return List.of(
-				client.getRealSkillLevel(Skill.ATTACK),
-				client.getRealSkillLevel(Skill.STRENGTH),
-				client.getRealSkillLevel(Skill.DEFENCE),
-				client.getRealSkillLevel(Skill.RANGED),
-				client.getRealSkillLevel(Skill.MAGIC),
-				client.getRealSkillLevel(Skill.HITPOINTS),
-				client.getRealSkillLevel(Skill.PRAYER)
-		);
-	}
-
-	public static List<Integer> getBoostedStats(Client client)
-	{
-		return List.of(
-				client.getBoostedSkillLevel(Skill.ATTACK),
-				client.getBoostedSkillLevel(Skill.STRENGTH),
-				client.getBoostedSkillLevel(Skill.DEFENCE),
-				client.getBoostedSkillLevel(Skill.RANGED),
-				client.getBoostedSkillLevel(Skill.MAGIC),
-				client.getBoostedSkillLevel(Skill.HITPOINTS),
-				client.getBoostedSkillLevel(Skill.PRAYER)
-		);
-	}
-}
-
-package com.combatlogger.util;
-
-import net.runelite.api.HeadIcon;
-import net.runelite.api.Varbits;
-
-import java.util.HashMap;
-import java.util.Map;
-
-public class OverheadToPrayer
-{
-	public static final Map<HeadIcon, Integer> HEADICON_TO_PRAYER_VARBIT = new HashMap<>();
-
-	static
-	{
-		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.MELEE, Varbits.PRAYER_PROTECT_FROM_MELEE);
-		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.RANGED, Varbits.PRAYER_PROTECT_FROM_MISSILES);
-		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.MAGIC, Varbits.PRAYER_PROTECT_FROM_MAGIC);
-		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.RETRIBUTION, Varbits.PRAYER_RETRIBUTION);
-		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.SMITE, Varbits.PRAYER_SMITE);
-		HEADICON_TO_PRAYER_VARBIT.put(HeadIcon.REDEMPTION, Varbits.PRAYER_REDEMPTION);
-	}
-
-}
-
-package com.combatlogger.util;
-
-import java.util.concurrent.LinkedBlockingDeque;
-
-/**
- * Double-ended queue (deque) with a fixed maximum capacity.
- * When new elements are added to the queue that exceed its capacity, the oldest elements in the queue are automatically removed.
- *
- * @param <E>
- */
-public class BoundedQueue<E> extends LinkedBlockingDeque<E>
-{
-	public BoundedQueue(int capacity)
-	{
-		super(capacity);
-	}
-
-	@Override
-	public boolean add(E e)
-	{
-		// Remove the oldest element if the queue is full
-		if (remainingCapacity() == 0)
-		{
-			poll();
-		}
-		return super.add(e);
-	}
-
-	@Override
-	public boolean offer(E e)
-	{
-		// Remove the oldest element if the queue is full
-		if (remainingCapacity() == 0)
-		{
-			poll();
-		}
-		return super.offer(e);
-	}
-}
-
-package com.combatlogger.util;
-
-import java.util.Arrays;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-public class HitSplatUtil
-{
-	private static final Map<Integer, String> hitsplatNames = initializeHitsplatNames();
-
-	private static Map<Integer, String> initializeHitsplatNames()
-	{
-		Map<Integer, String> names = new HashMap<>();
-
-		names.put(0, "CORRUPTION");
-		names.put(4, "DISEASE");
-		names.put(5, "VENOM");
-		names.put(6, "HEAL");
-		names.put(11, "CYAN_UP");
-		names.put(12, "BLOCK_ME");
-		names.put(13, "BLOCK_OTHER");
-		names.put(15, "CYAN_DOWN");
-		names.put(16, "DAMAGE_ME");
-		names.put(17, "DAMAGE_OTHER");
-		names.put(18, "DAMAGE_ME_CYAN");
-		names.put(19, "DAMAGE_OTHER_CYAN");
-		names.put(20, "DAMAGE_ME_ORANGE");
-		names.put(21, "DAMAGE_OTHER_ORANGE");
-		names.put(22, "DAMAGE_ME_YELLOW");
-		names.put(23, "DAMAGE_OTHER_YELLOW");
-		names.put(24, "DAMAGE_ME_WHITE");
-		names.put(25, "DAMAGE_OTHER_WHITE");
-		names.put(43, "DAMAGE_MAX_ME");
-		names.put(44, "DAMAGE_MAX_ME_CYAN");
-		names.put(45, "DAMAGE_MAX_ME_ORANGE");
-		names.put(46, "DAMAGE_MAX_ME_YELLOW");
-		names.put(47, "DAMAGE_MAX_ME_WHITE");
-		names.put(53, "DAMAGE_ME_POISE");
-		names.put(54, "DAMAGE_OTHER_POISE");
-		names.put(55, "DAMAGE_MAX_ME_POISE");
-		names.put(60, "PRAYER_DRAIN");
-		names.put(65, "POISON");
-		names.put(67, "BLEED");
-		names.put(71, "SANITY_DRAIN");
-		names.put(72, "SANITY_RESTORE");
-		names.put(73, "DOOM");
-		names.put(74, "BURN");
-
-		return names;
-	}
-
-	public static final List<String> NON_DAMAGE_HITSPLATS = Arrays.asList(
-			"CORRUPTION",
-			"DISEASE",
-			"HEAL",
-			"CYAN_UP",
-			"PRAYER_DRAIN",
-			"SANITY_DRAIN",
-			"SANITY_RESTORE"
-	);
-
-	public static String getHitsplatName(int hitsplatType)
-	{
-		return hitsplatNames.getOrDefault(hitsplatType, "Unknown_" + hitsplatType);
-	}
-
-	/**
-	 * Convert a "ME" hitsplat from another player into an "OTHER" hitsplat
-	 * Only results in hitsplat names that already exist for lookup purposes
-	 * e.g. DAMAGE_MAX_ME -> DAMAGE_OTHER
-	 */
-	public static String replaceMeWithExistingOther(String hitsplatName)
-	{
-		return hitsplatName.replace("MAX_ME", "OTHER").replace("ME", "OTHER");
-	}
-
-	/**
-	 * Convert a "ME" hitsplat from another player into an "OTHER" hitsplat
-	 * Can result in hitsplat names that don't normally exist
-	 * e.g. DAMAGE_MAX_ME -> DAMAGE_MAX_OTHER
-	 */
-	public static String replaceMeWithNewOther(String hitsplatName)
-	{
-		return hitsplatName.replace("ME", "OTHER");
-	}
-}
-
-package com.combatlogger.util;
-
-import com.google.common.collect.ImmutableSet;
-
-import java.util.*;
-import java.util.stream.Collectors;
-
-import static net.runelite.api.NpcID.*;
-
-public class BossNames
-{
-	public static final ImmutableSet<Integer> VERZIK_P1_END = ImmutableSet.of(
-			VERZIK_VITUR_10832, // entry mode
-			VERZIK_VITUR_8371, // normal mode
-			VERZIK_VITUR_10849 // hard mode
-	);
-	public static final List<String> BOSS_NAMES = Arrays.asList(
-			"Scurrius",
-			"Kree'arra",
-			"Commander Zilyana",
-			"General Graardor",
-			"K'ril Tsutsaroth",
-			"Nex",
-			"Kalphite Queen",
-			"Sarachnis",
-			"Scorpia",
-			"Abyssal Sire",
-			"The Leviathan",
-			"The Whisperer",
-			"Vardorvis",
-			"Duke Sucellus",
-			"Tekton",
-			"Ice demon",
-			"Vanguard",
-			"Vespula",
-			"Vasa Nistirio",
-			"Muttadile",
-			"Great Olm",
-			"The Maiden of Sugadinti",
-			"Pestilent Bloat",
-			"Nylocas Vasilias",
-			"Sotetseg",
-			"Xarpus",
-			"Verzik Vitur",
-			"Ba-Ba",
-			"Akkha",
-			"Kephri",
-			"Zebak",
-			"Obelisk",
-			"Tumeken's Warden",
-			"Corporeal Beast",
-			"King Black Dragon",
-			"Vorkath",
-			"Zulrah",
-			"Fragment of Seren",
-			"Alchemical Hydra",
-			"Bryophyta",
-			"Callisto",
-			"Cerberus",
-			"Crystalline Hunllef",
-			"Corrupted Hunllef",
-			"Giant Mole",
-			"Hespori",
-			"The Mimic",
-			"The Nightmare",
-			"Obor",
-			"Phantom Muspah",
-			"Skotizo",
-			"TzKal-Zuk",
-			"TzTok-Jad",
-			"Venenatis",
-			"Vet'ion",
-			"Sol Heredit"
-	);
-
-	public static final Map<String, List<String>> BOSS_TO_MINIONS;
-	public static final Map<String, String> MINION_TO_BOSS;
-
-	static
-	{
-		BOSS_TO_MINIONS = Map.of(
-				"Nylocas Vasilias", List.of("Nylocas Hagios", "Nylocas Ischyros", "Nylocas Toxobolos")
-		);
-
-		MINION_TO_BOSS = BOSS_TO_MINIONS.entrySet().stream()
-				.flatMap(entry -> entry.getValue().stream().map(minion -> Map.entry(minion, entry.getKey())))
-				.collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
 	}
 }
 
@@ -1378,2610 +2636,98 @@ public class NpcIdsToTrack
 	));
 }
 
-package com.combatlogger.messages;
+package com.combatlogger.util;
 
-import lombok.EqualsAndHashCode;
-import lombok.Value;
-import net.runelite.client.party.messages.PartyMemberMessage;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
 
-import java.util.List;
-
-@Value
-@EqualsAndHashCode(callSuper = true)
-public class BaseCombatStatsMessage extends PartyMemberMessage
+public class GraphicsObjectIdsToTrack
 {
-	List<Integer> stats;
+	public static final Set<Integer> GRAPHICS_OBJECT_IDS_TO_TRACK = new HashSet<>(Arrays.asList(
+			1570, // Bloat hand
+			1571, // Bloat foot
+			1572, // Bloat hand
+			1573, // Bloat foot
+			1579, // Maiden of Sugadinti blood
+			1595 // Verzik yellows
+	));
 }
 
-package com.combatlogger.messages;
+package com.combatlogger.util;
 
-import lombok.EqualsAndHashCode;
-import lombok.Value;
-import net.runelite.client.party.messages.PartyMemberMessage;
-
-import java.util.List;
-
-@Value
-@EqualsAndHashCode(callSuper = true)
-public class PrayerMessage extends PartyMemberMessage
-{
-	List<Integer> prayerIds;
-}
-
-package com.combatlogger.messages;
-
-import lombok.EqualsAndHashCode;
-import lombok.Value;
-import net.runelite.client.party.messages.PartyMemberMessage;
-
-import java.util.List;
-
-@Value
-@EqualsAndHashCode(callSuper = true)
-public class EquipmentMessage extends PartyMemberMessage
-{
-	List<Integer> itemIds;
-}
-
-package com.combatlogger.messages;
-
-import lombok.EqualsAndHashCode;
-import lombok.Value;
-import net.runelite.client.party.messages.PartyMemberMessage;
-
-@Value
-@EqualsAndHashCode(callSuper = true)
-public class DamageMessage extends PartyMemberMessage
-{
-	String target; // <id>-<index> or <playerName>
-	String targetName;
-	String hitsplatName;
-	int damage;
-}
-
-package com.combatlogger.messages;
-
-import lombok.EqualsAndHashCode;
-import lombok.Value;
-import net.runelite.client.party.messages.PartyMemberMessage;
-
-import java.util.List;
-
-@Value
-@EqualsAndHashCode(callSuper = true)
-public class BoostedCombatStatsMessage extends PartyMemberMessage
-{
-	List<Integer> stats;
-}
-
-package com.combatlogger;
-
-import com.combatlogger.messages.BaseCombatStatsMessage;
-import com.combatlogger.messages.BoostedCombatStatsMessage;
-import com.combatlogger.messages.DamageMessage;
-import com.combatlogger.messages.EquipmentMessage;
-import com.combatlogger.messages.PrayerMessage;
-import com.combatlogger.model.Fight;
-import com.combatlogger.model.TrackedNpc;
-import com.combatlogger.model.TrackedPartyMember;
-import com.combatlogger.model.logs.*;
-import com.combatlogger.overlay.DamageOverlay;
-import com.combatlogger.panel.CombatLoggerPanel;
-import com.combatlogger.util.AnimationIds;
-import com.combatlogger.util.BoundedQueue;
-import com.combatlogger.util.CombatStats;
-import com.google.inject.Provides;
-import lombok.Getter;
-import net.runelite.api.Menu;
-import net.runelite.api.Point;
-import net.runelite.api.*;
-import net.runelite.api.coords.LocalPoint;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.*;
-import net.runelite.api.kit.KitType;
-import net.runelite.client.RuneLite;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.chat.ChatMessageManager;
-import net.runelite.client.chat.QueuedMessage;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.eventbus.EventBus;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.ConfigChanged;
-import net.runelite.client.party.PartyMember;
-import net.runelite.client.party.PartyService;
-import net.runelite.client.party.WSClient;
-import net.runelite.client.party.messages.UserSync;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDependency;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.plugins.party.PartyPlugin;
-import net.runelite.client.ui.ClientToolbar;
-import net.runelite.client.ui.NavigationButton;
-import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.util.ImageUtil;
-import org.apache.commons.lang3.ArrayUtils;
-
-import javax.inject.Inject;
-import java.awt.*;
-import java.io.File;
-import java.io.IOException;
-import java.text.SimpleDateFormat;
-import java.util.List;
-import java.util.*;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-
-import static com.combatlogger.util.HitSplatUtil.getHitsplatName;
-import static com.combatlogger.util.NpcIdsToTrack.NPC_IDS_TO_TRACK;
-import static com.combatlogger.util.OverheadToPrayer.HEADICON_TO_PRAYER_VARBIT;
-
-@PluginDependency(PartyPlugin.class)
-
-@PluginDescriptor(
-		name = "Combat Logger",
-		description = "Damage meter and logs combat events to a text file - Upload and analyze your logs at runelogs.com.",
-		tags = {"damage", "dps", "pvm", "tob", "theatre of blood", "toa", "tombs of amascut", "meter", "counter", "tick"}
-)
-
-public class CombatLoggerPlugin extends Plugin
-{
-	public static final String DIRECTORY_NAME = "combat_log";
-	public static final File DIRECTORY;
-	private static final String LOG_FILE_NAME = "combat_log";
-	public static File LOG_FILE;
-
-	private static final SimpleDateFormat DATE_FORMAT = new SimpleDateFormat("MM-dd-yyyy HH:mm:ss", Locale.ENGLISH);
-	private static final Pattern ENCOUNTER_PATTERN = Pattern.compile("(Wave|Duration|Challenge)", Pattern.CASE_INSENSITIVE);
-
-	private static final List<Integer> TOB_ORBS_VARBITS = Arrays.asList(
-			Varbits.THEATRE_OF_BLOOD_ORB1,
-			Varbits.THEATRE_OF_BLOOD_ORB2,
-			Varbits.THEATRE_OF_BLOOD_ORB3,
-			Varbits.THEATRE_OF_BLOOD_ORB4,
-			Varbits.THEATRE_OF_BLOOD_ORB5
-	);
-
-	private static final List<Integer> TOA_ORBS_VARBITS = Arrays.asList(
-			Varbits.TOA_MEMBER_0_HEALTH,
-			Varbits.TOA_MEMBER_1_HEALTH,
-			Varbits.TOA_MEMBER_2_HEALTH,
-			Varbits.TOA_MEMBER_3_HEALTH,
-			Varbits.TOA_MEMBER_4_HEALTH,
-			Varbits.TOA_MEMBER_5_HEALTH,
-			Varbits.TOA_MEMBER_6_HEALTH,
-			Varbits.TOA_MEMBER_7_HEALTH
-	);
-
-	static
-	{
-		DIRECTORY = new File(RuneLite.RUNELITE_DIR, DIRECTORY_NAME);
-	}
-
-	private boolean checkPlayerName = false;
-
-	private Map<String, TrackedPartyMember> trackedPartyMembers = new HashMap<>();
-	private Map<String, TrackedNpc> trackedNpcs = new HashMap<>();
-	private List<Integer> previousBaseStats;
-	private boolean baseStatChangeLogScheduled;
-	private List<Integer> previousBoostedStats;
-	private boolean boostedStatChangeLogScheduled;
-	private int hitpointsXpLastUpdated = -1;
-	private List<Integer> previousPrayers;
-	private List<Integer> previousItemIds;
-	private Set<Integer> playerAnimationChanges = new HashSet<>();
-	private int regionId = -1;
-
-	private boolean inFight = false;
-	private javax.swing.Timer overlayTimeout = null;
-	@Getter
-	private Boolean overlayVisible = false;
-
-	@Inject
-	private Client client;
-
-	@Getter
-	@Inject
-	private ClientThread clientThread;
-
-	@Inject
-	private EventBus eventBus;
-
-	@Inject
-	private ChatMessageManager chatMessageManager;
-
-	@Inject
-	private LogQueueManager logQueueManager;
-
-	@Inject
-	private FightManager fightManager;
-
-	@Inject
-	private ClientToolbar clientToolbar;
-
-	@Inject
-	private CombatLoggerConfig config;
-
-	@Inject
-	private WSClient wsClient;
-
-	@Inject
-	private PartyService party;
-
-	@Inject
-	private OverlayManager overlayManager;
-
-	@Inject
-	private DamageOverlay damageOverlay;
-
-	private CombatLoggerPanel panel;
-
-	private NavigationButton navButton;
-
-	@Provides
-	CombatLoggerConfig provideConfig(ConfigManager configManager)
-	{
-		return configManager.getConfig(CombatLoggerConfig.class);
-	}
-
-	@Override
-	protected void startUp()
-	{
-		panel = injector.getInstance(CombatLoggerPanel.class);
-		logQueueManager.startUp(eventBus);
-
-		navButton = NavigationButton.builder()
-				.tooltip("Combat Logger")
-				.icon(ImageUtil.loadImageResource(getClass(), "/panel_icon.png"))
-				.priority(10)
-				.panel(panel)
-				.build();
-		clientToolbar.addNavigation(navButton);
-
-		DIRECTORY.mkdirs();
-		sendReminderMessage();
-		createLogFile();
-		wsClient.registerMessage(DamageMessage.class);
-		wsClient.registerMessage(BaseCombatStatsMessage.class);
-		wsClient.registerMessage(BoostedCombatStatsMessage.class);
-		wsClient.registerMessage(EquipmentMessage.class);
-		wsClient.registerMessage(PrayerMessage.class);
-
-		if (config.enableOverlay())
-		{
-			setOverlayVisible(true);
-			resetOverlayTimeout();
-		}
-	}
-
-	@Override
-	protected void shutDown()
-	{
-		previousBaseStats = null;
-		previousBoostedStats = null;
-		previousPrayers = null;
-		previousItemIds = null;
-		playerAnimationChanges.clear();
-		trackedPartyMembers.clear();
-		trackedNpcs.clear();
-		regionId = -1;
-		wsClient.unregisterMessage(DamageMessage.class);
-		wsClient.unregisterMessage(BaseCombatStatsMessage.class);
-		wsClient.unregisterMessage(BoostedCombatStatsMessage.class);
-		wsClient.unregisterMessage(EquipmentMessage.class);
-		wsClient.unregisterMessage(PrayerMessage.class);
-		clientToolbar.removeNavigation(navButton);
-		panel = null;
-		logQueueManager.shutDown(eventBus);
-		fightManager.shutDown();
-		setOverlayVisible(false);
-	}
-
-
-	@Subscribe
-	public void onCommandExecuted(CommandExecuted commandExecuted)
-	{
-		if (!commandExecuted.getCommand().equals("newlog"))
-		{
-			return;
-		}
-
-		createLogFile();
-		chatMessageManager
-				.queue(QueuedMessage.builder()
-						.type(ChatMessageType.GAMEMESSAGE)
-						.runeLiteFormattedMessage(String.format("<col=cc0000>New combat log created: %s</col>", LOG_FILE.getName()))
-						.build());
-		logEquipment(true); // Normally ItemContainerChanged is fired on startup, so it's not necessary in createLogFile()
-		logPrayers(true);
-	}
-
-	@Subscribe
-	public void onGameStateChanged(GameStateChanged gameStateChanged)
-	{
-		if (gameStateChanged.getGameState() == GameState.LOGGING_IN)
-		{
-			checkPlayerName = true;
-		}
-	}
-
-	@Subscribe
-	public void onNpcDespawned(NpcDespawned event)
-	{
-		int npcId = event.getNpc().getId();
-		if (!NPC_IDS_TO_TRACK.contains(npcId))
-		{
-			return;
-		}
-		String key = npcId + "-" + event.getNpc().getIndex();
-		trackedNpcs.remove(key);
-		logQueueManager.queue(String.format("%s\tDESPAWNED", key));
-	}
-
-	@Subscribe
-	public void onNpcChanged(NpcChanged event)
-	{
-		int oldNpcId = event.getOld().getId();
-		if (!NPC_IDS_TO_TRACK.contains(oldNpcId))
-		{
-			return;
-		}
-		String key = oldNpcId + "-" + event.getNpc().getIndex();
-		trackedNpcs.remove(key);
-		logQueueManager.queue(String.format("%s\tDESPAWNED", key));
-	}
-
-	@Subscribe
-	public void onGameTick(GameTick event)
-	{
-		Fight currentFight = fightManager.getLastFight();
-		boolean fightOngoing = currentFight != null && !currentFight.isOver();
-
-		if (fightOngoing && !inFight)
-		{
-			// Fight has just started
-			inFight = true;
-			setOverlayVisible(true);
-			stopOverlayTimeout();
-		}
-		else if (!fightOngoing && inFight)
-		{
-			// Fight has just ended
-			inFight = false;
-			resetOverlayTimeout();
-		}
-
-		if (fightOngoing)
-		{
-			currentFight.setFightLengthTicks(currentFight.getFightLengthTicks() + 1);
-
-			if ((currentFight.getLastActivityTick() + 100 < client.getTickCount() && !currentFight.getFightName().startsWith("Path of"))
-					|| (currentFight.getLastActivityTick() + 500 < client.getTickCount() && currentFight.getFightName().startsWith("Path of")))
-			{
-				// It's been 1 minute (or 5 minutes in a ToA path) without any activity. End the fight
-				currentFight.setOver(true);
-				damageOverlay.updateOverlay();
-			}
-		}
-
-		panel.updatePanel();
-
-		if (checkPlayerName && client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
-		{
-			logPlayerName();
-			clientThread.invokeLater(this::sendReminderMessage); // Delay so it's at bottom of chat
-			checkPlayerName = false;
-		}
-
-		Player local = client.getLocalPlayer();
-		if (local == null)
-		{
-			return;
-		}
-
-		logPrayers(false);
-
-		List<Player> players = client.getPlayers();
-		players.forEach(player -> {
-			this.checkBlowpipe(player);
-			this.logPosition(player);
-			this.logMemberEquipment(player);
-			this.logMemberOverhead(player);
-		});
-
-		for (int playerId : playerAnimationChanges)
-		{
-			Player player = players.stream()
-					.filter(p -> p.getId() == playerId)
-					.findFirst()
-					.orElse(null);
-			if (player != null)
-			{
-				int animationId = player.getAnimation();
-				checkAttackAnimation(player, animationId);
-			}
-		}
-		playerAnimationChanges.clear();
-
-		checkPlayerRegion();
-		validatePartyMembers();
-
-		List<NPC> npcs = client.getNpcs();
-		npcs.forEach(npc -> {
-			this.logPosition(npc);
-		});
-	}
-
-	private void logPrayers(boolean forceLogging)
-	{
-		Player player = client.getLocalPlayer();
-		List<Integer> currentPrayers = new ArrayList<>();
-		for (Prayer prayer : Prayer.values())
-		{
-			if (client.isPrayerActive(prayer))
-			{
-				currentPrayers.add(prayer.getVarbit());
-			}
-		}
-		if (forceLogging || !Objects.equals(currentPrayers, previousPrayers))
-		{
-			if (party.isInParty())
-			{
-				PrayerMessage prayerMessage = new PrayerMessage(currentPrayers);
-				clientThread.invokeLater(() -> party.send(prayerMessage));
-			}
-			logQueueManager.queue(String.format("%s\tPRAYERS\t%s", player.getName(), currentPrayers));
-			previousPrayers = currentPrayers;
-		}
-	}
-
-	private void checkBlowpipe(Player player)
-	{
-		int animationId = player.getAnimation();
-
-		if ((animationId == 5061 || animationId == 10656) && player.getAnimationFrame() == 0 && player.getInteracting() != null)
-		{
-			// Blowpipes will restart their attack animation (at frame 0) without sending an AnimationChanged event
-			// So we just check every player if they have the blowpipe animation at frame 0
-			logAttackAnimation(animationId, player);
-		}
-	}
-
-	private void logPosition(Player player)
-	{
-		if (party.getMemberByDisplayName(player.getName()) == null && !client.getLocalPlayer().getName().equals(player.getName()))
-		{
-			return;
-		}
-
-		TrackedPartyMember trackedPartyMember = trackedPartyMembers.getOrDefault(player.getName(), new TrackedPartyMember());
-		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, LocalPoint.fromWorld(client, player.getWorldLocation()));
-
-		if (currentWorldPoint.equals(trackedPartyMember.getWorldPoint()))
-		{
-			// Only log if their position has changed
-			return;
-		}
-
-		trackedPartyMember.setWorldPoint(currentWorldPoint);
-		if (player.getName().equals(client.getLocalPlayer().getName()))
-		{
-			trackedPartyMember.setUsingCombatLoggerPlugin(true);
-		}
-		trackedPartyMembers.put(player.getName(), trackedPartyMember);
-		logQueueManager.queue(String.format("%s\tPOSITION\t(%d, %d, %d)", player.getName(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
-	}
-
-	private void logMemberEquipment(Player player)
-	{
-		TrackedPartyMember trackedPartyMember = trackedPartyMembers.get(player.getName());
-
-		if (trackedPartyMember == null || trackedPartyMember.isUsingCombatLoggerPlugin())
-		{
-			return;
-		}
-
-		PlayerComposition composition = player.getPlayerComposition();
-		if (composition != null)
-		{
-			int[] compositionEquipmentIds = composition.getEquipmentIds();
-			List<Integer> currentEquipment = new ArrayList<>();
-			for (int i = 0; i < compositionEquipmentIds.length; i++)
-			{
-				currentEquipment.add(compositionEquipmentIds[i] > PlayerComposition.ITEM_OFFSET ? compositionEquipmentIds[i] - PlayerComposition.ITEM_OFFSET : -1); // Convert to item ID
-			}
-			for (int i = 0; i < 3; i++)
-			{
-				// Add slots we can't see as -2 to indicate unknown
-				currentEquipment.add(-2);
-			}
-			if (compositionEquipmentIds != null)
-			{
-				// Compare with previous equipment
-				if (!Objects.equals(currentEquipment, trackedPartyMember.getPreviousEquipment()))
-				{
-					logQueueManager.queue(String.format("%s\tEQUIPMENT\t%s", player.getName(), currentEquipment));
-					trackedPartyMember.setPreviousEquipment(currentEquipment);
-					trackedPartyMembers.put(player.getName(), trackedPartyMember);
-				}
-			}
-		}
-	}
-
-	private void logMemberOverhead(Player player)
-	{
-		TrackedPartyMember trackedPartyMember = trackedPartyMembers.get(player.getName());
-
-		if (trackedPartyMember == null || trackedPartyMember.isUsingCombatLoggerPlugin())
-		{
-			return;
-		}
-
-		int currentOverheadPrayerId = -1; // -1 represents none
-		if (player.getOverheadIcon() != null)
-		{
-			currentOverheadPrayerId = HEADICON_TO_PRAYER_VARBIT.get(player.getOverheadIcon());
-		}
-		if (currentOverheadPrayerId != trackedPartyMember.getPreviousOverheadPrayerId())
-		{
-			logQueueManager.queue(String.format("%s\tOVERHEAD\t%s", player.getName(), currentOverheadPrayerId));
-			trackedPartyMember.setPreviousOverheadPrayerId(currentOverheadPrayerId);
-			trackedPartyMembers.put(player.getName(), trackedPartyMember);
-		}
-	}
-
-	private void logPosition(NPC npc)
-	{
-		if (!NPC_IDS_TO_TRACK.contains(npc.getId()))
-		{
-			return;
-		}
-
-		TrackedNpc trackedNpc = trackedNpcs.getOrDefault(npc.getId() + "-" + npc.getIndex(), new TrackedNpc());
-		WorldPoint currentWorldPoint = WorldPoint.fromLocalInstance(client, LocalPoint.fromWorld(client, npc.getWorldLocation()));
-
-		if (currentWorldPoint.equals(trackedNpc.getWorldPoint()))
-		{
-			// Only log if their position has changed
-			return;
-		}
-
-		trackedNpc.setWorldPoint(currentWorldPoint);
-		trackedNpcs.put(npc.getId() + "-" + npc.getIndex(), trackedNpc);
-		logQueueManager.queue(String.format("%d-%d\tPOSITION\t(%d, %d, %d)", npc.getId(), npc.getIndex(), currentWorldPoint.getX(), currentWorldPoint.getY(), currentWorldPoint.getPlane()));
-	}
-
-	/**
-	 * Remove any trackedPartyMembers that are no longer in the party
-	 */
-	private void validatePartyMembers()
-	{
-		List<String> partyMemberNames = party.getMembers().stream().map(PartyMember::getDisplayName).collect(Collectors.toList());
-		trackedPartyMembers.keySet().removeIf(name -> !partyMemberNames.contains(name) && !client.getLocalPlayer().getName().equals(name));
-	}
-
-	private void logAttackAnimation(int animationId, Player player)
-	{
-		int weaponId = -1;
-		if (player.getPlayerComposition() != null)
-		{
-			weaponId = player.getPlayerComposition().getEquipmentId(KitType.WEAPON);
-		}
-
-		logQueueManager.queue(
-				new AttackAnimationLog(
-						client.getTickCount(),
-						getCurrentTimestamp(),
-						String.format("%s attack animation %d\t%s", player.getName(), animationId, getIdOrName(player.getInteracting())),
-						player.getName(),
-						getIdOrName(player.getInteracting()),
-						player.getInteracting().getName(),
-						animationId,
-						weaponId
-				)
-		);
-	}
-
-	private void checkAttackAnimation(Player player, int animationId)
-	{
-		if (player.getInteracting() == null)
-		{
-			// It's possible we see a player interacting, but their interacting target is outside our visibility range
-			// Just not going to count those for now
-			return;
-		}
-
-		if (animationId == 5061 || animationId == 10656)
-		{
-			// Blowpipe animations are handled in checkBlowpipe
-			return;
-		}
-
-		if (AnimationIds.MELEE_IDS.contains(animationId) ||
-				AnimationIds.RANGED_IDS.contains(animationId) ||
-				AnimationIds.MAGE_IDS.contains(animationId))
-		{
-			logAttackAnimation(animationId, player);
-		}
-
-		Player local = client.getLocalPlayer();
-		if (local != null && local.getId() == player.getId() && AnimationIds.MAGE_IDS.contains(animationId))
-		{
-			checkSplash(local);
-		}
-	}
-
-	private void checkPlayerRegion()
-	{
-		if (client.getLocalPlayer() != null)
-		{
-			LocalPoint localPoint = client.getLocalPlayer().getLocalLocation();
-			int currentRegionId = localPoint == null ? -1 : WorldPoint.fromLocalInstance(client, localPoint).getRegionID();
-			if (currentRegionId != regionId)
-			{
-				regionId = currentRegionId;
-				logQueueManager.queue(String.format("Player region %d", regionId));
-			}
-
-		}
-	}
-
-	@Subscribe
-	public void onStatChanged(StatChanged statChanged)
-	{
-		List<Integer> currentBaseStats = CombatStats.getBaseStats(client);
-		if (!Objects.equals(currentBaseStats, previousBaseStats))
-		{
-			previousBaseStats = currentBaseStats;
-			// Many StatChanged events are fired on login
-			// So we group them together to just get a single log message
-			if (!baseStatChangeLogScheduled)
-			{
-				baseStatChangeLogScheduled = true;
-				clientThread.invokeLater(() ->
-				{
-					if (party.isInParty())
-					{
-						BaseCombatStatsMessage baseCombatStatsMessage = new BaseCombatStatsMessage(previousBaseStats);
-						clientThread.invokeLater(() -> party.send(baseCombatStatsMessage));
-					}
-					logQueueManager.queue(String.format("%s\tBASE_STATS\t%s", client.getLocalPlayer().getName(), previousBaseStats));
-					baseStatChangeLogScheduled = false;
-				});
-			}
-		}
-
-		List<Integer> currentBoostedStats = CombatStats.getBoostedStats(client);
-		if (!Objects.equals(currentBoostedStats, previousBoostedStats))
-		{
-			previousBoostedStats = currentBoostedStats;
-			// Many StatChanged events are fired on login and some boosts effect multiple stats (like brews)
-			// So we group them together to just get a single log message
-			if (!boostedStatChangeLogScheduled)
-			{
-				boostedStatChangeLogScheduled = true;
-				clientThread.invokeLater(() ->
-				{
-					if (party.isInParty())
-					{
-						BoostedCombatStatsMessage boostedCombatStatsMessage = new BoostedCombatStatsMessage(previousBoostedStats);
-						clientThread.invokeLater(() -> party.send(boostedCombatStatsMessage));
-					}
-					logQueueManager.queue(String.format("%s\tBOOSTED_STATS\t%s", client.getLocalPlayer().getName(), previousBoostedStats));
-					boostedStatChangeLogScheduled = false;
-				});
-			}
-		}
-
-		if (statChanged.getSkill() == Skill.HITPOINTS)
-		{
-			hitpointsXpLastUpdated = client.getTickCount();
-		}
-	}
-
-	@Subscribe
-	public void onAnimationChanged(AnimationChanged event)
-	{
-		if (!(event.getActor() instanceof Player))
-		{
-			return;
-		}
-
-		// If we are standing right next to our target, the AnimationChanged event can fire before we are interacting
-		// So flag that it happened, but let onGameTick handle it, because it always fires last
-		playerAnimationChanges.add(((Player) event.getActor()).getId());
-	}
-
-	private void checkSplash(Player local)
-	{
-		int currentTick = client.getTickCount();
-		Actor target = local.getInteracting();
-		if (currentTick - hitpointsXpLastUpdated > 1 && !target.getName().toLowerCase().contains("dummy"))
-		{
-			// We used a spell attack animation, but it's been more than 1 tick since we gained hitpoints xp
-			// Assuming that is either a 0 or a miss (splash)
-
-			if (target.hasSpotAnim(GraphicID.SPLASH))
-			{
-				// I think technically you may have hit a 0 at the same time someone else splashed, but unlikely
-				logQueueManager.queue(String.format("%s\t%s\t%d", getIdOrName(target), "SPLASH_ME", 0));
-			}
-		}
-	}
-
-	@Subscribe
-	public void onGraphicChanged(GraphicChanged event)
-	{
-		Player local = client.getLocalPlayer();
-
-		if (event.getActor() != local)
-		{
-			return;
-		}
-
-		if (local.hasSpotAnim(GraphicID.SPLASH))
-		{
-			logQueueManager.queue(String.format("%s\t%s\t%d", getIdOrName(local), "SPLASH_ME", 0));
-		}
-	}
-
-	@Subscribe
-	public void onItemContainerChanged(ItemContainerChanged itemContainerChanged)
-	{
-		if (itemContainerChanged.getContainerId() == InventoryID.EQUIPMENT.getId())
-		{
-			logEquipment(false);
-		}
-	}
-
-	private void logEquipment(boolean forceLogging)
-	{
-		ItemContainer equipContainer = client.getItemContainer(InventoryID.EQUIPMENT);
-		if (equipContainer == null)
-		{
-			return;
-		}
-		List<Integer> currentItemIds = Arrays.stream(equipContainer.getItems())
-				.map(Item::getId)
-				.collect(Collectors.toList());
-
-		final int quiverAmmoId = client.getVarpValue(VarPlayer.DIZANAS_QUIVER_ITEM_ID);
-		currentItemIds.add(quiverAmmoId);
-
-		if (forceLogging || !Objects.equals(currentItemIds, previousItemIds))
-		{
-			if (party.isInParty())
-			{
-				EquipmentMessage equipmentMessage = new EquipmentMessage(currentItemIds);
-				clientThread.invokeLater(() -> party.send(equipmentMessage));
-			}
-
-			previousItemIds = currentItemIds;
-			logQueueManager.queue(String.format("%s\tEQUIPMENT\t%s", client.getLocalPlayer().getName(), currentItemIds));
-		}
-	}
-
-	@Subscribe
-	public void onUserSync(final UserSync event)
-	{
-		clientThread.invokeAtTickEnd(() -> {
-			EquipmentMessage equipmentMessage = new EquipmentMessage(previousItemIds);
-			party.send(equipmentMessage);
-
-			PrayerMessage prayerMessage = new PrayerMessage(previousPrayers);
-			party.send(prayerMessage);
-
-			BaseCombatStatsMessage baseCombatStatsMessage = new BaseCombatStatsMessage(previousBaseStats);
-			party.send(baseCombatStatsMessage);
-
-			BoostedCombatStatsMessage boostedCombatStatsMessage = new BoostedCombatStatsMessage(previousBoostedStats);
-			party.send(boostedCombatStatsMessage);
-		});
-	}
-
-	@Subscribe
-	public void onEquipmentMessage(EquipmentMessage event)
-	{
-		PartyMember localMember = party.getLocalMember();
-		if (localMember == null || localMember.getMemberId() == event.getMemberId())
-		{
-			// Don't need to update logs from ourselves
-			return;
-		}
-
-		markMemberHasPlugin(event.getMemberId());
-		PartyMember eventMember = party.getMemberById(event.getMemberId());
-
-		logQueueManager.queue(String.format("%s\tEQUIPMENT\t%s", eventMember.getDisplayName(), event.getItemIds()));
-	}
-
-	@Subscribe
-	public void onPrayerMessage(PrayerMessage event)
-	{
-		PartyMember localMember = party.getLocalMember();
-		if (localMember == null || localMember.getMemberId() == event.getMemberId())
-		{
-			// Don't need to update logs from ourselves
-			return;
-		}
-
-		markMemberHasPlugin(event.getMemberId());
-		PartyMember eventMember = party.getMemberById(event.getMemberId());
-
-		logQueueManager.queue(String.format("%s\tPRAYERS\t%s", eventMember.getDisplayName(), event.getPrayerIds()));
-	}
-
-	@Subscribe
-	public void onBaseCombatStatsMessage(BaseCombatStatsMessage event)
-	{
-		PartyMember localMember = party.getLocalMember();
-		if (localMember == null || localMember.getMemberId() == event.getMemberId())
-		{
-			// Don't need to update logs from ourselves
-			return;
-		}
-
-		markMemberHasPlugin(event.getMemberId());
-		PartyMember eventMember = party.getMemberById(event.getMemberId());
-
-		logQueueManager.queue(String.format("%s\tBASE_STATS\t%s", eventMember.getDisplayName(), event.getStats()));
-	}
-
-	@Subscribe
-	public void onBoostedCombatStatsMessage(BoostedCombatStatsMessage event)
-	{
-		PartyMember localMember = party.getLocalMember();
-		if (localMember == null || localMember.getMemberId() == event.getMemberId())
-		{
-			// Don't need to update logs from ourselves
-			return;
-		}
-
-		markMemberHasPlugin(event.getMemberId());
-		PartyMember eventMember = party.getMemberById(event.getMemberId());
-
-		logQueueManager.queue(String.format("%s\tBOOSTED_STATS\t%s", eventMember.getDisplayName(), event.getStats()));
-	}
-
-	private void markMemberHasPlugin(long memberId)
-	{
-		PartyMember eventMember = party.getMemberById(memberId);
-		if (eventMember == null)
-		{
-			return;
-		}
-
-		TrackedPartyMember trackedMember = trackedPartyMembers.getOrDefault(eventMember.getDisplayName(), new TrackedPartyMember());
-		trackedMember.setUsingCombatLoggerPlugin(true);
-		// I guess if they turn the plugin off without leaving and rejoining the party we just won't have logs for them anymore
-		trackedPartyMembers.put(eventMember.getDisplayName(), trackedMember);
-	}
-
-
-	@Subscribe
-	public void onHitsplatApplied(HitsplatApplied hitsplatApplied)
-	{
-		Actor actor = hitsplatApplied.getActor();
-		Hitsplat hitsplat = hitsplatApplied.getHitsplat();
-
-		int damageAmount = hitsplat.getAmount();
-		String target = getIdOrName(actor);
-		String hitsplatName = getHitsplatName(hitsplat.getHitsplatType());
-		String source = "Unknown";
-		String myName = client.getLocalPlayer().getName();
-
-		if (hitsplat.isMine() && !target.equals(myName))
-		{
-			source = myName;
-		}
-
-		logQueueManager.queue(
-				new DamageLog(
-						client.getTickCount(),
-						getCurrentTimestamp(),
-						(String.format("%s\t%s\t%s\t%d", source, hitsplatName, target, damageAmount)),
-						source,
-						getIdOrName(actor),
-						actor.getName(),
-						damageAmount,
-						hitsplatName
-				)
-		);
-
-		if (party.isInParty() && hitsplat.isMine() && !target.equals(myName))
-		{
-			DamageMessage damageMessage = new DamageMessage(target, actor.getName(), hitsplatName, damageAmount);
-			clientThread.invokeLater(() -> party.send(damageMessage));
-		}
-	}
-
-	@Subscribe
-	public void onInteractingChanged(InteractingChanged event)
-	{
-		Actor source = event.getSource();
-		if (event.getTarget() != null &&
-				!event.getSource().isDead() &&
-				(event.getTarget() instanceof Player || event.getTarget() instanceof NPC))
-		{
-			Actor target = event.getTarget();
-			logQueueManager.queue(
-					new TargetChangeLog(
-							client.getTickCount(),
-							getCurrentTimestamp(),
-							String.format("%s changes target to %s", getIdOrName(source), getIdOrName(target)),
-							getIdOrName(source),
-							source.getName(),
-							getIdOrName(target)
-					)
-			);
-		}
-	}
-
-	@Subscribe
-	public void onActorDeath(ActorDeath actorDeath)
-	{
-		logQueueManager.queue(
-				new DeathLog(
-						client.getTickCount(),
-						getCurrentTimestamp(),
-						String.format("%s dies", getIdOrName(actorDeath.getActor())),
-						getIdOrName(actorDeath.getActor())
-				)
-		);
-	}
-
-	@Subscribe
-	public void onVarbitChanged(VarbitChanged varbitChanged)
-	{
-		if (varbitChanged.getVarpId() == VarPlayer.DIZANAS_QUIVER_ITEM_ID)
-		{
-			logEquipment(false);
-		}
-
-		if (varbitChanged.getValue() != 30)
-		{
-			return;
-		}
-
-		if (TOB_ORBS_VARBITS.contains(varbitChanged.getVarbitId()) && isWipe(TOB_ORBS_VARBITS))
-		{
-			logQueueManager.queue("Theatre of Blood Wipe");
-		}
-		else if (TOA_ORBS_VARBITS.contains(varbitChanged.getVarbitId()) && isWipe(TOA_ORBS_VARBITS))
-		{
-			logQueueManager.queue("Tombs of Amascut Wipe");
-		}
-	}
-
-	private boolean isWipe(List<Integer> orbVarbits)
-	{
-		return orbVarbits.stream()
-				.allMatch(varbit -> {
-					int value = client.getVarbitValue(varbit);
-					// 0 = hidden
-					// 30 = dead
-					return value == 0 || value == 30;
-				});
-	}
-
-	@Subscribe
-	public void onChatMessage(ChatMessage event)
-	{
-
-		if (event.getType() != ChatMessageType.GAMEMESSAGE || "combat-logger".equals(event.getSender()))
-		{
-			return;
-		}
-
-		String message = event.getMessage();
-		if (ENCOUNTER_PATTERN.matcher(message).find())
-		{
-			logQueueManager.queue(
-					new GameMessageLog(
-							client.getTickCount(),
-							getCurrentTimestamp(),
-							message
-
-					)
-			);
-		}
-	}
-
-	/**
-	 * Sets the overlay visibility based on the provided parameter.
-	 *
-	 * @param visible If true, the overlay is shown; if false, it is hidden.
-	 */
-	public void setOverlayVisible(boolean visible)
-	{
-		if (visible && config.enableOverlay())
-		{
-			if (!overlayVisible)
-			{
-				overlayVisible = true;
-				overlayManager.add(damageOverlay);
-			}
-			resetOverlayTimeout();
-		}
-		else
-		{
-			if (overlayVisible)
-			{
-				overlayVisible = false;
-				overlayManager.remove(damageOverlay);
-			}
-			stopOverlayTimeout();
-		}
-	}
-
-	/**
-	 * Shows the overlay by setting its visibility to true.
-	 */
-	public void showOverlay()
-	{
-		setOverlayVisible(true);
-	}
-
-	/**
-	 * Hides the overlay by setting its visibility to false.
-	 */
-	public void hideOverlay()
-	{
-		setOverlayVisible(false);
-	}
-
-
-	/**
-	 * Stops and nullifies the existing overlay timer.
-	 */
-	public void stopOverlayTimeout()
-	{
-		if (overlayTimeout != null)
-		{
-			overlayTimeout.stop();
-			overlayTimeout = null;
-		}
-	}
-
-	/**
-	 * Resets the overlay timer to hide the overlay after the configured timeout.
-	 */
-	public void resetOverlayTimeout()
-	{
-		stopOverlayTimeout(); // Ensure no existing timer is running
-		if (config.enableOverlay())
-		{
-			var timeoutMS = config.overlayTimeout() * 60 * 1000; // Convert minutes to milliseconds
-			overlayTimeout = new javax.swing.Timer(timeoutMS, _ev -> setOverlayVisible(false));
-			overlayTimeout.setRepeats(false); // Ensure the timer only runs once
-			overlayTimeout.start();
-		}
-	}
-
-
-	@Subscribe
-	public void onMenuOpened(MenuOpened event)
-	{
-		Point mousePosition = client.getMouseCanvasPosition();
-		Rectangle overlayBounds = damageOverlay.getBounds();
-
-		if (overlayVisible && overlayBounds.contains(mousePosition.getX(), mousePosition.getY()))
-		{
-			// Get existing menu entries
-			MenuEntry[] existingEntries = event.getMenuEntries();
-
-			// Use a dynamic list to hold new entries
-			List<MenuEntry> newEntries = new ArrayList<>();
-
-			// Retrieve the current fights
-			BoundedQueue<Fight> fights = fightManager.getFights();
-
-			// Only add the "Select Fight" entry if there are active fights
-			if (fights != null && !fights.isEmpty())
-			{
-				// Create the main "Select Fight" menu entry
-				MenuEntry selectFightEntry = client.createMenuEntry(-3)
-						.setOption("Select Fight")
-						.setTarget("")
-						.setType(MenuAction.RUNELITE)
-						.setDeprioritized(true);
-
-				// Create a submenu for selecting a fight
-				Menu submenu = selectFightEntry.createSubMenu();
-				Iterator<Fight> iterator = fights.descendingIterator();
-
-				int i = -1;
-				while (iterator.hasNext())
-				{
-					Fight fight = iterator.next();
-					submenu.createMenuEntry(i)
-							.setOption(fight.getFightName() + " (" + Fight.formatTime(fight.getFightLengthTicks()) + ")")
-							.setTarget("")
-							.setType(MenuAction.RUNELITE)
-							.onClick((e) -> fightManager.setSelectedFight(fight));
-					i--;
-				}
-
-				// Add the "Select Fight" entry to the new entries list first
-				newEntries.add(selectFightEntry);
-			}
-
-			// Add "Clear All Fights" entry next
-			newEntries.add(client.createMenuEntry(-4)
-					.setOption("Clear All Fights")
-					.setTarget("")
-					.setType(MenuAction.RUNELITE)
-					.onClick((me) -> fightManager.clearFights()));
-
-			// Add "End Current Fight" entry last
-			newEntries.add(client.createMenuEntry(-5)
-					.setOption("End Current Fight")
-					.setTarget("")
-					.setType(MenuAction.RUNELITE)
-					.onClick((me) -> fightManager.endCurrentFight()));
-
-			// Convert the new entries list to an array
-			MenuEntry[] newEntriesArray = newEntries.toArray(new MenuEntry[0]);
-
-			// Combine existing entries with new entries and set the menu
-			client.setMenuEntries(ArrayUtils.addAll(existingEntries, newEntriesArray));
-		}
-	}
-
-
-	@Subscribe
-	public void onConfigChanged(ConfigChanged event)
-	{
-		if (!event.getGroup().equals("combatlogger"))
-		{
-			return;
-		}
-
-		switch (event.getKey())
-		{
-			case "secondaryMetric":
-				panel.updatePanel();
-				break;
-
-			case "selfDamageMeterColor":
-				fightManager.clearPlayerColors();
-				panel.updatePanel();
-				break;
-
-			case "enableOverlay":
-				if (config.enableOverlay())
-				{
-					showOverlay();
-				}
-				else
-				{
-					hideOverlay();
-				}
-				break;
-
-			case "showOverlayAvatar":
-				damageOverlay.clearAvatarCache();
-				break;
-
-			case "overlayTimeout":
-				resetOverlayTimeout();
-				break;
-
-			case "overlayOpacity":
-				damageOverlay.setOpacity(config.overlayOpacity());
-				break;
-		}
-	}
-
-	protected static String getCurrentTimestamp()
-	{
-		return DATE_FORMAT.format(new Date());
-	}
-
-	private static String getIdOrName(Actor actor)
-	{
-		if (actor instanceof NPC)
-		{
-			return ((NPC) actor).getId() + "-" + ((NPC) actor).getIndex();
-		}
-		else
-		{
-			return actor.getName();
-		}
-	}
-
-	private void createLogFile()
-	{
-		try
-		{
-			LOG_FILE = new File(DIRECTORY, LOG_FILE_NAME + "-" + System.currentTimeMillis() + ".txt");
-			LOG_FILE.createNewFile();
-			logQueueManager.queue("Log Version 1.3.0");
-			if (client.getLocalPlayer() != null && client.getLocalPlayer().getName() != null)
-			{
-				logPlayerName();
-				logQueueManager.queue(String.format("%s\tBASE_STATS\t%s", client.getLocalPlayer().getName(), previousBaseStats));
-				logQueueManager.queue(String.format("%s\tBOOSTED_STATS\t%s", client.getLocalPlayer().getName(), previousBoostedStats));
-			}
-		}
-		catch (IOException e)
-		{
-			e.printStackTrace();
-		}
-	}
-
-	private void logPlayerName()
-	{
-		logQueueManager.queue(String.format("Logged in player is %s", client.getLocalPlayer().getName()));
-	}
-
-	private void sendReminderMessage()
-	{
-		chatMessageManager
-				.queue(QueuedMessage.builder()
-						.type(ChatMessageType.GAMEMESSAGE)
-						.runeLiteFormattedMessage("<col=cc0000>Combat Logger plugin is logging to .runelite\\combat_log</col>")
-						.build());
-	}
-}
-
-package com.combatlogger;
-
-import com.combatlogger.messages.DamageMessage;
-import com.combatlogger.model.logs.*;
-import com.combatlogger.util.HitSplatUtil;
-import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
-import net.runelite.api.events.GameTick;
-import net.runelite.client.chat.ChatMessageManager;
-import net.runelite.client.chat.QueuedMessage;
-import net.runelite.client.eventbus.EventBus;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.party.PartyMember;
-import net.runelite.client.party.PartyService;
+import net.runelite.api.Skill;
 
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.io.BufferedWriter;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
-
-import static com.combatlogger.CombatLoggerPlugin.LOG_FILE;
-import static com.combatlogger.CombatLoggerPlugin.getCurrentTimestamp;
-
-@Singleton
-public class LogQueueManager
-{
-	private final Client client;
-	private final Queue<Log> logQueue = new ConcurrentLinkedQueue<>();
-
-	@Inject
-	private ChatMessageManager chatMessageManager;
-
-	@Inject
-	private CombatLoggerConfig config;
-
-	@Inject
-	private PartyService party;
-
-	@Inject
-	private FightManager fightManager;
-
-	@Inject
-	private LogQueueManager(Client client)
-	{
-		this.client = client;
-	}
-
-	public void startUp(EventBus eventBus)
-	{
-		eventBus.register(this);
-	}
-
-	public void shutDown(EventBus eventBus)
-	{
-		eventBus.unregister(this);
-	}
-
-	@Subscribe
-	public void onGameTick(GameTick event)
-	{
-		int currentTick = client.getTickCount();
-
-		// Wait until 2 ticks have passed before writing to the log file
-		// So that we can enrich the data from other players in the Party with DamageMessage
-		while (!logQueue.isEmpty() && currentTick >= logQueue.peek().getTickCount() + 2)
-		{
-			Log log = logQueue.poll();
-			log(log.getTickCount(), log.getTimestamp(), log.getMessage());
-
-			if (log instanceof DamageLog && isNPC(((DamageLog) log).getTarget()))
-			{
-				fightManager.addDamage((DamageLog) log);
-			}
-			else if (log instanceof DeathLog && isNPC(((DeathLog) log).getTarget()))
-			{
-				fightManager.recordDeath((DeathLog) log);
-			}
-			else if (log instanceof TargetChangeLog && isNPC(((TargetChangeLog) log).getSource()) && !isNPC(((TargetChangeLog) log).getTarget()))
-			{
-				fightManager.recordNPCTargetingPlayer((TargetChangeLog) log);
-			}
-			else if (log instanceof GameMessageLog)
-			{
-				fightManager.handleGameMessage((GameMessageLog) log);
-			}
-			else if (log instanceof AttackAnimationLog)
-			{
-				fightManager.addTicks((AttackAnimationLog) log);
-			}
-		}
-
-		// No need to call panel.onGameTick(event); as FightManager handles game ticks.
-	}
-
-	private void log(int tickCount, String timestamp, String message)
-	{
-		try (BufferedWriter writer = new BufferedWriter(new FileWriter(LOG_FILE, true)))
-		{
-			writer.write(String.format("%s %s\t%s\n", tickCount, timestamp, message));
-			if (config.logInChat())
-			{
-				chatMessageManager
-						.queue(QueuedMessage.builder()
-								.type(ChatMessageType.GAMEMESSAGE)
-								.sender("combat-logger")
-								.runeLiteFormattedMessage(message.replace("\t", " "))
-								.build());
-			}
-		}
-		catch (IOException e)
-		{
-			e.printStackTrace();
-		}
-	}
-
-	@Subscribe
-	protected void onDamageMessage(DamageMessage event)
-	{
-		PartyMember localMember = party.getLocalMember();
-
-		if (localMember == null || localMember.getMemberId() == event.getMemberId())
-		{
-			// Don't need to update logs from ourselves
-			return;
-		}
-
-		PartyMember eventMember = party.getMemberById(event.getMemberId());
-		String newHitsplatName = HitSplatUtil.replaceMeWithNewOther(event.getHitsplatName());
-
-		// Find a matching damage log in the queue and then add the source of the damage and rename the hitsplat appropriately
-		boolean matchFound = false;
-		for (Log log : logQueue)
-		{
-			if (log instanceof DamageLog)
-			{
-				DamageLog damageLog = (DamageLog) log;
-				if (damageLog.getSource().equals("Unknown")
-						&& event.getDamage() == damageLog.getDamageAmount()
-						&& event.getTarget().equals(damageLog.getTarget())
-						&& HitSplatUtil.replaceMeWithExistingOther(event.getHitsplatName()).equals(damageLog.getHitsplatName()))
-				{
-					// Match found, update the existing damage log
-					damageLog.setHitsplatName(newHitsplatName);
-					damageLog.setSource(eventMember.getDisplayName());
-					damageLog.setMessage(String.format("%s\t%s\t%s\t%d", eventMember.getDisplayName(), newHitsplatName, event.getTarget(), event.getDamage()));
-					matchFound = true;
-					break;
-				}
-			}
-		}
-
-		// If no match is found, add a new damage log to the queue
-		if (!matchFound)
-		{
-			queue(
-					new DamageLog(
-							client.getTickCount(),
-							getCurrentTimestamp(),
-							String.format("%s\t%s\t%s\t%d", eventMember.getDisplayName(), newHitsplatName, event.getTarget(), event.getDamage()),
-							eventMember.getDisplayName(),
-							event.getTarget(),
-							event.getTargetName(),
-							event.getDamage(),
-							newHitsplatName)
-			);
-		}
-	}
-
-	public void queue(Log log)
-	{
-		logQueue.add(log);
-	}
-
-	public void queue(String message)
-	{
-		logQueue.add(
-				new Log(
-						client.getTickCount(),
-						getCurrentTimestamp(),
-						message
-				));
-	}
-
-	public static boolean isNPC(String name)
-	{
-		return name.matches("\\d+-\\d+");
-	}
-}
-
-package com.combatlogger.overlay;
-
-import java.awt.*;
-import java.awt.image.BufferedImage;
-import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.Map;
-import javax.inject.Inject;
-
-import com.combatlogger.FightManager;
-import com.combatlogger.CombatLoggerConfig;
-import com.combatlogger.CombatLoggerPlugin;
-import com.combatlogger.model.Fight;
-import com.combatlogger.model.PlayerStats;
-import lombok.Setter;
-import net.runelite.client.plugins.party.PartyPluginService;
-import net.runelite.client.ui.overlay.*;
-import net.runelite.client.ui.overlay.components.ComponentConstants;
-import net.runelite.api.*;
-import net.runelite.api.Point;
-import net.runelite.client.party.PartyService;
-import net.runelite.client.ui.FontManager;
-import net.runelite.client.party.PartyMember;
-import net.runelite.client.ui.overlay.tooltip.Tooltip;
-import net.runelite.client.ui.overlay.tooltip.TooltipManager;
-import net.runelite.client.util.ImageUtil;
-
-public class DamageOverlay extends OverlayPanel
-{
-	private final CombatLoggerPlugin combatLoggerPlugin;
-	private final PartyService partyService;
-	private final CombatLoggerConfig config;
-	private final Client client;
-	private final TooltipManager tooltipManager;
-	private final FightManager fightManager;
-
-	private final BufferedImage defaultAvatar;
-	private final BufferedImage settingsIcon;
-	private final Map<String, BufferedImage> avatarCache = new ConcurrentHashMap<>();
-	private Fight cachedFight = null;
-	private int cachedFightLength = -1;
-	private List<PlayerStats> playerStatCache;
-
-	@Setter
-	private int opacity;
-
-	static final String IMAGE_DEFAULT_AVATAR_PATH = "/default_avatar.png";
-	static final String IMAGE_SETTINGS_PATH = "/settings.png";
-	static final int LINE_HEIGHT = 16;
-	static final Dimension MIN_SIZE = new Dimension((int) Math.floor((double) ComponentConstants.STANDARD_WIDTH / 2), LINE_HEIGHT * 2); //header + 1 row
-	static final Dimension DEFAULT_SIZE = new Dimension((int) Math.floor(ComponentConstants.STANDARD_WIDTH * 1.5), LINE_HEIGHT * 4); //header + 3 rows
-	static final int DEFAULT_BACKGROUND_ALPHA = 120;
-	static final int DEFAULT_HEADER_ALPHA = 200;
-	static final int DEFAULT_BAR_ALPHA = 255;
-
-	@Inject
-	public DamageOverlay(
-			CombatLoggerPlugin plugin,
-			Client client,
-			CombatLoggerConfig config,
-			PartyService partyService,
-			TooltipManager tooltipManager,
-			PartyPluginService partyPluginService,
-			FightManager fightManager
-	)
-	{
-		super(plugin);
-
-		setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
-		setPriority(PRIORITY_HIGHEST);
-		setPreferredSize(DEFAULT_SIZE);
-
-		this.combatLoggerPlugin = plugin;
-		this.config = config;
-		this.partyService = partyService;
-		this.tooltipManager = tooltipManager;
-		this.client = client;
-		this.fightManager = fightManager;
-		this.opacity = config.overlayOpacity();
-
-		defaultAvatar = loadImage(IMAGE_DEFAULT_AVATAR_PATH);
-		settingsIcon = loadImage(IMAGE_SETTINGS_PATH);
-	}
-
-	@Override
-	public Dimension render(Graphics2D graphics)
-	{
-		if (!config.enableOverlay() || !combatLoggerPlugin.getOverlayVisible())
-		{
-			return null;
-		}
-
-		Fight selectedFight = fightManager.getSelectedFight();
-		if (selectedFight == null)
-		{
-			// No fight is selected; reset cache and prevent rendering
-			cachedFight = null;
-			cachedFightLength = -1;
-			return null;
-		}
-
-		List<PlayerStats> playerStats;
-		if (selectedFight.equals(cachedFight) && selectedFight.getFightLengthTicks() == cachedFightLength)
-		{
-			playerStats = playerStatCache;
-		}
-		else
-		{
-			playerStats = playerStatCache = fightManager.getPlayerDamageForFight(selectedFight);
-			cachedFight = selectedFight;
-			cachedFightLength = selectedFight.getFightLengthTicks();
-		}
-
-		if (playerStats.isEmpty())
-		{
-			return null;
-		}
-
-		String fightName = selectedFight.getFightName() + " (" + Fight.formatTime(selectedFight.getFightLengthTicks()) + ")";
-		boolean showAvatars = config.showOverlayAvatar();
-		int overlayAlpha = (int) Math.round((opacity / 100.0) * 255);
-
-		Dimension currentSize = this.getBounds().getSize();
-
-		if (currentSize.height == 0 && currentSize.width == 0)
-		{
-			currentSize = DEFAULT_SIZE;
-		}
-
-		//ensure min height/width are enforced
-		currentSize.width = Math.max(currentSize.width, MIN_SIZE.width);
-		currentSize.height = Math.max(currentSize.height, MIN_SIZE.height);
-
-		graphics.setFont(FontManager.getRunescapeSmallFont());
-		FontMetrics metrics = graphics.getFontMetrics();
-
-		// Draw the background for the entire overlay with adjusted transparency
-		graphics.setColor(new Color(50, 50, 50, (int) Math.round((opacity / 100.0) * DEFAULT_BACKGROUND_ALPHA))); // Semi-transparent gray background
-		graphics.fillRect(0, 0, currentSize.width, currentSize.height);
-
-		// Draw the header background with adjusted transparency
-		graphics.setColor(new Color(30, 30, 30, (int) Math.round((opacity / 100.0) * DEFAULT_HEADER_ALPHA))); // Slightly darker semi-transparent background
-		graphics.fillRect(0, 0, currentSize.width, LINE_HEIGHT);
-
-		final Rectangle overlayBounds = this.getBounds();
-		final int avatarSize = showAvatars ? LINE_HEIGHT : 0;
-
-		// Position the settings icon in the header
-		if (settingsIcon != null)
-		{
-			int settingsIconX = currentSize.width - settingsIcon.getWidth() - 2; // 2px padding from the right
-			int settingsIconY = (LINE_HEIGHT - settingsIcon.getHeight()) / 2; // Vertically center the icon
-			graphics.drawImage(settingsIcon, settingsIconX, settingsIconY, null);
-
-			// Calculate global coordinates by adding overlay's top-left corner
-			int globalSettingsIconX = overlayBounds.x + settingsIconX;
-			int globalSettingsIconY = overlayBounds.y + settingsIconY;
-
-			Rectangle settingsIconBounds = new Rectangle(globalSettingsIconX, globalSettingsIconY, settingsIcon.getWidth(), settingsIcon.getHeight());
-
-			final Point mousePosition = client.getMouseCanvasPosition();
-
-			if (settingsIconBounds.contains(mousePosition.getX(), mousePosition.getY()))
-			{
-				tooltipManager.add(new Tooltip("Right click for Combat Logger overlay settings"));
-			}
-		}
-
-		int availableFightNameWidth = currentSize.width - (settingsIcon != null ? settingsIcon.getWidth() + 6 : 6); // Adjust if settings icon is present
-		String truncatedFightName = truncateText("Damage: " + fightName, metrics, availableFightNameWidth);
-
-		// Position the header text vertically centered
-		int headerTextY = (LINE_HEIGHT - metrics.getHeight()) / 2 + metrics.getAscent();
-
-		// Draw the header text
-		graphics.setColor(new Color(255, 255, 255, (int) Math.round((opacity / 100.0) * 255)));
-		graphics.drawString(truncatedFightName, 3, headerTextY + 1);
-
-		int yPosition = LINE_HEIGHT;
-		int maxRows = Math.min(((int) Math.floor((double) currentSize.height - LINE_HEIGHT) / LINE_HEIGHT), playerStats.size());
-		int maxDamage = playerStats.stream().mapToInt(PlayerStats::getDamage).max().orElse(1);
-
-		// Render each damage bar
-		for (var i = 0; i < maxRows; i++)
-		{
-			var stats = playerStats.get(i);
-			String playerName = stats.getName();
-			int damage = stats.getDamage();
-
-			if (damage == 0)
-			{
-				//skip players with 0 damage
-				continue;
-			}
-
-			double percentDamage = stats.getPercentDamage(); // Already handled to avoid NaN
-			CombatLoggerConfig.SecondaryMetric secondaryMetric = this.config.secondaryMetric();
-
-			// Calculate bar length proportionally
-			int availableBarWidth = showAvatars ? (currentSize.width - avatarSize) : currentSize.width;
-			int barLength = (int) ((double) damage / maxDamage * availableBarWidth);
-
-			BufferedImage avatarImage = null;
-			if (showAvatars)
-			{
-				avatarImage = avatarCache.get(playerName);
-				PartyMember partyMember = partyService.getMemberByDisplayName(playerName);
-
-				// Fetch and cache avatar
-				if (avatarImage == null)
-				{
-					if (partyMember != null && partyMember.getAvatar() != null)
-					{
-						avatarImage = ImageUtil.resizeImage(partyMember.getAvatar(), avatarSize, avatarSize);
-					}
-					else
-					{
-						avatarImage = ImageUtil.resizeImage(defaultAvatar, avatarSize, avatarSize);
-					}
-					avatarCache.put(playerName, avatarImage);
-				}
-			}
-
-
-			// Draw avatar or skip if avatars are hidden
-			int avatarX = 0;
-			int avatarY = yPosition; // Align avatar with the top of the bar
-
-			if (showAvatars && avatarImage != null)
-			{
-				graphics.drawImage(avatarImage, avatarX, avatarY, null);
-			}
-
-			// Adjust positions based on avatar visibility
-			int barX = showAvatars ? avatarSize : 0; // Bar starts after avatar if shown
-			int textX = showAvatars ? (barX + 5) : 5; // Text starts after avatar or with padding
-
-			// Draw bar line
-			graphics.setColor(new Color(70, 70, 70, (int) Math.round((opacity / 100.0) * DEFAULT_BACKGROUND_ALPHA)));
-			graphics.fillRect(barX, yPosition, availableBarWidth, LINE_HEIGHT);
-
-			// Get the player's color from FightManager
-			Color playerColor = fightManager.getPlayerColor(playerName);
-
-			// Draw Damage bar
-			Color semiTransparentPlayerColor = new Color(
-					playerColor.getRed(),
-					playerColor.getGreen(),
-					playerColor.getBlue(),
-					(int) Math.round((opacity / 100.0) * DEFAULT_BAR_ALPHA)
-			);
-			graphics.setColor(semiTransparentPlayerColor);
-			graphics.fillRect(barX, yPosition, barLength, LINE_HEIGHT);
-
-			// Metric
-			String secondaryText = "";
-			if (secondaryMetric == CombatLoggerConfig.SecondaryMetric.DPS)
-			{
-				secondaryText = String.format("(%.2f, %.1f%%)", stats.getDps(), percentDamage);
-			}
-			else if (secondaryMetric == CombatLoggerConfig.SecondaryMetric.TICKS)
-			{
-				secondaryText = String.format("(%d, %.1f%%)", stats.getTicks(), percentDamage);
-			}
-			int rowY = yPosition + ((LINE_HEIGHT - metrics.getHeight()) / 2) + metrics.getAscent();
-
-			// Damage text
-			graphics.setColor(new Color(255, 255, 255, (int) Math.round((opacity / 100.0) * 255)));
-			String damageText = String.format("%d %s", damage, secondaryText);
-			int damageTextXPosition = currentSize.width - metrics.stringWidth(damageText) - 2; // 2 pixels padding from the right edge
-			graphics.drawString(damageText, damageTextXPosition, rowY + 1);
-
-			int availableNameWidth = damageTextXPosition - textX - 5; // 5 pixels padding between name and damage
-			if (availableNameWidth > 0)
-			{
-				String truncatedNameText = truncateText(playerName, metrics, availableNameWidth);
-				graphics.drawString(truncatedNameText, textX, rowY + 1);
-			}
-
-			yPosition += LINE_HEIGHT;
-		}
-		return new Dimension(currentSize.width, currentSize.height);
-	}
-
-	private BufferedImage loadImage(String path)
-	{
-
-		return ImageUtil.loadImageResource(CombatLoggerPlugin.class, path);
-	}
-
-	/**
-	 * Truncates the given text and appends an ellipsis if it exceeds the maxWidth.
-	 *
-	 * @param text     The original text to potentially truncate.
-	 * @param fm       The FontMetrics object for measuring text width.
-	 * @param maxWidth The maximum allowed width for the text.
-	 * @return The original or truncated text with an ellipsis.
-	 */
-	private String truncateText(String text, FontMetrics fm, int maxWidth)
-	{
-		if (fm.stringWidth(text) <= maxWidth)
-		{
-			return text;
-		}
-
-		String ellipsis = "...";
-		int ellipsisWidth = fm.stringWidth(ellipsis);
-		int availableWidth = maxWidth - ellipsisWidth;
-
-		if (availableWidth <= 0)
-		{
-			return ellipsis;
-		}
-
-		int len = text.length();
-		while (len > 0 && fm.stringWidth(text.substring(0, len)) > availableWidth)
-		{
-			len--;
-		}
-
-		return text.substring(0, len) + ellipsis;
-	}
-
-	public void clearAvatarCache()
-	{
-		avatarCache.clear();
-	}
-
-	/**
-	 * Runelite redraws UI every frame, so a manual repaint isn't required.
-	 * This will clear caches to ensure player/avatar data is updated.
-	 */
-	public void updateOverlay()
-	{
-		clearAvatarCache();
-	}
-}
-package com.combatlogger.panel;
-
-import com.combatlogger.CombatLoggerConfig;
-import com.combatlogger.CombatLoggerPlugin;
-import com.combatlogger.FightManager;
-import com.combatlogger.model.PlayerStats;
-import net.runelite.client.util.ImageUtil;
-
-import javax.swing.*;
-import java.awt.*;
-import java.awt.image.BufferedImage;
 import java.util.List;
 
-public class DamageDrillDownPanel extends DamageBarsPanel
+public class CombatStats
 {
-	private final FightManager fightManager;
-	private final JLabel breakdownLabel = new JLabel();
-	private static final ImageIcon BACK_ICON;
-
-	static
+	public static List<Integer> getBaseStats(Client client)
 	{
-		final BufferedImage backIcon = ImageUtil.resizeImage(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/arrow_back.png"), 16, 16);
-		BACK_ICON = new ImageIcon(backIcon);
+		return List.of(
+				client.getRealSkillLevel(Skill.ATTACK),
+				client.getRealSkillLevel(Skill.STRENGTH),
+				client.getRealSkillLevel(Skill.DEFENCE),
+				client.getRealSkillLevel(Skill.RANGED),
+				client.getRealSkillLevel(Skill.MAGIC),
+				client.getRealSkillLevel(Skill.HITPOINTS),
+				client.getRealSkillLevel(Skill.PRAYER)
+		);
 	}
 
-
-	public DamageDrillDownPanel(CombatLoggerPanel parentPanel, CombatLoggerConfig config, FightManager fightManager)
+	public static List<Integer> getBoostedStats(Client client)
 	{
-		super(parentPanel, config, fightManager);
-		this.fightManager = fightManager;
-
-		JButton backButton = parentPanel.createButton(BACK_ICON, "Back to Overview", parentPanel::showOverviewPanel);
-		backButton.setPreferredSize(new Dimension(22, 25));
-		breakdownLabel.setHorizontalTextPosition(JLabel.LEFT);
-
-		topPanel.add(backButton);
-		topPanel.add(breakdownLabel);
-	}
-
-	public void setPlayerStats(String playerName, List<PlayerStats> damageBreakdown)
-	{
-		breakdownLabel.setText("Breakdown: " + playerName);
-		int totalDamage = damageBreakdown.stream().mapToInt(PlayerStats::getDamage).sum();
-
-		addDamageBars(damageBreakdown, totalDamage);
+		return List.of(
+				client.getBoostedSkillLevel(Skill.ATTACK),
+				client.getBoostedSkillLevel(Skill.STRENGTH),
+				client.getBoostedSkillLevel(Skill.DEFENCE),
+				client.getBoostedSkillLevel(Skill.RANGED),
+				client.getBoostedSkillLevel(Skill.MAGIC),
+				client.getBoostedSkillLevel(Skill.HITPOINTS),
+				client.getBoostedSkillLevel(Skill.PRAYER)
+		);
 	}
 }
 
-package com.combatlogger.panel;
+package com.combatlogger.util;
 
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.Graphics;
-import java.awt.GridBagConstraints;
-import java.awt.GridBagLayout;
-import java.awt.event.MouseListener;
-import javax.swing.*;
-import javax.swing.border.EmptyBorder;
-import javax.swing.border.LineBorder;
-
-import lombok.Getter;
-import net.runelite.client.ui.FontManager;
-import net.runelite.client.ui.components.shadowlabel.JShadowedLabel;
+import java.util.concurrent.LinkedBlockingDeque;
 
 /**
- * Based on ProgressBar from net.runelite.client.ui.components.ProgressBar
- * Except taller, bigger font, no center label, no dimming, no positions
+ * Double-ended queue (deque) with a fixed maximum capacity.
+ * When new elements are added to the queue that exceed its capacity, the oldest elements in the queue are automatically removed.
+ *
+ * @param <E>
  */
-
-public class DamageBar extends JPanel
+public class BoundedQueue<E> extends LinkedBlockingDeque<E>
 {
-	private int maximumValue;
-	private int value;
-
-	@Getter
-	private final JLabel leftLabel = new JShadowedLabel();
-	private final JLabel rightLabel = new JShadowedLabel();
-
-	public DamageBar()
+	public BoundedQueue(int capacity)
 	{
-		setLayout(new GridBagLayout());
-		GridBagConstraints gbc = new GridBagConstraints();
-
-		setBackground(new Color(61, 56, 49));
-		setForeground(new Color(139, 0, 0));
-
-		setPreferredSize(new Dimension(100, 25));
-
-		// The box layout will try to fit the parent container
-		// So we need to set the maximum height to prevent it from growing
-		setMaximumSize(new Dimension(1000, 25));
-
-		leftLabel.setFont(FontManager.getRunescapeFont());
-		leftLabel.setForeground(Color.WHITE);
-		leftLabel.setBorder(new EmptyBorder(2, 5, 0, 0));
-		gbc.gridx = 0;
-		gbc.gridy = 0;
-		gbc.weightx = 0.4;
-		gbc.fill = GridBagConstraints.HORIZONTAL;
-		add(leftLabel, gbc);
-
-		rightLabel.setFont(FontManager.getRunescapeFont());
-		rightLabel.setForeground(Color.WHITE);
-		rightLabel.setHorizontalAlignment(SwingConstants.RIGHT);
-		rightLabel.setBorder(new EmptyBorder(2, 0, 0, 5));
-		gbc.gridx = 2;
-		gbc.gridy = 0;
-		gbc.weightx = 0.4;
-		gbc.fill = GridBagConstraints.HORIZONTAL;
-		add(rightLabel, gbc);
-
-		setBorder(new LineBorder(new Color(20, 20, 20), 1));
+		super(capacity);
 	}
 
 	@Override
-	public void paint(Graphics g)
+	public boolean add(E e)
 	{
-		int percentage = getPercentage();
-		int topWidth = (int) (getSize().width * (percentage / 100f));
-
-		super.paint(g);
-		g.setColor(getForeground());
-		g.fillRect(0, 1, topWidth, 23); // 1px padding on top and bottom for border
-
-		super.paintComponents(g);
-	}
-
-	public void setLeftLabel(String txt)
-	{
-		leftLabel.setText(txt);
-	}
-
-	public void setRightLabel(String txt)
-	{
-		rightLabel.setText(txt);
-	}
-
-	public int getPercentage()
-	{
-		if (maximumValue == 0)
+		// Remove the oldest element if the queue is full
+		if (remainingCapacity() == 0)
 		{
-			return 0;
+			poll();
 		}
-
-		return (value * 100) / maximumValue;
-	}
-
-	public void setMaximumValue(int maximumValue)
-	{
-		this.maximumValue = maximumValue;
-		repaint();
-	}
-
-	public void setValue(int value)
-	{
-		this.value = value;
-		repaint();
-	}
-
-	public void addDrillDownMouseListener(MouseListener mouseListener)
-	{
-		this.addMouseListener(mouseListener);
-	}
-}
-
-package com.combatlogger.panel;
-
-import com.combatlogger.CombatLoggerConfig;
-import com.combatlogger.model.PlayerStats;
-import com.combatlogger.FightManager;
-
-import javax.swing.*;
-import javax.swing.border.LineBorder;
-import java.awt.*;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.util.List;
-
-public class DamageOverviewPanel extends DamageBarsPanel
-{
-	private final FightManager fightManager;
-
-	public DamageOverviewPanel(CombatLoggerPanel parentPanel, CombatLoggerConfig config, FightManager fightManager)
-	{
-		super(parentPanel, config, fightManager);
-		this.fightManager = fightManager;
-		topPanel.setLayout(new BorderLayout());
-		JLabel textLabel = new JLabel("Overview");
-		textLabel.setBorder(BorderFactory.createEmptyBorder(0, 5, 0, 0));
-		topPanel.add(textLabel);
-		topPanel.setVisible(false);
-	}
-
-	public void setPlayerStats(List<PlayerStats> playerStats)
-	{
-		// We use the highest player's damage instead of the sum, because the top player should have a full bar
-		int highestDamage = playerStats.isEmpty() ? 0 : playerStats.get(0).getDamage();
-
-		addDamageBars(playerStats, highestDamage);
-		for (DamageBar damageBar : damageBars)
-		{
-			attachDrillDownAction(damageBar, damageBar.getLeftLabel().getText());
-		}
-
-		topPanel.setVisible(!damageBars.isEmpty());
-	}
-
-	private void attachDrillDownAction(DamageBar damageBar, String playerName)
-	{
-		damageBar.addDrillDownMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mousePressed(MouseEvent e)
-			{
-				if (SwingUtilities.isLeftMouseButton(e))
-				{
-					parentPanel.showDrillDownPanel(parentPanel.getSelectedFight(), playerName);
-				}
-			}
-		});
-
-		damageBar.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseEntered(MouseEvent e)
-			{
-				damageBar.setBorder(new LineBorder(Color.WHITE, 1));
-			}
-
-			@Override
-			public void mouseExited(MouseEvent e)
-			{
-				damageBar.setBorder(new LineBorder(new Color(20, 20, 20), 1)); // Reset to default border
-			}
-		});
-	}
-}
-
-package com.combatlogger.panel;
-
-import com.combatlogger.CombatLoggerConfig;
-import com.combatlogger.FightManager;
-import com.combatlogger.model.PlayerStats;
-
-import javax.swing.*;
-import java.awt.*;
-import java.util.ArrayList;
-import java.util.List;
-
-public abstract class DamageBarsPanel extends JPanel
-{
-	private final FightManager fightManager;
-	private final CombatLoggerConfig config;
-	protected List<DamageBar> damageBars = new ArrayList<>();
-	protected CombatLoggerPanel parentPanel;
-
-	protected JPanel topPanel;
-
-
-	public DamageBarsPanel(CombatLoggerPanel parentPanel, CombatLoggerConfig config, FightManager fightManager)
-	{
-		this.parentPanel = parentPanel;
-		this.config = config;
-		this.fightManager = fightManager;
-
-		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-
-		topPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
-		topPanel.setPreferredSize(new Dimension(1000, 25));
-		topPanel.setMaximumSize(new Dimension(1000, 25));
-		add(topPanel);
-	}
-
-	protected DamageBar createDamageBar(PlayerStats stats, int maximumValue)
-	{
-		DamageBar damageBar = new DamageBar();
-		damageBar.setMaximumValue(maximumValue);
-		damageBar.setValue(stats.getDamage());
-		damageBar.setLeftLabel(stats.getName());
-
-		if (this.config.secondaryMetric() == CombatLoggerConfig.SecondaryMetric.DPS)
-		{
-			damageBar.setRightLabel(String.format("%d (%.2f, %.2f%%)", stats.getDamage(), stats.getDps(), stats.getPercentDamage()));
-		}
-		else
-		{
-			damageBar.setRightLabel(String.format("%d (%s, %.2f%%)", stats.getDamage(), stats.getTicks(), stats.getPercentDamage()));
-		}
-
-		// Assign color to the DamageBar
-		if (stats.getColor() == null)
-		{
-			stats.setColor(fightManager.getPlayerColor(stats.getName()));
-		}
-		damageBar.setForeground(stats.getColor());
-		return damageBar;
-	}
-
-	protected void addDamageBars(List<PlayerStats> damageBreakdown, int maximumValue)
-	{
-		damageBars.forEach(this::remove);
-		damageBars.clear();
-
-		for (PlayerStats stats : damageBreakdown)
-		{
-			if (stats.getDamage() > 0)
-			{
-				// Assign a color if not already set
-				if (stats.getColor() == null)
-				{
-					stats.setColor(fightManager.getPlayerColor(stats.getName()));
-				}
-
-				DamageBar newBar = createDamageBar(stats, maximumValue);
-				damageBars.add(newBar);
-				add(newBar);
-			}
-		}
-
-		revalidate();
-		repaint();
-	}
-}
-
-package com.combatlogger.panel;
-
-import com.combatlogger.CombatLoggerConfig;
-import com.combatlogger.CombatLoggerPlugin;
-import com.combatlogger.FightManager;
-import com.combatlogger.model.Fight;
-import com.combatlogger.model.PlayerStats;
-import com.combatlogger.util.BoundedQueue;
-import net.runelite.client.util.ImageUtil;
-import net.runelite.client.util.LinkBrowser;
-import net.runelite.client.util.SwingUtil;
-import lombok.Getter;
-import net.runelite.client.ui.PluginPanel;
-
-import javax.inject.Inject;
-import javax.swing.*;
-import javax.swing.border.EmptyBorder;
-import java.awt.*;
-import java.util.ArrayList;
-import java.util.List;
-
-import static com.combatlogger.CombatLoggerPlugin.DIRECTORY;
-
-public class CombatLoggerPanel extends PluginPanel
-{
-	private final FightManager fightManager;
-	private final CardLayout cardLayout;
-	private final JLabel currentFightLengthLabel = new JLabel("00:00");
-	private final JPanel damageMeterPanel;
-	private final DamageOverviewPanel damageOverviewPanel;
-	private final DamageDrillDownPanel drillDownPanel;
-
-	private final JComboBox<Fight> fightsComboBox = new JComboBox<>();
-
-	@Getter
-	private Fight selectedFight = null;
-
-	private static final ImageIcon FOLDER_ICON;
-	private static final ImageIcon STOP_ICON;
-	private static final ImageIcon CLOSE_ICON;
-
-	static
-	{
-		FOLDER_ICON = new ImageIcon(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/folder.png"));
-		STOP_ICON = new ImageIcon(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/stop.png"));
-		CLOSE_ICON = new ImageIcon(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/close.png"));
-	}
-
-	@Inject
-	public CombatLoggerPanel(CombatLoggerConfig config, FightManager fightManager)
-	{
-		this.fightManager = fightManager;
-
-		final JPanel topPanel = new JPanel();
-		topPanel.setLayout(new BorderLayout());
-		topPanel.setBorder(new EmptyBorder(0, 0, 20, 0));
-		topPanel.add(new JLabel("Combat Logger"), BorderLayout.WEST);
-		topPanel.add(createButton(FOLDER_ICON, "Open combat log folder", () -> LinkBrowser.open(DIRECTORY.toString())), BorderLayout.EAST);
-		add(topPanel, BorderLayout.NORTH);
-
-		final JPanel damageMeterTextPanel = new JPanel(new BorderLayout());
-		damageMeterTextPanel.setBorder(new EmptyBorder(0, 0, 10, 0));
-		damageMeterTextPanel.add(new JLabel("Damage Meter"), BorderLayout.WEST);
-		damageMeterTextPanel.add(currentFightLengthLabel, BorderLayout.EAST);
-		add(damageMeterTextPanel, BorderLayout.NORTH);
-
-		cardLayout = new CardLayout();
-		damageMeterPanel = new JPanel(cardLayout);
-
-		updateFightsComboBox(fightManager.getFights());
-
-		JButton clearFightsButton = createButton(CLOSE_ICON, "Clear all fights", () ->
-		{
-			if (isConfirmed("Are you sure you want to clear all fights?", "Clear all fights"))
-			{
-				fightManager.clearFights();
-				updateFightsComboBox(fightManager.getFights());
-				updateOverviewPanel(new ArrayList<>());
-				showOverviewPanel();
-			}
-		});
-		JButton stopFightButton = createButton(STOP_ICON, "End the current fight", () ->
-		{
-			if (isConfirmed("Are you sure you want to end the current fight?", "End fight"))
-			{
-				fightManager.endCurrentFight();
-			}
-		});
-		JPanel fightsPanel = new JPanel(new BorderLayout());
-		fightsPanel.add(fightsComboBox, BorderLayout.CENTER);
-
-		JPanel buttonPanel = new JPanel(new BorderLayout());
-		buttonPanel.add(stopFightButton, BorderLayout.WEST);
-		buttonPanel.add(clearFightsButton, BorderLayout.EAST);
-		fightsPanel.add(buttonPanel, BorderLayout.EAST);
-
-		add(fightsPanel, BorderLayout.NORTH);
-
-		fightsComboBox.setRenderer(new PlaceholderComboBoxRenderer("Start a fight..."));
-		fightsComboBox.addActionListener(e -> {
-			selectedFight = (Fight) fightsComboBox.getSelectedItem();
-			fightManager.setSelectedFight(selectedFight);
-			if (selectedFight != null)
-			{
-				List<PlayerStats> playerStats = fightManager.getPlayerDamageForFight(selectedFight);
-				updateOverviewPanel(playerStats);
-			}
-		});
-
-		damageOverviewPanel = new DamageOverviewPanel(this, config, fightManager);
-		drillDownPanel = new DamageDrillDownPanel(this, config, fightManager);
-
-		damageMeterPanel.add(damageOverviewPanel, "overview");
-		damageMeterPanel.add(drillDownPanel, "drilldown");
-
-		showOverviewPanel();
-		add(damageMeterPanel);
-	}
-
-	public void showOverviewPanel()
-	{
-		cardLayout.show(damageMeterPanel, "overview");
-	}
-
-	public void showDrillDownPanel(Fight fight, String playerName)
-	{
-		List<PlayerStats> playerTotalDamage = fightManager.getBreakdownDamage(fight, playerName);
-
-		drillDownPanel.setPlayerStats(playerName, playerTotalDamage);
-		cardLayout.show(damageMeterPanel, "drilldown");
-	}
-
-	public void updateOverviewPanel(List<PlayerStats> playerStats)
-	{
-		damageOverviewPanel.setPlayerStats(playerStats);
-	}
-
-	public void updateCurrentFightLength(String fightLength)
-	{
-		currentFightLengthLabel.setText(fightLength);
-	}
-
-	public void updateFightsComboBox(BoundedQueue<Fight> fights)
-	{
-		List<Fight> updatedFights = new ArrayList<>();
-		// Reverse order so the newest fights are first
-		fights.descendingIterator().forEachRemaining(updatedFights::add);
-
-		List<Fight> existingFights = new ArrayList<>();
-		for (int i = 0; i < fightsComboBox.getItemCount(); i++)
-		{
-			existingFights.add(fightsComboBox.getItemAt(i));
-		}
-
-		if (!existingFights.equals(updatedFights))
-		{
-			fightsComboBox.removeAllItems();
-			updatedFights.forEach(fightsComboBox::addItem);
-		}
-
-		// Set the selected item in the combo box
-		Fight selectedFight = fightManager.getSelectedFight();
-		if (selectedFight != null)
-		{
-			fightsComboBox.setSelectedItem(selectedFight);
-		}
-	}
-
-	public JButton createButton(ImageIcon icon, String toolTipText, Runnable onClick)
-	{
-		JButton button = new JButton(icon);
-		button.setPreferredSize(new Dimension(24, 24));
-		SwingUtil.removeButtonDecorations(button);
-		button.setToolTipText(toolTipText);
-		button.addActionListener(e -> onClick.run());
-
-		return button;
-	}
-
-	private boolean isConfirmed(final String message, final String title)
-	{
-		int confirm = JOptionPane.showConfirmDialog(this,
-				message, title, JOptionPane.OK_CANCEL_OPTION);
-
-		return confirm == JOptionPane.YES_OPTION;
-	}
-
-	/**
-	 * Update the panel with the latest data
-	 */
-	public void updatePanel()
-	{
-		selectedFight = fightManager.getSelectedFight();
-		if (selectedFight != null)
-		{
-			List<PlayerStats> playerStats = fightManager.getPlayerDamageForFight(selectedFight);
-			updateOverviewPanel(playerStats);
-			updateCurrentFightLength(Fight.formatTime(selectedFight.getFightLengthTicks()));
-		}
-		else
-		{
-			updateCurrentFightLength("00:00");
-		}
-
-		updateFightsComboBox(fightManager.getFights());
-	}
-}
-
-class PlaceholderComboBoxRenderer extends DefaultListCellRenderer
-{
-	private final String placeholder;
-
-	public PlaceholderComboBoxRenderer(String placeholder)
-	{
-		this.placeholder = placeholder;
+		return super.add(e);
 	}
 
 	@Override
-	public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus)
+	public boolean offer(E e)
 	{
-		if (list.getModel().getSize() == 0)
+		// Remove the oldest element if the queue is full
+		if (remainingCapacity() == 0)
 		{
-			value = placeholder;
+			poll();
 		}
-		return super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+		return super.offer(e);
 	}
-}
-
-package com.combatlogger.model;
-
-import lombok.Getter;
-import lombok.Setter;
-import net.runelite.api.coords.WorldPoint;
-
-import java.util.List;
-
-@Getter
-@Setter
-public class TrackedPartyMember
-{
-	private WorldPoint worldPoint;
-	private boolean usingCombatLoggerPlugin = false;
-	private List<Integer> previousEquipment;
-	private int previousOverheadPrayerId = -2; // -2 represents unknown
-}
-
-package com.combatlogger.model;
-
-import lombok.Getter;
-import lombok.Setter;
-
-import java.time.Duration;
-import java.util.HashMap;
-import java.util.concurrent.ConcurrentHashMap;
-
-@Getter
-@Setter
-public class Fight
-{
-	private String fightName;
-
-	private String mainTarget; // <id>-<index>
-
-	private ConcurrentHashMap<String, PlayerData> playerDataMap = new ConcurrentHashMap<>();
-
-	private int fightLengthTicks = 0;
-
-	private int lastActivityTick = 0;
-
-	private boolean isOver = false;
-
-	@Override
-	public String toString()
-	{
-		if (this.isOver)
-		{
-			return fightName + " - " + formatTime(fightLengthTicks);
-		}
-		else
-		{
-			return fightName;
-		}
-	}
-
-	public static String formatTime(int ticks)
-	{
-		long totalMilliseconds = ticks * 600L;
-		Duration duration = Duration.ofMillis(totalMilliseconds);
-		long minutes = duration.toMinutes();
-		long seconds = (duration.getSeconds() % 60);
-		long tenths = (totalMilliseconds / 100) % 10;
-
-		// Format as MM:SS.s
-		return String.format("%02d:%02d.%d", minutes, seconds, tenths);
-	}
-
-	public static class PlayerData
-	{
-		private final String name;
-
-		@Getter
-		private ConcurrentHashMap<String, PlayerTargetData> targetDataMap = new ConcurrentHashMap<>(); // key=target
-
-		public PlayerData(String name)
-		{
-			this.name = name;
-		}
-
-		public void addDamage(String target, int damage)
-		{
-			targetDataMap.computeIfAbsent(target, k -> new PlayerTargetData(0, 0))
-					.setDamage(targetDataMap.get(target).getDamage() + damage);
-		}
-
-		public void addActivityTicks(String target, int ticks)
-		{
-			targetDataMap.computeIfAbsent(target, k -> new PlayerTargetData(0, 0))
-					.setActivityTicks(targetDataMap.get(target).getActivityTicks() + ticks);
-		}
-
-		@Getter
-		@Setter
-		public static class PlayerTargetData
-		{
-			private int damage;
-			private int activityTicks;
-
-			public PlayerTargetData(int damage, int activityTicks)
-			{
-				this.damage = damage;
-				this.activityTicks = activityTicks;
-			}
-		}
-	}
-}
-
-package com.combatlogger.model;
-
-import lombok.Getter;
-import lombok.Setter;
-
-import java.awt.Color;
-
-@Getter
-@Setter
-public class PlayerStats
-{
-	private String name;
-	private int damage;
-	private double dps;
-	private int ticks;
-	private double percentDamage;
-	private Color color;
-
-	public PlayerStats(String name, int damage, int ticks)
-	{
-		this.name = name;
-		this.damage = damage;
-		this.ticks = ticks;
-		this.color = null;
-	}
-}
-
-package com.combatlogger.model.logs;
-
-import lombok.Getter;
-
-@Getter
-public class AttackAnimationLog extends Log
-{
-	private final String source;
-	private final String target; // <id>-<index> or <playerName>
-	private final String targetName;
-	private final int animationId;
-	private final int weaponId;
-
-	public AttackAnimationLog(int tickCount, String timestamp, String message, String source, String target, String targetName, int animationId, int weaponId)
-	{
-		super(tickCount, timestamp, message);
-		this.source = source;
-		this.target = target;
-		this.targetName = targetName;
-		this.animationId = animationId;
-		this.weaponId = weaponId;
-	}
-}
-
-package com.combatlogger.model.logs;
-
-import lombok.Getter;
-
-@Getter
-public class GameMessageLog extends Log
-{
-	public GameMessageLog(int tickCount, String timestamp, String message)
-	{
-		super(tickCount, timestamp, message);
-	}
-}
-
-package com.combatlogger.model.logs;
-
-import lombok.Getter;
-
-@Getter
-public class TargetChangeLog extends Log
-{
-	private final String source; // <id>-<index> or <playerName>
-	private final String sourceName;
-
-	private final String target; // <id>-<index> or <playerName>
-
-
-	public TargetChangeLog(int tickCount, String timestamp, String message, String source, String sourceName, String target)
-	{
-		super(tickCount, timestamp, message);
-		this.source = source;
-		this.sourceName = sourceName;
-		this.target = target;
-	}
-}
-
-package com.combatlogger.model.logs;
-
-import lombok.Getter;
-
-@Getter
-public class DeathLog extends Log
-{
-	private final String target; // <id>-<index> or <playerName>
-
-	public DeathLog(int tickCount, String timestamp, String message, String target)
-	{
-		super(tickCount, timestamp, message);
-		this.target = target;
-	}
-}
-
-package com.combatlogger.model.logs;
-
-import lombok.Getter;
-import lombok.Setter;
-
-@Getter
-public class DamageLog extends Log
-{
-	@Setter
-	private String source;
-
-	private final String target; // <id>-<index> or <playerName>
-
-	private final String targetName;
-
-	@Setter
-	private String hitsplatName;
-
-	private final int damageAmount;
-
-	public DamageLog(int tickCount, String timestamp, String message, String source, String target, String targetName, int damageAmount, String hitsplatName)
-	{
-		super(tickCount, timestamp, message);
-		this.damageAmount = damageAmount;
-		this.source = source;
-		this.target = target;
-		this.targetName = targetName;
-		this.hitsplatName = hitsplatName;
-	}
-}
-
-package com.combatlogger.model.logs;
-
-import lombok.Getter;
-import lombok.Setter;
-
-@Getter
-public class Log
-{
-	private final int tickCount;
-
-	private final String timestamp;
-
-	@Setter
-	private String message;
-
-	public Log(int tickCount, String timestamp, String message)
-	{
-		this.tickCount = tickCount;
-		this.timestamp = timestamp;
-		this.message = message;
-	}
-}
-
-package com.combatlogger.model;
-
-import lombok.Getter;
-import lombok.Setter;
-import net.runelite.api.coords.WorldPoint;
-
-@Getter
-@Setter
-public class TrackedNpc
-{
-	private int id;
-	private int index;
-	private WorldPoint worldPoint;
 }
 
 package com.combatlogger;
@@ -4601,3 +3347,1466 @@ public class FightManager
 	}
 }
 
+package com.combatlogger.model.logs;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+public class Log
+{
+	private final int tickCount;
+
+	private final String timestamp;
+
+	@Setter
+	private String message;
+
+	public Log(int tickCount, String timestamp, String message)
+	{
+		this.tickCount = tickCount;
+		this.timestamp = timestamp;
+		this.message = message;
+	}
+}
+
+package com.combatlogger.model.logs;
+
+import lombok.Getter;
+import lombok.Setter;
+
+@Getter
+public class DamageLog extends Log
+{
+	@Setter
+	private String source;
+
+	private final String target; // <id>-<index> or <playerName>
+
+	private final String targetName;
+
+	@Setter
+	private String hitsplatName;
+
+	private final int damageAmount;
+
+	public DamageLog(int tickCount, String timestamp, String message, String source, String target, String targetName, int damageAmount, String hitsplatName)
+	{
+		super(tickCount, timestamp, message);
+		this.damageAmount = damageAmount;
+		this.source = source;
+		this.target = target;
+		this.targetName = targetName;
+		this.hitsplatName = hitsplatName;
+	}
+}
+
+package com.combatlogger.model.logs;
+
+import lombok.Getter;
+
+@Getter
+public class TargetChangeLog extends Log
+{
+	private final String source; // <id>-<index> or <playerName>
+	private final String sourceName;
+
+	private final String target; // <id>-<index> or <playerName>
+
+
+	public TargetChangeLog(int tickCount, String timestamp, String message, String source, String sourceName, String target)
+	{
+		super(tickCount, timestamp, message);
+		this.source = source;
+		this.sourceName = sourceName;
+		this.target = target;
+	}
+}
+
+package com.combatlogger.model.logs;
+
+import lombok.Getter;
+
+@Getter
+public class DeathLog extends Log
+{
+	private final String target; // <id>-<index> or <playerName>
+
+	public DeathLog(int tickCount, String timestamp, String message, String target)
+	{
+		super(tickCount, timestamp, message);
+		this.target = target;
+	}
+}
+
+package com.combatlogger.model.logs;
+
+import lombok.Getter;
+
+@Getter
+public class AttackAnimationLog extends Log
+{
+	private final String source;
+	private final String target; // <id>-<index> or <playerName>
+	private final String targetName;
+	private final int animationId;
+	private final int weaponId;
+
+	public AttackAnimationLog(int tickCount, String timestamp, String message, String source, String target, String targetName, int animationId, int weaponId)
+	{
+		super(tickCount, timestamp, message);
+		this.source = source;
+		this.target = target;
+		this.targetName = targetName;
+		this.animationId = animationId;
+		this.weaponId = weaponId;
+	}
+}
+
+package com.combatlogger.model.logs;
+
+import lombok.Getter;
+
+@Getter
+public class GameMessageLog extends Log
+{
+	public GameMessageLog(int tickCount, String timestamp, String message)
+	{
+		super(tickCount, timestamp, message);
+	}
+}
+
+package com.combatlogger.model;
+
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.coords.WorldPoint;
+
+@Getter
+@Setter
+public class TrackedGraphicObject
+{
+	private int id;
+	private WorldPoint worldPoint;
+}
+
+package com.combatlogger.model;
+
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.coords.WorldPoint;
+
+import java.util.List;
+
+@Getter
+@Setter
+public class TrackedPartyMember
+{
+	private WorldPoint worldPoint;
+	private boolean usingCombatLoggerPlugin = false;
+	private List<Integer> previousEquipment;
+	private int previousOverheadPrayerId = -2; // -2 represents unknown
+}
+
+package com.combatlogger.model;
+
+import lombok.Getter;
+import lombok.Setter;
+
+import java.awt.Color;
+
+@Getter
+@Setter
+public class PlayerStats
+{
+	private String name;
+	private int damage;
+	private double dps;
+	private int ticks;
+	private double percentDamage;
+	private Color color;
+
+	public PlayerStats(String name, int damage, int ticks)
+	{
+		this.name = name;
+		this.damage = damage;
+		this.ticks = ticks;
+		this.color = null;
+	}
+}
+
+package com.combatlogger.model;
+
+import lombok.Getter;
+import lombok.Setter;
+
+import java.time.Duration;
+import java.util.HashMap;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Getter
+@Setter
+public class Fight
+{
+	private String fightName;
+
+	private String mainTarget; // <id>-<index>
+
+	private ConcurrentHashMap<String, PlayerData> playerDataMap = new ConcurrentHashMap<>();
+
+	private int fightLengthTicks = 0;
+
+	private int lastActivityTick = 0;
+
+	private boolean isOver = false;
+
+	@Override
+	public String toString()
+	{
+		if (this.isOver)
+		{
+			return fightName + " - " + formatTime(fightLengthTicks);
+		}
+		else
+		{
+			return fightName;
+		}
+	}
+
+	public static String formatTime(int ticks)
+	{
+		long totalMilliseconds = ticks * 600L;
+		Duration duration = Duration.ofMillis(totalMilliseconds);
+		long minutes = duration.toMinutes();
+		long seconds = (duration.getSeconds() % 60);
+		long tenths = (totalMilliseconds / 100) % 10;
+
+		// Format as MM:SS.s
+		return String.format("%02d:%02d.%d", minutes, seconds, tenths);
+	}
+
+	public static class PlayerData
+	{
+		private final String name;
+
+		@Getter
+		private ConcurrentHashMap<String, PlayerTargetData> targetDataMap = new ConcurrentHashMap<>(); // key=target
+
+		public PlayerData(String name)
+		{
+			this.name = name;
+		}
+
+		public void addDamage(String target, int damage)
+		{
+			targetDataMap.computeIfAbsent(target, k -> new PlayerTargetData(0, 0))
+					.setDamage(targetDataMap.get(target).getDamage() + damage);
+		}
+
+		public void addActivityTicks(String target, int ticks)
+		{
+			targetDataMap.computeIfAbsent(target, k -> new PlayerTargetData(0, 0))
+					.setActivityTicks(targetDataMap.get(target).getActivityTicks() + ticks);
+		}
+
+		@Getter
+		@Setter
+		public static class PlayerTargetData
+		{
+			private int damage;
+			private int activityTicks;
+
+			public PlayerTargetData(int damage, int activityTicks)
+			{
+				this.damage = damage;
+				this.activityTicks = activityTicks;
+			}
+		}
+	}
+}
+
+package com.combatlogger.model;
+
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.coords.WorldPoint;
+
+@Getter
+@Setter
+public class TrackedNpc
+{
+	private int id;
+	private int index;
+	private WorldPoint worldPoint;
+}
+
+package com.combatlogger.messages;
+
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+import java.util.List;
+
+@Value
+@EqualsAndHashCode(callSuper = true)
+public class BoostedCombatStatsMessage extends PartyMemberMessage
+{
+	List<Integer> stats;
+}
+
+package com.combatlogger.messages;
+
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+import java.util.List;
+
+@Value
+@EqualsAndHashCode(callSuper = true)
+public class PrayerMessage extends PartyMemberMessage
+{
+	List<Integer> prayerIds;
+}
+
+package com.combatlogger.messages;
+
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+@Value
+@EqualsAndHashCode(callSuper = true)
+public class DamageMessage extends PartyMemberMessage
+{
+	String target; // <id>-<index> or <playerName>
+	String targetName;
+	String hitsplatName;
+	int damage;
+}
+
+package com.combatlogger.messages;
+
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+import java.util.List;
+
+@Value
+@EqualsAndHashCode(callSuper = true)
+public class EquipmentMessage extends PartyMemberMessage
+{
+	List<Integer> itemIds;
+}
+
+package com.combatlogger.messages;
+
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+import java.util.List;
+
+@Value
+@EqualsAndHashCode(callSuper = true)
+public class BaseCombatStatsMessage extends PartyMemberMessage
+{
+	List<Integer> stats;
+}
+
+package com.combatlogger;
+
+import com.combatlogger.messages.DamageMessage;
+import com.combatlogger.model.logs.*;
+import com.combatlogger.util.HitSplatUtil;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.party.PartyMember;
+import net.runelite.client.party.PartyService;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.BufferedWriter;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import static com.combatlogger.CombatLoggerPlugin.LOG_FILE;
+import static com.combatlogger.CombatLoggerPlugin.getCurrentTimestamp;
+
+@Singleton
+public class LogQueueManager
+{
+	private final Client client;
+	private final Queue<Log> logQueue = new ConcurrentLinkedQueue<>();
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
+	@Inject
+	private CombatLoggerConfig config;
+
+	@Inject
+	private PartyService party;
+
+	@Inject
+	private FightManager fightManager;
+
+	@Inject
+	private LogQueueManager(Client client)
+	{
+		this.client = client;
+	}
+
+	public void startUp(EventBus eventBus)
+	{
+		eventBus.register(this);
+	}
+
+	public void shutDown(EventBus eventBus)
+	{
+		eventBus.unregister(this);
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		int currentTick = client.getTickCount();
+
+		// Wait until 2 ticks have passed before writing to the log file
+		// So that we can enrich the data from other players in the Party with DamageMessage
+		while (!logQueue.isEmpty() && currentTick >= logQueue.peek().getTickCount() + 2)
+		{
+			Log log = logQueue.poll();
+			log(log.getTickCount(), log.getTimestamp(), log.getMessage());
+
+			if (log instanceof DamageLog && isNPC(((DamageLog) log).getTarget()))
+			{
+				fightManager.addDamage((DamageLog) log);
+			}
+			else if (log instanceof DeathLog && isNPC(((DeathLog) log).getTarget()))
+			{
+				fightManager.recordDeath((DeathLog) log);
+			}
+			else if (log instanceof TargetChangeLog && isNPC(((TargetChangeLog) log).getSource()) && !isNPC(((TargetChangeLog) log).getTarget()))
+			{
+				fightManager.recordNPCTargetingPlayer((TargetChangeLog) log);
+			}
+			else if (log instanceof GameMessageLog)
+			{
+				fightManager.handleGameMessage((GameMessageLog) log);
+			}
+			else if (log instanceof AttackAnimationLog)
+			{
+				fightManager.addTicks((AttackAnimationLog) log);
+			}
+		}
+
+		// No need to call panel.onGameTick(event); as FightManager handles game ticks.
+	}
+
+	private void log(int tickCount, String timestamp, String message)
+	{
+		try (BufferedWriter writer = new BufferedWriter(new FileWriter(LOG_FILE, true)))
+		{
+			writer.write(String.format("%s %s\t%s\n", tickCount, timestamp, message));
+			if (config.logInChat())
+			{
+				chatMessageManager
+						.queue(QueuedMessage.builder()
+								.type(ChatMessageType.GAMEMESSAGE)
+								.sender("combat-logger")
+								.runeLiteFormattedMessage(message.replace("\t", " "))
+								.build());
+			}
+		}
+		catch (IOException e)
+		{
+			e.printStackTrace();
+		}
+	}
+
+	@Subscribe
+	protected void onDamageMessage(DamageMessage event)
+	{
+		PartyMember localMember = party.getLocalMember();
+
+		if (localMember == null || localMember.getMemberId() == event.getMemberId())
+		{
+			// Don't need to update logs from ourselves
+			return;
+		}
+
+		PartyMember eventMember = party.getMemberById(event.getMemberId());
+		String newHitsplatName = HitSplatUtil.replaceMeWithNewOther(event.getHitsplatName());
+
+		// Find a matching damage log in the queue and then add the source of the damage and rename the hitsplat appropriately
+		boolean matchFound = false;
+		for (Log log : logQueue)
+		{
+			if (log instanceof DamageLog)
+			{
+				DamageLog damageLog = (DamageLog) log;
+				if (damageLog.getSource().equals("Unknown")
+						&& event.getDamage() == damageLog.getDamageAmount()
+						&& event.getTarget().equals(damageLog.getTarget())
+						&& HitSplatUtil.replaceMeWithExistingOther(event.getHitsplatName()).equals(damageLog.getHitsplatName()))
+				{
+					// Match found, update the existing damage log
+					damageLog.setHitsplatName(newHitsplatName);
+					damageLog.setSource(eventMember.getDisplayName());
+					damageLog.setMessage(String.format("%s\t%s\t%s\t%d", eventMember.getDisplayName(), newHitsplatName, event.getTarget(), event.getDamage()));
+					matchFound = true;
+					break;
+				}
+			}
+		}
+
+		// If no match is found, add a new damage log to the queue
+		if (!matchFound)
+		{
+			queue(
+					new DamageLog(
+							client.getTickCount(),
+							getCurrentTimestamp(),
+							String.format("%s\t%s\t%s\t%d", eventMember.getDisplayName(), newHitsplatName, event.getTarget(), event.getDamage()),
+							eventMember.getDisplayName(),
+							event.getTarget(),
+							event.getTargetName(),
+							event.getDamage(),
+							newHitsplatName)
+			);
+		}
+	}
+
+	public void queue(Log log)
+	{
+		logQueue.add(log);
+	}
+
+	public void queue(String message)
+	{
+		logQueue.add(
+				new Log(
+						client.getTickCount(),
+						getCurrentTimestamp(),
+						message
+				));
+	}
+
+	public static boolean isNPC(String name)
+	{
+		return name.matches("\\d+-\\d+");
+	}
+}
+
+package com.combatlogger.overlay;
+
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
+import javax.inject.Inject;
+
+import com.combatlogger.FightManager;
+import com.combatlogger.CombatLoggerConfig;
+import com.combatlogger.CombatLoggerPlugin;
+import com.combatlogger.model.Fight;
+import com.combatlogger.model.PlayerStats;
+import lombok.Setter;
+import net.runelite.client.plugins.party.PartyPluginService;
+import net.runelite.client.ui.overlay.*;
+import net.runelite.client.ui.overlay.components.ComponentConstants;
+import net.runelite.api.*;
+import net.runelite.api.Point;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.party.PartyMember;
+import net.runelite.client.ui.overlay.tooltip.Tooltip;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
+import net.runelite.client.util.ImageUtil;
+
+public class DamageOverlay extends OverlayPanel
+{
+	private final CombatLoggerPlugin combatLoggerPlugin;
+	private final PartyService partyService;
+	private final CombatLoggerConfig config;
+	private final Client client;
+	private final TooltipManager tooltipManager;
+	private final FightManager fightManager;
+
+	private final BufferedImage defaultAvatar;
+	private final BufferedImage settingsIcon;
+	private final Map<String, BufferedImage> avatarCache = new ConcurrentHashMap<>();
+	private Fight cachedFight = null;
+	private int cachedFightLength = -1;
+	private List<PlayerStats> playerStatCache;
+
+	@Setter
+	private int opacity;
+
+	static final String IMAGE_DEFAULT_AVATAR_PATH = "/default_avatar.png";
+	static final String IMAGE_SETTINGS_PATH = "/settings.png";
+	static final int LINE_HEIGHT = 16;
+	static final Dimension MIN_SIZE = new Dimension((int) Math.floor((double) ComponentConstants.STANDARD_WIDTH / 2), LINE_HEIGHT * 2); //header + 1 row
+	static final Dimension DEFAULT_SIZE = new Dimension((int) Math.floor(ComponentConstants.STANDARD_WIDTH * 1.5), LINE_HEIGHT * 4); //header + 3 rows
+	static final int DEFAULT_BACKGROUND_ALPHA = 120;
+	static final int DEFAULT_HEADER_ALPHA = 200;
+	static final int DEFAULT_BAR_ALPHA = 255;
+
+	@Inject
+	public DamageOverlay(
+			CombatLoggerPlugin plugin,
+			Client client,
+			CombatLoggerConfig config,
+			PartyService partyService,
+			TooltipManager tooltipManager,
+			PartyPluginService partyPluginService,
+			FightManager fightManager
+	)
+	{
+		super(plugin);
+
+		setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
+		setPriority(PRIORITY_HIGHEST);
+		setPreferredSize(DEFAULT_SIZE);
+
+		this.combatLoggerPlugin = plugin;
+		this.config = config;
+		this.partyService = partyService;
+		this.tooltipManager = tooltipManager;
+		this.client = client;
+		this.fightManager = fightManager;
+		this.opacity = config.overlayOpacity();
+
+		defaultAvatar = loadImage(IMAGE_DEFAULT_AVATAR_PATH);
+		settingsIcon = loadImage(IMAGE_SETTINGS_PATH);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (!config.enableOverlay() || !combatLoggerPlugin.getOverlayVisible())
+		{
+			return null;
+		}
+
+		Fight selectedFight = fightManager.getSelectedFight();
+		if (selectedFight == null)
+		{
+			// No fight is selected; reset cache and prevent rendering
+			cachedFight = null;
+			cachedFightLength = -1;
+			return null;
+		}
+
+		List<PlayerStats> playerStats;
+		if (selectedFight.equals(cachedFight) && selectedFight.getFightLengthTicks() == cachedFightLength)
+		{
+			playerStats = playerStatCache;
+		}
+		else
+		{
+			playerStats = playerStatCache = fightManager.getPlayerDamageForFight(selectedFight);
+			cachedFight = selectedFight;
+			cachedFightLength = selectedFight.getFightLengthTicks();
+		}
+
+		if (playerStats.isEmpty())
+		{
+			return null;
+		}
+
+		String fightName = selectedFight.getFightName() + " (" + Fight.formatTime(selectedFight.getFightLengthTicks()) + ")";
+		boolean showAvatars = config.showOverlayAvatar();
+		int overlayAlpha = (int) Math.round((opacity / 100.0) * 255);
+
+		Dimension currentSize = this.getBounds().getSize();
+
+		if (currentSize.height == 0 && currentSize.width == 0)
+		{
+			currentSize = DEFAULT_SIZE;
+		}
+
+		//ensure min height/width are enforced
+		currentSize.width = Math.max(currentSize.width, MIN_SIZE.width);
+		currentSize.height = Math.max(currentSize.height, MIN_SIZE.height);
+
+		graphics.setFont(FontManager.getRunescapeSmallFont());
+		FontMetrics metrics = graphics.getFontMetrics();
+
+		// Draw the background for the entire overlay with adjusted transparency
+		graphics.setColor(new Color(50, 50, 50, (int) Math.round((opacity / 100.0) * DEFAULT_BACKGROUND_ALPHA))); // Semi-transparent gray background
+		graphics.fillRect(0, 0, currentSize.width, currentSize.height);
+
+		// Draw the header background with adjusted transparency
+		graphics.setColor(new Color(30, 30, 30, (int) Math.round((opacity / 100.0) * DEFAULT_HEADER_ALPHA))); // Slightly darker semi-transparent background
+		graphics.fillRect(0, 0, currentSize.width, LINE_HEIGHT);
+
+		final Rectangle overlayBounds = this.getBounds();
+		final int avatarSize = showAvatars ? LINE_HEIGHT : 0;
+
+		// Position the settings icon in the header
+		if (settingsIcon != null)
+		{
+			int settingsIconX = currentSize.width - settingsIcon.getWidth() - 2; // 2px padding from the right
+			int settingsIconY = (LINE_HEIGHT - settingsIcon.getHeight()) / 2; // Vertically center the icon
+			graphics.drawImage(settingsIcon, settingsIconX, settingsIconY, null);
+
+			// Calculate global coordinates by adding overlay's top-left corner
+			int globalSettingsIconX = overlayBounds.x + settingsIconX;
+			int globalSettingsIconY = overlayBounds.y + settingsIconY;
+
+			Rectangle settingsIconBounds = new Rectangle(globalSettingsIconX, globalSettingsIconY, settingsIcon.getWidth(), settingsIcon.getHeight());
+
+			final Point mousePosition = client.getMouseCanvasPosition();
+
+			if (settingsIconBounds.contains(mousePosition.getX(), mousePosition.getY()))
+			{
+				tooltipManager.add(new Tooltip("Right click for Combat Logger overlay settings"));
+			}
+		}
+
+		int availableFightNameWidth = currentSize.width - (settingsIcon != null ? settingsIcon.getWidth() + 6 : 6); // Adjust if settings icon is present
+		String truncatedFightName = truncateText("Damage: " + fightName, metrics, availableFightNameWidth);
+
+		// Position the header text vertically centered
+		int headerTextY = (LINE_HEIGHT - metrics.getHeight()) / 2 + metrics.getAscent();
+
+		// Draw the header text
+		graphics.setColor(new Color(255, 255, 255, (int) Math.round((opacity / 100.0) * 255)));
+		graphics.drawString(truncatedFightName, 3, headerTextY + 1);
+
+		int yPosition = LINE_HEIGHT;
+		int maxRows = Math.min(((int) Math.floor((double) currentSize.height - LINE_HEIGHT) / LINE_HEIGHT), playerStats.size());
+		int maxDamage = playerStats.stream().mapToInt(PlayerStats::getDamage).max().orElse(1);
+
+		// Render each damage bar
+		for (var i = 0; i < maxRows; i++)
+		{
+			var stats = playerStats.get(i);
+			String playerName = stats.getName();
+			int damage = stats.getDamage();
+
+			if (damage == 0)
+			{
+				//skip players with 0 damage
+				continue;
+			}
+
+			double percentDamage = stats.getPercentDamage(); // Already handled to avoid NaN
+			CombatLoggerConfig.SecondaryMetric secondaryMetric = this.config.secondaryMetric();
+
+			// Calculate bar length proportionally
+			int availableBarWidth = showAvatars ? (currentSize.width - avatarSize) : currentSize.width;
+			int barLength = (int) ((double) damage / maxDamage * availableBarWidth);
+
+			BufferedImage avatarImage = null;
+			if (showAvatars)
+			{
+				avatarImage = avatarCache.get(playerName);
+				PartyMember partyMember = partyService.getMemberByDisplayName(playerName);
+
+				// Fetch and cache avatar
+				if (avatarImage == null)
+				{
+					if (partyMember != null && partyMember.getAvatar() != null)
+					{
+						avatarImage = ImageUtil.resizeImage(partyMember.getAvatar(), avatarSize, avatarSize);
+					}
+					else
+					{
+						avatarImage = ImageUtil.resizeImage(defaultAvatar, avatarSize, avatarSize);
+					}
+					avatarCache.put(playerName, avatarImage);
+				}
+			}
+
+
+			// Draw avatar or skip if avatars are hidden
+			int avatarX = 0;
+			int avatarY = yPosition; // Align avatar with the top of the bar
+
+			if (showAvatars && avatarImage != null)
+			{
+				graphics.drawImage(avatarImage, avatarX, avatarY, null);
+			}
+
+			// Adjust positions based on avatar visibility
+			int barX = showAvatars ? avatarSize : 0; // Bar starts after avatar if shown
+			int textX = showAvatars ? (barX + 5) : 5; // Text starts after avatar or with padding
+
+			// Draw bar line
+			graphics.setColor(new Color(70, 70, 70, (int) Math.round((opacity / 100.0) * DEFAULT_BACKGROUND_ALPHA)));
+			graphics.fillRect(barX, yPosition, availableBarWidth, LINE_HEIGHT);
+
+			// Get the player's color from FightManager
+			Color playerColor = fightManager.getPlayerColor(playerName);
+
+			// Draw Damage bar
+			Color semiTransparentPlayerColor = new Color(
+					playerColor.getRed(),
+					playerColor.getGreen(),
+					playerColor.getBlue(),
+					(int) Math.round((opacity / 100.0) * DEFAULT_BAR_ALPHA)
+			);
+			graphics.setColor(semiTransparentPlayerColor);
+			graphics.fillRect(barX, yPosition, barLength, LINE_HEIGHT);
+
+			// Metric
+			String secondaryText = "";
+			if (secondaryMetric == CombatLoggerConfig.SecondaryMetric.DPS)
+			{
+				secondaryText = String.format("(%.2f, %.1f%%)", stats.getDps(), percentDamage);
+			}
+			else if (secondaryMetric == CombatLoggerConfig.SecondaryMetric.TICKS)
+			{
+				secondaryText = String.format("(%d, %.1f%%)", stats.getTicks(), percentDamage);
+			}
+			int rowY = yPosition + ((LINE_HEIGHT - metrics.getHeight()) / 2) + metrics.getAscent();
+
+			// Damage text
+			graphics.setColor(new Color(255, 255, 255, (int) Math.round((opacity / 100.0) * 255)));
+			String damageText = String.format("%d %s", damage, secondaryText);
+			int damageTextXPosition = currentSize.width - metrics.stringWidth(damageText) - 2; // 2 pixels padding from the right edge
+			graphics.drawString(damageText, damageTextXPosition, rowY + 1);
+
+			int availableNameWidth = damageTextXPosition - textX - 5; // 5 pixels padding between name and damage
+			if (availableNameWidth > 0)
+			{
+				String truncatedNameText = truncateText(playerName, metrics, availableNameWidth);
+				graphics.drawString(truncatedNameText, textX, rowY + 1);
+			}
+
+			yPosition += LINE_HEIGHT;
+		}
+		return new Dimension(currentSize.width, currentSize.height);
+	}
+
+	private BufferedImage loadImage(String path)
+	{
+
+		return ImageUtil.loadImageResource(CombatLoggerPlugin.class, path);
+	}
+
+	/**
+	 * Truncates the given text and appends an ellipsis if it exceeds the maxWidth.
+	 *
+	 * @param text     The original text to potentially truncate.
+	 * @param fm       The FontMetrics object for measuring text width.
+	 * @param maxWidth The maximum allowed width for the text.
+	 * @return The original or truncated text with an ellipsis.
+	 */
+	private String truncateText(String text, FontMetrics fm, int maxWidth)
+	{
+		if (fm.stringWidth(text) <= maxWidth)
+		{
+			return text;
+		}
+
+		String ellipsis = "...";
+		int ellipsisWidth = fm.stringWidth(ellipsis);
+		int availableWidth = maxWidth - ellipsisWidth;
+
+		if (availableWidth <= 0)
+		{
+			return ellipsis;
+		}
+
+		int len = text.length();
+		while (len > 0 && fm.stringWidth(text.substring(0, len)) > availableWidth)
+		{
+			len--;
+		}
+
+		return text.substring(0, len) + ellipsis;
+	}
+
+	public void clearAvatarCache()
+	{
+		avatarCache.clear();
+	}
+
+	/**
+	 * Runelite redraws UI every frame, so a manual repaint isn't required.
+	 * This will clear caches to ensure player/avatar data is updated.
+	 */
+	public void updateOverlay()
+	{
+		clearAvatarCache();
+	}
+}
+package com.combatlogger.panel;
+
+import com.combatlogger.CombatLoggerConfig;
+import com.combatlogger.FightManager;
+import com.combatlogger.model.PlayerStats;
+
+import javax.swing.*;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public abstract class DamageBarsPanel extends JPanel
+{
+	private final FightManager fightManager;
+	private final CombatLoggerConfig config;
+	protected List<DamageBar> damageBars = new ArrayList<>();
+	protected CombatLoggerPanel parentPanel;
+
+	protected JPanel topPanel;
+
+
+	public DamageBarsPanel(CombatLoggerPanel parentPanel, CombatLoggerConfig config, FightManager fightManager)
+	{
+		this.parentPanel = parentPanel;
+		this.config = config;
+		this.fightManager = fightManager;
+
+		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+
+		topPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 2, 0));
+		topPanel.setPreferredSize(new Dimension(1000, 25));
+		topPanel.setMaximumSize(new Dimension(1000, 25));
+		add(topPanel);
+	}
+
+	protected DamageBar createDamageBar(PlayerStats stats, int maximumValue)
+	{
+		DamageBar damageBar = new DamageBar();
+		damageBar.setMaximumValue(maximumValue);
+		damageBar.setValue(stats.getDamage());
+		damageBar.setLeftLabel(stats.getName());
+
+		if (this.config.secondaryMetric() == CombatLoggerConfig.SecondaryMetric.DPS)
+		{
+			damageBar.setRightLabel(String.format("%d (%.2f, %.2f%%)", stats.getDamage(), stats.getDps(), stats.getPercentDamage()));
+		}
+		else
+		{
+			damageBar.setRightLabel(String.format("%d (%s, %.2f%%)", stats.getDamage(), stats.getTicks(), stats.getPercentDamage()));
+		}
+
+		// Assign color to the DamageBar
+		if (stats.getColor() == null)
+		{
+			stats.setColor(fightManager.getPlayerColor(stats.getName()));
+		}
+		damageBar.setForeground(stats.getColor());
+		return damageBar;
+	}
+
+	protected void addDamageBars(List<PlayerStats> damageBreakdown, int maximumValue)
+	{
+		damageBars.forEach(this::remove);
+		damageBars.clear();
+
+		for (PlayerStats stats : damageBreakdown)
+		{
+			if (stats.getDamage() > 0)
+			{
+				// Assign a color if not already set
+				if (stats.getColor() == null)
+				{
+					stats.setColor(fightManager.getPlayerColor(stats.getName()));
+				}
+
+				DamageBar newBar = createDamageBar(stats, maximumValue);
+				damageBars.add(newBar);
+				add(newBar);
+			}
+		}
+
+		revalidate();
+		repaint();
+	}
+}
+
+package com.combatlogger.panel;
+
+import com.combatlogger.CombatLoggerConfig;
+import com.combatlogger.CombatLoggerPlugin;
+import com.combatlogger.FightManager;
+import com.combatlogger.model.PlayerStats;
+import net.runelite.client.util.ImageUtil;
+
+import javax.swing.*;
+import java.awt.*;
+import java.awt.image.BufferedImage;
+import java.util.List;
+
+public class DamageDrillDownPanel extends DamageBarsPanel
+{
+	private final FightManager fightManager;
+	private final JLabel breakdownLabel = new JLabel();
+	private static final ImageIcon BACK_ICON;
+
+	static
+	{
+		final BufferedImage backIcon = ImageUtil.resizeImage(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/arrow_back.png"), 16, 16);
+		BACK_ICON = new ImageIcon(backIcon);
+	}
+
+
+	public DamageDrillDownPanel(CombatLoggerPanel parentPanel, CombatLoggerConfig config, FightManager fightManager)
+	{
+		super(parentPanel, config, fightManager);
+		this.fightManager = fightManager;
+
+		JButton backButton = parentPanel.createButton(BACK_ICON, "Back to Overview", parentPanel::showOverviewPanel);
+		backButton.setPreferredSize(new Dimension(22, 25));
+		breakdownLabel.setHorizontalTextPosition(JLabel.LEFT);
+
+		topPanel.add(backButton);
+		topPanel.add(breakdownLabel);
+	}
+
+	public void setPlayerStats(String playerName, List<PlayerStats> damageBreakdown)
+	{
+		breakdownLabel.setText("Breakdown: " + playerName);
+		int totalDamage = damageBreakdown.stream().mapToInt(PlayerStats::getDamage).sum();
+
+		addDamageBars(damageBreakdown, totalDamage);
+	}
+}
+
+package com.combatlogger.panel;
+
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics;
+import java.awt.GridBagConstraints;
+import java.awt.GridBagLayout;
+import java.awt.event.MouseListener;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.border.LineBorder;
+
+import lombok.Getter;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.components.shadowlabel.JShadowedLabel;
+
+/**
+ * Based on ProgressBar from net.runelite.client.ui.components.ProgressBar
+ * Except taller, bigger font, no center label, no dimming, no positions
+ */
+
+public class DamageBar extends JPanel
+{
+	private int maximumValue;
+	private int value;
+
+	@Getter
+	private final JLabel leftLabel = new JShadowedLabel();
+	private final JLabel rightLabel = new JShadowedLabel();
+
+	public DamageBar()
+	{
+		setLayout(new GridBagLayout());
+		GridBagConstraints gbc = new GridBagConstraints();
+
+		setBackground(new Color(61, 56, 49));
+		setForeground(new Color(139, 0, 0));
+
+		setPreferredSize(new Dimension(100, 25));
+
+		// The box layout will try to fit the parent container
+		// So we need to set the maximum height to prevent it from growing
+		setMaximumSize(new Dimension(1000, 25));
+
+		leftLabel.setFont(FontManager.getRunescapeFont());
+		leftLabel.setForeground(Color.WHITE);
+		leftLabel.setBorder(new EmptyBorder(2, 5, 0, 0));
+		gbc.gridx = 0;
+		gbc.gridy = 0;
+		gbc.weightx = 0.4;
+		gbc.fill = GridBagConstraints.HORIZONTAL;
+		add(leftLabel, gbc);
+
+		rightLabel.setFont(FontManager.getRunescapeFont());
+		rightLabel.setForeground(Color.WHITE);
+		rightLabel.setHorizontalAlignment(SwingConstants.RIGHT);
+		rightLabel.setBorder(new EmptyBorder(2, 0, 0, 5));
+		gbc.gridx = 2;
+		gbc.gridy = 0;
+		gbc.weightx = 0.4;
+		gbc.fill = GridBagConstraints.HORIZONTAL;
+		add(rightLabel, gbc);
+
+		setBorder(new LineBorder(new Color(20, 20, 20), 1));
+	}
+
+	@Override
+	public void paint(Graphics g)
+	{
+		int percentage = getPercentage();
+		int topWidth = (int) (getSize().width * (percentage / 100f));
+
+		super.paint(g);
+		g.setColor(getForeground());
+		g.fillRect(0, 1, topWidth, 23); // 1px padding on top and bottom for border
+
+		super.paintComponents(g);
+	}
+
+	public void setLeftLabel(String txt)
+	{
+		leftLabel.setText(txt);
+	}
+
+	public void setRightLabel(String txt)
+	{
+		rightLabel.setText(txt);
+	}
+
+	public int getPercentage()
+	{
+		if (maximumValue == 0)
+		{
+			return 0;
+		}
+
+		return (value * 100) / maximumValue;
+	}
+
+	public void setMaximumValue(int maximumValue)
+	{
+		this.maximumValue = maximumValue;
+		repaint();
+	}
+
+	public void setValue(int value)
+	{
+		this.value = value;
+		repaint();
+	}
+
+	public void addDrillDownMouseListener(MouseListener mouseListener)
+	{
+		this.addMouseListener(mouseListener);
+	}
+}
+
+package com.combatlogger.panel;
+
+import com.combatlogger.CombatLoggerConfig;
+import com.combatlogger.model.PlayerStats;
+import com.combatlogger.FightManager;
+
+import javax.swing.*;
+import javax.swing.border.LineBorder;
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.List;
+
+public class DamageOverviewPanel extends DamageBarsPanel
+{
+	private final FightManager fightManager;
+
+	public DamageOverviewPanel(CombatLoggerPanel parentPanel, CombatLoggerConfig config, FightManager fightManager)
+	{
+		super(parentPanel, config, fightManager);
+		this.fightManager = fightManager;
+		topPanel.setLayout(new BorderLayout());
+		JLabel textLabel = new JLabel("Overview");
+		textLabel.setBorder(BorderFactory.createEmptyBorder(0, 5, 0, 0));
+		topPanel.add(textLabel);
+		topPanel.setVisible(false);
+	}
+
+	public void setPlayerStats(List<PlayerStats> playerStats)
+	{
+		// We use the highest player's damage instead of the sum, because the top player should have a full bar
+		int highestDamage = playerStats.isEmpty() ? 0 : playerStats.get(0).getDamage();
+
+		addDamageBars(playerStats, highestDamage);
+		for (DamageBar damageBar : damageBars)
+		{
+			attachDrillDownAction(damageBar, damageBar.getLeftLabel().getText());
+		}
+
+		topPanel.setVisible(!damageBars.isEmpty());
+	}
+
+	private void attachDrillDownAction(DamageBar damageBar, String playerName)
+	{
+		damageBar.addDrillDownMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mousePressed(MouseEvent e)
+			{
+				if (SwingUtilities.isLeftMouseButton(e))
+				{
+					parentPanel.showDrillDownPanel(parentPanel.getSelectedFight(), playerName);
+				}
+			}
+		});
+
+		damageBar.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseEntered(MouseEvent e)
+			{
+				damageBar.setBorder(new LineBorder(Color.WHITE, 1));
+			}
+
+			@Override
+			public void mouseExited(MouseEvent e)
+			{
+				damageBar.setBorder(new LineBorder(new Color(20, 20, 20), 1)); // Reset to default border
+			}
+		});
+	}
+}
+
+package com.combatlogger.panel;
+
+import com.combatlogger.CombatLoggerConfig;
+import com.combatlogger.CombatLoggerPlugin;
+import com.combatlogger.FightManager;
+import com.combatlogger.model.Fight;
+import com.combatlogger.model.PlayerStats;
+import com.combatlogger.util.BoundedQueue;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.LinkBrowser;
+import net.runelite.client.util.SwingUtil;
+import lombok.Getter;
+import net.runelite.client.ui.PluginPanel;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+
+import static com.combatlogger.CombatLoggerPlugin.DIRECTORY;
+
+public class CombatLoggerPanel extends PluginPanel
+{
+	private final FightManager fightManager;
+	private final CardLayout cardLayout;
+	private final JLabel currentFightLengthLabel = new JLabel("00:00");
+	private final JPanel damageMeterPanel;
+	private final DamageOverviewPanel damageOverviewPanel;
+	private final DamageDrillDownPanel drillDownPanel;
+
+	private final JComboBox<Fight> fightsComboBox = new JComboBox<>();
+
+	@Getter
+	private Fight selectedFight = null;
+
+	private static final ImageIcon FOLDER_ICON;
+	private static final ImageIcon STOP_ICON;
+	private static final ImageIcon CLOSE_ICON;
+
+	static
+	{
+		FOLDER_ICON = new ImageIcon(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/folder.png"));
+		STOP_ICON = new ImageIcon(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/stop.png"));
+		CLOSE_ICON = new ImageIcon(ImageUtil.loadImageResource(CombatLoggerPlugin.class, "/close.png"));
+	}
+
+	@Inject
+	public CombatLoggerPanel(CombatLoggerConfig config, FightManager fightManager)
+	{
+		this.fightManager = fightManager;
+
+		final JPanel topPanel = new JPanel();
+		topPanel.setLayout(new BorderLayout());
+		topPanel.setBorder(new EmptyBorder(0, 0, 20, 0));
+		topPanel.add(new JLabel("Combat Logger"), BorderLayout.WEST);
+		topPanel.add(createButton(FOLDER_ICON, "Open combat log folder", () -> LinkBrowser.open(DIRECTORY.toString())), BorderLayout.EAST);
+		add(topPanel, BorderLayout.NORTH);
+
+		final JPanel damageMeterTextPanel = new JPanel(new BorderLayout());
+		damageMeterTextPanel.setBorder(new EmptyBorder(0, 0, 10, 0));
+		damageMeterTextPanel.add(new JLabel("Damage Meter"), BorderLayout.WEST);
+		damageMeterTextPanel.add(currentFightLengthLabel, BorderLayout.EAST);
+		add(damageMeterTextPanel, BorderLayout.NORTH);
+
+		cardLayout = new CardLayout();
+		damageMeterPanel = new JPanel(cardLayout);
+
+		updateFightsComboBox(fightManager.getFights());
+
+		JButton clearFightsButton = createButton(CLOSE_ICON, "Clear all fights", () ->
+		{
+			if (isConfirmed("Are you sure you want to clear all fights?", "Clear all fights"))
+			{
+				fightManager.clearFights();
+				updateFightsComboBox(fightManager.getFights());
+				updateOverviewPanel(new ArrayList<>());
+				showOverviewPanel();
+			}
+		});
+		JButton stopFightButton = createButton(STOP_ICON, "End the current fight", () ->
+		{
+			if (isConfirmed("Are you sure you want to end the current fight?", "End fight"))
+			{
+				fightManager.endCurrentFight();
+			}
+		});
+		JPanel fightsPanel = new JPanel(new BorderLayout());
+		fightsPanel.add(fightsComboBox, BorderLayout.CENTER);
+
+		JPanel buttonPanel = new JPanel(new BorderLayout());
+		buttonPanel.add(stopFightButton, BorderLayout.WEST);
+		buttonPanel.add(clearFightsButton, BorderLayout.EAST);
+		fightsPanel.add(buttonPanel, BorderLayout.EAST);
+
+		add(fightsPanel, BorderLayout.NORTH);
+
+		fightsComboBox.setRenderer(new PlaceholderComboBoxRenderer("Start a fight..."));
+		fightsComboBox.addActionListener(e -> {
+			selectedFight = (Fight) fightsComboBox.getSelectedItem();
+			fightManager.setSelectedFight(selectedFight);
+			if (selectedFight != null)
+			{
+				List<PlayerStats> playerStats = fightManager.getPlayerDamageForFight(selectedFight);
+				updateOverviewPanel(playerStats);
+			}
+		});
+
+		damageOverviewPanel = new DamageOverviewPanel(this, config, fightManager);
+		drillDownPanel = new DamageDrillDownPanel(this, config, fightManager);
+
+		damageMeterPanel.add(damageOverviewPanel, "overview");
+		damageMeterPanel.add(drillDownPanel, "drilldown");
+
+		showOverviewPanel();
+		add(damageMeterPanel);
+	}
+
+	public void showOverviewPanel()
+	{
+		cardLayout.show(damageMeterPanel, "overview");
+	}
+
+	public void showDrillDownPanel(Fight fight, String playerName)
+	{
+		List<PlayerStats> playerTotalDamage = fightManager.getBreakdownDamage(fight, playerName);
+
+		drillDownPanel.setPlayerStats(playerName, playerTotalDamage);
+		cardLayout.show(damageMeterPanel, "drilldown");
+	}
+
+	public void updateOverviewPanel(List<PlayerStats> playerStats)
+	{
+		damageOverviewPanel.setPlayerStats(playerStats);
+	}
+
+	public void updateCurrentFightLength(String fightLength)
+	{
+		currentFightLengthLabel.setText(fightLength);
+	}
+
+	public void updateFightsComboBox(BoundedQueue<Fight> fights)
+	{
+		List<Fight> updatedFights = new ArrayList<>();
+		// Reverse order so the newest fights are first
+		fights.descendingIterator().forEachRemaining(updatedFights::add);
+
+		List<Fight> existingFights = new ArrayList<>();
+		for (int i = 0; i < fightsComboBox.getItemCount(); i++)
+		{
+			existingFights.add(fightsComboBox.getItemAt(i));
+		}
+
+		if (!existingFights.equals(updatedFights))
+		{
+			fightsComboBox.removeAllItems();
+			updatedFights.forEach(fightsComboBox::addItem);
+		}
+
+		// Set the selected item in the combo box
+		Fight selectedFight = fightManager.getSelectedFight();
+		if (selectedFight != null)
+		{
+			fightsComboBox.setSelectedItem(selectedFight);
+		}
+	}
+
+	public JButton createButton(ImageIcon icon, String toolTipText, Runnable onClick)
+	{
+		JButton button = new JButton(icon);
+		button.setPreferredSize(new Dimension(24, 24));
+		SwingUtil.removeButtonDecorations(button);
+		button.setToolTipText(toolTipText);
+		button.addActionListener(e -> onClick.run());
+
+		return button;
+	}
+
+	private boolean isConfirmed(final String message, final String title)
+	{
+		int confirm = JOptionPane.showConfirmDialog(this,
+				message, title, JOptionPane.OK_CANCEL_OPTION);
+
+		return confirm == JOptionPane.YES_OPTION;
+	}
+
+	/**
+	 * Update the panel with the latest data
+	 */
+	public void updatePanel()
+	{
+		selectedFight = fightManager.getSelectedFight();
+		if (selectedFight != null)
+		{
+			List<PlayerStats> playerStats = fightManager.getPlayerDamageForFight(selectedFight);
+			updateOverviewPanel(playerStats);
+			updateCurrentFightLength(Fight.formatTime(selectedFight.getFightLengthTicks()));
+		}
+		else
+		{
+			updateCurrentFightLength("00:00");
+		}
+
+		updateFightsComboBox(fightManager.getFights());
+	}
+}
+
+class PlaceholderComboBoxRenderer extends DefaultListCellRenderer
+{
+	private final String placeholder;
+
+	public PlaceholderComboBoxRenderer(String placeholder)
+	{
+		this.placeholder = placeholder;
+	}
+
+	@Override
+	public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus)
+	{
+		if (list.getModel().getSize() == 0)
+		{
+			value = placeholder;
+		}
+		return super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+	}
+}
+
+package com.combatlogger;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class CombatLoggerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(CombatLoggerPlugin.class);
+		RuneLite.main(args);
+	}
+}
