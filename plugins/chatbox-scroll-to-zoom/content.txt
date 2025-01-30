@@ -85,7 +85,7 @@ public class ChatboxScrollToZoomPlugin extends Plugin {
 		// the correct arguments for this script were identified via inspection of
 		// the arguments of the ScriptEvent that is triggered when scrolling in
 		// the chatbox normally
-		client.runScript(36, 10617389, 10616888, scriptEvent.getMouseY());
+		client.runScript(36, 10617390, 10616889, scriptEvent.getMouseY());
 	}
 
 	private void runZoomScript(ScriptEvent scriptEvent) {
