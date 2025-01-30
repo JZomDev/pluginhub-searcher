@@ -1039,7 +1039,9 @@ public class GameUiChangesHandler {
         {
             OfferEditor flippingWidget = new OfferEditor(offerManager, client.getWidget(ComponentID.CHATBOX_CONTAINER), offerHandler, client);
             Suggestion suggestion = suggestionManager.getSuggestion();
-            flippingWidget.showSuggestion(suggestion);
+            if (suggestion != null) {
+                flippingWidget.showSuggestion(suggestion);
+            }
         });
     }
 
@@ -1664,13 +1666,10 @@ public class GrandExchangeCollectHandler {
 package com.flippingcopilot.controller;
 import com.flippingcopilot.model.*;
 import com.flippingcopilot.ui.GpDropOverlay;
-import com.google.common.hash.Hasher;
-import com.google.common.hash.Hashing;
 
-import java.net.NetworkInterface;
-import java.net.SocketException;
 import java.time.Instant;
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedQueue;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 
@@ -1680,11 +1679,8 @@ import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
-import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GrandExchangeOfferChanged;
 import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.util.OSType;
-import net.runelite.http.api.worlds.WorldType;
 
 import static com.flippingcopilot.model.OsrsLoginManager.GE_LOGIN_BURST_WINDOW;
 
@@ -1705,7 +1701,7 @@ public class GrandExchangeOfferEventHandler {
     private final SuggestionManager suggestionManager;
 
     // state
-    private final List<Transaction> transactionsToProcess = new ArrayList<>();
+    private final Queue<Transaction> transactionsToProcess = new ConcurrentLinkedQueue<>();
 
     public void onGameTick() {
         if(!transactionsToProcess.isEmpty()) {
@@ -1752,7 +1748,7 @@ public class GrandExchangeOfferEventHandler {
             suggestionManager.setSuggestionNeeded(true);
             log.debug("inferred transaction {}", t);
         }
-        updatedUncollected(accountHash, slot, o, prev, consistent);
+        updateUncollected(accountHash, slot, o, prev, consistent);
         offerPersistence.saveOffer(accountHash, slot, o);
     }
 
@@ -1768,7 +1764,7 @@ public class GrandExchangeOfferEventHandler {
         }
     }
 
-    private void updatedUncollected(Long accountHash, int slot, SavedOffer o, SavedOffer prev, boolean consistent) {
+    private void updateUncollected(Long accountHash, int slot, SavedOffer o, SavedOffer prev, boolean consistent) {
         if(!consistent) {
             return;
         }
@@ -1803,13 +1799,13 @@ public class GrandExchangeOfferEventHandler {
     private void processTransactions() {
         String displayName = osrsLoginManager.getPlayerDisplayName();
         if(displayName != null) {
-            for (Transaction transaction: transactionsToProcess) {
+            Transaction transaction;
+            while ((transaction = transactionsToProcess.poll()) != null) {
                 long profit = transactionManager.addTransaction(transaction, displayName);
                 if (grandExchange.isHomeScreenOpen() && profit != 0) {
                     new GpDropOverlay(overlayManager, client, profit, transaction.getBoxId());
                 }
             }
-            transactionsToProcess.clear();
         }
     }
 
@@ -1928,6 +1924,9 @@ public class SuggestionController {
     }
 
     void onGameTick() {
+        if(suggestionManager.isSuggestionRequestInProgress()) {
+            return;
+        }
         // There is a race condition when the collect button is hit at the same time as offers fill.
         // In such a case we can end up with the uncollectedManager falsely thinking there is items to collect.
         // We identify if this has happened here by checking if the collect button is actually visible.
@@ -2127,7 +2126,6 @@ package com.flippingcopilot.controller;
 import com.flippingcopilot.model.*;
 import com.google.gson.*;
 import com.google.gson.reflect.TypeToken;
-import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -2228,6 +2226,45 @@ public class ApiRequestHandler {
         });
     }
 
+    public void sendTransactionsAsync(List<Transaction> transactions, String displayName, Consumer<List<FlipV2>> onSuccess, Consumer<HttpResponseException> onFailure) {
+        log.debug("sending {} transactions for display name {}", transactions.size(), displayName);
+        JsonArray body = new JsonArray();
+        for (Transaction transaction : transactions) {
+            body.add(transaction.toJsonObject());
+        }
+        String encodedDisplayName = URLEncoder.encode(displayName, StandardCharsets.UTF_8);
+        Request request = new Request.Builder()
+                .url(serverUrl + "/profit-tracking/client-transactions?display_name=" + encodedDisplayName)
+                .addHeader("Authorization", "Bearer " + loginResponseManager.getJwtToken())
+                .post(RequestBody.create(MediaType.get("application/json; charset=utf-8"), body.toString()))
+                .build();
+
+        client.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                log.warn("call to sync transactions failed", e);
+                onFailure.accept(new HttpResponseException(-1, "Unknown Error"));
+            }
+            @Override
+            public void onResponse(Call call, Response response) {
+                try {
+                    if (!response.isSuccessful()) {
+                        String errorMessage = extractErrorMessage(response);
+                        log.warn("call to sync transactions failed status code {}, error message {}", response.code(), errorMessage);
+                        onFailure.accept(new HttpResponseException(response.code(), errorMessage));
+                        return;
+                    }
+                    String body = response.body() == null ? "" : response.body().string();
+                    List<FlipV2> changedFlips = gson.fromJson(body, new TypeToken<List<FlipV2>>(){}.getType());
+                    onSuccess.accept(changedFlips);
+                } catch (IOException | JsonParseException e) {
+                    log.warn("error reading/parsing sync transactions response body", e);
+                    onFailure.accept(new HttpResponseException(-1, "Unknown Error"));
+                }
+            }
+        });
+    }
+
     private String extractErrorMessage(Response response) {
         if (response.body() != null) {
             try {
@@ -2255,16 +2292,6 @@ public class ApiRequestHandler {
             log.error("error fetching copilot price for item {}, resp code {}", itemId, e.getResponseCode(), e);
             return new ItemPrice(0, 0, "Unable to fetch price copilot price (possible server update)");
         }
-    }
-
-    public List<FlipV2> SendTransactions(List<Transaction> transactions, String displayName) throws HttpResponseException {
-        JsonArray body = new JsonArray();
-        for (Transaction transaction : transactions) {
-            body.add(transaction.toJsonObject());
-        }
-        String encodedDisplayName = URLEncoder.encode(displayName, StandardCharsets.UTF_8);
-        Type respType = new TypeToken<List<FlipV2>>(){}.getType();
-        return doHttpRequest("POST", body, "/profit-tracking/client-transactions?display_name=" + encodedDisplayName, respType);
     }
 
     public Map<String, Integer> loadUserDisplayNames() throws HttpResponseException {
@@ -2437,8 +2464,12 @@ import okhttp3.OkHttpClient;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Consumer;
 
 @Slf4j
 @Singleton
@@ -2451,58 +2482,58 @@ public class TransactionManger {
     private final ApiRequestHandler api;
     private final LoginResponseManager loginResponseManager;
     private final OsrsLoginManager osrsLoginManager;
-    private final OkHttpClient okHttpClient;
 
     // state
-    private final Map<String, List<Transaction>> cachedUnAckedTransactions = new HashMap<>();
-    private final Map<String, Boolean> transactionSyncScheduled = new HashMap<>();
+    private final ConcurrentMap<String, List<Transaction>> cachedUnAckedTransactions = new ConcurrentHashMap<>();
+    private final ConcurrentMap<String, AtomicBoolean> transactionSyncScheduled = new ConcurrentHashMap<>();
 
     public void syncUnAckedTransactions(String displayName) {
-        List<Transaction> unAckedTransactions = getUnAckedTransactions(displayName);
+
+        long s = System.nanoTime();
+        List<Transaction> toSend;
         synchronized (this) {
-            if(unAckedTransactions.isEmpty()) {
-                transactionSyncScheduled.put(displayName, false);
+            toSend = new ArrayList<>(getUnAckedTransactions(displayName));
+            if(toSend.isEmpty()) {
+                transactionSyncScheduled.get(displayName).set(false);
                 return;
             }
         }
-        // ScheduledExecutorService only has one thread, we don't really want to block it. Need to
-        // refactor the API call to be async style but until then just run in okHttpClient's executor
-        okHttpClient.dispatcher().executorService().submit(() -> {
-            try {
-                long s = System.nanoTime();
-                List<Transaction> toSend = new ArrayList<>(getUnAckedTransactions(displayName));
-                log.debug("sending {} transactions to server", toSend.size());
-                List<FlipV2> flips = api.SendTransactions(toSend, displayName);
-                for (FlipV2 f : flips) {
-                    log.debug("server updated flip for {} closed qty {}, profit {}", f.getItemName(), f.getClosedQuantity(), f.getProfit());
-                }
-                flipManager.mergeFlips(flips, displayName);
-                log.info("sending {} transactions took {}ms", toSend.size(), (System.nanoTime() - s) / 1000_000);
-                synchronized (this) {
-                    transactionSyncScheduled.put(displayName, false);
-                    toSend.forEach(unAckedTransactions::remove);
-                    if(!unAckedTransactions.isEmpty()) {
-                        scheduleSyncIn(0, displayName);
-                    }
-                }
-            } catch (Exception e) {
-                synchronized (this) {
-                    transactionSyncScheduled.put(displayName, false);
-                }
-                String currentDisplayName = osrsLoginManager.getPlayerDisplayName();
-                if (loginResponseManager.isLoggedIn() && (currentDisplayName == null || currentDisplayName.equals(displayName))) {
-                    log.warn("failed to send transactions to copilot server {}", e.getMessage(), e);
-                    scheduleSyncIn(10, displayName);
+
+        Consumer<List<FlipV2>> onSuccess = (flips) -> {
+            for (FlipV2 f : flips) {
+                log.debug("server updated flip for {} closed qty {}, profit {}", f.getItemName(), f.getClosedQuantity(), f.getProfit());
+            }
+            flipManager.mergeFlips(flips, displayName);
+            log.info("sending {} transactions took {}ms", toSend.size(), (System.nanoTime() - s) / 1000_000);
+            synchronized (this) {
+                List<Transaction> unAckedTransactions  = getUnAckedTransactions(displayName);
+                transactionSyncScheduled.get(displayName).set(false);
+                toSend.forEach(unAckedTransactions::remove);
+                if(!unAckedTransactions.isEmpty()) {
+                    scheduleSyncIn(0, displayName);
                 }
             }
-        });
+        };
+
+        Consumer<HttpResponseException> onFailure = (e) -> {
+            synchronized (this) {
+                transactionSyncScheduled.get(displayName).set(false);
+            }
+            String currentDisplayName = osrsLoginManager.getPlayerDisplayName();
+            if (loginResponseManager.isLoggedIn() && (currentDisplayName == null || currentDisplayName.equals(displayName))) {
+                log.warn("failed to send transactions to copilot server {}", e.getMessage(), e);
+                scheduleSyncIn(10, displayName);
+            }
+        };
+        api.sendTransactionsAsync(toSend, displayName, onSuccess, onFailure);
     }
 
     public long addTransaction(Transaction transaction, String displayName) {
-        List<Transaction> unAckedTransactions  = getUnAckedTransactions(displayName);
-        unAckedTransactions.add(transaction);
-        Persistance.storeUnAckedTransactions(unAckedTransactions, displayName);
-        Persistance.storeTransaction(transaction, displayName);
+        synchronized (this) {
+            List<Transaction> unAckedTransactions = getUnAckedTransactions(displayName);
+            unAckedTransactions.add(transaction);
+            Persistance.storeUnAckedTransactions(unAckedTransactions, displayName);
+        }
         MutableReference<Long> profit = new MutableReference<>(0L);
         if (OfferStatus.SELL.equals(transaction.getType())) {
             profit.setValue(flipManager.estimateTransactionProfit(displayName, transaction));
@@ -2512,16 +2543,18 @@ public class TransactionManger {
     }
 
     private List<Transaction> getUnAckedTransactions(String displayName) {
-        return cachedUnAckedTransactions.computeIfAbsent(displayName, (k) -> Collections.synchronizedList(Persistance.loadUnAckedTransactions(displayName)));
+        return cachedUnAckedTransactions.computeIfAbsent(displayName, (k) -> Persistance.loadUnAckedTransactions(displayName));
     }
 
     public synchronized void scheduleSyncIn(int seconds, String displayName) {
-        if (!transactionSyncScheduled.computeIfAbsent(displayName, (k) -> false)) {
+        AtomicBoolean scheduled = transactionSyncScheduled.computeIfAbsent(displayName, k -> new AtomicBoolean(false));
+        if(scheduled.compareAndSet(false, true)) {
             log.info("scheduling attempt to sync {} transactions in {}s", displayName, seconds);
-            transactionSyncScheduled.put(displayName, true);
             executorService.schedule(() ->  {
                 this.syncUnAckedTransactions(displayName);
             }, seconds, TimeUnit.SECONDS);
+        } else {
+            log.debug("skipping scheduling sync as already scheduled");
         }
     }
 }
@@ -3465,8 +3498,7 @@ public class GrandExchangeUncollectedManager {
     // dependencies
     private final Client client;
 
-    // state
-    @Getter
+    // stated
     private int lastUncollectedAddedTick = -1;
     private int lastClearedTick = -1;
     private final Map<Integer, Long> lastClearedUncollected = new HashMap<>();
@@ -3568,7 +3600,11 @@ public class GrandExchangeUncollectedManager {
         return lastClearedSlots;
     }
 
-    public void reset() {
+    public synchronized int getLastUncollectedAddedTick() {
+        return lastUncollectedAddedTick;
+    }
+
+    public synchronized void reset() {
         lastClearedUncollected.clear();
         lastClearedTick = -1;
         lastUncollectedAddedTick = -1;
@@ -4155,8 +4191,8 @@ public class FlipManager {
     }
 
     public synchronized long estimateTransactionProfit(String displayName, Transaction t) {
-        int accountId = displayNameToAccountId.get(displayName);
-        if (lastOpenFLipByItemId.containsKey(accountId)) {
+        Integer accountId = displayNameToAccountId.get(displayName);
+        if (accountId != null && lastOpenFLipByItemId.containsKey(accountId)) {
             FlipV2 flip = lastOpenFLipByItemId.get(accountId).get(t.getItemId());
             if(flip != null) {
                 return flip.calculateProfit(t);
