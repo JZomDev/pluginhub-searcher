@@ -1,18 +1,5 @@
 package thestonedturtle.lootlogger;
 
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
-
-public class LootLoggerPluginTest
-{
-	public static void main(String[] args) throws Exception
-	{
-		ExternalPluginManager.loadBuiltin(LootLoggerPlugin.class);
-		RuneLite.main(args);
-	}
-}
-package thestonedturtle.lootlogger;
-
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 
@@ -35,24 +22,1005 @@ public enum UniqueItemPlacement
 
 package thestonedturtle.lootlogger;
 
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.LinkedListMultimap;
+import com.google.common.collect.SetMultimap;
+import com.google.inject.Provides;
+import java.awt.image.BufferedImage;
+import java.text.NumberFormat;
+import java.text.ParseException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import javax.inject.Inject;
+import javax.swing.SwingUtilities;
 import lombok.Getter;
-import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.InterfaceID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneScapeProfileType;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.PluginManager;
+import net.runelite.client.plugins.loottracker.LootReceived;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.Text;
+import net.runelite.http.api.loottracker.LootRecordType;
+import org.apache.commons.lang3.ArrayUtils;
+import thestonedturtle.lootlogger.data.BossTab;
+import thestonedturtle.lootlogger.data.KillCountNameMapper;
+import thestonedturtle.lootlogger.data.LootLog;
+import thestonedturtle.lootlogger.data.Pet;
+import thestonedturtle.lootlogger.data.UniqueItem;
+import thestonedturtle.lootlogger.localstorage.LTItemEntry;
+import thestonedturtle.lootlogger.localstorage.LTRecord;
+import thestonedturtle.lootlogger.localstorage.LootRecordWriter;
+import thestonedturtle.lootlogger.ui.LootLoggerPanel;
 
-@Getter
-@RequiredArgsConstructor
-public enum ItemSortTypes
+@Slf4j
+@PluginDescriptor(
+	name = "Loot Logger"
+)
+public class LootLoggerPlugin extends Plugin
 {
-	ALPHABETICAL("Alphabetical"),
-	ITEM_ID("Item ID"),
-	VALUE("Value"),
-	PRICE("Price");
+	private static final String SIRE_FONT_TEXT = "you place the unsired into the font of consumption...";
+	private static final String SIRE_REWARD_TEXT = "the font consumes the unsired";
+	private static final int MAX_TEXT_CHECK = 25;
+	private static final int MAX_PET_TICKS = 5;
 
-	private final String name;
+	// Kill count handling
+	private static final Pattern CLUE_SCROLL_PATTERN = Pattern.compile("You have completed ([0-9]+) ([a-z]+) Treasure Trails.");
+	private static final Pattern BOSS_NAME_NUMBER_PATTERN = Pattern.compile("Your (.*) kill count is:? ([0-9,]*).");
+	private static final Pattern NUMBER_PATTERN = Pattern.compile("([0-9,]+)");
+
+	private static final NumberFormat NUMBER_FORMATTER = NumberFormat.getNumberInstance(Locale.US);
+
+	private static final ImmutableSet<String> PET_MESSAGES = ImmutableSet.of("You have a funny feeling like you're being followed.",
+		"You feel something weird sneaking into your backpack.",
+		"You have a funny feeling like you would have been followed...");
+
+	private static final int NMZ_MAP_REGION = 9033;
+
+	public static final String SESSION_NAME = "Current Session Data";
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	public LootLoggerConfig config;
+
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private LootRecordWriter writer;
+
+	@Inject
+	private PluginManager pluginManager;
+
+	private LootLoggerPanel panel;
+	private NavigationButton navButton;
+
+	@Getter
+	private SetMultimap<LootRecordType, String> lootNames = HashMultimap.create();
+
+	private boolean prepared = false;
+	private boolean unsiredReclaiming = false;
+	private int unsiredCheckCount = 0;
+	// Some pets aren't handled (skilling pets) so reset gotPet after a few ticks
+	private int petTicks = 0;
+	private boolean gotPet = false;
+
+	private final Map<String, Integer> killCountMap = new HashMap<>();
+	private final LinkedListMultimap<String, LTRecord> sessionData = LinkedListMultimap.create();
+
+	@Provides
+	LootLoggerConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(LootLoggerConfig.class);
+	}
 
 	@Override
-	public String toString()
+	protected void startUp() throws Exception
 	{
-		return name;
+		panel = new LootLoggerPanel(itemManager, this);
+
+		final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "panel-icon.png");
+
+		navButton = NavigationButton.builder()
+			.tooltip("Loot Logger")
+			.icon(icon)
+			.priority(6)
+			.panel(panel)
+			.build();
+
+		if (config.enableUI())
+		{
+			clientToolbar.addNavigation(navButton);
+		}
+
+		// Attach necessary info from item manager on load, probably a better method
+		if (!prepared)
+		{
+			prepared = true;
+			clientThread.invokeLater(() ->
+			{
+				switch (client.getGameState())
+				{
+					case UNKNOWN:
+					case STARTING:
+						return false;
+				}
+
+				UniqueItem.prepareUniqueItems(itemManager);
+				return true;
+			});
+		}
+
+		if (client.getGameState().equals(GameState.LOGGED_IN) || client.getGameState().equals(GameState.LOADING))
+		{
+			updateWriterUsername();
+		}
+
+		final Optional<Plugin> mainPlugin = pluginManager.getPlugins().stream().filter(p -> p.getName().equals("Loot Tracker")).findFirst();
+		if (mainPlugin.isPresent() && !pluginManager.isPluginEnabled(mainPlugin.get()))
+		{
+			pluginManager.setPluginEnabled(mainPlugin.get(), true);
+		}
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		if (config.enableUI())
+		{
+			clientToolbar.removeNavigation(navButton);
+		}
+
+		gotPet = false;
+		petTicks = 0;
+		writer.setName(null);
+	}
+
+	@Subscribe
+	public void onConfigChanged(final ConfigChanged event)
+	{
+		if (event.getGroup().equals("lootlogger"))
+		{
+			if (event.getKey().equals("enableUI"))
+			{
+				if (config.enableUI())
+				{
+					clientToolbar.addNavigation(navButton);
+				}
+				else
+				{
+					clientToolbar.removeNavigation(navButton);
+				}
+			}
+
+			if (config.enableUI())
+			{
+				SwingUtilities.invokeLater(panel::refreshUI);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(final GameStateChanged event)
+	{
+		if (event.getGameState() == GameState.LOGGED_IN)
+		{
+			updateWriterUsername();
+		}
+	}
+
+	private void updateWriterUsername()
+	{
+		// Check if we're already using this user as we are now updating the username on `LOGGED_IN` instead of `LOGGING_IN`
+		// `LOGGED_IN` will be triggered after every `LOADING` state which happens much more frequently
+		String folder = String.valueOf(client.getAccountHash());
+		RuneScapeProfileType profileType = RuneScapeProfileType.getCurrent(client);
+		if (profileType != RuneScapeProfileType.STANDARD)
+		{
+			folder += "-" + Text.titleCase(profileType);
+		}
+
+		if (folder.equalsIgnoreCase(writer.getName()))
+		{
+			return;
+		}
+
+		// If we aren't first attempt to migrate from the deprecated login name to the account hash
+		String name = client.getUsername();
+		if (name != null && name.length() > 0 && client.getAccountHash() != -1)
+		{
+			// We are using the accountHash as RL doesn't return a login name when ran through the Jagex launcher
+			writer.renameUsernameFolderToAccountHash(name.toLowerCase(), client.getAccountHash());
+		}
+
+		if (writer.setPlayerUsername(folder))
+		{
+			localPlayerNameChanged();
+		}
+	}
+
+	private void localPlayerNameChanged()
+	{
+		lootNames = writer.getKnownFileNames();
+		if (config.enableUI())
+		{
+			SwingUtilities.invokeLater(panel::showSelectionView);
+		}
+	}
+
+	private Collection<LTItemEntry> convertToLTItemEntries(Collection<ItemStack> stacks)
+	{
+		return stacks.stream().map(i -> createLTItemEntry(i.getId(), i.getQuantity())).collect(Collectors.toList());
+	}
+
+	private LTItemEntry createLTItemEntry(final int id, final int qty)
+	{
+		final ItemComposition c = itemManager.getItemComposition(id);
+		final int realId = c.getNote() == -1 ? c.getId() : c.getLinkedNoteId();
+		final int price = itemManager.getItemPrice(realId);
+		return new LTItemEntry(c.getName(), id, qty, price);
+	}
+
+	private void addRecord(final LTRecord record)
+	{
+		writer.addLootTrackerRecord(record);
+		lootNames.put(record.getType(), record.getName().toLowerCase());
+		sessionData.put(record.getName().toLowerCase(), record);
+		if (config.enableUI())
+		{
+			SwingUtilities.invokeLater(() -> panel.addLog(record));
+		}
+	}
+
+	@Subscribe
+	public void onLootReceived(final LootReceived event)
+	{
+		if (isInNightmareZone() && config.ignoreNmz())
+		{
+			return;
+		}
+
+		final Collection<LTItemEntry> drops = convertToLTItemEntries(event.getItems());
+
+		if (gotPet)
+		{
+			final Pet p = Pet.getByBossName(event.getName());
+			if (p != null)
+			{
+				gotPet = false;
+				petTicks = 0;
+				drops.add(createLTItemEntry(p.getPetID(), 1));
+			}
+		}
+
+		int kc = killCountMap.getOrDefault(event.getName().toUpperCase(), -1);
+
+		// Check aliases if they exist for kill counts
+		BossTab tab = BossTab.getByName(event.getName());
+		if (kc == -1 && tab != null && tab.getAliases().size() > 0) {
+			for (final String alias : tab.getAliases()) {
+				kc = killCountMap.getOrDefault(alias.toUpperCase(), -1);
+				if (kc > 0) {
+					break;
+				}
+			}
+		}
+
+		final LTRecord record = new LTRecord(event.getName(), event.getCombatLevel(), kc, event.getType(), drops, new Date());
+		addRecord(record);
+	}
+
+	public Collection<LTRecord> getDataByName(LootRecordType type, String name)
+	{
+		final BossTab tab = BossTab.getByName(name);
+		if (tab == null)
+		{
+			return writer.loadLootTrackerRecords(type, name);
+		}
+
+		final Collection<LTRecord> records = new ArrayList<>();
+		for (final String alias : tab.getAliases()) {
+			records.addAll(writer.loadLootTrackerRecords(type, alias));
+		}
+
+		return records;
+	}
+
+	/**
+	 * Creates a loot log for this name and then attaches it to the UI when finished
+	 * @param name record name
+	 */
+	public void requestLootLog(final LootRecordType type, final String name)
+	{
+		clientThread.invoke(() ->
+		{
+			if (name.equalsIgnoreCase(SESSION_NAME))
+			{
+				final LootLog log = new LootLog(Collections.emptyList(), name);
+				for (final String key : sessionData.keySet())
+				{
+					log.getMinionLogs().add(new LootLog(sessionData.get(key), key));
+				}
+
+				SwingUtilities.invokeLater(() -> panel.useLog(log));
+				return;
+			}
+			
+			final Collection<LTRecord> records = getDataByName(type, name);
+			final LootLog log = new LootLog(records, name);
+			if (log.getType().equals(LootRecordType.UNKNOWN))
+			{
+				log.setType(type);
+			}
+
+			final BossTab tab = BossTab.getByName(name);
+			if (tab != null && tab.getMinions().size() > 0)
+			{
+				for (final String minion : tab.getMinions())
+				{
+					final Collection<LTRecord> minionRecords = getDataByName(type, minion);
+					final LootLog minionLog = new LootLog(minionRecords, minion);
+
+					log.getMinionLogs().add(minionLog);
+				}
+			}
+
+			SwingUtilities.invokeLater(() -> panel.useLog(log));
+		});
+	}
+
+	public boolean clearStoredDataByName(final LootRecordType type, final String name)
+	{
+		if (name.equalsIgnoreCase(SESSION_NAME))
+		{
+			sessionData.clear();
+			return true;
+		}
+
+		if (panel.getLootLog().getName().equalsIgnoreCase(SESSION_NAME))
+		{
+			sessionData.removeAll(name.toLowerCase());
+			return true;
+		}
+
+		lootNames.remove(type, name);
+		return writer.deleteLootTrackerRecords(type, name);
+	}
+
+	@Subscribe
+	public void onWidgetLoaded(WidgetLoaded event)
+	{
+		if (event.getGroupId() != InterfaceID.DIALOG_SPRITE)
+		{
+			return;
+		}
+
+		Widget text = client.getWidget(ComponentID.DIALOG_SPRITE_TEXT);
+		if (text != null && text.getText().toLowerCase().contains(SIRE_FONT_TEXT))
+		{
+			unsiredCheckCount = 0;
+			unsiredReclaiming = true;
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick t)
+	{
+		if (gotPet)
+		{
+			if (petTicks > MAX_PET_TICKS)
+			{
+				gotPet = false;
+				petTicks = 0;
+			}
+			else
+			{
+				petTicks++;
+			}
+		}
+
+		if (unsiredReclaiming)
+		{
+			if (hasUnsiredWidgetUpdated())
+			{
+				unsiredReclaiming = false;
+				return;
+			}
+
+			unsiredCheckCount++;
+			if (unsiredCheckCount >= MAX_TEXT_CHECK)
+			{
+				unsiredReclaiming = false;
+			}
+		}
+	}
+
+	// Handles checking for unsired loot reclamation
+	private boolean hasUnsiredWidgetUpdated()
+	{
+		final Widget text = client.getWidget(ComponentID.DIALOG_SPRITE_TEXT);
+		// Reclaimed an item?
+		if (text != null && text.getText().toLowerCase().contains(SIRE_REWARD_TEXT))
+		{
+			final Widget sprite = client.getWidget(InterfaceID.DIALOG_SPRITE);
+			if (sprite == null || sprite.getItemId() == -1)
+			{
+				return false;
+			}
+
+			log.debug("Unsired was exchanged for item ID: {}", sprite.getItemId());
+			receivedUnsiredLoot(sprite.getItemId());
+			return true;
+		}
+
+		return false;
+	}
+
+	// Handles adding the unsired loot to the tracker
+	private void receivedUnsiredLoot(int itemID)
+	{
+		clientThread.invokeLater(() ->
+		{
+			Collection<LTRecord> data = getDataByName(LootRecordType.NPC, BossTab.ABYSSAL_SIRE.getName());
+			ItemComposition c = itemManager.getItemComposition(itemID);
+			LTItemEntry itemEntry = new LTItemEntry(c.getName(), itemID, 1, 0);
+
+			log.debug("Received Unsired item: {}", c.getName());
+
+			// Don't have data for sire, create a new record with just this data.
+			if (data == null)
+			{
+				log.debug("No previous Abyssal sire loot, creating new loot record");
+				LTRecord r = new LTRecord(BossTab.ABYSSAL_SIRE.getName(), 350, -1, LootRecordType.NPC, Collections.singletonList(itemEntry), new Date());
+				addRecord(r);
+				return;
+			}
+
+			log.debug("Adding drop to last abyssal sire loot record");
+			// Add data to last kill count
+			final List<LTRecord> items = new ArrayList<>(data);
+			final LTRecord r = items.get(items.size() - 1);
+			r.addDropEntry(itemEntry);
+			writer.writeLootTrackerFile(BossTab.ABYSSAL_SIRE.getName(), items);
+			if (config.enableUI())
+			{
+				SwingUtilities.invokeLater(panel::refreshUI);
+			}
+		});
+	}
+
+	public int convertToInt(String s)
+	{
+		try {
+			return NUMBER_FORMATTER.parse(s).intValue();
+		}
+		catch (ParseException e)
+		{
+			return -1;
+		}
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+		if (event.getType() != ChatMessageType.GAMEMESSAGE && event.getType() != ChatMessageType.SPAM)
+		{
+			return;
+		}
+
+		final String chatMessage = Text.removeTags(event.getMessage());
+
+		if (PET_MESSAGES.contains(chatMessage))
+		{
+			gotPet = true;
+		}
+
+		// Check if message is for a clue scroll reward
+		final Matcher m = CLUE_SCROLL_PATTERN.matcher(chatMessage);
+		if (m.find())
+		{
+			final String eventType;
+			switch (m.group(2).toLowerCase())
+			{
+				case "beginner":
+					eventType = "Clue Scroll (Beginner)";
+					break;
+				case "easy":
+					eventType = "Clue Scroll (Easy)";
+					break;
+				case "medium":
+					eventType = "Clue Scroll (Medium)";
+					break;
+				case "hard":
+					eventType = "Clue Scroll (Hard)";
+					break;
+				case "elite":
+					eventType = "Clue Scroll (Elite)";
+					break;
+				case "master":
+					eventType = "Clue Scroll (Master)";
+					break;
+				default:
+					return;
+			}
+
+			final int killCount = convertToInt(m.group(1));
+			killCountMap.put(eventType.toUpperCase(), killCount);
+			return;
+		}
+
+		// Barrows KC
+		if (chatMessage.startsWith("Your Barrows chest count is"))
+		{
+			Matcher n = NUMBER_PATTERN.matcher(chatMessage);
+			if (n.find())
+			{
+				killCountMap.put("BARROWS", convertToInt(n.group()));
+				return;
+			}
+		}
+
+		// Raids KC
+		if (chatMessage.startsWith("Your completed Chambers of Xeric count is"))
+		{
+			Matcher n = NUMBER_PATTERN.matcher(chatMessage);
+			if (n.find())
+			{
+				killCountMap.put("CHAMBERS OF XERIC", convertToInt(n.group()));
+				return;
+			}
+		}
+		
+		// Tob KC
+		if (chatMessage.startsWith("Your completed Theatre of Blood count is"))
+		{
+			Matcher n = NUMBER_PATTERN.matcher(chatMessage);
+			if (n.find())
+			{
+				killCountMap.put("THEATRE OF BLOOD", convertToInt(n.group()));
+				return;
+			}
+		}
+
+		// Handle the other bosses
+		final Matcher boss = BOSS_NAME_NUMBER_PATTERN.matcher(chatMessage);
+		if (boss.find())
+		{
+			final String bossName = boss.group(1);
+			final String actualBossName = KillCountNameMapper.getBossNameFromKillCountName(bossName);
+			final int killCount = convertToInt(boss.group(2));
+			killCountMap.put(actualBossName.toUpperCase(), killCount);
+		}
+	}
+
+	/**
+	 * Is the player inside the NMZ arena?
+	 */
+	private boolean isInNightmareZone()
+	{
+		if (client.getLocalPlayer() == null) {
+			return false;
+		}
+
+		// It seems that KBD shares the map region with NMZ but NMZ is never in plane 0.
+		return ArrayUtils.contains(client.getMapRegions(), NMZ_MAP_REGION) && client.getLocalPlayer().getWorldLocation().getPlane() > 0;
+	}
+}
+
+/*
+ * Copyright (c) 2020, TheStonedTurtle <https://github.com/TheStonedTurtle>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package thestonedturtle.lootlogger.data;
+
+import com.google.common.collect.ImmutableMap;
+import lombok.Getter;
+import net.runelite.api.ItemID;
+
+@Getter
+public enum Pet
+{
+	// GWD Pets
+	PET_GENERAL_GRAARDOR(ItemID.PET_GENERAL_GRAARDOR, BossTab.GENERAL_GRAARDOR.getName()),
+	PET_KREEARRA(ItemID.PET_KREEARRA, BossTab.KREEARRA.getName()),
+	PET_KRIL_TSUTSAROTH(ItemID.PET_KRIL_TSUTSAROTH, BossTab.KRIL_TSUTSAROTH.getName()),
+	PET_ZILYANA(ItemID.PET_ZILYANA, BossTab.COMMANDER_ZILYANA.getName()),
+	NEXLING(ItemID.NEXLING, BossTab.NEX.getName()),
+	// Wildy Pets
+	CALLISTO_CUB(ItemID.CALLISTO_CUB, BossTab.CALLISTO.getName(), "Artio"),
+	PET_CHAOS_ELEMENTAL(ItemID.PET_CHAOS_ELEMENTAL, BossTab.CHAOS_ELEMENTAL.getName(), BossTab.CHAOS_FANATIC.getName()),
+	SCORPIAS_OFFSPRING(ItemID.SCORPIAS_OFFSPRING, BossTab.SCORPIA.getName()),
+	VENENATIS_SPIDERLING(ItemID.VENENATIS_SPIDERLING, BossTab.VENENATIS.getName(), "Spindel"),
+	VETION_JR(ItemID.VETION_JR, BossTab.VETION.getName(), "Vet'ion", "Calvar'ion"),
+	// KBD isn't really in wildy but meh
+	PRINCE_BLACK_DRAGON(ItemID.PRINCE_BLACK_DRAGON, BossTab.KING_BLACK_DRAGON.getName()),
+	// Slayer Pets
+	ABYSSAL_ORPHAN(ItemID.ABYSSAL_ORPHAN, BossTab.ABYSSAL_SIRE.getName()),
+	HELLPUPPY(ItemID.HELLPUPPY, BossTab.CERBERUS.getName()),
+	NOON(ItemID.NOON, BossTab.GROTESQUE_GUARDIANS.getName()),
+	PET_KRAKEN(ItemID.PET_KRAKEN, BossTab.KRAKEN.getName()),
+	PET_SMOKE_DEVIL(ItemID.PET_SMOKE_DEVIL, BossTab.THERMONUCLEAR_SMOKE_DEVIL.getName()),
+	SKOTOS(ItemID.SKOTOS, BossTab.SKOTIZO.getName()),
+	NID(ItemID.NID, BossTab.ARAXXOR.getName()),
+	// Other Bosses
+	BABY_MOLE(ItemID.BABY_MOLE, BossTab.GIANT_MOLE.getName()),
+	KALPHITE_PRINCESS(ItemID.KALPHITE_PRINCESS, BossTab.KALPHITE_QUEEN.getName()),
+	OLMLET(ItemID.OLMLET, BossTab.CHAMBERS_OF_XERIC.getName()),
+	LIL_ZIK(ItemID.LIL_ZIK, BossTab.THEATRE_OF_BLOOD.getName()),
+	PET_DARK_CORE(ItemID.PET_DARK_CORE, BossTab.CORPOREAL_BEAST.getName()),
+	PET_SNAKELING(ItemID.PET_SNAKELING, BossTab.ZULRAH.getName()),
+	PET_DAGANNOTH_REX(ItemID.PET_DAGANNOTH_REX, BossTab.DAGANNOTH_REX.getName()),
+	PET_DAGANNOTH_PRIME(ItemID.PET_DAGANNOTH_PRIME, BossTab.DAGANNOTH_PRIME.getName()),
+	PET_DAGANNOTH_SUPREME(ItemID.PET_DAGANNOTH_SUPREME, BossTab.DAGANNOTH_SUPREME.getName()),
+	VORKI(ItemID.VORKI, BossTab.VORKATH.getName()),
+	BLOODHOUND(ItemID.BLOODHOUND, BossTab.CLUE_SCROLL_MASTER.getName()),
+	IKKLE_HYDRA(ItemID.IKKLE_HYDRA, BossTab.ALCHEMICAL_HYDRA.getName()),
+	YOUNGLLEF(ItemID.YOUNGLLEF, BossTab.THE_GAUNTLET.getName()),
+	SRARACHA(ItemID.SRARACHA, BossTab.SARACHNIS.getName()),
+	SMOLCANO(ItemID.SMOLCANO, BossTab.ZALCANO.getName()),
+	LITTLE_NIGHTMARE(ItemID.LITTLE_NIGHTMARE, BossTab.NIGHTMARE.getName(), BossTab.PHOSANIS_NIGHTMARE.getName()),
+	HERBI(ItemID.HERBI, "Herbiboar"),
+	HUBERTE(ItemID.HUBERTE, BossTab.HUEYCOATL.getName()),
+	// Pretty sure
+	PHOENIX(ItemID.PHOENIX, BossTab.WINTERTODT.getName()),
+	PET_PENANCE_QUEEN(ItemID.PET_PENANCE_QUEEN, "Barbarian Assault"),
+	TINY_TEMPOR(ItemID.TINY_TEMPOR, BossTab.TEMPOROSS.getName()),
+	TUMEKENS_GUARDIAN(ItemID.TUMEKENS_GUARDIAN, BossTab.TOMBS_OF_AMASCUT.getName()),
+	MUPHIN(ItemID.MUPHIN, BossTab.PHANTOM_MUSPAH.getName()),
+
+	// Forgotten Four
+	BUTCH(ItemID.BUTCH, BossTab.VARDORVIS.getName()),
+	LILVIATHAN(ItemID.LILVIATHAN, BossTab.THE_LEVIATHAN.getName()),
+	BARON(ItemID.BARON, BossTab.DUKE_SUCELLUS.getName()),
+	WISP(ItemID.WISP, BossTab.THE_WHISPERER.getName()),
+
+	// Fortis Colosseum
+	SMOL_HEREDIT(ItemID.SMOL_HEREDIT, BossTab.FORTIS_COLOSSEUM.getName()),
+
+	// Pets that aren't tied to a BossTab
+	MOXI(ItemID.MOXI, "Amoxliatl"),
+	SCURRY(ItemID.SCURRY, "Scurrius"),
+	;
+
+	private static final ImmutableMap<String, Pet> BOSS_MAP;
+	static
+	{
+		final ImmutableMap.Builder<String, Pet> byName = ImmutableMap.builder();
+		for (final Pet pet : values())
+		{
+			for (final String bossName : pet.getBossNames())
+			{
+				byName.put(bossName.toUpperCase(), pet);
+			}
+		}
+
+		BOSS_MAP = byName.build();
+	}
+
+	private final int petID;
+	private final String[] bossNames;
+
+	Pet(final int id, final String... bossNames)
+	{
+		this.petID = id;
+		this.bossNames = bossNames;
+	}
+
+	public static Pet getByBossName(final String name)
+	{
+		return BOSS_MAP.get(name.toUpperCase());
+	}
+}
+
+/*
+ * Copyright (c) 2024, TheStonedTurtle <https://github.com/TheStonedTurtle>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package thestonedturtle.lootlogger.data;
+
+import com.google.common.collect.ImmutableMap;
+import lombok.AllArgsConstructor;
+
+// Some NPCs have a different name for their KC messages than their in-game name
+@AllArgsConstructor
+public enum KillCountNameMapper
+{
+	THE_WHISPERER("The Whisperer", "Whisperer"),
+	THE_LEVIATHAN("The Leviathan", "Leviathan"),
+	MOONS_OF_PERIL("Moons of Peril", "Lunar Chest"),
+
+	;
+
+	private final String bossName;
+	private final String killCountName;
+
+	private static final ImmutableMap<String, String> nameMap;
+
+	static
+	{
+
+		final ImmutableMap.Builder<String, String> m = ImmutableMap.builder();
+		for (final KillCountNameMapper entry : KillCountNameMapper.values())
+		{
+			m.put(entry.killCountName.toLowerCase(), entry.bossName);
+		}
+
+		nameMap = m.build();
+	}
+
+	public static String getBossNameFromKillCountName(String name)
+	{
+		return nameMap.getOrDefault(name.toLowerCase(), name);
+	}
+}
+
+/*
+ * Copyright (c) 2018, TheStonedTurtle <www.github.com/TheStonedTurtle>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package thestonedturtle.lootlogger.data;
+
+import com.google.common.collect.ImmutableMap;
+import com.google.common.collect.ImmutableMultimap;
+import com.google.common.collect.ImmutableSet;
+import com.google.common.collect.Multimap;
+import java.util.Arrays;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import lombok.Getter;
+import net.runelite.api.ItemID;
+import net.runelite.http.api.loottracker.LootRecordType;
+
+@Getter
+public enum BossTab
+{
+	// Raids
+	CHAMBERS_OF_XERIC("Chambers of Xeric", ItemID.OLMLET, "Chests / Raids", LootRecordType.EVENT),
+	THEATRE_OF_BLOOD("Theatre of Blood", ItemID.LIL_ZIK, "Chests / Raids", LootRecordType.EVENT),
+	TOMBS_OF_AMASCUT("Tombs of Amascut", ItemID.TUMEKENS_GUARDIAN, "Chests / Raids", LootRecordType.EVENT,
+		ImmutableSet.of("Cache of runes")),
+
+	BARROWS("Barrows", ItemID.BARROWS_TELEPORT, "Chests / Raids", LootRecordType.EVENT),
+	MOONS_OF_PERIL("Moons of Peril", ItemID.DUAL_MACUAHUITL, "Chests / Raids", LootRecordType.EVENT, "Lunar Chest"),
+	FORTIS_COLOSSEUM("Fortis Colosseum", ItemID.SMOL_HEREDIT, "Chests / Raids", LootRecordType.EVENT),
+
+	// Loot received on NPC death
+	ZULRAH("Zulrah", ItemID.PET_SNAKELING, "Other", LootRecordType.NPC),
+	VORKATH("Vorkath", ItemID.VORKI, "Other", LootRecordType.NPC),
+
+	// Forgotten Four
+	VARDORVIS("Vardorvis", ItemID.BUTCH, "Forgotten Four", LootRecordType.NPC),
+	THE_LEVIATHAN("The Leviathan", ItemID.LILVIATHAN, "Forgotten Four", LootRecordType.NPC),
+	DUKE_SUCELLUS("Duke Sucellus", ItemID.BARON, "Forgotten Four", LootRecordType.NPC),
+	THE_WHISPERER("The Whisperer", ItemID.WISP, "Forgotten Four", LootRecordType.NPC),
+
+	// God wars dungeon
+	KREEARRA("Kree'arra", ItemID.PET_KREEARRA , "God Wars Dungeon", LootRecordType.NPC,
+		ImmutableSet.of("Wingman Skree", "Flockleader Geerin", "Flight Kilisa")),
+	GENERAL_GRAARDOR("General Graardor", ItemID.PET_GENERAL_GRAARDOR , "God Wars Dungeon", LootRecordType.NPC,
+		ImmutableSet.of("Sergeant Strongstack", "Sergeant Steelwill", "Sergeant Grimspike")),
+	COMMANDER_ZILYANA("Commander Zilyana", ItemID.PET_ZILYANA , "God Wars Dungeon", LootRecordType.NPC,
+		ImmutableSet.of("Growler", "Bree", "Starlight")),
+	KRIL_TSUTSAROTH("K'ril Tsutsaroth", ItemID.PET_KRIL_TSUTSAROTH , "God Wars Dungeon", LootRecordType.NPC,
+		ImmutableSet.of("Balfrug Kreeyath", "Tstanon Karlak", "Zakl'n Gritch")),
+	NEX("Nex", ItemID.NEXLING, "God Wars Dungeon", LootRecordType.NPC,
+		ImmutableSet.of("Fumus", "Umbra", "Cruor", "Glacies")),
+
+	// Wildy Bosses
+	VETION("Vet'ion Reborn", ItemID.VETION_JR , "Wilderness", LootRecordType.NPC, ImmutableSet.of("Calvar'ion"), "Vet'ion"),
+	VENENATIS("Venenatis", ItemID.VENENATIS_SPIDERLING , "Wilderness", LootRecordType.NPC, ImmutableSet.of("Spindel")),
+	CALLISTO("Callisto", ItemID.CALLISTO_CUB , "Wilderness", LootRecordType.NPC, ImmutableSet.of("Artio")),
+	CHAOS_ELEMENTAL("Chaos Elemental", ItemID.PET_CHAOS_ELEMENTAL , "Wilderness", LootRecordType.NPC),
+	// Wildy Demi-Bosses
+	SCORPIA("Scorpia", ItemID.SCORPIAS_OFFSPRING, "Wilderness", LootRecordType.NPC),
+	CHAOS_FANATIC("Chaos Fanatic", ItemID.ANCIENT_STAFF , "Wilderness", LootRecordType.NPC),
+	CRAZY_ARCHAEOLOGIST("Crazy Archaeologist", ItemID.FEDORA , "Wilderness", LootRecordType.NPC),
+	// Wildy Other
+	KING_BLACK_DRAGON("King Black Dragon", ItemID.PRINCE_BLACK_DRAGON , "Wilderness", LootRecordType.NPC),
+
+	// Slayer Bosses
+	SKOTIZO("Skotizo", ItemID.SKOTOS, "Slayer", LootRecordType.NPC),
+	GROTESQUE_GUARDIANS("Grotesque Guardians", ItemID.NOON, "Slayer", LootRecordType.NPC, "Dusk"),
+	ABYSSAL_SIRE("Abyssal Sire", ItemID.ABYSSAL_ORPHAN, "Slayer", LootRecordType.NPC),
+	KRAKEN("Kraken", ItemID.PET_KRAKEN, "Slayer", LootRecordType.NPC),
+	CERBERUS("Cerberus", ItemID.HELLPUPPY, "Slayer", LootRecordType.NPC),
+	THERMONUCLEAR_SMOKE_DEVIL("Thermonuclear smoke devil", ItemID.PET_SMOKE_DEVIL, "Slayer", LootRecordType.NPC),
+	ALCHEMICAL_HYDRA("Alchemical Hydra", ItemID.IKKLE_HYDRA, "Slayer", LootRecordType.NPC),
+	ARAXXOR("Araxxor", ItemID.NID, "Slayer", LootRecordType.NPC),
+
+	// Other Bosses
+	KALPHITE_QUEEN("Kalphite Queen", ItemID.KALPHITE_PRINCESS, "Other", LootRecordType.NPC),
+	GIANT_MOLE("Giant Mole", ItemID.BABY_MOLE, "Other", LootRecordType.NPC),
+	CORPOREAL_BEAST("Corporeal Beast", ItemID.PET_CORPOREAL_CRITTER, "Other", LootRecordType.NPC),
+	SARACHNIS("Sarachnis", ItemID.SRARACHA, "Other", LootRecordType.NPC),
+	THE_GAUNTLET("The Gauntlet", ItemID.YOUNGLLEF, "Other", LootRecordType.EVENT),
+	NIGHTMARE("The Nightmare", ItemID.LITTLE_NIGHTMARE, "Other", LootRecordType.NPC),
+	PHOSANIS_NIGHTMARE("Phosani's Nightmare", ItemID.LITTLE_PARASITE, "Other", LootRecordType.NPC),
+	PHANTOM_MUSPAH("Phantom Muspah", ItemID.MUPHIN, "Other", LootRecordType.NPC),
+	HUEYCOATL("The Hueycoatl", ItemID.HUBERTE, "Other", LootRecordType.NPC),
+
+	// Dagannoth Kings
+	DAGANNOTH_REX("Dagannoth Rex", ItemID.PET_DAGANNOTH_REX, "Dagannoth Kings", LootRecordType.NPC),
+	DAGANNOTH_PRIME("Dagannoth Prime", ItemID.PET_DAGANNOTH_PRIME, "Dagannoth Kings", LootRecordType.NPC),
+	DAGANNOTH_SUPREME("Dagannoth Supreme", ItemID.PET_DAGANNOTH_SUPREME, "Dagannoth Kings", LootRecordType.NPC),
+
+	// Clue scrolls
+	CLUE_SCROLL_BEGINNER("Clue Scroll (Beginner)", ItemID.CLUE_SCROLL_BEGINNER, "Clue Scrolls", LootRecordType.EVENT),
+	CLUE_SCROLL_EASY("Clue Scroll (Easy)", ItemID.CLUE_SCROLL_EASY, "Clue Scrolls", LootRecordType.EVENT),
+	CLUE_SCROLL_MEDIUM("Clue Scroll (Medium)", ItemID.CLUE_SCROLL_MEDIUM, "Clue Scrolls", LootRecordType.EVENT),
+	CLUE_SCROLL_HARD("Clue Scroll (Hard)", ItemID.CLUE_SCROLL_HARD, "Clue Scrolls", LootRecordType.EVENT),
+	CLUE_SCROLL_ELITE("Clue Scroll (Elite)", ItemID.CLUE_SCROLL_ELITE, "Clue Scrolls", LootRecordType.EVENT),
+	CLUE_SCROLL_MASTER("Clue Scroll (Master)", ItemID.CLUE_SCROLL_MASTER, "Clue Scrolls", LootRecordType.EVENT),
+
+	// Skilling
+	WINTERTODT("Wintertodt", ItemID.PHOENIX, "Skilling", LootRecordType.EVENT, "Supply crate (Wintertodt)"),
+	TEMPOROSS("Tempoross", ItemID.TINY_TEMPOR, "Skilling", LootRecordType.EVENT,
+		ImmutableSet.of("Casket (Tempoross)"), "Reward pool (Tempoross)"),
+	ZALCANO("Zalcano", ItemID.SMOLCANO, "Skilling", LootRecordType.NPC),
+	;
+
+	private final String name;
+	private final int itemID;
+	private final String category;
+	private final LootRecordType type;
+	private final Set<String> aliases = new HashSet<>();
+	private final Set<String> minions;
+
+	BossTab(final String name, final int itemID, final String category, final LootRecordType type, final String... aliases)
+	{
+		this(name, itemID, category, type, Collections.emptyList(), aliases);
+	}
+
+	BossTab(final String name, final int itemID, final String category, final LootRecordType type, final Collection<String> minions, final String... aliases)
+	{
+		this.name = name;
+		this.itemID = itemID;
+		this.category = category;
+		this.type = type;
+
+		this.aliases.add(name);
+		this.aliases.addAll(Arrays.asList(aliases));
+		this.minions = minions.stream().map(String::toLowerCase).collect(Collectors.toSet());
+	}
+
+	private static final Map<String, BossTab> NAME_MAP;
+	private static final Multimap<String, BossTab> CATEGORY_MAP;
+	static
+	{
+		final ImmutableMap.Builder<String, BossTab> byName = ImmutableMap.builder();
+		final ImmutableMultimap.Builder<String, BossTab> categoryMap = ImmutableMultimap.builder();
+
+		for (BossTab tab : values())
+		{
+			for (final String name : tab.getAliases()) {
+				byName.put(name.toUpperCase(), tab);
+			}
+			categoryMap.put(tab.getCategory(), tab);
+		}
+
+		NAME_MAP = byName.build();
+		CATEGORY_MAP = categoryMap.build();
+	}
+
+	@Nullable
+	public static BossTab getByName(final String name)
+	{
+		return NAME_MAP.get(name.toUpperCase());
+	}
+
+	public static Collection<BossTab> getByCategoryName(final String name)
+	{
+		return CATEGORY_MAP.get(name);
+	}
+
+	public static TreeSet<String> getCategories()
+	{
+		return new TreeSet<>(CATEGORY_MAP.keySet());
 	}
 }
 
@@ -160,6 +1128,7 @@ public enum UniqueItem
 	ANCESTRAL_HAT(ItemID.ANCESTRAL_HAT, BossTab.CHAMBERS_OF_XERIC, 0),
 	ANCESTRAL_ROBE_TOP(ItemID.ANCESTRAL_ROBE_TOP, BossTab.CHAMBERS_OF_XERIC, 0),
 	ANCESTRAL_ROBE_BOTTOM(ItemID.ANCESTRAL_ROBE_BOTTOM, BossTab.CHAMBERS_OF_XERIC, 0),
+	TWISTED_ANCESTRAL_COLOUR_KIT(ItemID.TWISTED_ANCESTRAL_COLOUR_KIT, BossTab.CHAMBERS_OF_XERIC, 0),
 	// Range
 	DRAGON_HUNTER_CROSSBOW(ItemID.DRAGON_HUNTER_CROSSBOW, BossTab.CHAMBERS_OF_XERIC, 1),
 	TWISTED_BUCKLER(ItemID.TWISTED_BUCKLER, BossTab.CHAMBERS_OF_XERIC, 1),
@@ -173,18 +1142,25 @@ public enum UniqueItem
 	ARCANE_PRAYER_SCROLL(ItemID.ARCANE_PRAYER_SCROLL, BossTab.CHAMBERS_OF_XERIC, 3),
 	DEXTEROUS_PRAYER_SCROLL(ItemID.DEXTEROUS_PRAYER_SCROLL, BossTab.CHAMBERS_OF_XERIC, 3),
 	DARK_RELIC(ItemID.DARK_RELIC, BossTab.CHAMBERS_OF_XERIC, 3),
+	//
+	METAMORPHIC(ItemID.METAMORPHIC_DUST, BossTab.CHAMBERS_OF_XERIC, 4),
+	OLMLET(ItemID.OLMLET, BossTab.CHAMBERS_OF_XERIC, 4),
 
 	// Raids 2 Unqiues (Theater of Blood)
 	// Weapons / Pet
 	GHRAZI_RAPIER(ItemID.GHRAZI_RAPIER, BossTab.THEATRE_OF_BLOOD, 0),
-	SCYTHE_OF_VITUR_UNCHARGED(ItemID.SCYTHE_OF_VITUR_UNCHARGED, BossTab.THEATRE_OF_BLOOD, 0),
 	SANGUINESTI_STAFF_UNCHAGRED(ItemID.SANGUINESTI_STAFF_UNCHARGED, BossTab.THEATRE_OF_BLOOD, 0),
+	SCYTHE_OF_VITUR_UNCHARGED(ItemID.SCYTHE_OF_VITUR_UNCHARGED, BossTab.THEATRE_OF_BLOOD, 0),
 	LIL_ZIK(ItemID.LIL_ZIK, BossTab.THEATRE_OF_BLOOD, 0),
 	// Armor
 	AVERNIC_DEFENDER_HILT(ItemID.AVERNIC_DEFENDER_HILT, BossTab.THEATRE_OF_BLOOD, 1),
 	JUSTICIAR_FACEGUARD(ItemID.JUSTICIAR_FACEGUARD, BossTab.THEATRE_OF_BLOOD, 1),
 	JUSTICIAR_CHESTGUARD(ItemID.JUSTICIAR_CHESTGUARD, BossTab.THEATRE_OF_BLOOD, 1),
 	JUSTICIAR_LEGGUARDS(ItemID.JUSTICIAR_LEGGUARDS, BossTab.THEATRE_OF_BLOOD, 1),
+
+	HOLY_ORNAMENT_KIT(ItemID.HOLY_ORNAMENT_KIT, BossTab.THEATRE_OF_BLOOD, 2),
+	SANGUINE_ORNAMENT_KIT(ItemID.SANGUINE_ORNAMENT_KIT, BossTab.THEATRE_OF_BLOOD, 2),
+	SANGUINE_DUST(ItemID.SANGUINE_DUST, BossTab.THEATRE_OF_BLOOD, 2),
 
 	// Zulrah
 	// Uniques
@@ -1011,6 +1987,12 @@ public enum UniqueItem
 	MENAPHITE_ORNAMENT_KIT(ItemID.MENAPHITE_ORNAMENT_KIT, BossTab.TOMBS_OF_AMASCUT, 3),
 	MASORI_CRAFTING_KIT(ItemID.MASORI_CRAFTING_KIT, BossTab.TOMBS_OF_AMASCUT, 3),
 
+	REMNANT_OF_AKKHA(ItemID.REMNANT_OF_AKKHA, BossTab.TOMBS_OF_AMASCUT, 4),
+	REMNANT_OF_BABA(ItemID.REMNANT_OF_BABA, BossTab.TOMBS_OF_AMASCUT, 4),
+	REMNANT_OF_KEPHRI(ItemID.REMNANT_OF_KEPHRI, BossTab.TOMBS_OF_AMASCUT, 4),
+	REMNANT_OF_ZEBAK(ItemID.REMNANT_OF_ZEBAK, BossTab.TOMBS_OF_AMASCUT, 4),
+	ANCIENT_REMNANT(ItemID.ANCIENT_REMNANT, BossTab.TOMBS_OF_AMASCUT, 4),
+
 	// Phantom Muspah
 	ANCIENT_ESSENCE(ItemID.ANCIENT_ESSENCE, BossTab.PHANTOM_MUSPAH, 0),
 	FROZEN_CACHE(ItemID.FROZEN_CACHE, BossTab.PHANTOM_MUSPAH, 0),
@@ -1436,7 +2418,7 @@ public class LootLog
 }
 
 /*
- * Copyright (c) 2020, TheStonedTurtle <https://github.com/TheStonedTurtle>
+ * Copyright (c) 2018, TheStonedTurtle <https://github.com/TheStonedTurtle>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -1459,104 +2441,28 @@ public class LootLog
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-package thestonedturtle.lootlogger.data;
+package thestonedturtle.lootlogger.localstorage;
 
-import com.google.common.collect.ImmutableMap;
-import lombok.Getter;
-import net.runelite.api.ItemID;
+import java.util.Collection;
+import java.util.Date;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import net.runelite.http.api.loottracker.LootRecordType;
 
-@Getter
-public enum Pet
+@Data
+@AllArgsConstructor
+public class LTRecord
 {
-	// GWD Pets
-	PET_GENERAL_GRAARDOR(ItemID.PET_GENERAL_GRAARDOR, BossTab.GENERAL_GRAARDOR.getName()),
-	PET_KREEARRA(ItemID.PET_KREEARRA, BossTab.KREEARRA.getName()),
-	PET_KRIL_TSUTSAROTH(ItemID.PET_KRIL_TSUTSAROTH, BossTab.KRIL_TSUTSAROTH.getName()),
-	PET_ZILYANA(ItemID.PET_ZILYANA, BossTab.COMMANDER_ZILYANA.getName()),
-	NEXLING(ItemID.NEXLING, BossTab.NEX.getName()),
-	// Wildy Pets
-	CALLISTO_CUB(ItemID.CALLISTO_CUB, BossTab.CALLISTO.getName(), "Artio"),
-	PET_CHAOS_ELEMENTAL(ItemID.PET_CHAOS_ELEMENTAL, BossTab.CHAOS_ELEMENTAL.getName(), BossTab.CHAOS_FANATIC.getName()),
-	SCORPIAS_OFFSPRING(ItemID.SCORPIAS_OFFSPRING, BossTab.SCORPIA.getName()),
-	VENENATIS_SPIDERLING(ItemID.VENENATIS_SPIDERLING, BossTab.VENENATIS.getName(), "Spindel"),
-	VETION_JR(ItemID.VETION_JR, BossTab.VETION.getName(), "Vet'ion", "Calvar'ion"),
-	// KBD isn't really in wildy but meh
-	PRINCE_BLACK_DRAGON(ItemID.PRINCE_BLACK_DRAGON, BossTab.KING_BLACK_DRAGON.getName()),
-	// Slayer Pets
-	ABYSSAL_ORPHAN(ItemID.ABYSSAL_ORPHAN, BossTab.ABYSSAL_SIRE.getName()),
-	HELLPUPPY(ItemID.HELLPUPPY, BossTab.CERBERUS.getName()),
-	NOON(ItemID.NOON, BossTab.GROTESQUE_GUARDIANS.getName()),
-	PET_KRAKEN(ItemID.PET_KRAKEN, BossTab.KRAKEN.getName()),
-	PET_SMOKE_DEVIL(ItemID.PET_SMOKE_DEVIL, BossTab.THERMONUCLEAR_SMOKE_DEVIL.getName()),
-	SKOTOS(ItemID.SKOTOS, BossTab.SKOTIZO.getName()),
-	NID(ItemID.NID, BossTab.ARAXXOR.getName()),
-	// Other Bosses
-	BABY_MOLE(ItemID.BABY_MOLE, BossTab.GIANT_MOLE.getName()),
-	KALPHITE_PRINCESS(ItemID.KALPHITE_PRINCESS, BossTab.KALPHITE_QUEEN.getName()),
-	OLMLET(ItemID.OLMLET, BossTab.CHAMBERS_OF_XERIC.getName()),
-	LIL_ZIK(ItemID.LIL_ZIK, BossTab.THEATRE_OF_BLOOD.getName()),
-	PET_DARK_CORE(ItemID.PET_DARK_CORE, BossTab.CORPOREAL_BEAST.getName()),
-	PET_SNAKELING(ItemID.PET_SNAKELING, BossTab.ZULRAH.getName()),
-	PET_DAGANNOTH_REX(ItemID.PET_DAGANNOTH_REX, BossTab.DAGANNOTH_REX.getName()),
-	PET_DAGANNOTH_PRIME(ItemID.PET_DAGANNOTH_PRIME, BossTab.DAGANNOTH_PRIME.getName()),
-	PET_DAGANNOTH_SUPREME(ItemID.PET_DAGANNOTH_SUPREME, BossTab.DAGANNOTH_SUPREME.getName()),
-	VORKI(ItemID.VORKI, BossTab.VORKATH.getName()),
-	BLOODHOUND(ItemID.BLOODHOUND, BossTab.CLUE_SCROLL_MASTER.getName()),
-	IKKLE_HYDRA(ItemID.IKKLE_HYDRA, BossTab.ALCHEMICAL_HYDRA.getName()),
-	YOUNGLLEF(ItemID.YOUNGLLEF, BossTab.THE_GAUNTLET.getName()),
-	SRARACHA(ItemID.SRARACHA, BossTab.SARACHNIS.getName()),
-	SMOLCANO(ItemID.SMOLCANO, BossTab.ZALCANO.getName()),
-	LITTLE_NIGHTMARE(ItemID.LITTLE_NIGHTMARE, BossTab.NIGHTMARE.getName(), BossTab.PHOSANIS_NIGHTMARE.getName()),
-	HERBI(ItemID.HERBI, "Herbiboar"),
-	HUBERTE(ItemID.HUBERTE, BossTab.HUEYCOATL.getName()),
-	// Pretty sure
-	PHOENIX(ItemID.PHOENIX, BossTab.WINTERTODT.getName()),
-	PET_PENANCE_QUEEN(ItemID.PET_PENANCE_QUEEN, "Barbarian Assault"),
-	TINY_TEMPOR(ItemID.TINY_TEMPOR, BossTab.TEMPOROSS.getName()),
-	TUMEKENS_GUARDIAN(ItemID.TUMEKENS_GUARDIAN, BossTab.TOMBS_OF_AMASCUT.getName()),
-	MUPHIN(ItemID.MUPHIN, BossTab.PHANTOM_MUSPAH.getName()),
+	public final String name;
+	public final int level;
+	public final int killCount;
+	public LootRecordType type;
+	public final Collection<LTItemEntry> drops;
+	public Date date;
 
-	// Forgotten Four
-	BUTCH(ItemID.BUTCH, BossTab.VARDORVIS.getName()),
-	LILVIATHAN(ItemID.LILVIATHAN, BossTab.THE_LEVIATHAN.getName()),
-	BARON(ItemID.BARON, BossTab.DUKE_SUCELLUS.getName()),
-	WISP(ItemID.WISP, BossTab.THE_WHISPERER.getName()),
-
-	// Fortis Colosseum
-	SMOL_HEREDIT(ItemID.SMOL_HEREDIT, BossTab.FORTIS_COLOSSEUM.getName()),
-
-	// Pets that aren't tied to a BossTab
-	MOXI(ItemID.MOXI, "Amoxliatl"),
-	SCURRY(ItemID.SCURRY, "Scurrius"),
-	;
-
-	private static final ImmutableMap<String, Pet> BOSS_MAP;
-	static
+	public void addDropEntry(LTItemEntry itemEntry)
 	{
-		final ImmutableMap.Builder<String, Pet> byName = ImmutableMap.builder();
-		for (final Pet pet : values())
-		{
-			for (final String bossName : pet.getBossNames())
-			{
-				byName.put(bossName.toUpperCase(), pet);
-			}
-		}
-
-		BOSS_MAP = byName.build();
-	}
-
-	private final int petID;
-	private final String[] bossNames;
-
-	Pet(final int id, final String... bossNames)
-	{
-		this.petID = id;
-		this.bossNames = bossNames;
-	}
-
-	public static Pet getByBossName(final String name)
-	{
-		return BOSS_MAP.get(name.toUpperCase());
+		drops.add(itemEntry);
 	}
 }
 
@@ -1584,879 +2490,477 @@ public enum Pet
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-package thestonedturtle.lootlogger.data;
+package thestonedturtle.lootlogger.localstorage;
 
-import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.ImmutableMultimap;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.Multimap;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
-import java.util.stream.Collectors;
-import javax.annotation.Nullable;
-import lombok.Getter;
-import net.runelite.api.ItemID;
-import net.runelite.http.api.loottracker.LootRecordType;
+import lombok.AllArgsConstructor;
+import lombok.Data;
 
-@Getter
-public enum BossTab
+@Data
+@AllArgsConstructor
+public class LTItemEntry
 {
-	// Raids
-	CHAMBERS_OF_XERIC("Chambers of Xeric", ItemID.OLMLET, "Chests / Raids", LootRecordType.EVENT),
-	THEATRE_OF_BLOOD("Theatre of Blood", ItemID.LIL_ZIK, "Chests / Raids", LootRecordType.EVENT),
-	TOMBS_OF_AMASCUT("Tombs of Amascut", ItemID.TUMEKENS_GUARDIAN, "Chests / Raids", LootRecordType.EVENT,
-		ImmutableSet.of("Cache of runes")),
+	public final String name;
+	public final int id;
+	public int quantity;
+	public long price;
 
-	BARROWS("Barrows", ItemID.BARROWS_TELEPORT, "Chests / Raids", LootRecordType.EVENT),
-	MOONS_OF_PERIL("Moons of Peril", ItemID.DUAL_MACUAHUITL, "Chests / Raids", LootRecordType.EVENT, "Lunar Chest"),
-	FORTIS_COLOSSEUM("Fortis Colosseum", ItemID.SMOL_HEREDIT, "Chests / Raids", LootRecordType.EVENT),
-
-	// Loot received on NPC death
-	ZULRAH("Zulrah", ItemID.PET_SNAKELING, "Other", LootRecordType.NPC),
-	VORKATH("Vorkath", ItemID.VORKI, "Other", LootRecordType.NPC),
-
-	// Forgotten Four
-	VARDORVIS("Vardorvis", ItemID.BUTCH, "Forgotten Four", LootRecordType.NPC),
-	THE_LEVIATHAN("The Leviathan", ItemID.LILVIATHAN, "Forgotten Four", LootRecordType.NPC),
-	DUKE_SUCELLUS("Duke Sucellus", ItemID.BARON, "Forgotten Four", LootRecordType.NPC),
-	THE_WHISPERER("The Whisperer", ItemID.WISP, "Forgotten Four", LootRecordType.NPC),
-
-	// God wars dungeon
-	KREEARRA("Kree'arra", ItemID.PET_KREEARRA , "God Wars Dungeon", LootRecordType.NPC,
-		ImmutableSet.of("Wingman Skree", "Flockleader Geerin", "Flight Kilisa")),
-	GENERAL_GRAARDOR("General Graardor", ItemID.PET_GENERAL_GRAARDOR , "God Wars Dungeon", LootRecordType.NPC,
-		ImmutableSet.of("Sergeant Strongstack", "Sergeant Steelwill", "Sergeant Grimspike")),
-	COMMANDER_ZILYANA("Commander Zilyana", ItemID.PET_ZILYANA , "God Wars Dungeon", LootRecordType.NPC,
-		ImmutableSet.of("Growler", "Bree", "Starlight")),
-	KRIL_TSUTSAROTH("K'ril Tsutsaroth", ItemID.PET_KRIL_TSUTSAROTH , "God Wars Dungeon", LootRecordType.NPC,
-		ImmutableSet.of("Balfrug Kreeyath", "Tstanon Karlak", "Zakl'n Gritch")),
-	NEX("Nex", ItemID.NEXLING, "God Wars Dungeon", LootRecordType.NPC,
-		ImmutableSet.of("Fumus", "Umbra", "Cruor", "Glacies")),
-
-	// Wildy Bosses
-	VETION("Vet'ion Reborn", ItemID.VETION_JR , "Wilderness", LootRecordType.NPC, ImmutableSet.of("Calvar'ion"), "Vet'ion"),
-	VENENATIS("Venenatis", ItemID.VENENATIS_SPIDERLING , "Wilderness", LootRecordType.NPC, ImmutableSet.of("Spindel")),
-	CALLISTO("Callisto", ItemID.CALLISTO_CUB , "Wilderness", LootRecordType.NPC, ImmutableSet.of("Artio")),
-	CHAOS_ELEMENTAL("Chaos Elemental", ItemID.PET_CHAOS_ELEMENTAL , "Wilderness", LootRecordType.NPC),
-	// Wildy Demi-Bosses
-	SCORPIA("Scorpia", ItemID.SCORPIAS_OFFSPRING, "Wilderness", LootRecordType.NPC),
-	CHAOS_FANATIC("Chaos Fanatic", ItemID.ANCIENT_STAFF , "Wilderness", LootRecordType.NPC),
-	CRAZY_ARCHAEOLOGIST("Crazy Archaeologist", ItemID.FEDORA , "Wilderness", LootRecordType.NPC),
-	// Wildy Other
-	KING_BLACK_DRAGON("King Black Dragon", ItemID.PRINCE_BLACK_DRAGON , "Wilderness", LootRecordType.NPC),
-
-	// Slayer Bosses
-	SKOTIZO("Skotizo", ItemID.SKOTOS, "Slayer", LootRecordType.NPC),
-	GROTESQUE_GUARDIANS("Grotesque Guardians", ItemID.NOON, "Slayer", LootRecordType.NPC, "Dusk"),
-	ABYSSAL_SIRE("Abyssal Sire", ItemID.ABYSSAL_ORPHAN, "Slayer", LootRecordType.NPC),
-	KRAKEN("Kraken", ItemID.PET_KRAKEN, "Slayer", LootRecordType.NPC),
-	CERBERUS("Cerberus", ItemID.HELLPUPPY, "Slayer", LootRecordType.NPC),
-	THERMONUCLEAR_SMOKE_DEVIL("Thermonuclear smoke devil", ItemID.PET_SMOKE_DEVIL, "Slayer", LootRecordType.NPC),
-	ALCHEMICAL_HYDRA("Alchemical Hydra", ItemID.IKKLE_HYDRA, "Slayer", LootRecordType.NPC),
-	ARAXXOR("Araxxor", ItemID.NID, "Slayer", LootRecordType.NPC),
-
-	// Other Bosses
-	KALPHITE_QUEEN("Kalphite Queen", ItemID.KALPHITE_PRINCESS, "Other", LootRecordType.NPC),
-	GIANT_MOLE("Giant Mole", ItemID.BABY_MOLE, "Other", LootRecordType.NPC),
-	CORPOREAL_BEAST("Corporeal Beast", ItemID.PET_CORPOREAL_CRITTER, "Other", LootRecordType.NPC),
-	SARACHNIS("Sarachnis", ItemID.SRARACHA, "Other", LootRecordType.NPC),
-	THE_GAUNTLET("The Gauntlet", ItemID.YOUNGLLEF, "Other", LootRecordType.EVENT),
-	NIGHTMARE("The Nightmare", ItemID.LITTLE_NIGHTMARE, "Other", LootRecordType.NPC),
-	PHOSANIS_NIGHTMARE("Phosani's Nightmare", ItemID.LITTLE_PARASITE, "Other", LootRecordType.NPC),
-	PHANTOM_MUSPAH("Phantom Muspah", ItemID.MUPHIN, "Other", LootRecordType.NPC),
-	HUEYCOATL("Hueycoatl", ItemID.HUBERTE, "Other", LootRecordType.NPC),
-
-	// Dagannoth Kings
-	DAGANNOTH_REX("Dagannoth Rex", ItemID.PET_DAGANNOTH_REX, "Dagannoth Kings", LootRecordType.NPC),
-	DAGANNOTH_PRIME("Dagannoth Prime", ItemID.PET_DAGANNOTH_PRIME, "Dagannoth Kings", LootRecordType.NPC),
-	DAGANNOTH_SUPREME("Dagannoth Supreme", ItemID.PET_DAGANNOTH_SUPREME, "Dagannoth Kings", LootRecordType.NPC),
-
-	// Clue scrolls
-	CLUE_SCROLL_BEGINNER("Clue Scroll (Beginner)", ItemID.CLUE_SCROLL_BEGINNER, "Clue Scrolls", LootRecordType.EVENT),
-	CLUE_SCROLL_EASY("Clue Scroll (Easy)", ItemID.CLUE_SCROLL_EASY, "Clue Scrolls", LootRecordType.EVENT),
-	CLUE_SCROLL_MEDIUM("Clue Scroll (Medium)", ItemID.CLUE_SCROLL_MEDIUM, "Clue Scrolls", LootRecordType.EVENT),
-	CLUE_SCROLL_HARD("Clue Scroll (Hard)", ItemID.CLUE_SCROLL_HARD, "Clue Scrolls", LootRecordType.EVENT),
-	CLUE_SCROLL_ELITE("Clue Scroll (Elite)", ItemID.CLUE_SCROLL_ELITE, "Clue Scrolls", LootRecordType.EVENT),
-	CLUE_SCROLL_MASTER("Clue Scroll (Master)", ItemID.CLUE_SCROLL_MASTER, "Clue Scrolls", LootRecordType.EVENT),
-
-	// Skilling
-	WINTERTODT("Wintertodt", ItemID.PHOENIX, "Skilling", LootRecordType.EVENT, "Supply crate (Wintertodt)"),
-	TEMPOROSS("Tempoross", ItemID.TINY_TEMPOR, "Skilling", LootRecordType.EVENT,
-		ImmutableSet.of("Casket (Tempoross)"), "Reward pool (Tempoross)"),
-	ZALCANO("Zalcano", ItemID.SMOLCANO, "Skilling", LootRecordType.NPC),
-	;
-
-	private final String name;
-	private final int itemID;
-	private final String category;
-	private final LootRecordType type;
-	private final Set<String> aliases = new HashSet<>();
-	private final Set<String> minions;
-
-	BossTab(final String name, final int itemID, final String category, final LootRecordType type, final String... aliases)
+	public long getTotal()
 	{
-		this(name, itemID, category, type, Collections.emptyList(), aliases);
-	}
-
-	BossTab(final String name, final int itemID, final String category, final LootRecordType type, final Collection<String> minions, final String... aliases)
-	{
-		this.name = name;
-		this.itemID = itemID;
-		this.category = category;
-		this.type = type;
-
-		this.aliases.add(name);
-		this.aliases.addAll(Arrays.asList(aliases));
-		this.minions = minions.stream().map(String::toLowerCase).collect(Collectors.toSet());
-	}
-
-	private static final Map<String, BossTab> NAME_MAP;
-	private static final Multimap<String, BossTab> CATEGORY_MAP;
-	static
-	{
-		final ImmutableMap.Builder<String, BossTab> byName = ImmutableMap.builder();
-		final ImmutableMultimap.Builder<String, BossTab> categoryMap = ImmutableMultimap.builder();
-
-		for (BossTab tab : values())
-		{
-			for (final String name : tab.getAliases()) {
-				byName.put(name.toUpperCase(), tab);
-			}
-			categoryMap.put(tab.getCategory(), tab);
-		}
-
-		NAME_MAP = byName.build();
-		CATEGORY_MAP = categoryMap.build();
-	}
-
-	@Nullable
-	public static BossTab getByName(final String name)
-	{
-		return NAME_MAP.get(name.toUpperCase());
-	}
-
-	public static Collection<BossTab> getByCategoryName(final String name)
-	{
-		return CATEGORY_MAP.get(name);
-	}
-
-	public static TreeSet<String> getCategories()
-	{
-		return new TreeSet<>(CATEGORY_MAP.keySet());
+		return this.quantity * this.price;
 	}
 }
 
-package thestonedturtle.lootlogger;
+/*
+ * Copyright (c) 2023, TheStonedTurtle <https://github.com/TheStonedTurtle>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package thestonedturtle.lootlogger.localstorage;
 
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.LinkedListMultimap;
-import com.google.common.collect.SetMultimap;
-import com.google.inject.Provides;
-import java.awt.image.BufferedImage;
-import java.text.NumberFormat;
+import com.google.gson.TypeAdapter;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonToken;
+import com.google.gson.stream.JsonWriter;
+import java.io.IOException;
 import java.text.ParseException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
+import java.text.SimpleDateFormat;
 import java.util.Date;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-import java.util.Optional;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
-import java.util.stream.Collectors;
-import javax.inject.Inject;
-import javax.swing.SwingUtilities;
-import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.ChatMessageType;
-import net.runelite.api.Client;
-import net.runelite.api.GameState;
-import net.runelite.api.ItemComposition;
-import net.runelite.api.events.ChatMessage;
-import net.runelite.api.events.GameStateChanged;
-import net.runelite.api.events.GameTick;
-import net.runelite.api.events.WidgetLoaded;
-import net.runelite.api.widgets.ComponentID;
-import net.runelite.api.widgets.InterfaceID;
-import net.runelite.api.widgets.Widget;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.config.RuneScapeProfileType;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.ConfigChanged;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.game.ItemStack;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.plugins.PluginManager;
-import net.runelite.client.plugins.loottracker.LootReceived;
-import net.runelite.client.ui.ClientToolbar;
-import net.runelite.client.ui.NavigationButton;
-import net.runelite.client.util.ImageUtil;
-import net.runelite.client.util.Text;
-import net.runelite.http.api.loottracker.LootRecordType;
-import org.apache.commons.lang3.ArrayUtils;
-import thestonedturtle.lootlogger.data.BossTab;
-import thestonedturtle.lootlogger.data.LootLog;
-import thestonedturtle.lootlogger.data.Pet;
-import thestonedturtle.lootlogger.data.UniqueItem;
-import thestonedturtle.lootlogger.localstorage.LTItemEntry;
-import thestonedturtle.lootlogger.localstorage.LTRecord;
-import thestonedturtle.lootlogger.localstorage.LootRecordWriter;
-import thestonedturtle.lootlogger.ui.LootLoggerPanel;
 
+/**
+ * This class is needed because at some point after Java 17 but including Java 20 the default date format changed
+ * For Java 17- it uses a normal space between the AM/PM while in Java 20+ the unicode character U+202f is used
+ * This adapter checks to see if the unicode character is within the date and will use the proper GSON object for parsing it
+ */
 @Slf4j
-@PluginDescriptor(
-	name = "Loot Logger"
-)
-public class LootLoggerPlugin extends Plugin
+public class LootRecordDateAdapter extends TypeAdapter<Date>
 {
-	private static final String SIRE_FONT_TEXT = "you place the unsired into the font of consumption...";
-	private static final String SIRE_REWARD_TEXT = "the font consumes the unsired";
-	private static final int MAX_TEXT_CHECK = 25;
-	private static final int MAX_PET_TICKS = 5;
+	private final SimpleDateFormat SPACE_FORMAT = new SimpleDateFormat("MMM d, yyyy, h:mm:ss aaa");
+	private final SimpleDateFormat UNICODE_FORMAT = new SimpleDateFormat("MMM d, yyyy, h:mm:ss\u202Faaa");
 
-	// Kill count handling
-	private static final Pattern CLUE_SCROLL_PATTERN = Pattern.compile("You have completed ([0-9]+) ([a-z]+) Treasure Trails.");
-	private static final Pattern BOSS_NAME_NUMBER_PATTERN = Pattern.compile("Your (.*) kill count is:? ([0-9,]*).");
-	private static final Pattern NUMBER_PATTERN = Pattern.compile("([0-9,]+)");
-
-	private static final NumberFormat NUMBER_FORMATTER = NumberFormat.getNumberInstance(Locale.US);
-
-	private static final ImmutableSet<String> PET_MESSAGES = ImmutableSet.of("You have a funny feeling like you're being followed.",
-		"You feel something weird sneaking into your backpack.",
-		"You have a funny feeling like you would have been followed...");
-
-	private static final int NMZ_MAP_REGION = 9033;
-
-	public static final String SESSION_NAME = "Current Session Data";
-
-	@Inject
-	private Client client;
-
-	@Inject
-	private ClientToolbar clientToolbar;
-
-	@Inject
-	public LootLoggerConfig config;
-
-	@Inject
-	private ItemManager itemManager;
-
-	@Inject
-	private ClientThread clientThread;
-
-	@Inject
-	private LootRecordWriter writer;
-
-	@Inject
-	private PluginManager pluginManager;
-
-	private LootLoggerPanel panel;
-	private NavigationButton navButton;
-
-	@Getter
-	private SetMultimap<LootRecordType, String> lootNames = HashMultimap.create();
-
-	private boolean prepared = false;
-	private boolean unsiredReclaiming = false;
-	private int unsiredCheckCount = 0;
-	// Some pets aren't handled (skilling pets) so reset gotPet after a few ticks
-	private int petTicks = 0;
-	private boolean gotPet = false;
-
-	private final Map<String, Integer> killCountMap = new HashMap<>();
-	private final LinkedListMultimap<String, LTRecord> sessionData = LinkedListMultimap.create();
-
-	@Provides
-	LootLoggerConfig provideConfig(ConfigManager configManager)
+	@Override
+	public void write(JsonWriter out, Date value) throws IOException
 	{
-		return configManager.getConfig(LootLoggerConfig.class);
+		if (value == null) {
+			out.nullValue();
+			return;
+		}
+
+		out.value(SPACE_FORMAT.format(value));
 	}
 
 	@Override
-	protected void startUp() throws Exception
-	{
-		panel = new LootLoggerPanel(itemManager, this);
-
-		final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "panel-icon.png");
-
-		navButton = NavigationButton.builder()
-			.tooltip("Loot Logger")
-			.icon(icon)
-			.priority(6)
-			.panel(panel)
-			.build();
-
-		if (config.enableUI())
-		{
-			clientToolbar.addNavigation(navButton);
+	public Date read(JsonReader reader) throws IOException {
+		if (reader.peek() == JsonToken.NULL) {
+			reader.nextNull();
+			return null;
 		}
 
-		// Attach necessary info from item manager on load, probably a better method
-		if (!prepared)
+		String date = reader.nextString();
+		try
 		{
-			prepared = true;
-			clientThread.invokeLater(() ->
+			if (date.contains("\u202F"))
 			{
-				switch (client.getGameState())
-				{
-					case UNKNOWN:
-					case STARTING:
-						return false;
-				}
-
-				UniqueItem.prepareUniqueItems(itemManager);
-				return true;
-			});
-		}
-
-		if (client.getGameState().equals(GameState.LOGGED_IN) || client.getGameState().equals(GameState.LOADING))
-		{
-			updateWriterUsername();
-		}
-
-		final Optional<Plugin> mainPlugin = pluginManager.getPlugins().stream().filter(p -> p.getName().equals("Loot Tracker")).findFirst();
-		if (mainPlugin.isPresent() && !pluginManager.isPluginEnabled(mainPlugin.get()))
-		{
-			pluginManager.setPluginEnabled(mainPlugin.get(), true);
-		}
-	}
-
-	@Override
-	protected void shutDown()
-	{
-		if (config.enableUI())
-		{
-			clientToolbar.removeNavigation(navButton);
-		}
-
-		gotPet = false;
-		petTicks = 0;
-		writer.setName(null);
-	}
-
-	@Subscribe
-	public void onConfigChanged(final ConfigChanged event)
-	{
-		if (event.getGroup().equals("lootlogger"))
-		{
-			if (event.getKey().equals("enableUI"))
-			{
-				if (config.enableUI())
-				{
-					clientToolbar.addNavigation(navButton);
-				}
-				else
-				{
-					clientToolbar.removeNavigation(navButton);
-				}
+				return UNICODE_FORMAT.parse(date);
 			}
 
-			if (config.enableUI())
-			{
-				SwingUtilities.invokeLater(panel::refreshUI);
-			}
-		}
-	}
-
-	@Subscribe
-	public void onGameStateChanged(final GameStateChanged event)
-	{
-		if (event.getGameState() == GameState.LOGGED_IN)
-		{
-			updateWriterUsername();
-		}
-	}
-
-	private void updateWriterUsername()
-	{
-		// Check if we're already using this user as we are now updating the username on `LOGGED_IN` instead of `LOGGING_IN`
-		// `LOGGED_IN` will be triggered after every `LOADING` state which happens much more frequently
-		String folder = String.valueOf(client.getAccountHash());
-		RuneScapeProfileType profileType = RuneScapeProfileType.getCurrent(client);
-		if (profileType != RuneScapeProfileType.STANDARD)
-		{
-			folder += "-" + Text.titleCase(profileType);
-		}
-
-		if (folder.equalsIgnoreCase(writer.getName()))
-		{
-			return;
-		}
-
-		// If we aren't first attempt to migrate from the deprecated login name to the account hash
-		String name = client.getUsername();
-		if (name != null && name.length() > 0 && client.getAccountHash() != -1)
-		{
-			// We are using the accountHash as RL doesn't return a login name when ran through the Jagex launcher
-			writer.renameUsernameFolderToAccountHash(name.toLowerCase(), client.getAccountHash());
-		}
-
-		if (writer.setPlayerUsername(folder))
-		{
-			localPlayerNameChanged();
-		}
-	}
-
-	private void localPlayerNameChanged()
-	{
-		lootNames = writer.getKnownFileNames();
-		if (config.enableUI())
-		{
-			SwingUtilities.invokeLater(panel::showSelectionView);
-		}
-	}
-
-	private Collection<LTItemEntry> convertToLTItemEntries(Collection<ItemStack> stacks)
-	{
-		return stacks.stream().map(i -> createLTItemEntry(i.getId(), i.getQuantity())).collect(Collectors.toList());
-	}
-
-	private LTItemEntry createLTItemEntry(final int id, final int qty)
-	{
-		final ItemComposition c = itemManager.getItemComposition(id);
-		final int realId = c.getNote() == -1 ? c.getId() : c.getLinkedNoteId();
-		final int price = itemManager.getItemPrice(realId);
-		return new LTItemEntry(c.getName(), id, qty, price);
-	}
-
-	private void addRecord(final LTRecord record)
-	{
-		writer.addLootTrackerRecord(record);
-		lootNames.put(record.getType(), record.getName().toLowerCase());
-		sessionData.put(record.getName().toLowerCase(), record);
-		if (config.enableUI())
-		{
-			SwingUtilities.invokeLater(() -> panel.addLog(record));
-		}
-	}
-
-	@Subscribe
-	public void onLootReceived(final LootReceived event)
-	{
-		if (isInNightmareZone() && config.ignoreNmz())
-		{
-			return;
-		}
-
-		final Collection<LTItemEntry> drops = convertToLTItemEntries(event.getItems());
-
-		if (gotPet)
-		{
-			final Pet p = Pet.getByBossName(event.getName());
-			if (p != null)
-			{
-				gotPet = false;
-				petTicks = 0;
-				drops.add(createLTItemEntry(p.getPetID(), 1));
-			}
-		}
-
-		int kc = killCountMap.getOrDefault(event.getName().toUpperCase(), -1);
-
-		// Check aliases if they exist for kill counts
-		BossTab tab = BossTab.getByName(event.getName());
-		if (kc == -1 && tab != null && tab.getAliases().size() > 0) {
-			for (final String alias : tab.getAliases()) {
-				kc = killCountMap.getOrDefault(alias.toUpperCase(), -1);
-				if (kc > 0) {
-					break;
-				}
-			}
-		}
-
-		final LTRecord record = new LTRecord(event.getName(), event.getCombatLevel(), kc, event.getType(), drops, new Date());
-		addRecord(record);
-	}
-
-	public Collection<LTRecord> getDataByName(LootRecordType type, String name)
-	{
-		final BossTab tab = BossTab.getByName(name);
-		if (tab == null)
-		{
-			return writer.loadLootTrackerRecords(type, name);
-		}
-
-		final Collection<LTRecord> records = new ArrayList<>();
-		for (final String alias : tab.getAliases()) {
-			records.addAll(writer.loadLootTrackerRecords(type, alias));
-		}
-
-		return records;
-	}
-
-	/**
-	 * Creates a loot log for this name and then attaches it to the UI when finished
-	 * @param name record name
-	 */
-	public void requestLootLog(final LootRecordType type, final String name)
-	{
-		clientThread.invoke(() ->
-		{
-			if (name.equalsIgnoreCase(SESSION_NAME))
-			{
-				final LootLog log = new LootLog(Collections.emptyList(), name);
-				for (final String key : sessionData.keySet())
-				{
-					log.getMinionLogs().add(new LootLog(sessionData.get(key), key));
-				}
-
-				SwingUtilities.invokeLater(() -> panel.useLog(log));
-				return;
-			}
-			
-			final Collection<LTRecord> records = getDataByName(type, name);
-			final LootLog log = new LootLog(records, name);
-			if (log.getType().equals(LootRecordType.UNKNOWN))
-			{
-				log.setType(type);
-			}
-
-			final BossTab tab = BossTab.getByName(name);
-			if (tab != null && tab.getMinions().size() > 0)
-			{
-				for (final String minion : tab.getMinions())
-				{
-					final Collection<LTRecord> minionRecords = getDataByName(type, minion);
-					final LootLog minionLog = new LootLog(minionRecords, minion);
-
-					log.getMinionLogs().add(minionLog);
-				}
-			}
-
-			SwingUtilities.invokeLater(() -> panel.useLog(log));
-		});
-	}
-
-	public boolean clearStoredDataByName(final LootRecordType type, final String name)
-	{
-		if (name.equalsIgnoreCase(SESSION_NAME))
-		{
-			sessionData.clear();
-			return true;
-		}
-
-		if (panel.getLootLog().getName().equalsIgnoreCase(SESSION_NAME))
-		{
-			sessionData.removeAll(name.toLowerCase());
-			return true;
-		}
-
-		lootNames.remove(type, name);
-		return writer.deleteLootTrackerRecords(type, name);
-	}
-
-	@Subscribe
-	public void onWidgetLoaded(WidgetLoaded event)
-	{
-		if (event.getGroupId() != InterfaceID.DIALOG_SPRITE)
-		{
-			return;
-		}
-
-		Widget text = client.getWidget(ComponentID.DIALOG_SPRITE_TEXT);
-		if (text != null && text.getText().toLowerCase().contains(SIRE_FONT_TEXT))
-		{
-			unsiredCheckCount = 0;
-			unsiredReclaiming = true;
-		}
-	}
-
-	@Subscribe
-	public void onGameTick(GameTick t)
-	{
-		if (gotPet)
-		{
-			if (petTicks > MAX_PET_TICKS)
-			{
-				gotPet = false;
-				petTicks = 0;
-			}
-			else
-			{
-				petTicks++;
-			}
-		}
-
-		if (unsiredReclaiming)
-		{
-			if (hasUnsiredWidgetUpdated())
-			{
-				unsiredReclaiming = false;
-				return;
-			}
-
-			unsiredCheckCount++;
-			if (unsiredCheckCount >= MAX_TEXT_CHECK)
-			{
-				unsiredReclaiming = false;
-			}
-		}
-	}
-
-	// Handles checking for unsired loot reclamation
-	private boolean hasUnsiredWidgetUpdated()
-	{
-		final Widget text = client.getWidget(ComponentID.DIALOG_SPRITE_TEXT);
-		// Reclaimed an item?
-		if (text != null && text.getText().toLowerCase().contains(SIRE_REWARD_TEXT))
-		{
-			final Widget sprite = client.getWidget(InterfaceID.DIALOG_SPRITE);
-			if (sprite == null || sprite.getItemId() == -1)
-			{
-				return false;
-			}
-
-			log.debug("Unsired was exchanged for item ID: {}", sprite.getItemId());
-			receivedUnsiredLoot(sprite.getItemId());
-			return true;
-		}
-
-		return false;
-	}
-
-	// Handles adding the unsired loot to the tracker
-	private void receivedUnsiredLoot(int itemID)
-	{
-		clientThread.invokeLater(() ->
-		{
-			Collection<LTRecord> data = getDataByName(LootRecordType.NPC, BossTab.ABYSSAL_SIRE.getName());
-			ItemComposition c = itemManager.getItemComposition(itemID);
-			LTItemEntry itemEntry = new LTItemEntry(c.getName(), itemID, 1, 0);
-
-			log.debug("Received Unsired item: {}", c.getName());
-
-			// Don't have data for sire, create a new record with just this data.
-			if (data == null)
-			{
-				log.debug("No previous Abyssal sire loot, creating new loot record");
-				LTRecord r = new LTRecord(BossTab.ABYSSAL_SIRE.getName(), 350, -1, LootRecordType.NPC, Collections.singletonList(itemEntry), new Date());
-				addRecord(r);
-				return;
-			}
-
-			log.debug("Adding drop to last abyssal sire loot record");
-			// Add data to last kill count
-			final List<LTRecord> items = new ArrayList<>(data);
-			final LTRecord r = items.get(items.size() - 1);
-			r.addDropEntry(itemEntry);
-			writer.writeLootTrackerFile(BossTab.ABYSSAL_SIRE.getName(), items);
-			if (config.enableUI())
-			{
-				SwingUtilities.invokeLater(panel::refreshUI);
-			}
-		});
-	}
-
-	public int convertToInt(String s)
-	{
-		try {
-			return NUMBER_FORMATTER.parse(s).intValue();
+			return SPACE_FORMAT.parse(date);
 		}
 		catch (ParseException e)
 		{
-			return -1;
+			log.error("Error parsing LootRecord date value: {}", date);
+			e.printStackTrace();
+			return null;
 		}
 	}
 
-	@Subscribe
-	public void onChatMessage(ChatMessage event)
+}
+
+/*
+ * Copyright (c) 2018, TheStonedTurtle <https://github.com/TheStonedTurtle>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package thestonedturtle.lootlogger.localstorage;
+
+import com.google.common.collect.HashMultimap;
+import com.google.common.collect.SetMultimap;
+import com.google.gson.Gson;
+import java.io.BufferedReader;
+import java.io.BufferedWriter;
+import java.io.File;
+import java.io.FileNotFoundException;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Map;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import static net.runelite.client.RuneLite.RUNELITE_DIR;
+import net.runelite.http.api.RuneLiteAPI;
+import net.runelite.http.api.loottracker.LootRecordType;
+
+/**
+ * Reads & Writes LootRecord data from `*name*.log` files located in `.runelite/loots/`.
+ * Data is stored as json delimited by newlines, aka JSON Lines {@see <a href="http://jsonlines.org">http://jsonlines.org</a>}
+ */
+@Slf4j
+@Singleton
+public class LootRecordWriter
+{
+	private static final String FILE_EXTENSION = ".log";
+	private static final File LOOT_RECORD_DIR = new File(RUNELITE_DIR, "loots");
+
+	// Data is stored in a folder with the players username (login name)
+	private File playerFolder = LOOT_RECORD_DIR;
+	// Data is separated into sub-folders by event type to prevent issues.
+	private final Map<LootRecordType, File> eventFolders = new HashMap<>();
+	@Setter
+	@Getter
+	private String name;
+
+	// The default date format does not allow migrating between Java 17 and Java 20+ (in either direction)
+	// Java 20+ uses unicode character U+202f while java 17- use a normal space before the AM/PM part of the date string
+	// This date adapter will attempt to match between both variants but will always write with a space
+	private final Gson CUSTOM_GSON = RuneLiteAPI.GSON.newBuilder()
+		.registerTypeAdapter(Date.class, new LootRecordDateAdapter())
+		.create();
+
+	@Inject
+	public LootRecordWriter()
 	{
-		if (event.getType() != ChatMessageType.GAMEMESSAGE && event.getType() != ChatMessageType.SPAM)
+		LOOT_RECORD_DIR.mkdir();
+	}
+
+	public boolean setPlayerUsername(final String username)
+	{
+		if (username.equalsIgnoreCase(name))
 		{
-			return;
+			return false;
 		}
 
-		final String chatMessage = Text.removeTags(event.getMessage());
+		playerFolder = new File(LOOT_RECORD_DIR, username);
+		playerFolder.mkdir();
+		name = username;
+		createSubFolders();
+		return true;
+	}
 
-		if (PET_MESSAGES.contains(chatMessage))
+	private void createSubFolders()
+	{
+		eventFolders.clear();
+		for (final LootRecordType type : LootRecordType.values())
 		{
-			gotPet = true;
+			final File folder = new File(playerFolder, type.name().toLowerCase());
+			folder.mkdir();
+			eventFolders.put(type, folder);
 		}
+	}
 
-		// Check if message is for a clue scroll reward
-		final Matcher m = CLUE_SCROLL_PATTERN.matcher(chatMessage);
-		if (m.find())
+	private static String npcNameToFileName(final String npcName)
+	{
+		return npcName.toLowerCase().trim() + FILE_EXTENSION;
+	}
+
+	public SetMultimap<LootRecordType, String> getKnownFileNames()
+	{
+		final SetMultimap<LootRecordType, String> fileNames = HashMultimap.create();
+
+		for (final Map.Entry<LootRecordType, File> entry : eventFolders.entrySet())
 		{
-			final String eventType;
-			switch (m.group(2).toLowerCase())
+			final File[] files = entry.getValue().listFiles((dir, name) -> name.endsWith(FILE_EXTENSION));
+			if (files != null)
 			{
-				case "beginner":
-					eventType = "Clue Scroll (Beginner)";
-					break;
-				case "easy":
-					eventType = "Clue Scroll (Easy)";
-					break;
-				case "medium":
-					eventType = "Clue Scroll (Medium)";
-					break;
-				case "hard":
-					eventType = "Clue Scroll (Hard)";
-					break;
-				case "elite":
-					eventType = "Clue Scroll (Elite)";
-					break;
-				case "master":
-					eventType = "Clue Scroll (Master)";
-					break;
-				default:
-					return;
-			}
-
-			final int killCount = convertToInt(m.group(1));
-			killCountMap.put(eventType.toUpperCase(), killCount);
-			return;
-		}
-
-		// Barrows KC
-		if (chatMessage.startsWith("Your Barrows chest count is"))
-		{
-			Matcher n = NUMBER_PATTERN.matcher(chatMessage);
-			if (n.find())
-			{
-				killCountMap.put("BARROWS", convertToInt(n.group()));
-				return;
+				for (final File f : files)
+				{
+					fileNames.put(entry.getKey(), f.getName().replace(FILE_EXTENSION, ""));
+				}
 			}
 		}
 
-		// Raids KC
-		if (chatMessage.startsWith("Your completed Chambers of Xeric count is"))
+		return fileNames;
+	}
+
+	public synchronized Collection<LTRecord> loadLootTrackerRecords(LootRecordType recordType, String npcName)
+	{
+		final String fileName = npcNameToFileName(npcName);
+		final File file = new File(eventFolders.get(recordType), fileName);
+		final Collection<LTRecord> data = new ArrayList<>();
+
+		try (final BufferedReader br = new BufferedReader(new FileReader(file)))
 		{
-			Matcher n = NUMBER_PATTERN.matcher(chatMessage);
-			if (n.find())
+			String line;
+			while ((line = br.readLine()) != null)
 			{
-				killCountMap.put("CHAMBERS OF XERIC", convertToInt(n.group()));
-				return;
+				// Skips the empty line at end of file
+				if (line.length() > 0)
+				{
+					final LTRecord r = CUSTOM_GSON.fromJson(line, LTRecord.class);
+					data.add(r);
+				}
 			}
+
 		}
-		
-		// Tob KC
-		if (chatMessage.startsWith("Your completed Theatre of Blood count is"))
+		catch (FileNotFoundException e)
 		{
-			Matcher n = NUMBER_PATTERN.matcher(chatMessage);
-			if (n.find())
-			{
-				killCountMap.put("THEATRE OF BLOOD", convertToInt(n.group()));
-				return;
-			}
+			log.debug("File not found: {}", fileName);
+		}
+		catch (IOException e)
+		{
+			log.warn("IOException for file {}: {}", fileName, e.getMessage());
 		}
 
-		// Handle the other bosses
-		final Matcher boss = BOSS_NAME_NUMBER_PATTERN.matcher(chatMessage);
-		if (boss.find())
+		return data;
+	}
+
+	public synchronized boolean addLootTrackerRecord(LTRecord rec)
+	{
+		// Grab file
+		final String fileName = npcNameToFileName(rec.getName());
+		final File lootFile = new File(eventFolders.get(rec.getType()), fileName);
+
+		// Convert entry to JSON
+		final String dataAsString = CUSTOM_GSON.toJson(rec);
+
+		// Open File in append mode and write new data
+		try
 		{
-			final String bossName = boss.group(1);
-			final int killCount = convertToInt(boss.group(2));
-			killCountMap.put(bossName.toUpperCase(), killCount);
+			final BufferedWriter file = new BufferedWriter(new FileWriter(String.valueOf(lootFile), true));
+			file.append(dataAsString);
+			file.newLine();
+			file.close();
+			return true;
+		}
+		catch (IOException ioe)
+		{
+			log.warn("Error writing loot data to file {}: {}", fileName, ioe.getMessage());
+			return false;
+		}
+	}
+
+	public synchronized boolean deleteLootTrackerRecords(final LootRecordType type, String npcName)
+	{
+		final String fileName = npcNameToFileName(npcName);
+		final File lootFile = new File(eventFolders.get(type), fileName);
+
+		if (lootFile.delete())
+		{
+			log.debug("Deleted loot file: {}", fileName);
+			return true;
+		}
+		else
+		{
+			log.debug("Couldn't delete file: {}", fileName);
+			return false;
 		}
 	}
 
 	/**
-	 * Is the player inside the NMZ arena?
-	 */
-	private boolean isInNightmareZone()
+	 * Writes an entire log file based on the passed collection.
+	 * Used when you need to adjust previous data and not just append, such as receiving a pet.
+ 	 */
+	public synchronized boolean writeLootTrackerFile(final String npcName, final Collection<LTRecord> loots)
 	{
-		if (client.getLocalPlayer() == null) {
+		final String fileName = npcNameToFileName(npcName);
+		final File lootFile = new File(playerFolder, fileName);
+
+		try
+		{
+			final BufferedWriter file = new BufferedWriter(new FileWriter(String.valueOf(lootFile), false));
+			for (final LTRecord rec : loots)
+			{
+				// Convert entry to JSON
+				final String dataAsString = CUSTOM_GSON.toJson(rec);
+				file.append(dataAsString);
+				file.newLine();
+			}
+			file.close();
+
+			return true;
+		}
+		catch (IOException ioe)
+		{
+			log.warn("Error rewriting loot data to file {}: {}", fileName, ioe.getMessage());
+			return false;
+		}
+	}
+
+	public synchronized boolean renameUsernameFolderToAccountHash(final String username, final long hash)
+	{
+		final File usernameDir = new File(LOOT_RECORD_DIR, username);
+		if (!usernameDir.exists())
+		{
+			log.debug("Already rewritten");
+			return true;
+		}
+
+		final File hashDir = new File(LOOT_RECORD_DIR, String.valueOf(hash));
+		if (hashDir.exists())
+		{
+			log.warn("Can't rename username folder to account hash as the folder for this account hash already exists."
+				+ " This was most likely caused by running RL through the Jagex launcher before the migration code was added");
+			log.warn("Username: {} | AccountHash: {}", username, hash);
 			return false;
 		}
 
-		// It seems that KBD shares the map region with NMZ but NMZ is never in plane 0.
-		return ArrayUtils.contains(client.getMapRegions(), NMZ_MAP_REGION) && client.getLocalPlayer().getWorldLocation().getPlane() > 0;
+		return usernameDir.renameTo(hashDir);
 	}
 }
 
-package thestonedturtle.lootlogger;
+/*
+ * Copyright (c) 2021, TheStonedTurtle <https://github.com/TheStonedTurtle>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package thestonedturtle.lootlogger.ui;
 
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-import net.runelite.client.config.Range;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.function.BiConsumer;
+import javax.swing.BoxLayout;
+import javax.swing.JMenuItem;
+import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
+import javax.swing.SwingUtilities;
+import lombok.Getter;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.http.api.loottracker.LootRecordType;
+import thestonedturtle.lootlogger.data.LootLog;
+import thestonedturtle.lootlogger.localstorage.LTItemEntry;
 
-@ConfigGroup("lootlogger")
-public interface LootLoggerConfig extends Config
+public class NamedLootGrid extends JPanel
 {
-	@ConfigItem(
-		keyName = "enableUI",
-		name = "Enable Side-Panel",
-		description = "Controls whether the side panel should be displayed, data will be logged either way"
-	)
-	default boolean enableUI()
-	{
-		return true;
+	private boolean isCollapsed = false;
+	private final LootGridName namePanel;
+	private final LootGrid grid;
+	@Getter
+	private long price;
+
+	NamedLootGrid(final String name, final int count, final long price, final LootGrid grid,
+				 final LootRecordType type, final BiConsumer<LootRecordType, String> clearData) {
+		this.grid = grid;
+		this.price = price;
+
+		this.setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+		this.setBackground(ColorScheme.DARKER_GRAY_COLOR.darker());
+
+		namePanel = new LootGridName(name, count, price);
+
+		// Clear data popup-menu
+		final JPopupMenu menu = new JPopupMenu();
+		final JMenuItem delete = new JMenuItem("Clear stored data");
+		delete.addActionListener(ev -> clearData.accept(type, name));
+		menu.add(delete);
+		namePanel.setComponentPopupMenu(menu);
+		namePanel.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				if (SwingUtilities.isRightMouseButton(e))
+				{
+					return;
+				}
+
+				changeCollapse();
+			}
+		});
+
+		this.add(namePanel);
+		this.add(grid);
 	}
 
-	@ConfigItem(
-		position = 0,
-		keyName = "uniquesPlacement",
-		name = "Uniques Placement",
-		description = "Where should unique items be displayed inside the UI"
-	)
-	default UniqueItemPlacement uniquesPlacement()
+	void updateGrid(final LootLog log, final LTItemEntry[] itemsToDisplay, final ItemManager itemManager)
 	{
-		return UniqueItemPlacement.BOTH;
+		price = log.getLootValue(false);
+		namePanel.updateLabel(log.getName(), log.getRecords().size(), price);
+
+		grid.updateGrid(itemsToDisplay, itemManager);
+
+		if (isCollapsed)
+		{
+			changeCollapse();
+		}
 	}
 
-	@ConfigItem(
-		position = 1,
-		keyName = "itemSortType",
-		name = "Item Sorting",
-		description = "Determines how items should be sorted inside the item breakdown"
-	)
-	default ItemSortTypes itemSortType()
+	void changeCollapse()
 	{
-		return ItemSortTypes.VALUE;
-	}
+		isCollapsed = !isCollapsed;
+		grid.setVisible(!isCollapsed);
 
-	@ConfigItem(
-		position = 3,
-		keyName = "bossButtons",
-		name = "Show boss icons",
-		description = "Toggles whether the selection screen will use the boss icons"
-	)
-	default boolean bossButtons()
-	{
-		return true;
-	}
-
-	@ConfigItem(
-		position = 4,
-		keyName = "ignoreNmz",
-		name = "Ignore nightmare zone",
-		description = "Whether to ignore loot received while inside Nightmare Zone"
-	)
-	default boolean ignoreNmz()
-	{
-		return true;
-	}
-
-	@ConfigItem(
-		position = 5,
-		keyName = "itemMissingAlpha",
-		name = "Missing item opacity",
-		description = "Controls the image opacity for unacquired unique items inside the uniques panel.<br/>0 is transparent and 100 is fully opaque. default value is 35"
-	)
-	@Range(max = 100)
-	default int itemMissingAlpha() { return 35; }
-
-	@ConfigItem(
-		position = 6,
-		keyName = "includeMinions",
-		name = "Include Minions",
-		description = "Toggles whether loot from minions will be included when looking at specific loot tabs, such as the GWD bosses"
-	)
-	default boolean includeMinions()
-	{
-		return true;
+		// Copied from RuneLite's LootTrackerBox::applyDimmer
+		for (Component component : namePanel.getComponents())
+		{
+			Color color = component.getForeground();
+			component.setForeground(isCollapsed ? color.darker() : color.brighter());
+		}
 	}
 }
 
@@ -2895,367 +3399,6 @@ class SelectionPanel extends JPanel
 }
 
 /*
- * Copyright (c) 2018, TheStonedTurtle <https://github.com/TheStonedTurtle>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package thestonedturtle.lootlogger.ui;
-
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.awt.image.BufferedImage;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import javax.swing.ImageIcon;
-import javax.swing.JLabel;
-import javax.swing.JOptionPane;
-import javax.swing.JPanel;
-import javax.swing.JScrollPane;
-import javax.swing.border.CompoundBorder;
-import javax.swing.border.EmptyBorder;
-import javax.swing.border.MatteBorder;
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.ui.ColorScheme;
-import net.runelite.client.ui.PluginPanel;
-import net.runelite.client.ui.components.PluginErrorPanel;
-import net.runelite.client.util.ImageUtil;
-import net.runelite.http.api.loottracker.LootRecordType;
-import thestonedturtle.lootlogger.LootLoggerPlugin;
-import thestonedturtle.lootlogger.data.BossTab;
-import thestonedturtle.lootlogger.data.LootLog;
-import thestonedturtle.lootlogger.localstorage.LTRecord;
-
-@Slf4j
-public class LootLoggerPanel extends PluginPanel
-{
-	private static final BufferedImage ICON_DELETE;
-	private static final BufferedImage ICON_REFRESH;
-	private static final BufferedImage ICON_BACK;
-	private static final BufferedImage ICON_REPLAY;
-
-	private final static Color BACKGROUND_COLOR = ColorScheme.DARK_GRAY_COLOR;
-	private final static Color BUTTON_HOVER_COLOR = ColorScheme.DARKER_GRAY_HOVER_COLOR;
-
-	static
-	{
-		ICON_DELETE = ImageUtil.loadImageResource(LootLoggerPlugin.class, "delete-white.png");
-		ICON_REFRESH = ImageUtil.loadImageResource(LootLoggerPlugin.class, "refresh-white.png");
-		ICON_BACK = ImageUtil.loadImageResource(LootLoggerPlugin.class, "back-arrow-white.png");
-		ICON_REPLAY = ImageUtil.loadImageResource(LootLoggerPlugin.class, "replay-white.png");
-	}
-
-	private final ItemManager itemManager;
-	private final LootLoggerPlugin plugin;
-
-	private LootPanel lootPanel;
-	@Getter
-	private LootLog lootLog;
-	private SelectionPanel selectionPanel;
-
-	public LootLoggerPanel(final ItemManager itemManager, final LootLoggerPlugin plugin)
-	{
-		super(false);
-		this.itemManager = itemManager;
-		this.plugin = plugin;
-
-		this.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		this.setLayout(new BorderLayout());
-
-		showSelectionView();
-	}
-
-	public void useLog(final LootLog log)
-	{
-		lootLog = log;
-		showLootView();
-	}
-
-	public void requestLootLog(final LootRecordType type, final String name)
-	{
-		// For some reason removing all the components when there's a lot of names in the selectionPanel causes lag.
-		// Removing them here seems to mitigate the lag
-		if (selectionPanel != null)
-		{
-			selectionPanel.getNamePanel().removeAll();
-		}
-
-		plugin.requestLootLog(type, name);
-	}
-
-	// Loot Selection view
-	public void showSelectionView()
-	{
-		this.removeAll();
-		lootLog = null;
-		lootPanel = null;
-
-		final PluginErrorPanel errorPanel = new PluginErrorPanel();
-		errorPanel.setBorder(new EmptyBorder(10, 25, 10, 25));
-		errorPanel.setContent("Loot Logger", "Select the Activity, Player, or NPC you wish to view loot for");
-
-		selectionPanel = new SelectionPanel(plugin.config.bossButtons(), plugin.getLootNames(), this, itemManager);
-
-		this.add(errorPanel, BorderLayout.NORTH);
-		this.add(wrapContainer(selectionPanel), BorderLayout.CENTER);
-
-		this.revalidate();
-		this.repaint();
-	}
-
-	// Loot breakdown view
-	public void showLootView()
-	{
-		this.removeAll();
-		selectionPanel = null;
-
-		final JPanel title = createLootViewTitle();
-		lootPanel = new LootPanel(lootLog, plugin.config, itemManager, (lootRecordType, name) -> {
-			if (clearData(lootRecordType, name))
-			{
-				requestLootLog(lootRecordType, lootLog.getName());
-			}
-		});
-
-		this.add(title, BorderLayout.NORTH);
-		this.add(wrapContainer(lootPanel), BorderLayout.CENTER);
-
-		this.revalidate();
-		this.repaint();
-	}
-
-	// Title element for Loot breakdown view
-	private JPanel createLootViewTitle()
-	{
-		final String name = lootLog.getName();
-		final JPanel title = new JPanel();
-		title.setBorder(new CompoundBorder(
-				new EmptyBorder(10, 8, 8, 8),
-				new MatteBorder(0, 0, 1, 0, Color.GRAY)
-		));
-		title.setLayout(new BorderLayout());
-		title.setBackground(BACKGROUND_COLOR);
-
-		final JPanel first = new JPanel();
-		first.setBackground(BACKGROUND_COLOR);
-
-		// Back Button
-		final JLabel back = createIconLabel(ICON_BACK);
-		back.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				showSelectionView();
-			}
-		});
-		back.setToolTipText("Back to selection screen");
-
-		final JLabel text = new JLabel(name);
-		text.setForeground(Color.WHITE);
-
-		first.add(back);
-		first.add(text);
-
-		final JPanel second = new JPanel();
-		second.setBackground(BACKGROUND_COLOR);
-
-		// Refresh Data button
-		final JLabel refresh = createIconLabel(ICON_REFRESH);
-		refresh.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				requestLootLog(lootLog.getType(), name);
-			}
-		});
-		refresh.setToolTipText("Refresh panel");
-
-		// Clear data button
-		final JLabel clear = createIconLabel(ICON_DELETE);
-		clear.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				if (clearData(lootLog.getType(), name))
-				{
-					showSelectionView();
-				}
-			}
-		});
-		clear.setToolTipText("Clear stored data");
-
-		// Clear data button
-		final JLabel replay = createIconLabel(ICON_REPLAY);
-		replay.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				playbackLoot();
-			}
-		});
-		replay.setToolTipText("Replay Loot");
-
-		second.add(refresh);
-		second.add(clear);
-		second.add(replay);
-
-		title.add(first, BorderLayout.WEST);
-		title.add(second, BorderLayout.EAST);
-
-		return title;
-	}
-
-	private JLabel createIconLabel(final BufferedImage icon)
-	{
-		final JLabel label = new JLabel();
-		label.setIcon(new ImageIcon(icon));
-		label.setOpaque(true);
-		label.setBackground(BACKGROUND_COLOR);
-
-		label.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseEntered(MouseEvent e)
-			{
-				label.setBackground(BUTTON_HOVER_COLOR);
-			}
-
-			@Override
-			public void mouseExited(MouseEvent e)
-			{
-				label.setBackground(BACKGROUND_COLOR);
-			}
-		});
-
-		return label;
-	}
-
-	// Wrap the panel inside a scroll pane
-	private JScrollPane wrapContainer(final JPanel container)
-	{
-		final JPanel wrapped = new JPanel(new BorderLayout());
-		wrapped.add(container, BorderLayout.NORTH);
-		wrapped.setBackground(BACKGROUND_COLOR);
-
-		final JScrollPane scroller = new JScrollPane(wrapped);
-		scroller.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
-		scroller.getVerticalScrollBar().setPreferredSize(new Dimension(8, 0));
-		scroller.setBackground(BACKGROUND_COLOR);
-
-		return scroller;
-	}
-
-	// Clear stored data and return to selection screen
-	private boolean clearData(final LootRecordType type, final String name)
-	{
-		// Confirm delete action
-		final int delete = JOptionPane.showConfirmDialog(this.getRootPane(), "<html>Are you sure you want to clear all data for this tab?<br/>There is no way to undo this action.</html>", "Warning", JOptionPane.YES_NO_OPTION);
-		if (delete == JOptionPane.YES_OPTION)
-		{
-			boolean deletedAtleastOne = plugin.clearStoredDataByName(type, name);
-
-			final BossTab tab = BossTab.getByName(name);
-			if (tab != null)
-			{
-				for (final String alias : tab.getAliases())
-				{
-					deletedAtleastOne |= plugin.clearStoredDataByName(type, alias);
-				}
-			}
-
-			if (!deletedAtleastOne)
-			{
-				JOptionPane.showMessageDialog(this.getRootPane(), "Unable to clear stored data, please try again.");
-				return false;
-			}
-
-			return true;
-		}
-
-		return false;
-	}
-
-	public void addLog(final LTRecord r)
-	{
-		// Account for aliases
-		final BossTab tab = BossTab.getByName(r.getName());
-
-		if (lootLog == null)
-		{
-			// Use tab name so when an alias is killed it shows the main boss tab
-			requestLootLog(r.getType(), tab == null ? r.getName() : tab.getName());
-		}
-		else if (lootLog.getName().equalsIgnoreCase(r.getName()) || (tab != null && lootLog.getName().equalsIgnoreCase(tab.getName())))
-		{
-			lootPanel.addedRecord(r);
-		}
-		else if (lootLog.getName().equalsIgnoreCase(LootLoggerPlugin.SESSION_NAME)
-			|| lootPanel.getMinionGridMap().containsKey(r.getName().toLowerCase())
-			|| (tab != null && tab.getMinions().contains(r.getName().toLowerCase())))
-		{
-			lootPanel.addMinionRecord(r);
-		}
-	}
-
-	// Refresh panel when config options are changed
-	public void refreshUI()
-	{
-		log.debug("Refreshing UI");
-		if (lootLog == null)
-		{
-			showSelectionView();
-		}
-		else
-		{
-			showLootView();
-		}
-	}
-
-	private void playbackLoot()
-	{
-		if (lootPanel == null)
-		{
-			return;
-		}
-
-		// Create a new thread for this so it doesn't cause swing freezes
-		final ScheduledExecutorService ex = Executors.newSingleThreadScheduledExecutor();
-		if (lootLog != null)
-		{
-			ex.schedule(lootPanel::playback, 0, TimeUnit.SECONDS);
-		}
-	}
-}
-
-/*
  * Copyright (c) 2021, TheStonedTurtle <https://github.com/TheStonedTurtle>
  * All rights reserved.
  *
@@ -3336,7 +3479,7 @@ public class LootGridName extends JPanel
 }
 
 /*
- * Copyright (c) 2021, TheStonedTurtle <https://github.com/TheStonedTurtle>
+ * Copyright (c) 2018, TheStonedTurtle <https://github.com/TheStonedTurtle>
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -3361,172 +3504,78 @@ public class LootGridName extends JPanel
  */
 package thestonedturtle.lootlogger.ui;
 
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.util.function.BiConsumer;
-import javax.swing.BoxLayout;
-import javax.swing.JMenuItem;
-import javax.swing.JPanel;
-import javax.swing.JPopupMenu;
-import javax.swing.SwingUtilities;
-import lombok.Getter;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.ui.ColorScheme;
-import net.runelite.http.api.loottracker.LootRecordType;
-import thestonedturtle.lootlogger.data.LootLog;
-import thestonedturtle.lootlogger.localstorage.LTItemEntry;
-
-public class NamedLootGrid extends JPanel
-{
-	private boolean isCollapsed = false;
-	private final LootGridName namePanel;
-	private final LootGrid grid;
-	@Getter
-	private long price;
-
-	NamedLootGrid(final String name, final int count, final long price, final LootGrid grid,
-				 final LootRecordType type, final BiConsumer<LootRecordType, String> clearData) {
-		this.grid = grid;
-		this.price = price;
-
-		this.setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-		this.setBackground(ColorScheme.DARKER_GRAY_COLOR.darker());
-
-		namePanel = new LootGridName(name, count, price);
-
-		// Clear data popup-menu
-		final JPopupMenu menu = new JPopupMenu();
-		final JMenuItem delete = new JMenuItem("Clear stored data");
-		delete.addActionListener(ev -> clearData.accept(type, name));
-		menu.add(delete);
-		namePanel.setComponentPopupMenu(menu);
-		namePanel.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				if (SwingUtilities.isRightMouseButton(e))
-				{
-					return;
-				}
-
-				changeCollapse();
-			}
-		});
-
-		this.add(namePanel);
-		this.add(grid);
-	}
-
-	void updateGrid(final LootLog log, final LTItemEntry[] itemsToDisplay, final ItemManager itemManager)
-	{
-		price = log.getLootValue(false);
-		namePanel.updateLabel(log.getName(), log.getRecords().size(), price);
-
-		grid.updateGrid(itemsToDisplay, itemManager);
-
-		if (isCollapsed)
-		{
-			changeCollapse();
-		}
-	}
-
-	void changeCollapse()
-	{
-		isCollapsed = !isCollapsed;
-		grid.setVisible(!isCollapsed);
-
-		// Copied from RuneLite's LootTrackerBox::applyDimmer
-		for (Component component : namePanel.getComponents())
-		{
-			Color color = component.getForeground();
-			component.setForeground(isCollapsed ? color.darker() : color.brighter());
-		}
-	}
-}
-
-/*
- * Copyright (c) 2018, TheStonedTurtle <www.github.com/TheStonedTurtle>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package thestonedturtle.lootlogger.ui;
-
-import java.awt.BorderLayout;
-import java.awt.Color;
-import javax.swing.BorderFactory;
+import java.awt.Dimension;
+import java.awt.GridLayout;
 import javax.swing.JLabel;
 import javax.swing.JPanel;
 import javax.swing.SwingConstants;
-import javax.swing.border.Border;
-import lombok.Getter;
+import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.util.QuantityFormatter;
+import thestonedturtle.lootlogger.localstorage.LTItemEntry;
 
-@Getter
-class TextPanel extends JPanel
+/**
+ * Displays an array of {@link LTItemEntry} in a grid with a max of 5 items (columns) per row
+ */
+class LootGrid extends JPanel
 {
-	private static final Color PANEL_BACKGROUND_COLOR = ColorScheme.DARKER_GRAY_COLOR;
-	private static final Border PANEL_BORDER = BorderFactory.createMatteBorder(8, 15, 8, 0, PANEL_BACKGROUND_COLOR);
+	private static final int ITEMS_PER_ROW = 5;
+	private static final Dimension ITEM_SIZE = new Dimension(40, 40);
 
-	private final JLabel textLabel = new JLabel("", SwingConstants.LEFT);
-	private final JLabel valueLabel = new JLabel("", SwingConstants.LEFT);
-
-	TextPanel()
+	LootGrid()
 	{
-		this.setLayout(new BorderLayout());
-		this.setBackground(PANEL_BACKGROUND_COLOR);
-		this.setBorder(PANEL_BORDER);
-
-		textLabel.setForeground(Color.WHITE);
-		valueLabel.setBorder(BorderFactory.createEmptyBorder(0, 5, 0, 0));
-
-		this.add(textLabel, BorderLayout.LINE_START);
-		this.add(valueLabel, BorderLayout.CENTER);
 	}
 
-	// Long value should be for Total Value
-	public void updatePanel(final String text, final long totalValue)
+	LootGrid(final LTItemEntry[] itemsToDisplay, final ItemManager itemManager)
 	{
-		textLabel.setText(text);
-
-		// Item Values (Colored off Total Value of item)
-		valueLabel.setText(QuantityFormatter.quantityToStackSize(totalValue) + " gp");
-		valueLabel.setForeground(getRSValueColor(totalValue));
-
-		this.setToolTipText(QuantityFormatter.formatNumber(totalValue));
+		updateGrid(itemsToDisplay, itemManager);
 	}
 
-	public void updatePanel(final String text, final int value)
+	public void updateGrid(final LTItemEntry[] itemsToDisplay, final ItemManager itemManager)
 	{
-		textLabel.setText(text);
-		valueLabel.setText(QuantityFormatter.formatNumber(value));
+		removeAll();
+
+		// Calculates how many rows need to be display to fit all items
+		final int rowSize = ((itemsToDisplay.length % ITEMS_PER_ROW == 0) ? 0 : 1) + itemsToDisplay.length / ITEMS_PER_ROW;
+		setLayout(new GridLayout(rowSize, ITEMS_PER_ROW, 1, 1));
+
+		// Create stacked items from the item list, calculates total price and then displays all the items in the UI.
+		for (int i = 0; i < rowSize * ITEMS_PER_ROW; i++)
+		{
+			final JPanel slot = new JPanel();
+			slot.setLayout(new GridLayout(1, 1, 0, 0));
+			slot.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			slot.setPreferredSize(ITEM_SIZE);
+			if (i < itemsToDisplay.length)
+			{
+				final LTItemEntry item = itemsToDisplay[i];
+				if (item == null)
+				{
+					continue;
+				}
+				final JLabel itemLabel = new JLabel();
+				itemLabel.setToolTipText(buildToolTip(item));
+				itemLabel.setVerticalAlignment(SwingConstants.CENTER);
+				itemLabel.setHorizontalAlignment(SwingConstants.CENTER);
+				itemManager.getImage(item.getId(), item.getQuantity(), item.getQuantity() > 1).addTo(itemLabel);
+				slot.add(itemLabel);
+			}
+
+			add(slot);
+		}
+
+		repaint();
 	}
 
-	private static Color getRSValueColor(long val)
+	private static String buildToolTip(final LTItemEntry item)
 	{
-		return (val >= 10000000) ? Color.GREEN : (val >= 100000) ? Color.WHITE : Color.YELLOW;
+		final String name = item.getName();
+		final int quantity = item.getQuantity();
+		final long price = item.getPrice();
+
+		return "<html>" + name + " x " + QuantityFormatter.formatNumber(quantity)
+			+ "<br/>Price: " + QuantityFormatter.quantityToStackSize(price)
+			+ "<br/>Total: " + QuantityFormatter.quantityToStackSize(quantity * price) +	"</html>";
 	}
 }
 
@@ -3944,6 +3993,89 @@ class LootPanel extends JPanel
 }
 
 /*
+ * Copyright (c) 2018, TheStonedTurtle <www.github.com/TheStonedTurtle>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package thestonedturtle.lootlogger.ui;
+
+import java.awt.BorderLayout;
+import java.awt.Color;
+import javax.swing.BorderFactory;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.SwingConstants;
+import javax.swing.border.Border;
+import lombok.Getter;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.QuantityFormatter;
+
+@Getter
+class TextPanel extends JPanel
+{
+	private static final Color PANEL_BACKGROUND_COLOR = ColorScheme.DARKER_GRAY_COLOR;
+	private static final Border PANEL_BORDER = BorderFactory.createMatteBorder(8, 15, 8, 0, PANEL_BACKGROUND_COLOR);
+
+	private final JLabel textLabel = new JLabel("", SwingConstants.LEFT);
+	private final JLabel valueLabel = new JLabel("", SwingConstants.LEFT);
+
+	TextPanel()
+	{
+		this.setLayout(new BorderLayout());
+		this.setBackground(PANEL_BACKGROUND_COLOR);
+		this.setBorder(PANEL_BORDER);
+
+		textLabel.setForeground(Color.WHITE);
+		valueLabel.setBorder(BorderFactory.createEmptyBorder(0, 5, 0, 0));
+
+		this.add(textLabel, BorderLayout.LINE_START);
+		this.add(valueLabel, BorderLayout.CENTER);
+	}
+
+	// Long value should be for Total Value
+	public void updatePanel(final String text, final long totalValue)
+	{
+		textLabel.setText(text);
+
+		// Item Values (Colored off Total Value of item)
+		valueLabel.setText(QuantityFormatter.quantityToStackSize(totalValue) + " gp");
+		valueLabel.setForeground(getRSValueColor(totalValue));
+
+		this.setToolTipText(QuantityFormatter.formatNumber(totalValue));
+	}
+
+	public void updatePanel(final String text, final int value)
+	{
+		textLabel.setText(text);
+		valueLabel.setText(QuantityFormatter.formatNumber(value));
+	}
+
+	private static Color getRSValueColor(long val)
+	{
+		return (val >= 10000000) ? Color.GREEN : (val >= 100000) ? Color.WHITE : Color.YELLOW;
+	}
+}
+
+/*
  * Copyright (c) 2018, TheStonedTurtle <https://github.com/TheStonedTurtle>
  * All rights reserved.
  *
@@ -3969,78 +4101,338 @@ class LootPanel extends JPanel
  */
 package thestonedturtle.lootlogger.ui;
 
+import java.awt.BorderLayout;
+import java.awt.Color;
 import java.awt.Dimension;
-import java.awt.GridLayout;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import javax.swing.ImageIcon;
 import javax.swing.JLabel;
+import javax.swing.JOptionPane;
 import javax.swing.JPanel;
-import javax.swing.SwingConstants;
+import javax.swing.JScrollPane;
+import javax.swing.border.CompoundBorder;
+import javax.swing.border.EmptyBorder;
+import javax.swing.border.MatteBorder;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.ColorScheme;
-import net.runelite.client.util.QuantityFormatter;
-import thestonedturtle.lootlogger.localstorage.LTItemEntry;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.PluginErrorPanel;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.http.api.loottracker.LootRecordType;
+import thestonedturtle.lootlogger.LootLoggerPlugin;
+import thestonedturtle.lootlogger.data.BossTab;
+import thestonedturtle.lootlogger.data.LootLog;
+import thestonedturtle.lootlogger.localstorage.LTRecord;
 
-/**
- * Displays an array of {@link LTItemEntry} in a grid with a max of 5 items (columns) per row
- */
-class LootGrid extends JPanel
+@Slf4j
+public class LootLoggerPanel extends PluginPanel
 {
-	private static final int ITEMS_PER_ROW = 5;
-	private static final Dimension ITEM_SIZE = new Dimension(40, 40);
+	private static final BufferedImage ICON_DELETE;
+	private static final BufferedImage ICON_REFRESH;
+	private static final BufferedImage ICON_BACK;
+	private static final BufferedImage ICON_REPLAY;
 
-	LootGrid()
+	private final static Color BACKGROUND_COLOR = ColorScheme.DARK_GRAY_COLOR;
+	private final static Color BUTTON_HOVER_COLOR = ColorScheme.DARKER_GRAY_HOVER_COLOR;
+
+	static
 	{
+		ICON_DELETE = ImageUtil.loadImageResource(LootLoggerPlugin.class, "delete-white.png");
+		ICON_REFRESH = ImageUtil.loadImageResource(LootLoggerPlugin.class, "refresh-white.png");
+		ICON_BACK = ImageUtil.loadImageResource(LootLoggerPlugin.class, "back-arrow-white.png");
+		ICON_REPLAY = ImageUtil.loadImageResource(LootLoggerPlugin.class, "replay-white.png");
 	}
 
-	LootGrid(final LTItemEntry[] itemsToDisplay, final ItemManager itemManager)
+	private final ItemManager itemManager;
+	private final LootLoggerPlugin plugin;
+
+	private LootPanel lootPanel;
+	@Getter
+	private LootLog lootLog;
+	private SelectionPanel selectionPanel;
+
+	public LootLoggerPanel(final ItemManager itemManager, final LootLoggerPlugin plugin)
 	{
-		updateGrid(itemsToDisplay, itemManager);
+		super(false);
+		this.itemManager = itemManager;
+		this.plugin = plugin;
+
+		this.setBackground(ColorScheme.DARK_GRAY_COLOR);
+		this.setLayout(new BorderLayout());
+
+		showSelectionView();
 	}
 
-	public void updateGrid(final LTItemEntry[] itemsToDisplay, final ItemManager itemManager)
+	public void useLog(final LootLog log)
 	{
-		removeAll();
+		lootLog = log;
+		showLootView();
+	}
 
-		// Calculates how many rows need to be display to fit all items
-		final int rowSize = ((itemsToDisplay.length % ITEMS_PER_ROW == 0) ? 0 : 1) + itemsToDisplay.length / ITEMS_PER_ROW;
-		setLayout(new GridLayout(rowSize, ITEMS_PER_ROW, 1, 1));
-
-		// Create stacked items from the item list, calculates total price and then displays all the items in the UI.
-		for (int i = 0; i < rowSize * ITEMS_PER_ROW; i++)
+	public void requestLootLog(final LootRecordType type, final String name)
+	{
+		// For some reason removing all the components when there's a lot of names in the selectionPanel causes lag.
+		// Removing them here seems to mitigate the lag
+		if (selectionPanel != null)
 		{
-			final JPanel slot = new JPanel();
-			slot.setLayout(new GridLayout(1, 1, 0, 0));
-			slot.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-			slot.setPreferredSize(ITEM_SIZE);
-			if (i < itemsToDisplay.length)
-			{
-				final LTItemEntry item = itemsToDisplay[i];
-				if (item == null)
-				{
-					continue;
-				}
-				final JLabel itemLabel = new JLabel();
-				itemLabel.setToolTipText(buildToolTip(item));
-				itemLabel.setVerticalAlignment(SwingConstants.CENTER);
-				itemLabel.setHorizontalAlignment(SwingConstants.CENTER);
-				itemManager.getImage(item.getId(), item.getQuantity(), item.getQuantity() > 1).addTo(itemLabel);
-				slot.add(itemLabel);
-			}
-
-			add(slot);
+			selectionPanel.getNamePanel().removeAll();
 		}
 
-		repaint();
+		plugin.requestLootLog(type, name);
 	}
 
-	private static String buildToolTip(final LTItemEntry item)
+	// Loot Selection view
+	public void showSelectionView()
 	{
-		final String name = item.getName();
-		final int quantity = item.getQuantity();
-		final long price = item.getPrice();
+		this.removeAll();
+		lootLog = null;
+		lootPanel = null;
 
-		return "<html>" + name + " x " + QuantityFormatter.formatNumber(quantity)
-			+ "<br/>Price: " + QuantityFormatter.quantityToStackSize(price)
-			+ "<br/>Total: " + QuantityFormatter.quantityToStackSize(quantity * price) +	"</html>";
+		final PluginErrorPanel errorPanel = new PluginErrorPanel();
+		errorPanel.setBorder(new EmptyBorder(10, 25, 10, 25));
+		errorPanel.setContent("Loot Logger", "Select the Activity, Player, or NPC you wish to view loot for");
+
+		selectionPanel = new SelectionPanel(plugin.config.bossButtons(), plugin.getLootNames(), this, itemManager);
+
+		this.add(errorPanel, BorderLayout.NORTH);
+		this.add(wrapContainer(selectionPanel), BorderLayout.CENTER);
+
+		this.revalidate();
+		this.repaint();
+	}
+
+	// Loot breakdown view
+	public void showLootView()
+	{
+		this.removeAll();
+		selectionPanel = null;
+
+		final JPanel title = createLootViewTitle();
+		lootPanel = new LootPanel(lootLog, plugin.config, itemManager, (lootRecordType, name) -> {
+			if (clearData(lootRecordType, name))
+			{
+				requestLootLog(lootRecordType, lootLog.getName());
+			}
+		});
+
+		this.add(title, BorderLayout.NORTH);
+		this.add(wrapContainer(lootPanel), BorderLayout.CENTER);
+
+		this.revalidate();
+		this.repaint();
+	}
+
+	// Title element for Loot breakdown view
+	private JPanel createLootViewTitle()
+	{
+		final String name = lootLog.getName();
+		final JPanel title = new JPanel();
+		title.setBorder(new CompoundBorder(
+				new EmptyBorder(10, 8, 8, 8),
+				new MatteBorder(0, 0, 1, 0, Color.GRAY)
+		));
+		title.setLayout(new BorderLayout());
+		title.setBackground(BACKGROUND_COLOR);
+
+		final JPanel first = new JPanel();
+		first.setBackground(BACKGROUND_COLOR);
+
+		// Back Button
+		final JLabel back = createIconLabel(ICON_BACK);
+		back.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				showSelectionView();
+			}
+		});
+		back.setToolTipText("Back to selection screen");
+
+		final JLabel text = new JLabel(name);
+		text.setForeground(Color.WHITE);
+
+		first.add(back);
+		first.add(text);
+
+		final JPanel second = new JPanel();
+		second.setBackground(BACKGROUND_COLOR);
+
+		// Refresh Data button
+		final JLabel refresh = createIconLabel(ICON_REFRESH);
+		refresh.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				requestLootLog(lootLog.getType(), name);
+			}
+		});
+		refresh.setToolTipText("Refresh panel");
+
+		// Clear data button
+		final JLabel clear = createIconLabel(ICON_DELETE);
+		clear.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				if (clearData(lootLog.getType(), name))
+				{
+					showSelectionView();
+				}
+			}
+		});
+		clear.setToolTipText("Clear stored data");
+
+		// Clear data button
+		final JLabel replay = createIconLabel(ICON_REPLAY);
+		replay.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				playbackLoot();
+			}
+		});
+		replay.setToolTipText("Replay Loot");
+
+		second.add(refresh);
+		second.add(clear);
+		second.add(replay);
+
+		title.add(first, BorderLayout.WEST);
+		title.add(second, BorderLayout.EAST);
+
+		return title;
+	}
+
+	private JLabel createIconLabel(final BufferedImage icon)
+	{
+		final JLabel label = new JLabel();
+		label.setIcon(new ImageIcon(icon));
+		label.setOpaque(true);
+		label.setBackground(BACKGROUND_COLOR);
+
+		label.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseEntered(MouseEvent e)
+			{
+				label.setBackground(BUTTON_HOVER_COLOR);
+			}
+
+			@Override
+			public void mouseExited(MouseEvent e)
+			{
+				label.setBackground(BACKGROUND_COLOR);
+			}
+		});
+
+		return label;
+	}
+
+	// Wrap the panel inside a scroll pane
+	private JScrollPane wrapContainer(final JPanel container)
+	{
+		final JPanel wrapped = new JPanel(new BorderLayout());
+		wrapped.add(container, BorderLayout.NORTH);
+		wrapped.setBackground(BACKGROUND_COLOR);
+
+		final JScrollPane scroller = new JScrollPane(wrapped);
+		scroller.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+		scroller.getVerticalScrollBar().setPreferredSize(new Dimension(8, 0));
+		scroller.setBackground(BACKGROUND_COLOR);
+
+		return scroller;
+	}
+
+	// Clear stored data and return to selection screen
+	private boolean clearData(final LootRecordType type, final String name)
+	{
+		// Confirm delete action
+		final int delete = JOptionPane.showConfirmDialog(this.getRootPane(), "<html>Are you sure you want to clear all data for this tab?<br/>There is no way to undo this action.</html>", "Warning", JOptionPane.YES_NO_OPTION);
+		if (delete == JOptionPane.YES_OPTION)
+		{
+			boolean deletedAtleastOne = plugin.clearStoredDataByName(type, name);
+
+			final BossTab tab = BossTab.getByName(name);
+			if (tab != null)
+			{
+				for (final String alias : tab.getAliases())
+				{
+					deletedAtleastOne |= plugin.clearStoredDataByName(type, alias);
+				}
+			}
+
+			if (!deletedAtleastOne)
+			{
+				JOptionPane.showMessageDialog(this.getRootPane(), "Unable to clear stored data, please try again.");
+				return false;
+			}
+
+			return true;
+		}
+
+		return false;
+	}
+
+	public void addLog(final LTRecord r)
+	{
+		// Account for aliases
+		final BossTab tab = BossTab.getByName(r.getName());
+
+		if (lootLog == null)
+		{
+			// Use tab name so when an alias is killed it shows the main boss tab
+			requestLootLog(r.getType(), tab == null ? r.getName() : tab.getName());
+		}
+		else if (lootLog.getName().equalsIgnoreCase(r.getName()) || (tab != null && lootLog.getName().equalsIgnoreCase(tab.getName())))
+		{
+			lootPanel.addedRecord(r);
+		}
+		else if (lootLog.getName().equalsIgnoreCase(LootLoggerPlugin.SESSION_NAME)
+			|| lootPanel.getMinionGridMap().containsKey(r.getName().toLowerCase())
+			|| (tab != null && tab.getMinions().contains(r.getName().toLowerCase())))
+		{
+			lootPanel.addMinionRecord(r);
+		}
+	}
+
+	// Refresh panel when config options are changed
+	public void refreshUI()
+	{
+		log.debug("Refreshing UI");
+		if (lootLog == null)
+		{
+			showSelectionView();
+		}
+		else
+		{
+			showLootView();
+		}
+	}
+
+	private void playbackLoot()
+	{
+		if (lootPanel == null)
+		{
+			return;
+		}
+
+		// Create a new thread for this so it doesn't cause swing freezes
+		final ScheduledExecutorService ex = Executors.newSingleThreadScheduledExecutor();
+		if (lootLog != null)
+		{
+			ex.schedule(lootPanel::playback, 0, TimeUnit.SECONDS);
+		}
 	}
 }
 
@@ -4172,438 +4564,124 @@ class UniqueItemPanel extends JPanel
 	}
 }
 
-/*
- * Copyright (c) 2018, TheStonedTurtle <www.github.com/TheStonedTurtle>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package thestonedturtle.lootlogger.localstorage;
+package thestonedturtle.lootlogger;
 
-import lombok.AllArgsConstructor;
-import lombok.Data;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 
-@Data
-@AllArgsConstructor
-public class LTItemEntry
+@Getter
+@RequiredArgsConstructor
+public enum ItemSortTypes
 {
-	public final String name;
-	public final int id;
-	public int quantity;
-	public long price;
+	ALPHABETICAL("Alphabetical"),
+	ITEM_ID("Item ID"),
+	VALUE("Value"),
+	PRICE("Price");
 
-	public long getTotal()
+	private final String name;
+
+	@Override
+	public String toString()
 	{
-		return this.quantity * this.price;
+		return name;
 	}
 }
 
-/*
- * Copyright (c) 2018, TheStonedTurtle <https://github.com/TheStonedTurtle>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package thestonedturtle.lootlogger.localstorage;
+package thestonedturtle.lootlogger;
 
-import com.google.common.collect.HashMultimap;
-import com.google.common.collect.SetMultimap;
-import com.google.gson.Gson;
-import java.io.BufferedReader;
-import java.io.BufferedWriter;
-import java.io.File;
-import java.io.FileNotFoundException;
-import java.io.FileReader;
-import java.io.FileWriter;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.Map;
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import static net.runelite.client.RuneLite.RUNELITE_DIR;
-import net.runelite.http.api.RuneLiteAPI;
-import net.runelite.http.api.loottracker.LootRecordType;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Range;
 
-/**
- * Reads & Writes LootRecord data from `*name*.log` files located in `.runelite/loots/`.
- * Data is stored as json delimited by newlines, aka JSON Lines {@see <a href="http://jsonlines.org">http://jsonlines.org</a>}
- */
-@Slf4j
-@Singleton
-public class LootRecordWriter
+@ConfigGroup("lootlogger")
+public interface LootLoggerConfig extends Config
 {
-	private static final String FILE_EXTENSION = ".log";
-	private static final File LOOT_RECORD_DIR = new File(RUNELITE_DIR, "loots");
-
-	// Data is stored in a folder with the players username (login name)
-	private File playerFolder = LOOT_RECORD_DIR;
-	// Data is separated into sub-folders by event type to prevent issues.
-	private final Map<LootRecordType, File> eventFolders = new HashMap<>();
-	@Setter
-	@Getter
-	private String name;
-
-	// The default date format does not allow migrating between Java 17 and Java 20+ (in either direction)
-	// Java 20+ uses unicode character U+202f while java 17- use a normal space before the AM/PM part of the date string
-	// This date adapter will attempt to match between both variants but will always write with a space
-	private final Gson CUSTOM_GSON = RuneLiteAPI.GSON.newBuilder()
-		.registerTypeAdapter(Date.class, new LootRecordDateAdapter())
-		.create();
-
-	@Inject
-	public LootRecordWriter()
+	@ConfigItem(
+		keyName = "enableUI",
+		name = "Enable Side-Panel",
+		description = "Controls whether the side panel should be displayed, data will be logged either way"
+	)
+	default boolean enableUI()
 	{
-		LOOT_RECORD_DIR.mkdir();
-	}
-
-	public boolean setPlayerUsername(final String username)
-	{
-		if (username.equalsIgnoreCase(name))
-		{
-			return false;
-		}
-
-		playerFolder = new File(LOOT_RECORD_DIR, username);
-		playerFolder.mkdir();
-		name = username;
-		createSubFolders();
 		return true;
 	}
 
-	private void createSubFolders()
+	@ConfigItem(
+		position = 0,
+		keyName = "uniquesPlacement",
+		name = "Uniques Placement",
+		description = "Where should unique items be displayed inside the UI"
+	)
+	default UniqueItemPlacement uniquesPlacement()
 	{
-		eventFolders.clear();
-		for (final LootRecordType type : LootRecordType.values())
-		{
-			final File folder = new File(playerFolder, type.name().toLowerCase());
-			folder.mkdir();
-			eventFolders.put(type, folder);
-		}
+		return UniqueItemPlacement.BOTH;
 	}
 
-	private static String npcNameToFileName(final String npcName)
+	@ConfigItem(
+		position = 1,
+		keyName = "itemSortType",
+		name = "Item Sorting",
+		description = "Determines how items should be sorted inside the item breakdown"
+	)
+	default ItemSortTypes itemSortType()
 	{
-		return npcName.toLowerCase().trim() + FILE_EXTENSION;
+		return ItemSortTypes.VALUE;
 	}
 
-	public SetMultimap<LootRecordType, String> getKnownFileNames()
+	@ConfigItem(
+		position = 3,
+		keyName = "bossButtons",
+		name = "Show boss icons",
+		description = "Toggles whether the selection screen will use the boss icons"
+	)
+	default boolean bossButtons()
 	{
-		final SetMultimap<LootRecordType, String> fileNames = HashMultimap.create();
-
-		for (final Map.Entry<LootRecordType, File> entry : eventFolders.entrySet())
-		{
-			final File[] files = entry.getValue().listFiles((dir, name) -> name.endsWith(FILE_EXTENSION));
-			if (files != null)
-			{
-				for (final File f : files)
-				{
-					fileNames.put(entry.getKey(), f.getName().replace(FILE_EXTENSION, ""));
-				}
-			}
-		}
-
-		return fileNames;
+		return true;
 	}
 
-	public synchronized Collection<LTRecord> loadLootTrackerRecords(LootRecordType recordType, String npcName)
+	@ConfigItem(
+		position = 4,
+		keyName = "ignoreNmz",
+		name = "Ignore nightmare zone",
+		description = "Whether to ignore loot received while inside Nightmare Zone"
+	)
+	default boolean ignoreNmz()
 	{
-		final String fileName = npcNameToFileName(npcName);
-		final File file = new File(eventFolders.get(recordType), fileName);
-		final Collection<LTRecord> data = new ArrayList<>();
-
-		try (final BufferedReader br = new BufferedReader(new FileReader(file)))
-		{
-			String line;
-			while ((line = br.readLine()) != null)
-			{
-				// Skips the empty line at end of file
-				if (line.length() > 0)
-				{
-					final LTRecord r = CUSTOM_GSON.fromJson(line, LTRecord.class);
-					data.add(r);
-				}
-			}
-
-		}
-		catch (FileNotFoundException e)
-		{
-			log.debug("File not found: {}", fileName);
-		}
-		catch (IOException e)
-		{
-			log.warn("IOException for file {}: {}", fileName, e.getMessage());
-		}
-
-		return data;
+		return true;
 	}
 
-	public synchronized boolean addLootTrackerRecord(LTRecord rec)
+	@ConfigItem(
+		position = 5,
+		keyName = "itemMissingAlpha",
+		name = "Missing item opacity",
+		description = "Controls the image opacity for unacquired unique items inside the uniques panel.<br/>0 is transparent and 100 is fully opaque. default value is 35"
+	)
+	@Range(max = 100)
+	default int itemMissingAlpha() { return 35; }
+
+	@ConfigItem(
+		position = 6,
+		keyName = "includeMinions",
+		name = "Include Minions",
+		description = "Toggles whether loot from minions will be included when looking at specific loot tabs, such as the GWD bosses"
+	)
+	default boolean includeMinions()
 	{
-		// Grab file
-		final String fileName = npcNameToFileName(rec.getName());
-		final File lootFile = new File(eventFolders.get(rec.getType()), fileName);
-
-		// Convert entry to JSON
-		final String dataAsString = CUSTOM_GSON.toJson(rec);
-
-		// Open File in append mode and write new data
-		try
-		{
-			final BufferedWriter file = new BufferedWriter(new FileWriter(String.valueOf(lootFile), true));
-			file.append(dataAsString);
-			file.newLine();
-			file.close();
-			return true;
-		}
-		catch (IOException ioe)
-		{
-			log.warn("Error writing loot data to file {}: {}", fileName, ioe.getMessage());
-			return false;
-		}
-	}
-
-	public synchronized boolean deleteLootTrackerRecords(final LootRecordType type, String npcName)
-	{
-		final String fileName = npcNameToFileName(npcName);
-		final File lootFile = new File(eventFolders.get(type), fileName);
-
-		if (lootFile.delete())
-		{
-			log.debug("Deleted loot file: {}", fileName);
-			return true;
-		}
-		else
-		{
-			log.debug("Couldn't delete file: {}", fileName);
-			return false;
-		}
-	}
-
-	/**
-	 * Writes an entire log file based on the passed collection.
-	 * Used when you need to adjust previous data and not just append, such as receiving a pet.
- 	 */
-	public synchronized boolean writeLootTrackerFile(final String npcName, final Collection<LTRecord> loots)
-	{
-		final String fileName = npcNameToFileName(npcName);
-		final File lootFile = new File(playerFolder, fileName);
-
-		try
-		{
-			final BufferedWriter file = new BufferedWriter(new FileWriter(String.valueOf(lootFile), false));
-			for (final LTRecord rec : loots)
-			{
-				// Convert entry to JSON
-				final String dataAsString = CUSTOM_GSON.toJson(rec);
-				file.append(dataAsString);
-				file.newLine();
-			}
-			file.close();
-
-			return true;
-		}
-		catch (IOException ioe)
-		{
-			log.warn("Error rewriting loot data to file {}: {}", fileName, ioe.getMessage());
-			return false;
-		}
-	}
-
-	public synchronized boolean renameUsernameFolderToAccountHash(final String username, final long hash)
-	{
-		final File usernameDir = new File(LOOT_RECORD_DIR, username);
-		if (!usernameDir.exists())
-		{
-			log.debug("Already rewritten");
-			return true;
-		}
-
-		final File hashDir = new File(LOOT_RECORD_DIR, String.valueOf(hash));
-		if (hashDir.exists())
-		{
-			log.warn("Can't rename username folder to account hash as the folder for this account hash already exists."
-				+ " This was most likely caused by running RL through the Jagex launcher before the migration code was added");
-			log.warn("Username: {} | AccountHash: {}", username, hash);
-			return false;
-		}
-
-		return usernameDir.renameTo(hashDir);
+		return true;
 	}
 }
 
-/*
- * Copyright (c) 2023, TheStonedTurtle <https://github.com/TheStonedTurtle>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package thestonedturtle.lootlogger.localstorage;
+package thestonedturtle.lootlogger;
 
-import com.google.gson.TypeAdapter;
-import com.google.gson.stream.JsonReader;
-import com.google.gson.stream.JsonToken;
-import com.google.gson.stream.JsonWriter;
-import java.io.IOException;
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
-import java.util.Date;
-import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
 
-/**
- * This class is needed because at some point after Java 17 but including Java 20 the default date format changed
- * For Java 17- it uses a normal space between the AM/PM while in Java 20+ the unicode character U+202f is used
- * This adapter checks to see if the unicode character is within the date and will use the proper GSON object for parsing it
- */
-@Slf4j
-public class LootRecordDateAdapter extends TypeAdapter<Date>
+public class LootLoggerPluginTest
 {
-	private final SimpleDateFormat SPACE_FORMAT = new SimpleDateFormat("MMM d, yyyy, h:mm:ss aaa");
-	private final SimpleDateFormat UNICODE_FORMAT = new SimpleDateFormat("MMM d, yyyy, h:mm:ss\u202Faaa");
-
-	@Override
-	public void write(JsonWriter out, Date value) throws IOException
+	public static void main(String[] args) throws Exception
 	{
-		if (value == null) {
-			out.nullValue();
-			return;
-		}
-
-		out.value(SPACE_FORMAT.format(value));
-	}
-
-	@Override
-	public Date read(JsonReader reader) throws IOException {
-		if (reader.peek() == JsonToken.NULL) {
-			reader.nextNull();
-			return null;
-		}
-
-		String date = reader.nextString();
-		try
-		{
-			if (date.contains("\u202F"))
-			{
-				return UNICODE_FORMAT.parse(date);
-			}
-
-			return SPACE_FORMAT.parse(date);
-		}
-		catch (ParseException e)
-		{
-			log.error("Error parsing LootRecord date value: {}", date);
-			e.printStackTrace();
-			return null;
-		}
-	}
-
-}
-
-/*
- * Copyright (c) 2018, TheStonedTurtle <https://github.com/TheStonedTurtle>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package thestonedturtle.lootlogger.localstorage;
-
-import java.util.Collection;
-import java.util.Date;
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import net.runelite.http.api.loottracker.LootRecordType;
-
-@Data
-@AllArgsConstructor
-public class LTRecord
-{
-	public final String name;
-	public final int level;
-	public final int killCount;
-	public LootRecordType type;
-	public final Collection<LTItemEntry> drops;
-	public Date date;
-
-	public void addDropEntry(LTItemEntry itemEntry)
-	{
-		drops.add(itemEntry);
+		ExternalPluginManager.loadBuiltin(LootLoggerPlugin.class);
+		RuneLite.main(args);
 	}
 }
-
