@@ -1,16 +1,632 @@
 package com.radiusmarkers;
 
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
+import com.google.common.base.Strings;
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.reflect.TypeToken;
+import com.google.inject.Inject;
+import com.google.inject.Provides;
+import java.awt.Point;
+import java.awt.Polygon;
+import java.awt.Rectangle;
+import java.awt.Shape;
+import java.awt.geom.Ellipse2D;
+import java.awt.image.BufferedImage;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.stream.Collectors;
+import javax.swing.JOptionPane;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import static net.runelite.api.MenuAction.MENU_ACTION_DEPRIORITIZE_OFFSET;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.NPC;
+import net.runelite.api.SpriteID;
+import net.runelite.api.Varbits;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.SpriteManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.components.colorpicker.ColorPickerManager;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ImageUtil;
 
-public class RadiusMarkerPluginTest
+@PluginDescriptor(
+	name = "Radius Markers",
+	description = "Highlight NPC radius regions like attack, hunt, max and wander range",
+	tags = {"npc", "range", "region", "aggression", "attack", "hunt", "interaction", "max", "retreat", "wander"}
+)
+public class RadiusMarkerPlugin extends Plugin
 {
-	public static void main(String[] args) throws Exception
+	public static final String CONFIG_GROUP = "radiusmarkers";
+	private static final String CONFIG_KEY = "markers";
+	private static final String PLUGIN_NAME = "Radius Markers";
+	private static final String ICON_FILE = "panel_icon.png";
+	private static final String DEFAULT_MARKER_NAME = "Marker";
+	private static final String UPDATE_MARKER = "Update marker";
+
+	@Getter(AccessLevel.PACKAGE)
+	private final List<ColourRadiusMarker> markers = new ArrayList<>();
+
+	@Setter(AccessLevel.PACKAGE)
+	private ColourRadiusMarker renameMarker = null;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private RadiusMarkerConfig config;
+
+	@Inject
+	private RadiusMarkerMapOverlay mapOverlay;
+
+	@Inject
+	private RadiusMarkerSceneOverlay sceneOverlay;
+
+	@Inject
+	private RadiusMarkerMinimapOverlay minimapOverlay;
+
+	@Inject
+	private ConfigManager configManager;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private Gson gson;
+
+	@Inject
+	private SpriteManager spriteManager;
+
+	@Getter
+	@Inject
+	private ColorPickerManager colourPickerManager;
+
+	private RadiusMarkerPluginPanel pluginPanel;
+	private NavigationButton navigationButton;
+	private BufferedImage minimapSpriteFixed;
+	private BufferedImage minimapSpriteResizeable;
+	private Shape minimapClipFixed;
+	private Shape minimapClipResizeable;
+	private Rectangle minimapRectangle = new Rectangle();
+
+	@Provides
+	RadiusMarkerConfig providesConfig(ConfigManager configManager)
 	{
-		ExternalPluginManager.loadBuiltin(RadiusMarkerPlugin.class);
-		RuneLite.main(args);
+		return configManager.getConfig(RadiusMarkerConfig.class);
+	}
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		overlayManager.add(mapOverlay);
+		overlayManager.add(sceneOverlay);
+		overlayManager.add(minimapOverlay);
+
+		loadMarkers();
+
+		pluginPanel = new RadiusMarkerPluginPanel(client, this, config);
+		pluginPanel.rebuild();
+
+		final BufferedImage icon = ImageUtil.loadImageResource(getClass(), ICON_FILE);
+
+		navigationButton = NavigationButton.builder()
+			.tooltip(PLUGIN_NAME)
+			.icon(icon)
+			.priority(5)
+			.panel(pluginPanel)
+			.build();
+
+
+		if (!config.hideNavButton())
+		{
+			clientToolbar.addNavigation(navigationButton);
+		}
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		overlayManager.remove(mapOverlay);
+		overlayManager.remove(sceneOverlay);
+		overlayManager.remove(minimapOverlay);
+
+		markers.clear();
+
+		clientToolbar.removeNavigation(navigationButton);
+
+		pluginPanel = null;
+		navigationButton = null;
+	}
+
+	@Subscribe
+	public void onConfigChanged(final ConfigChanged configChanged)
+	{
+		if (!configChanged.getGroup().equals(CONFIG_GROUP))
+		{
+			return;
+		}
+		if (configChanged.getKey().equals("hideNavButton"))
+		{
+			if (config.hideNavButton())
+			{
+				clientToolbar.removeNavigation(navigationButton);
+			}
+			else
+			{
+				clientToolbar.addNavigation(navigationButton);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onMenuEntryAdded(final MenuEntryAdded event)
+	{
+		int type = event.getType();
+
+		if (type >= MENU_ACTION_DEPRIORITIZE_OFFSET)
+		{
+			type -= MENU_ACTION_DEPRIORITIZE_OFFSET;
+		}
+
+		final MenuAction menuAction = MenuAction.of(type);
+
+		if (MenuAction.EXAMINE_NPC.equals(menuAction) && renameMarker != null)
+		{
+			final NPC npc = client.getTopLevelWorldView().npcs().byIndex(event.getIdentifier());
+
+			if (npc == null || npc.getName() == null)
+			{
+				return;
+			}
+
+			client.createMenuEntry(-1)
+				.setOption(UPDATE_MARKER)
+				.setTarget(event.getTarget())
+				.setParam0(event.getActionParam0())
+				.setParam1(event.getActionParam1())
+				.setIdentifier(event.getIdentifier())
+				.setType(MenuAction.RUNELITE)
+				.onClick(this::updateMarkerInfo);
+		}
+	}
+
+	private void updateMarkerInfo(MenuEntry entry)
+	{
+		final NPC npc = client.getTopLevelWorldView().npcs().byIndex(entry.getIdentifier());
+
+		if (npc == null || npc.getName() == null || renameMarker == null)
+		{
+			return;
+		}
+
+		renameMarker.getPanel().setMarkerText(npc.getName());
+		renameMarker.getPanel().setNpcId(npc.getId());
+	}
+
+	private void loadMarkers()
+	{
+		markers.clear();
+
+		final Collection<RadiusMarker> radiusMarkers = getRadiusMarkers();
+
+		if (radiusMarkers != null)
+		{
+			final List<ColourRadiusMarker> colourRadiusMarkers = translateToColourRadiusMarker(radiusMarkers);
+			markers.addAll(colourRadiusMarkers);
+			Collections.sort(markers);
+		}
+	}
+
+	private Collection<RadiusMarker> getRadiusMarkers()
+	{
+		String json = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY);
+
+		if (Strings.isNullOrEmpty(json))
+		{
+			return Collections.emptyList();
+		}
+
+		try
+		{
+			List<RadiusMarker> loaded = gson.fromJson(json, new TypeToken<List<RadiusMarker>>(){}.getType());
+			loaded.removeIf(RadiusMarker::isInvalid);
+			return loaded;
+		}
+		catch (IllegalStateException | JsonSyntaxException ignore)
+		{
+			JOptionPane.showConfirmDialog(pluginPanel,
+				"The radius markers you are trying to load from your config are malformed",
+				"Warning", JOptionPane.OK_CANCEL_OPTION);
+			return null;
+		}
+	}
+
+	private void saveMarkers(Collection<RadiusMarker> markers)
+	{
+		if (markers == null || markers.isEmpty())
+		{
+			configManager.unsetConfiguration(CONFIG_GROUP, CONFIG_KEY);
+			return;
+		}
+
+		String json = gson.toJson(markers);
+		configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY, json);
+	}
+
+	public String copyMarkers()
+	{
+		List<RadiusMarker> markersCopy = new ArrayList<>();
+
+		int regionId = client.getLocalPlayer() == null ? -1 : client.getLocalPlayer().getWorldLocation().getRegionID();
+		String searchTerm = pluginPanel.getSearchText().toLowerCase();
+		PanelFilter filter = pluginPanel.getPanelFilter();
+
+		for (ColourRadiusMarker marker : markers)
+		{
+			if (marker.getName().toLowerCase().contains(searchTerm) &&
+				(PanelFilter.ALL.equals(filter) ||
+				(PanelFilter.REGION.equals(filter) && marker.getWorldPoint().getRegionID() == regionId) ||
+				(PanelFilter.VISIBLE.equals(filter) && marker.isVisible()) ||
+				(PanelFilter.INVISIBLE.equals(filter) && !marker.isVisible())))
+			{
+				markersCopy.add(translateToRadiusMarker(marker));
+			}
+		}
+
+		if (markersCopy.isEmpty())
+		{
+			return null;
+		}
+
+		return gson.toJson(markersCopy);
+	}
+
+	public boolean pasteMarkers(String json)
+	{
+		if (Strings.isNullOrEmpty(json))
+		{
+			return false;
+		}
+
+		List<RadiusMarker> radiusMarkers;
+		try
+		{
+			radiusMarkers = gson.fromJson(json, new TypeToken<List<RadiusMarker>>(){}.getType());
+			radiusMarkers.removeIf(RadiusMarker::isInvalid);
+		}
+		catch (IllegalStateException | JsonSyntaxException ignore)
+		{
+			JOptionPane.showConfirmDialog(pluginPanel,
+				"The radius markers you are trying to import are malformed",
+				"Warning", JOptionPane.OK_CANCEL_OPTION);
+			return false;
+		}
+		List<ColourRadiusMarker> outputMarkers = new ArrayList<>();
+		List<ColourRadiusMarker> colourRadiusMarkers = translateToColourRadiusMarker(radiusMarkers);
+
+		for (ColourRadiusMarker radiusMarker : colourRadiusMarkers)
+		{
+			boolean unique = true;
+			for (ColourRadiusMarker marker : markers)
+			{
+				if (marker.getId() == radiusMarker.getId())
+				{
+					unique = false;
+					break;
+				}
+			}
+			if (unique)
+			{
+				outputMarkers.add(radiusMarker);
+			}
+		}
+
+		if (outputMarkers.isEmpty())
+		{
+			return false;
+		}
+
+		markers.addAll(outputMarkers);
+		Collections.sort(markers);
+		saveMarkers();
+
+		return true;
+	}
+
+	public boolean exclude(NPC npc)
+	{
+		return npc == null || npc.getName() == null || npc.getName().isEmpty() || "null".equals(npc.getName());
+	}
+
+	private List<ColourRadiusMarker> translateToColourRadiusMarker(Collection<RadiusMarker> markers)
+	{
+		if (markers.isEmpty())
+		{
+			return Collections.emptyList();
+		}
+
+		return markers.stream().map(ColourRadiusMarker::new).collect(Collectors.toList());
+	}
+
+	private RadiusMarker translateToRadiusMarker(ColourRadiusMarker colourRadiusMarker)
+	{
+		return new RadiusMarker(
+			colourRadiusMarker.getId(),
+			colourRadiusMarker.getName(),
+			colourRadiusMarker.isVisible(),
+			colourRadiusMarker.isCollapsed(),
+			colourRadiusMarker.getZ(),
+			colourRadiusMarker.getSpawnX(),
+			colourRadiusMarker.getSpawnY(),
+			colourRadiusMarker.getSpawnColour(),
+			colourRadiusMarker.isSpawnVisible(),
+			colourRadiusMarker.getWanderRadius(),
+			colourRadiusMarker.getWanderColour(),
+			colourRadiusMarker.isWanderVisible(),
+			colourRadiusMarker.getMaxRadius(),
+			colourRadiusMarker.getMaxColour(),
+			colourRadiusMarker.isMaxVisible(),
+			colourRadiusMarker.getAggressionColour(),
+			colourRadiusMarker.isAggressionVisible(),
+			colourRadiusMarker.getRetreatInteractionColour(),
+			colourRadiusMarker.isRetreatInteractionVisible(),
+			colourRadiusMarker.getNpcId(),
+			colourRadiusMarker.getAttackRadius(),
+			colourRadiusMarker.getAttackColour(),
+			colourRadiusMarker.getAttackType(),
+			colourRadiusMarker.isAttackVisible(),
+			colourRadiusMarker.getHuntRadius(),
+			colourRadiusMarker.getHuntColour(),
+			colourRadiusMarker.isHuntVisible(),
+			colourRadiusMarker.getInteractionRadius(),
+			colourRadiusMarker.getInteractionColour(),
+			colourRadiusMarker.isInteractionVisible());
+	}
+
+	private ColourRadiusMarker findColourRadiusMarker(RadiusMarker radiusMarker)
+	{
+		for (final ColourRadiusMarker colourRadiusMarker : markers)
+		{
+			if (colourRadiusMarker.equals(radiusMarker))
+			{
+				return colourRadiusMarker;
+			}
+		}
+		return null;
+	}
+
+	private Polygon bufferedImageToPolygon(BufferedImage image)
+	{
+		int outsideColour = -1;
+		int previousColour;
+		final int width = image.getWidth();
+		final int height = image.getHeight();
+		List<Point> points = new ArrayList<>();
+		for (int y = 0; y < height; y++)
+		{
+			previousColour = outsideColour;
+			for (int x = 0; x < width; x++)
+			{
+				int colour = image.getRGB(x, y);
+				if (x == 0 && y == 0)
+				{
+					outsideColour = colour;
+					previousColour = colour;
+				}
+				if (colour != outsideColour && previousColour == outsideColour)
+				{
+					points.add(new Point(x, y));
+				}
+				if ((colour == outsideColour || x == (width - 1)) && previousColour != outsideColour)
+				{
+					points.add(0, new Point(x, y));
+				}
+				previousColour = colour;
+			}
+		}
+		int offsetX = 0;
+		int offsetY = 0;
+		Widget minimapDrawWidget = getMinimapDrawWidget();
+		if (minimapDrawWidget != null)
+		{
+			offsetX = minimapDrawWidget.getBounds().x;
+			offsetY = minimapDrawWidget.getBounds().y;
+		}
+		Polygon polygon = new Polygon();
+		for (Point point : points)
+		{
+			polygon.addPoint(point.x + offsetX, point.y + offsetY);
+		}
+		return polygon;
+	}
+
+	private Shape getMinimapClipAreaSimple()
+	{
+		Widget minimapDrawArea = getMinimapDrawWidget();
+
+		if (minimapDrawArea == null || minimapDrawArea.isHidden())
+		{
+			return null;
+		}
+
+		Rectangle bounds = minimapDrawArea.getBounds();
+
+		return new Ellipse2D.Double(bounds.getX(), bounds.getY(), bounds.getWidth(), bounds.getHeight());
+	}
+
+	public void saveMarkers()
+	{
+		List<RadiusMarker> radiusMarkers = new ArrayList<>();
+
+		for (ColourRadiusMarker cm : markers)
+		{
+			radiusMarkers.add(translateToRadiusMarker(cm));
+		}
+
+		saveMarkers(radiusMarkers);
+	}
+
+	public ColourRadiusMarker addMarker()
+	{
+		if (client.getLocalPlayer() == null)
+		{
+			return null;
+		}
+
+		final WorldPoint worldPoint = WorldPoint.fromLocalInstance(client, client.getLocalPlayer().getLocalLocation());
+
+		return findColourRadiusMarker(addMarker(worldPoint));
+	}
+
+	public RadiusMarker addMarker(WorldPoint worldPoint)
+	{
+		final RadiusMarker marker = new RadiusMarker(
+			Instant.now().toEpochMilli(),
+			DEFAULT_MARKER_NAME + " " + (markers.size() + 1),
+			true,
+			false,
+			worldPoint.getPlane(),
+			worldPoint.getX(),
+			worldPoint.getY(),
+			config.defaultColourSpawn(),
+			true,
+			config.defaultRadiusWander(),
+			config.defaultColourWander(),
+			true,
+			config.defaultRadiusMax(),
+			config.defaultColourMax(),
+			true,
+			config.defaultColourAggression(),
+			true,
+			config.defaultColourRetreatInteraction(),
+			false,
+			0,
+			config.defaultRadiusAttack(),
+			config.defaultColourAttack(),
+			AttackType.MELEE,
+			true,
+			config.defaultRadiusHunt(),
+			config.defaultColourHunt(),
+			false,
+			config.defaultRadiusInteraction(),
+			config.defaultColourInteraction(),
+			false);
+
+		List<RadiusMarker> radiusMarkers = new ArrayList<>(getRadiusMarkers());
+		if (!radiusMarkers.contains(marker))
+		{
+			radiusMarkers.add(marker);
+		}
+
+		saveMarkers(radiusMarkers);
+
+		loadMarkers();
+
+		pluginPanel.rebuild();
+
+		return marker;
+	}
+
+	public void removeMarker(ColourRadiusMarker colourRadiusMarker)
+	{
+		RadiusMarker radiusMarker = translateToRadiusMarker(colourRadiusMarker);
+
+		List<RadiusMarker> radiusMarkers = new ArrayList<>(getRadiusMarkers());
+
+		radiusMarkers.remove(radiusMarker);
+
+		saveMarkers(radiusMarkers);
+
+		loadMarkers();
+
+		pluginPanel.rebuild();
+	}
+
+	public Collection<WorldPoint> getInstanceWorldPoints(WorldPoint worldPointTemplate)
+	{
+		if (!client.isInInstancedRegion())
+		{
+			return Collections.singleton(worldPointTemplate);
+		}
+
+		return WorldPoint.toLocalInstance(client, worldPointTemplate);
+	}
+
+	public Shape getMinimapClipArea()
+	{
+		Widget minimapWidget = getMinimapDrawWidget();
+
+		if (minimapWidget == null || minimapWidget.isHidden() || !minimapRectangle.equals(minimapRectangle = minimapWidget.getBounds()))
+		{
+			minimapClipFixed = null;
+			minimapClipResizeable = null;
+			minimapSpriteFixed = null;
+			minimapSpriteResizeable = null;
+		}
+
+		if (client.isResized())
+		{
+			if (minimapClipResizeable != null)
+			{
+				return minimapClipResizeable;
+			}
+			if (minimapSpriteResizeable == null)
+			{
+				minimapSpriteResizeable = spriteManager.getSprite(SpriteID.RESIZEABLE_MODE_MINIMAP_ALPHA_MASK, 0);
+			}
+			if (minimapSpriteResizeable != null)
+			{
+				return minimapClipResizeable = bufferedImageToPolygon(minimapSpriteResizeable);
+			}
+			return getMinimapClipAreaSimple();
+		}
+		if (minimapClipFixed != null)
+		{
+			return minimapClipFixed;
+		}
+		if (minimapSpriteFixed == null)
+		{
+			minimapSpriteFixed = spriteManager.getSprite(SpriteID.FIXED_MODE_MINIMAP_ALPHA_MASK, 0);
+		}
+		if (minimapSpriteFixed != null)
+		{
+			return minimapClipFixed = bufferedImageToPolygon(minimapSpriteFixed);
+		}
+		return getMinimapClipAreaSimple();
+	}
+
+	public Widget getMinimapDrawWidget()
+	{
+		if (client.isResized())
+		{
+			if (client.getVarbitValue(Varbits.SIDE_PANELS) == 1)
+			{
+				return client.getWidget(ComponentID.RESIZABLE_VIEWPORT_BOTTOM_LINE_MINIMAP_DRAW_AREA);
+			}
+			return client.getWidget(ComponentID.RESIZABLE_VIEWPORT_MINIMAP_DRAW_AREA);
+		}
+		return client.getWidget(ComponentID.FIXED_VIEWPORT_MINIMAP_DRAW_AREA);
 	}
 }
+
 package com.radiusmarkers;
 
 import java.awt.BorderLayout;
@@ -1203,892 +1819,6 @@ class RadiusMarkerPanel extends JPanel
 
 package com.radiusmarkers;
 
-import com.google.common.base.Strings;
-import com.google.gson.Gson;
-import com.google.gson.JsonSyntaxException;
-import com.google.gson.reflect.TypeToken;
-import com.google.inject.Inject;
-import com.google.inject.Provides;
-import java.awt.Point;
-import java.awt.Polygon;
-import java.awt.Rectangle;
-import java.awt.Shape;
-import java.awt.geom.Ellipse2D;
-import java.awt.image.BufferedImage;
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.List;
-import java.util.stream.Collectors;
-import javax.swing.JOptionPane;
-import lombok.AccessLevel;
-import lombok.Getter;
-import lombok.Setter;
-import net.runelite.api.Client;
-import net.runelite.api.MenuAction;
-import static net.runelite.api.MenuAction.MENU_ACTION_DEPRIORITIZE_OFFSET;
-import net.runelite.api.MenuEntry;
-import net.runelite.api.NPC;
-import net.runelite.api.SpriteID;
-import net.runelite.api.Varbits;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.MenuEntryAdded;
-import net.runelite.api.widgets.ComponentID;
-import net.runelite.api.widgets.Widget;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.ConfigChanged;
-import net.runelite.client.game.SpriteManager;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.ui.ClientToolbar;
-import net.runelite.client.ui.NavigationButton;
-import net.runelite.client.ui.components.colorpicker.ColorPickerManager;
-import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.util.ImageUtil;
-
-@PluginDescriptor(
-	name = "Radius Markers",
-	description = "Highlight NPC radius regions like attack, hunt, max and wander range",
-	tags = {"npc", "range", "region", "aggression", "attack", "hunt", "interaction", "max", "retreat", "wander"}
-)
-public class RadiusMarkerPlugin extends Plugin
-{
-	public static final String CONFIG_GROUP = "radiusmarkers";
-	private static final String CONFIG_KEY = "markers";
-	private static final String PLUGIN_NAME = "Radius Markers";
-	private static final String ICON_FILE = "panel_icon.png";
-	private static final String DEFAULT_MARKER_NAME = "Marker";
-	private static final String UPDATE_MARKER = "Update marker";
-
-	@Getter(AccessLevel.PACKAGE)
-	private final List<ColourRadiusMarker> markers = new ArrayList<>();
-
-	@Setter(AccessLevel.PACKAGE)
-	private ColourRadiusMarker renameMarker = null;
-
-	@Inject
-	private Client client;
-
-	@Inject
-	private RadiusMarkerConfig config;
-
-	@Inject
-	private RadiusMarkerMapOverlay mapOverlay;
-
-	@Inject
-	private RadiusMarkerSceneOverlay sceneOverlay;
-
-	@Inject
-	private RadiusMarkerMinimapOverlay minimapOverlay;
-
-	@Inject
-	private ConfigManager configManager;
-
-	@Inject
-	private ClientToolbar clientToolbar;
-
-	@Inject
-	private OverlayManager overlayManager;
-
-	@Inject
-	private Gson gson;
-
-	@Inject
-	private SpriteManager spriteManager;
-
-	@Getter
-	@Inject
-	private ColorPickerManager colourPickerManager;
-
-	private RadiusMarkerPluginPanel pluginPanel;
-	private NavigationButton navigationButton;
-	private BufferedImage minimapSpriteFixed;
-	private BufferedImage minimapSpriteResizeable;
-	private Shape minimapClipFixed;
-	private Shape minimapClipResizeable;
-	private Rectangle minimapRectangle = new Rectangle();
-
-	@Provides
-	RadiusMarkerConfig providesConfig(ConfigManager configManager)
-	{
-		return configManager.getConfig(RadiusMarkerConfig.class);
-	}
-
-	@Override
-	protected void startUp() throws Exception
-	{
-		overlayManager.add(mapOverlay);
-		overlayManager.add(sceneOverlay);
-		overlayManager.add(minimapOverlay);
-
-		loadMarkers();
-
-		pluginPanel = new RadiusMarkerPluginPanel(client, this, config);
-		pluginPanel.rebuild();
-
-		final BufferedImage icon = ImageUtil.loadImageResource(getClass(), ICON_FILE);
-
-		navigationButton = NavigationButton.builder()
-			.tooltip(PLUGIN_NAME)
-			.icon(icon)
-			.priority(5)
-			.panel(pluginPanel)
-			.build();
-
-
-		if (!config.hideNavButton())
-		{
-			clientToolbar.addNavigation(navigationButton);
-		}
-	}
-
-	@Override
-	protected void shutDown() throws Exception
-	{
-		overlayManager.remove(mapOverlay);
-		overlayManager.remove(sceneOverlay);
-		overlayManager.remove(minimapOverlay);
-
-		markers.clear();
-
-		clientToolbar.removeNavigation(navigationButton);
-
-		pluginPanel = null;
-		navigationButton = null;
-	}
-
-	@Subscribe
-	public void onConfigChanged(final ConfigChanged configChanged)
-	{
-		if (!configChanged.getGroup().equals(CONFIG_GROUP))
-		{
-			return;
-		}
-		if (configChanged.getKey().equals("hideNavButton"))
-		{
-			if (config.hideNavButton())
-			{
-				clientToolbar.removeNavigation(navigationButton);
-			}
-			else
-			{
-				clientToolbar.addNavigation(navigationButton);
-			}
-		}
-	}
-
-	@Subscribe
-	public void onMenuEntryAdded(final MenuEntryAdded event)
-	{
-		int type = event.getType();
-
-		if (type >= MENU_ACTION_DEPRIORITIZE_OFFSET)
-		{
-			type -= MENU_ACTION_DEPRIORITIZE_OFFSET;
-		}
-
-		final MenuAction menuAction = MenuAction.of(type);
-
-		if (MenuAction.EXAMINE_NPC.equals(menuAction) && renameMarker != null)
-		{
-			final int id = event.getIdentifier();
-			final NPC[] cachedNPCs = client.getCachedNPCs();
-			final NPC npc = cachedNPCs[id];
-
-			if (npc == null || npc.getName() == null)
-			{
-				return;
-			}
-
-			client.createMenuEntry(-1)
-				.setOption(UPDATE_MARKER)
-				.setTarget(event.getTarget())
-				.setParam0(event.getActionParam0())
-				.setParam1(event.getActionParam1())
-				.setIdentifier(event.getIdentifier())
-				.setType(MenuAction.RUNELITE)
-				.onClick(this::updateMarkerInfo);
-		}
-	}
-
-	private void updateMarkerInfo(MenuEntry entry)
-	{
-		final NPC[] cachedNPCs = client.getCachedNPCs();
-		final NPC npc = cachedNPCs[entry.getIdentifier()];
-
-		if (npc == null || npc.getName() == null || renameMarker == null)
-		{
-			return;
-		}
-
-		renameMarker.getPanel().setMarkerText(npc.getName());
-		renameMarker.getPanel().setNpcId(npc.getId());
-	}
-
-	private void loadMarkers()
-	{
-		markers.clear();
-
-		final Collection<RadiusMarker> radiusMarkers = getRadiusMarkers();
-
-		if (radiusMarkers != null)
-		{
-			final List<ColourRadiusMarker> colourRadiusMarkers = translateToColourRadiusMarker(radiusMarkers);
-			markers.addAll(colourRadiusMarkers);
-			Collections.sort(markers);
-		}
-	}
-
-	private Collection<RadiusMarker> getRadiusMarkers()
-	{
-		String json = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY);
-
-		if (Strings.isNullOrEmpty(json))
-		{
-			return Collections.emptyList();
-		}
-
-		try
-		{
-			List<RadiusMarker> loaded = gson.fromJson(json, new TypeToken<List<RadiusMarker>>(){}.getType());
-			loaded.removeIf(RadiusMarker::isInvalid);
-			return loaded;
-		}
-		catch (IllegalStateException | JsonSyntaxException ignore)
-		{
-			JOptionPane.showConfirmDialog(pluginPanel,
-				"The radius markers you are trying to load from your config are malformed",
-				"Warning", JOptionPane.OK_CANCEL_OPTION);
-			return null;
-		}
-	}
-
-	private void saveMarkers(Collection<RadiusMarker> markers)
-	{
-		if (markers == null || markers.isEmpty())
-		{
-			configManager.unsetConfiguration(CONFIG_GROUP, CONFIG_KEY);
-			return;
-		}
-
-		String json = gson.toJson(markers);
-		configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY, json);
-	}
-
-	public String copyMarkers()
-	{
-		List<RadiusMarker> markersCopy = new ArrayList<>();
-
-		int regionId = client.getLocalPlayer() == null ? -1 : client.getLocalPlayer().getWorldLocation().getRegionID();
-		String searchTerm = pluginPanel.getSearchText().toLowerCase();
-		PanelFilter filter = pluginPanel.getPanelFilter();
-
-		for (ColourRadiusMarker marker : markers)
-		{
-			if (marker.getName().toLowerCase().contains(searchTerm) &&
-				(PanelFilter.ALL.equals(filter) ||
-				(PanelFilter.REGION.equals(filter) && marker.getWorldPoint().getRegionID() == regionId) ||
-				(PanelFilter.VISIBLE.equals(filter) && marker.isVisible()) ||
-				(PanelFilter.INVISIBLE.equals(filter) && !marker.isVisible())))
-			{
-				markersCopy.add(translateToRadiusMarker(marker));
-			}
-		}
-
-		if (markersCopy.isEmpty())
-		{
-			return null;
-		}
-
-		return gson.toJson(markersCopy);
-	}
-
-	public boolean pasteMarkers(String json)
-	{
-		if (Strings.isNullOrEmpty(json))
-		{
-			return false;
-		}
-
-		List<RadiusMarker> radiusMarkers;
-		try
-		{
-			radiusMarkers = gson.fromJson(json, new TypeToken<List<RadiusMarker>>(){}.getType());
-			radiusMarkers.removeIf(RadiusMarker::isInvalid);
-		}
-		catch (IllegalStateException | JsonSyntaxException ignore)
-		{
-			JOptionPane.showConfirmDialog(pluginPanel,
-				"The radius markers you are trying to import are malformed",
-				"Warning", JOptionPane.OK_CANCEL_OPTION);
-			return false;
-		}
-		List<ColourRadiusMarker> outputMarkers = new ArrayList<>();
-		List<ColourRadiusMarker> colourRadiusMarkers = translateToColourRadiusMarker(radiusMarkers);
-
-		for (ColourRadiusMarker radiusMarker : colourRadiusMarkers)
-		{
-			boolean unique = true;
-			for (ColourRadiusMarker marker : markers)
-			{
-				if (marker.getId() == radiusMarker.getId())
-				{
-					unique = false;
-					break;
-				}
-			}
-			if (unique)
-			{
-				outputMarkers.add(radiusMarker);
-			}
-		}
-
-		if (outputMarkers.isEmpty())
-		{
-			return false;
-		}
-
-		markers.addAll(outputMarkers);
-		Collections.sort(markers);
-		saveMarkers();
-
-		return true;
-	}
-
-	public boolean exclude(NPC npc)
-	{
-		return npc == null || npc.getName() == null || npc.getName().isEmpty() || "null".equals(npc.getName());
-	}
-
-	private List<ColourRadiusMarker> translateToColourRadiusMarker(Collection<RadiusMarker> markers)
-	{
-		if (markers.isEmpty())
-		{
-			return Collections.emptyList();
-		}
-
-		return markers.stream().map(ColourRadiusMarker::new).collect(Collectors.toList());
-	}
-
-	private RadiusMarker translateToRadiusMarker(ColourRadiusMarker colourRadiusMarker)
-	{
-		return new RadiusMarker(
-			colourRadiusMarker.getId(),
-			colourRadiusMarker.getName(),
-			colourRadiusMarker.isVisible(),
-			colourRadiusMarker.isCollapsed(),
-			colourRadiusMarker.getZ(),
-			colourRadiusMarker.getSpawnX(),
-			colourRadiusMarker.getSpawnY(),
-			colourRadiusMarker.getSpawnColour(),
-			colourRadiusMarker.isSpawnVisible(),
-			colourRadiusMarker.getWanderRadius(),
-			colourRadiusMarker.getWanderColour(),
-			colourRadiusMarker.isWanderVisible(),
-			colourRadiusMarker.getMaxRadius(),
-			colourRadiusMarker.getMaxColour(),
-			colourRadiusMarker.isMaxVisible(),
-			colourRadiusMarker.getAggressionColour(),
-			colourRadiusMarker.isAggressionVisible(),
-			colourRadiusMarker.getRetreatInteractionColour(),
-			colourRadiusMarker.isRetreatInteractionVisible(),
-			colourRadiusMarker.getNpcId(),
-			colourRadiusMarker.getAttackRadius(),
-			colourRadiusMarker.getAttackColour(),
-			colourRadiusMarker.getAttackType(),
-			colourRadiusMarker.isAttackVisible(),
-			colourRadiusMarker.getHuntRadius(),
-			colourRadiusMarker.getHuntColour(),
-			colourRadiusMarker.isHuntVisible(),
-			colourRadiusMarker.getInteractionRadius(),
-			colourRadiusMarker.getInteractionColour(),
-			colourRadiusMarker.isInteractionVisible());
-	}
-
-	private ColourRadiusMarker findColourRadiusMarker(RadiusMarker radiusMarker)
-	{
-		for (final ColourRadiusMarker colourRadiusMarker : markers)
-		{
-			if (colourRadiusMarker.equals(radiusMarker))
-			{
-				return colourRadiusMarker;
-			}
-		}
-		return null;
-	}
-
-	private Polygon bufferedImageToPolygon(BufferedImage image)
-	{
-		int outsideColour = -1;
-		int previousColour;
-		final int width = image.getWidth();
-		final int height = image.getHeight();
-		List<Point> points = new ArrayList<>();
-		for (int y = 0; y < height; y++)
-		{
-			previousColour = outsideColour;
-			for (int x = 0; x < width; x++)
-			{
-				int colour = image.getRGB(x, y);
-				if (x == 0 && y == 0)
-				{
-					outsideColour = colour;
-					previousColour = colour;
-				}
-				if (colour != outsideColour && previousColour == outsideColour)
-				{
-					points.add(new Point(x, y));
-				}
-				if ((colour == outsideColour || x == (width - 1)) && previousColour != outsideColour)
-				{
-					points.add(0, new Point(x, y));
-				}
-				previousColour = colour;
-			}
-		}
-		int offsetX = 0;
-		int offsetY = 0;
-		Widget minimapDrawWidget = getMinimapDrawWidget();
-		if (minimapDrawWidget != null)
-		{
-			offsetX = minimapDrawWidget.getBounds().x;
-			offsetY = minimapDrawWidget.getBounds().y;
-		}
-		Polygon polygon = new Polygon();
-		for (Point point : points)
-		{
-			polygon.addPoint(point.x + offsetX, point.y + offsetY);
-		}
-		return polygon;
-	}
-
-	private Shape getMinimapClipAreaSimple()
-	{
-		Widget minimapDrawArea = getMinimapDrawWidget();
-
-		if (minimapDrawArea == null || minimapDrawArea.isHidden())
-		{
-			return null;
-		}
-
-		Rectangle bounds = minimapDrawArea.getBounds();
-
-		return new Ellipse2D.Double(bounds.getX(), bounds.getY(), bounds.getWidth(), bounds.getHeight());
-	}
-
-	public void saveMarkers()
-	{
-		List<RadiusMarker> radiusMarkers = new ArrayList<>();
-
-		for (ColourRadiusMarker cm : markers)
-		{
-			radiusMarkers.add(translateToRadiusMarker(cm));
-		}
-
-		saveMarkers(radiusMarkers);
-	}
-
-	public ColourRadiusMarker addMarker()
-	{
-		if (client.getLocalPlayer() == null)
-		{
-			return null;
-		}
-
-		final WorldPoint worldPoint = WorldPoint.fromLocalInstance(client, client.getLocalPlayer().getLocalLocation());
-
-		return findColourRadiusMarker(addMarker(worldPoint));
-	}
-
-	public RadiusMarker addMarker(WorldPoint worldPoint)
-	{
-		final RadiusMarker marker = new RadiusMarker(
-			Instant.now().toEpochMilli(),
-			DEFAULT_MARKER_NAME + " " + (markers.size() + 1),
-			true,
-			false,
-			worldPoint.getPlane(),
-			worldPoint.getX(),
-			worldPoint.getY(),
-			config.defaultColourSpawn(),
-			true,
-			config.defaultRadiusWander(),
-			config.defaultColourWander(),
-			true,
-			config.defaultRadiusMax(),
-			config.defaultColourMax(),
-			true,
-			config.defaultColourAggression(),
-			true,
-			config.defaultColourRetreatInteraction(),
-			false,
-			0,
-			config.defaultRadiusAttack(),
-			config.defaultColourAttack(),
-			AttackType.MELEE,
-			true,
-			config.defaultRadiusHunt(),
-			config.defaultColourHunt(),
-			false,
-			config.defaultRadiusInteraction(),
-			config.defaultColourInteraction(),
-			false);
-
-		List<RadiusMarker> radiusMarkers = new ArrayList<>(getRadiusMarkers());
-		if (!radiusMarkers.contains(marker))
-		{
-			radiusMarkers.add(marker);
-		}
-
-		saveMarkers(radiusMarkers);
-
-		loadMarkers();
-
-		pluginPanel.rebuild();
-
-		return marker;
-	}
-
-	public void removeMarker(ColourRadiusMarker colourRadiusMarker)
-	{
-		RadiusMarker radiusMarker = translateToRadiusMarker(colourRadiusMarker);
-
-		List<RadiusMarker> radiusMarkers = new ArrayList<>(getRadiusMarkers());
-
-		radiusMarkers.remove(radiusMarker);
-
-		saveMarkers(radiusMarkers);
-
-		loadMarkers();
-
-		pluginPanel.rebuild();
-	}
-
-	public Collection<WorldPoint> getInstanceWorldPoints(WorldPoint worldPointTemplate)
-	{
-		if (!client.isInInstancedRegion())
-		{
-			return Collections.singleton(worldPointTemplate);
-		}
-
-		return WorldPoint.toLocalInstance(client, worldPointTemplate);
-	}
-
-	public Shape getMinimapClipArea()
-	{
-		Widget minimapWidget = getMinimapDrawWidget();
-
-		if (minimapWidget == null || minimapWidget.isHidden() || !minimapRectangle.equals(minimapRectangle = minimapWidget.getBounds()))
-		{
-			minimapClipFixed = null;
-			minimapClipResizeable = null;
-			minimapSpriteFixed = null;
-			minimapSpriteResizeable = null;
-		}
-
-		if (client.isResized())
-		{
-			if (minimapClipResizeable != null)
-			{
-				return minimapClipResizeable;
-			}
-			if (minimapSpriteResizeable == null)
-			{
-				minimapSpriteResizeable = spriteManager.getSprite(SpriteID.RESIZEABLE_MODE_MINIMAP_ALPHA_MASK, 0);
-			}
-			if (minimapSpriteResizeable != null)
-			{
-				return minimapClipResizeable = bufferedImageToPolygon(minimapSpriteResizeable);
-			}
-			return getMinimapClipAreaSimple();
-		}
-		if (minimapClipFixed != null)
-		{
-			return minimapClipFixed;
-		}
-		if (minimapSpriteFixed == null)
-		{
-			minimapSpriteFixed = spriteManager.getSprite(SpriteID.FIXED_MODE_MINIMAP_ALPHA_MASK, 0);
-		}
-		if (minimapSpriteFixed != null)
-		{
-			return minimapClipFixed = bufferedImageToPolygon(minimapSpriteFixed);
-		}
-		return getMinimapClipAreaSimple();
-	}
-
-	public Widget getMinimapDrawWidget()
-	{
-		if (client.isResized())
-		{
-			if (client.getVarbitValue(Varbits.SIDE_PANELS) == 1)
-			{
-				return client.getWidget(ComponentID.RESIZABLE_VIEWPORT_BOTTOM_LINE_MINIMAP_DRAW_AREA);
-			}
-			return client.getWidget(ComponentID.RESIZABLE_VIEWPORT_MINIMAP_DRAW_AREA);
-		}
-		return client.getWidget(ComponentID.FIXED_VIEWPORT_MINIMAP_DRAW_AREA);
-	}
-}
-
-package com.radiusmarkers;
-
-import com.google.inject.Inject;
-import java.awt.BasicStroke;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.Graphics2D;
-import java.awt.Stroke;
-import java.awt.geom.GeneralPath;
-import java.util.Collection;
-import java.util.List;
-import net.runelite.api.Client;
-import net.runelite.api.NPC;
-import net.runelite.api.Perspective;
-import net.runelite.api.Point;
-import net.runelite.api.coords.LocalPoint;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayLayer;
-import net.runelite.client.ui.overlay.OverlayPosition;
-
-class RadiusMarkerSceneOverlay extends Overlay
-{
-	private static final int MAX_DRAW_DISTANCE = 32;
-	private static final int LOCAL_TILE_SIZE = Perspective.LOCAL_TILE_SIZE;
-
-	private final Client client;
-	private final RadiusMarkerConfig config;
-	private final RadiusMarkerPlugin plugin;
-
-	private int x;
-	private int y;
-
-	@Inject
-	private RadiusMarkerSceneOverlay(Client client, RadiusMarkerConfig config, RadiusMarkerPlugin plugin)
-	{
-		this.client = client;
-		this.config = config;
-		this.plugin = plugin;
-		setPosition(OverlayPosition.DYNAMIC);
-		setPriority(Overlay.PRIORITY_LOW);
-		setLayer(OverlayLayer.ABOVE_SCENE);
-	}
-
-	@Override
-	public Dimension render(Graphics2D graphics)
-	{
-		final Collection<ColourRadiusMarker> markers = plugin.getMarkers();
-		final List<NPC> npcs = client.getNpcs();
-
-		if (markers.isEmpty())
-		{
-			return null;
-		}
-
-		Stroke stroke = new BasicStroke((float) config.borderWidth());
-
-		for (final ColourRadiusMarker marker : markers)
-		{
-			if (!marker.isVisible())
-			{
-				continue;
-			}
-
-			final boolean excludeCorner = AttackType.MELEE.equals(marker.getAttackType());
-
-			final Collection<WorldPoint> worldPoints = plugin.getInstanceWorldPoints(marker.getWorldPoint());
-
-			for (WorldPoint worldPoint : worldPoints)
-			{
-				if (worldPoint.getPlane() != client.getPlane())
-				{
-					continue;
-				}
-
-				if (config.includeRetreatInteractionRange() && marker.isRetreatInteractionVisible())
-				{
-					drawBox(graphics, worldPoint, marker.getRetreatInteractionRadius(),
-						marker.getRetreatInteractionColour(), stroke, 1, false);
-				}
-
-				if (config.includeAggressionRange() && marker.isAggressionVisible())
-				{
-					drawBox(graphics, worldPoint, marker.getAggressionRadius(), marker.getAggressionColour(),
-						stroke, client.getNpcDefinition(marker.getNpcId()).getSize(), excludeCorner);
-				}
-
-				if (config.includeMaxRange() && marker.isMaxVisible())
-				{
-					drawBox(graphics, worldPoint, marker.getMaxRadius(), marker.getMaxColour(), stroke, 1, false);
-				}
-
-				if (config.includeWanderRange() && marker.isWanderVisible())
-				{
-					drawBox(graphics, worldPoint, marker.getWanderRadius(), marker.getWanderColour(), stroke, 1, false);
-				}
-
-				if (marker.isSpawnVisible())
-				{
-					drawBox(graphics, worldPoint, 0, marker.getSpawnColour(), stroke, 1, false);
-				}
-			}
-
-			for (NPC npc : npcs)
-			{
-				if (npc.getId() != marker.getNpcId() || plugin.exclude(npc))
-				{
-					continue;
-				}
-
-				final WorldPoint npcLocation = npc.getWorldLocation();
-				final int size = npc.getComposition().getSize();
-
-				if (config.includeInteractionRange() && marker.isInteractionVisible())
-				{
-					drawBox(graphics, npcLocation, marker.getInteractionRadius(),
-						marker.getInteractionColour(), stroke, size, false);
-				}
-
-				if (config.includeHuntRange() && marker.isHuntVisible())
-				{
-					drawBox(graphics, npcLocation, marker.getHuntRadius(), marker.getHuntColour(), stroke, 1, false);
-				}
-
-				if (config.includeAttackRange() && marker.isAttackVisible())
-				{
-					drawBox(graphics, npcLocation, marker.getAttackRadius(), marker.getAttackColour(),
-						stroke, size, excludeCorner);
-				}
-			}
-		}
-
-		return null;
-	}
-
-	private void drawBox(Graphics2D graphics, WorldPoint worldPoint, int radius,
-		Color borderColour, Stroke borderStroke, int size, boolean excludeCorner)
-	{
-		graphics.setStroke(borderStroke);
-		graphics.setColor(borderColour);
-		graphics.draw(getSquare(worldPoint, radius, size, excludeCorner));
-	}
-
-	private GeneralPath getSquare(final WorldPoint worldPoint, final int radius, final int size, boolean excludeCorner)
-	{
-		GeneralPath path = new GeneralPath();
-
-		if (client.getLocalPlayer() == null)
-		{
-			return path;
-		}
-
-		final int startX = worldPoint.getX() - radius;
-		final int startY = worldPoint.getY() - radius;
-		final int z = worldPoint.getPlane();
-
-		final int diameter = 2 * radius + size;
-
-		excludeCorner = excludeCorner && radius > 0;
-
-		x = startX;
-		y = startY;
-
-		final WorldPoint playerLocation = client.getLocalPlayer().getWorldLocation();
-
-		final int[] xs = new int[4 * diameter + 1];
-		final int[] ys = new int[xs.length];
-
-		for (int i = 0; i < xs.length; i++)
-		{
-			if (i < diameter)
-			{
-				xs[0 * diameter + i] = startX + i;
-				xs[1 * diameter + i] = startX + diameter;
-				xs[2 * diameter + i] = startX + diameter - i;
-				xs[3 * diameter + i] = startX;
-				ys[0 * diameter + i] = startY;
-				ys[1 * diameter + i] = startY + i;
-				ys[2 * diameter + i] = startY + diameter;
-				ys[3 * diameter + i] = startY + diameter - i;
-			}
-			else if (i == diameter)
-			{
-				xs[xs.length - 1] = xs[0];
-				ys[ys.length - 1] = ys[0];
-			}
-			if (excludeCorner && i == 0)
-			{
-				xs[0 * diameter + i] += 1;
-				xs[1 * diameter + i] -= 1;
-				xs[2 * diameter + i] -= 1;
-				xs[3 * diameter + i] += 1;
-				ys[0 * diameter + i] += 1;
-				ys[1 * diameter + i] += 1;
-				ys[2 * diameter + i] -= 1;
-				ys[3 * diameter + i] -= 1;
-				x = xs[i];
-				y = ys[i];
-			}
-
-			boolean hasFirst = false;
-			if (playerLocation.distanceTo(new WorldPoint(x, y, z)) < MAX_DRAW_DISTANCE)
-			{
-				hasFirst = moveTo(path, x, y, z);
-			}
-
-			x = xs[i];
-			y = ys[i];
-
-			if (hasFirst && playerLocation.distanceTo(new WorldPoint(x, y, z)) < MAX_DRAW_DISTANCE)
-			{
-				lineTo(path, x, y, z);
-			}
-		}
-
-		return path;
-	}
-
-	private boolean moveTo(GeneralPath path, final int x, final int y, final int z)
-	{
-		Point point = XYToPoint(x, y, z);
-		if (point != null)
-		{
-			path.moveTo(point.getX(), point.getY());
-			return true;
-		}
-		return false;
-	}
-
-	private void lineTo(GeneralPath path, final int x, final int y, final int z)
-	{
-		Point point = XYToPoint(x, y, z);
-		if (point != null)
-		{
-			path.lineTo(point.getX(), point.getY());
-		}
-	}
-
-	private Point XYToPoint(int x, int y, int z)
-	{
-		LocalPoint localPoint = LocalPoint.fromWorld(client, x, y);
-
-		if (localPoint == null)
-		{
-			return null;
-		}
-
-		return Perspective.localToCanvas(
-			client,
-			new LocalPoint(localPoint.getX() - LOCAL_TILE_SIZE / 2, localPoint.getY() - LOCAL_TILE_SIZE / 2),
-			z);
-	}
-}
-
-package com.radiusmarkers;
-
 enum PanelFilter
 {
 	ALL,
@@ -2106,140 +1836,366 @@ enum PanelFilter
 
 package com.radiusmarkers;
 
+import java.applet.Applet;
+import java.awt.BorderLayout;
 import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Rectangle;
+import java.awt.Toolkit;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.StringSelection;
+import java.awt.datatransfer.UnsupportedFlavorException;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.io.IOException;
+import java.util.function.Consumer;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.ImageIcon;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.SwingUtilities;
+import javax.swing.border.EmptyBorder;
 import lombok.Getter;
-import lombok.Setter;
-import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.Client;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.IconTextField;
+import net.runelite.client.ui.components.PluginErrorPanel;
+import net.runelite.client.util.ImageUtil;
 
-/**
- * Used to denote marked tiles, radiuses and their colours.
- * Note: This is not used for serialization of radius markers; see {@link RadiusMarker}
- */
-@Getter
-@Setter
-class ColourRadiusMarker implements Comparable<ColourRadiusMarker>
+class RadiusMarkerPluginPanel extends PluginPanel
 {
-	static final int RETREAT_INTERACTION_RANGE = 11;
+	private static final ImageIcon COPY_ICON;
+	private static final ImageIcon COPY_HOVER_ICON;
+	private static final ImageIcon PASTE_ICON;
+	private static final ImageIcon PASTE_HOVER_ICON;
+	private static final ImageIcon ADD_ICON;
+	private static final ImageIcon ADD_HOVER_ICON;
 
-	private RadiusMarkerPanel panel;
+	private static final ImageIcon[] FILTER_ICONS;
+	private static final String[] FILTER_TEXT = {"ALL", "R", "", ""};
+	private static final String[] FILTER_DESCRIPTIONS;
 
-	private long id;
+	private final JLabel copyMarkers = new JLabel(COPY_ICON);
+	private final JLabel pasteMarkers = new JLabel(PASTE_ICON);
+	private final JLabel markerAdd = new JLabel(ADD_ICON);
+	private final JLabel title = new JLabel();
+	private final JLabel filter = new JLabel(FILTER_ICONS[0]);
+	private final IconTextField searchBar = new IconTextField();
+	private final PluginErrorPanel noMarkersPanel = new PluginErrorPanel();
+	private final JPanel markerView = new JPanel();
+	private final JPanel searchPanel = new JPanel(new BorderLayout());
 
-	private String name;
-	private boolean visible;
-	private boolean collapsed;
+	private final Client client;
+	private final RadiusMarkerPlugin plugin;
+	private final RadiusMarkerConfig config;
 
-	private final int z;
+	@Getter
+	private PanelFilter panelFilter = PanelFilter.ALL;
 
-	private int spawnX;
-	private int spawnY;
-	private Color spawnColour;
-	private boolean spawnVisible;
-
-	private int wanderRadius;
-	private Color wanderColour;
-	private boolean wanderVisible;
-
-	private int maxRadius;
-	private Color maxColour;
-	private boolean maxVisible;
-
-	private int aggressionRadius;
-	private Color aggressionColour;
-	private boolean aggressionVisible;
-
-	private int retreatInteractionRadius;
-	private Color retreatInteractionColour;
-	private boolean retreatInteractionVisible;
-
-	private int npcId;
-
-	private int attackRadius;
-	private Color attackColour;
-	private AttackType attackType;
-	private boolean attackVisible;
-
-	private int huntRadius;
-	private Color huntColour;
-	private boolean huntVisible;
-
-	private int interactionRadius;
-	private Color interactionColour;
-	private boolean interactionVisible;
-
-	ColourRadiusMarker(RadiusMarker radiusMarker)
+	static
 	{
-		this.id = radiusMarker.getId();
+		final BufferedImage copyIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "copy_icon.png");
+		COPY_ICON = new ImageIcon(copyIcon);
+		COPY_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(copyIcon, 0.53f));
 
-		this.name = radiusMarker.getName() == null ? "Marker" : radiusMarker.getName();
-		this.visible = radiusMarker.isVisible();
-		this.collapsed = radiusMarker.isCollapsed();
+		final BufferedImage pasteIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "paste_icon.png");
+		PASTE_ICON = new ImageIcon(pasteIcon);
+		PASTE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(pasteIcon, 0.53f));
 
-		this.z = radiusMarker.getZ();
-		this.spawnX = radiusMarker.getSpawnX();
-		this.spawnY = radiusMarker.getSpawnY();
-		this.spawnColour = radiusMarker.getSpawnColour();
-		this.spawnVisible = radiusMarker.isSpawnVisible();
+		final BufferedImage addIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "add_icon.png");
+		ADD_ICON = new ImageIcon(addIcon);
+		ADD_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(addIcon, 0.53f));
 
-		this.wanderRadius = radiusMarker.getWanderRadius();
-		this.wanderColour = radiusMarker.getWanderColour();
-		this.wanderVisible = radiusMarker.isWanderVisible();
+		final BufferedImage visibleImg = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "visible_icon.png");
+		final BufferedImage invisibleImg = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "invisible_icon.png");
+		final BufferedImage regionIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "region_icon.png");
 
-		this.maxRadius = radiusMarker.getMaxRadius();
-		this.maxColour = radiusMarker.getMaxColour();
-		this.maxVisible = radiusMarker.isMaxVisible();
+		FILTER_ICONS = new ImageIcon[]
+		{
+			new ImageIcon(ImageUtil.alphaOffset(visibleImg, 0.0f)),
+			new ImageIcon(regionIcon),
+			new ImageIcon(visibleImg),
+			new ImageIcon(invisibleImg)
+		};
 
-		this.aggressionRadius = radiusMarker.getMaxRadius() + radiusMarker.getAttackRadius();
-		this.aggressionColour = radiusMarker.getAggressionColour();
-		this.aggressionVisible = radiusMarker.isAggressionVisible();
-
-		this.retreatInteractionRadius = radiusMarker.getMaxRadius() + RETREAT_INTERACTION_RANGE;
-		this.retreatInteractionColour = radiusMarker.getRetreatInteractionColour();
-		this.retreatInteractionVisible = radiusMarker.isRetreatInteractionVisible();
-
-		this.npcId = radiusMarker.getNpcId();
-
-		this.attackRadius = radiusMarker.getAttackRadius();
-		this.attackColour = radiusMarker.getAttackColour();
-		this.attackType = radiusMarker.getAttackType();
-		this.attackVisible = radiusMarker.isAttackVisible();
-
-		this.huntRadius = radiusMarker.getHuntRadius();
-		this.huntColour = radiusMarker.getHuntColour();
-		this.huntVisible = radiusMarker.isHuntVisible();
-
-		this.interactionRadius = radiusMarker.getInteractionRadius();
-		this.interactionColour = radiusMarker.getInteractionColour();
-		this.interactionVisible = radiusMarker.isInteractionVisible();
+		FILTER_DESCRIPTIONS = new String[]
+		{
+			"<html>Filter:<br>Listing all markers</html>",
+			"<html>Filter:<br>Listing only markers in the current region</html>",
+			"<html>Filter:<br>Listing only visible markers</html>",
+			"<html>Filter:<br>Listing only hidden markers</html>"
+		};
 	}
 
-	public void setMaxRadius(int maxRadius)
+	public RadiusMarkerPluginPanel(Client client, RadiusMarkerPlugin plugin, RadiusMarkerConfig config)
 	{
-		this.maxRadius = maxRadius;
-		aggressionRadius = maxRadius + attackRadius;
-		retreatInteractionRadius = maxRadius + RETREAT_INTERACTION_RANGE;
+		this.client = client;
+		this.plugin = plugin;
+		this.config = config;
+
+		setLayout(new BorderLayout());
+		setBorder(new EmptyBorder(10, 10, 10, 10));
+
+		JPanel northPanel = new JPanel(new BorderLayout());
+		northPanel.setBorder(new EmptyBorder(1, 0, 10, 0));
+
+		JPanel titlePanel = new JPanel(new BorderLayout());
+		titlePanel.setBorder(new EmptyBorder(1, 3, 10, 7));
+
+		JPanel markerButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 7, 3));
+
+		searchPanel.setBorder(new EmptyBorder(1, 0, 0, 0));
+
+		searchBar.setIcon(IconTextField.Icon.SEARCH);
+		searchBar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		searchBar.setHoverBackgroundColor(ColorScheme.DARKER_GRAY_HOVER_COLOR);
+		searchBar.setPreferredSize(new Dimension(PluginPanel.PANEL_WIDTH - 43 - filter.getWidth(), 24));
+		searchBar.addActionListener(e -> rebuild());
+		searchBar.addClearListener(this::rebuild);
+		searchBar.addKeyListener(new KeyAdapter()
+		{
+			@Override
+			public void keyPressed(KeyEvent e)
+			{
+				if (e.getKeyCode() == KeyEvent.VK_ESCAPE)
+				{
+					searchBar.setText("");
+					rebuild();
+				}
+			}
+		});
+
+		filter.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		filter.setOpaque(true);
+		filter.setPreferredSize(new Dimension(28, 24));
+		filter.setText(FILTER_TEXT[0]);
+		filter.setToolTipText(FILTER_DESCRIPTIONS[0]);
+		filter.setHorizontalTextPosition(JLabel.CENTER);
+		filter.setFont(FontManager.getRunescapeSmallFont());
+		filter.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mousePressed(MouseEvent mouseEvent)
+			{
+				panelFilter = panelFilter.next();
+				filter.setText(FILTER_TEXT[panelFilter.ordinal()]);
+				filter.setIcon(FILTER_ICONS[panelFilter.ordinal()]);
+				filter.setToolTipText(FILTER_DESCRIPTIONS[panelFilter.ordinal()]);
+				rebuild();
+			}
+
+			@Override
+			public void mouseEntered(MouseEvent mouseEvent)
+			{
+				filter.setBackground(ColorScheme.DARKER_GRAY_HOVER_COLOR);
+			}
+
+			@Override
+			public void mouseExited(MouseEvent mouseEvent)
+			{
+				filter.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			}
+		});
+
+		title.setText("Radius Markers");
+		title.setForeground(Color.WHITE);
+
+		titlePanel.add(title, BorderLayout.WEST);
+		titlePanel.add(markerButtons, BorderLayout.EAST);
+
+		searchPanel.add(searchBar, BorderLayout.WEST);
+		searchPanel.add(filter, BorderLayout.EAST);
+
+		northPanel.add(titlePanel, BorderLayout.NORTH);
+		northPanel.add(searchPanel, BorderLayout.CENTER);
+
+		JPanel centerPanel = new JPanel(new BorderLayout());
+		centerPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+		markerView.setLayout(new BoxLayout(markerView, BoxLayout.Y_AXIS));
+		markerView.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+		noMarkersPanel.setVisible(false);
+
+		markerView.add(noMarkersPanel);
+
+		copyMarkers.setToolTipText("Export all searched or filtered markers to your clipboard");
+		copyMarkers.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mousePressed(MouseEvent e)
+			{
+				copyMarkers();
+			}
+
+			@Override
+			public void mouseEntered(MouseEvent e)
+			{
+				copyMarkers.setIcon(COPY_HOVER_ICON);
+			}
+
+			@Override
+			public void mouseExited(MouseEvent e)
+			{
+				copyMarkers.setIcon(COPY_ICON);
+			}
+		});
+
+		pasteMarkers.setToolTipText("Import markers from your clipboard");
+		pasteMarkers.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mousePressed(MouseEvent e)
+			{
+				pasteMarkers();
+			}
+
+			@Override
+			public void mouseEntered(MouseEvent e)
+			{
+				pasteMarkers.setIcon(PASTE_HOVER_ICON);
+			}
+
+			@Override
+			public void mouseExited(MouseEvent e)
+			{
+				pasteMarkers.setIcon(PASTE_ICON);
+			}
+		});
+
+		markerAdd.setToolTipText("Add new radius marker");
+		markerAdd.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mousePressed(MouseEvent mouseEvent)
+			{
+				addMarker();
+			}
+
+			@Override
+			public void mouseEntered(MouseEvent mouseEvent)
+			{
+				markerAdd.setIcon(ADD_HOVER_ICON);
+			}
+
+			@Override
+			public void mouseExited(MouseEvent mouseEvent)
+			{
+				markerAdd.setIcon(ADD_ICON);
+			}
+		});
+
+		markerButtons.add(pasteMarkers);
+		markerButtons.add(copyMarkers);
+		markerButtons.add(markerAdd);
+
+		centerPanel.add(markerView, BorderLayout.NORTH);
+
+		add(northPanel, BorderLayout.NORTH);
+		add(centerPanel, BorderLayout.CENTER);
 	}
 
-	public void setAttackRadius(int attackRadius)
+	public void rebuild()
 	{
-		this.attackRadius = attackRadius;
-		aggressionRadius = maxRadius + attackRadius;
+		markerView.removeAll();
+
+		filterMarkersAndDo(marker ->
+		{
+			markerView.add(new RadiusMarkerPanel(plugin, config, marker));
+			markerView.add(Box.createRigidArea(new Dimension(0, 10)));
+		});
+
+		boolean empty = markerView.getComponentCount() == 0;
+		noMarkersPanel.setContent("Radius Markers",
+			"Click the '+' button to add a radius marker at the feet of your character.");
+		noMarkersPanel.setVisible(empty);
+		searchPanel.setVisible(!empty);
+		if (empty && plugin.getMarkers().size() > 0)
+		{
+			noMarkersPanel.setContent("Radius Markers",
+				"No radius markers are available for the current search term and/or selected filter.");
+			searchPanel.setVisible(true);
+		}
+
+		markerView.add(noMarkersPanel);
+
+		repaint();
+		revalidate();
 	}
 
-	public WorldPoint getWorldPoint()
+	private void filterMarkersAndDo(Consumer<ColourRadiusMarker> consumer)
 	{
-		return new WorldPoint(spawnX, spawnY, z);
+		String searchText = getSearchText().toLowerCase();
+		int regionId = client.getLocalPlayer() == null ? -1 : client.getLocalPlayer().getWorldLocation().getRegionID();
+
+		for (final ColourRadiusMarker marker : plugin.getMarkers())
+		{
+			if (marker.getName().toLowerCase().contains(searchText) &&
+				(PanelFilter.ALL.equals(panelFilter) ||
+				(PanelFilter.REGION.equals(panelFilter) && marker.getWorldPoint().getRegionID() == regionId) ||
+				(PanelFilter.VISIBLE.equals(panelFilter) && marker.isVisible()) ||
+				(PanelFilter.INVISIBLE.equals(panelFilter) && !marker.isVisible())))
+			{
+				consumer.accept(marker);
+			}
+		}
 	}
 
-	@Override
-	public int compareTo(ColourRadiusMarker other)
+	public String getSearchText()
 	{
-		return this.name.compareTo(other.name);
+		return searchBar.getText();
 	}
 
-	public boolean equals(RadiusMarker other)
+	private void addMarker()
 	{
-		return id == other.getId();
+		noMarkersPanel.setVisible(false);
+		searchPanel.setVisible(true);
+		final ColourRadiusMarker marker = plugin.addMarker();
+		SwingUtilities.invokeLater(() ->
+		{
+			if (marker != null && marker.getPanel() != null)
+			{
+				Rectangle markerPosition = marker.getPanel().getBounds();
+				markerPosition.setLocation((int) markerPosition.getX(), (int) markerPosition.getY() - 10 -
+					(int) markerPosition.getHeight() / 2 + ((Applet) client).getParent().getHeight());
+				scrollRectToVisible(markerPosition);
+			}
+		});
+	}
+
+	private void copyMarkers()
+	{
+		if (plugin.copyMarkers() != null)
+		{
+			Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(plugin.copyMarkers()), null);
+		}
+	}
+
+	private void pasteMarkers()
+	{
+		final String clipboardText;
+		try
+		{
+			clipboardText = Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor).toString();
+		}
+		catch (IOException | UnsupportedFlavorException ignore)
+		{
+			return;
+		}
+
+		if (plugin.pasteMarkers(clipboardText))
+		{
+			noMarkersPanel.setVisible(false);
+			searchPanel.setVisible(true);
+			rebuild();
+		}
 	}
 }
 
@@ -2481,6 +2437,642 @@ class RadiusMarkerMinimapOverlay extends Overlay
 		final int minimapY = loc.getY() + yy + minimapDrawWidget.getHeight() / 2;
 
 		return new Point(minimapX, minimapY);
+	}
+}
+
+package com.radiusmarkers;
+
+import com.google.inject.Inject;
+import java.awt.BasicStroke;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.Stroke;
+import java.awt.geom.GeneralPath;
+import java.util.Collection;
+import java.util.List;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.Perspective;
+import net.runelite.api.Point;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+class RadiusMarkerSceneOverlay extends Overlay
+{
+	private static final int MAX_DRAW_DISTANCE = 32;
+	private static final int LOCAL_TILE_SIZE = Perspective.LOCAL_TILE_SIZE;
+
+	private final Client client;
+	private final RadiusMarkerConfig config;
+	private final RadiusMarkerPlugin plugin;
+
+	private int x;
+	private int y;
+
+	@Inject
+	private RadiusMarkerSceneOverlay(Client client, RadiusMarkerConfig config, RadiusMarkerPlugin plugin)
+	{
+		this.client = client;
+		this.config = config;
+		this.plugin = plugin;
+		setPosition(OverlayPosition.DYNAMIC);
+		setPriority(Overlay.PRIORITY_LOW);
+		setLayer(OverlayLayer.ABOVE_SCENE);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		final Collection<ColourRadiusMarker> markers = plugin.getMarkers();
+		final List<NPC> npcs = client.getNpcs();
+
+		if (markers.isEmpty())
+		{
+			return null;
+		}
+
+		Stroke stroke = new BasicStroke((float) config.borderWidth());
+
+		for (final ColourRadiusMarker marker : markers)
+		{
+			if (!marker.isVisible())
+			{
+				continue;
+			}
+
+			final boolean excludeCorner = AttackType.MELEE.equals(marker.getAttackType());
+
+			final Collection<WorldPoint> worldPoints = plugin.getInstanceWorldPoints(marker.getWorldPoint());
+
+			for (WorldPoint worldPoint : worldPoints)
+			{
+				if (worldPoint.getPlane() != client.getPlane())
+				{
+					continue;
+				}
+
+				if (config.includeRetreatInteractionRange() && marker.isRetreatInteractionVisible())
+				{
+					drawBox(graphics, worldPoint, marker.getRetreatInteractionRadius(),
+						marker.getRetreatInteractionColour(), stroke, 1, false);
+				}
+
+				if (config.includeAggressionRange() && marker.isAggressionVisible())
+				{
+					drawBox(graphics, worldPoint, marker.getAggressionRadius(), marker.getAggressionColour(),
+						stroke, client.getNpcDefinition(marker.getNpcId()).getSize(), excludeCorner);
+				}
+
+				if (config.includeMaxRange() && marker.isMaxVisible())
+				{
+					drawBox(graphics, worldPoint, marker.getMaxRadius(), marker.getMaxColour(), stroke, 1, false);
+				}
+
+				if (config.includeWanderRange() && marker.isWanderVisible())
+				{
+					drawBox(graphics, worldPoint, marker.getWanderRadius(), marker.getWanderColour(), stroke, 1, false);
+				}
+
+				if (marker.isSpawnVisible())
+				{
+					drawBox(graphics, worldPoint, 0, marker.getSpawnColour(), stroke, 1, false);
+				}
+			}
+
+			for (NPC npc : npcs)
+			{
+				if (npc.getId() != marker.getNpcId() || plugin.exclude(npc))
+				{
+					continue;
+				}
+
+				final WorldPoint npcLocation = npc.getWorldLocation();
+				final int size = npc.getComposition().getSize();
+
+				if (config.includeInteractionRange() && marker.isInteractionVisible())
+				{
+					drawBox(graphics, npcLocation, marker.getInteractionRadius(),
+						marker.getInteractionColour(), stroke, size, false);
+				}
+
+				if (config.includeHuntRange() && marker.isHuntVisible())
+				{
+					drawBox(graphics, npcLocation, marker.getHuntRadius(), marker.getHuntColour(), stroke, 1, false);
+				}
+
+				if (config.includeAttackRange() && marker.isAttackVisible())
+				{
+					drawBox(graphics, npcLocation, marker.getAttackRadius(), marker.getAttackColour(),
+						stroke, size, excludeCorner);
+				}
+			}
+		}
+
+		return null;
+	}
+
+	private void drawBox(Graphics2D graphics, WorldPoint worldPoint, int radius,
+		Color borderColour, Stroke borderStroke, int size, boolean excludeCorner)
+	{
+		graphics.setStroke(borderStroke);
+		graphics.setColor(borderColour);
+		graphics.draw(getSquare(worldPoint, radius, size, excludeCorner));
+	}
+
+	private GeneralPath getSquare(final WorldPoint worldPoint, final int radius, final int size, boolean excludeCorner)
+	{
+		GeneralPath path = new GeneralPath(GeneralPath.WIND_EVEN_ODD);
+
+		if (client.getLocalPlayer() == null)
+		{
+			return path;
+		}
+
+		final int startX = worldPoint.getX() - radius;
+		final int startY = worldPoint.getY() - radius;
+		final int z = worldPoint.getPlane();
+
+		final int diameter = 2 * radius + size;
+
+		excludeCorner = excludeCorner && radius > 0;
+
+		x = startX;
+		y = startY;
+
+		final WorldPoint playerLocation = client.getLocalPlayer().getWorldLocation();
+
+		final int[] xs = new int[4 * diameter + 1];
+		final int[] ys = new int[xs.length];
+
+		boolean hasFirst = false;
+		for (int i = 0; i < xs.length; i++)
+		{
+			if (i < diameter)
+			{
+				xs[0 * diameter + i] = startX + i;
+				xs[1 * diameter + i] = startX + diameter;
+				xs[2 * diameter + i] = startX + diameter - i;
+				xs[3 * diameter + i] = startX;
+				ys[0 * diameter + i] = startY;
+				ys[1 * diameter + i] = startY + i;
+				ys[2 * diameter + i] = startY + diameter;
+				ys[3 * diameter + i] = startY + diameter - i;
+			}
+			else if (i == diameter)
+			{
+				xs[xs.length - 1] = xs[0];
+				ys[ys.length - 1] = ys[0];
+			}
+			if (excludeCorner && i == 0)
+			{
+				xs[0 * diameter + i] += 1;
+				xs[1 * diameter + i] -= 1;
+				xs[2 * diameter + i] -= 1;
+				xs[3 * diameter + i] += 1;
+				ys[0 * diameter + i] += 1;
+				ys[1 * diameter + i] += 1;
+				ys[2 * diameter + i] -= 1;
+				ys[3 * diameter + i] -= 1;
+				x = xs[i];
+				y = ys[i];
+			}
+
+			if (!hasFirst && playerLocation.distanceTo(new WorldPoint(x, y, z)) < MAX_DRAW_DISTANCE)
+			{
+				hasFirst = moveTo(path, x, y, z);
+			}
+
+			x = xs[i];
+			y = ys[i];
+
+			if (hasFirst && playerLocation.distanceTo(new WorldPoint(x, y, z)) < MAX_DRAW_DISTANCE)
+			{
+				lineTo(path, x, y, z);
+			}
+		}
+
+		return path;
+	}
+
+	private boolean moveTo(GeneralPath path, final int x, final int y, final int z)
+	{
+		Point point = XYToPoint(x, y, z);
+		if (point != null)
+		{
+			path.moveTo(point.getX(), point.getY());
+			return true;
+		}
+		return false;
+	}
+
+	private void lineTo(GeneralPath path, final int x, final int y, final int z)
+	{
+		Point point = XYToPoint(x, y, z);
+		if (point != null)
+		{
+			path.lineTo(point.getX(), point.getY());
+		}
+	}
+
+	private Point XYToPoint(int x, int y, int z)
+	{
+		LocalPoint localPoint = LocalPoint.fromWorld(client, x, y);
+
+		if (localPoint == null)
+		{
+			return null;
+		}
+
+		return Perspective.localToCanvas(
+			client,
+			new LocalPoint(localPoint.getX() - LOCAL_TILE_SIZE / 2, localPoint.getY() - LOCAL_TILE_SIZE / 2),
+			z);
+	}
+}
+
+package com.radiusmarkers;
+
+enum AttackType
+{
+	MELEE,
+	HALBERD,
+	MAGIC,
+	RANGED
+}
+
+package com.radiusmarkers;
+
+import java.awt.Color;
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.api.coords.WorldPoint;
+
+/**
+ * Used to denote marked tiles, radiuses and their colours.
+ * Note: This is not used for serialization of radius markers; see {@link RadiusMarker}
+ */
+@Getter
+@Setter
+class ColourRadiusMarker implements Comparable<ColourRadiusMarker>
+{
+	static final int RETREAT_INTERACTION_RANGE = 11;
+
+	private RadiusMarkerPanel panel;
+
+	private long id;
+
+	private String name;
+	private boolean visible;
+	private boolean collapsed;
+
+	private final int z;
+
+	private int spawnX;
+	private int spawnY;
+	private Color spawnColour;
+	private boolean spawnVisible;
+
+	private int wanderRadius;
+	private Color wanderColour;
+	private boolean wanderVisible;
+
+	private int maxRadius;
+	private Color maxColour;
+	private boolean maxVisible;
+
+	private int aggressionRadius;
+	private Color aggressionColour;
+	private boolean aggressionVisible;
+
+	private int retreatInteractionRadius;
+	private Color retreatInteractionColour;
+	private boolean retreatInteractionVisible;
+
+	private int npcId;
+
+	private int attackRadius;
+	private Color attackColour;
+	private AttackType attackType;
+	private boolean attackVisible;
+
+	private int huntRadius;
+	private Color huntColour;
+	private boolean huntVisible;
+
+	private int interactionRadius;
+	private Color interactionColour;
+	private boolean interactionVisible;
+
+	ColourRadiusMarker(RadiusMarker radiusMarker)
+	{
+		this.id = radiusMarker.getId();
+
+		this.name = radiusMarker.getName() == null ? "Marker" : radiusMarker.getName();
+		this.visible = radiusMarker.isVisible();
+		this.collapsed = radiusMarker.isCollapsed();
+
+		this.z = radiusMarker.getZ();
+		this.spawnX = radiusMarker.getSpawnX();
+		this.spawnY = radiusMarker.getSpawnY();
+		this.spawnColour = radiusMarker.getSpawnColour();
+		this.spawnVisible = radiusMarker.isSpawnVisible();
+
+		this.wanderRadius = radiusMarker.getWanderRadius();
+		this.wanderColour = radiusMarker.getWanderColour();
+		this.wanderVisible = radiusMarker.isWanderVisible();
+
+		this.maxRadius = radiusMarker.getMaxRadius();
+		this.maxColour = radiusMarker.getMaxColour();
+		this.maxVisible = radiusMarker.isMaxVisible();
+
+		this.aggressionRadius = radiusMarker.getMaxRadius() + radiusMarker.getAttackRadius();
+		this.aggressionColour = radiusMarker.getAggressionColour();
+		this.aggressionVisible = radiusMarker.isAggressionVisible();
+
+		this.retreatInteractionRadius = radiusMarker.getMaxRadius() + RETREAT_INTERACTION_RANGE;
+		this.retreatInteractionColour = radiusMarker.getRetreatInteractionColour();
+		this.retreatInteractionVisible = radiusMarker.isRetreatInteractionVisible();
+
+		this.npcId = radiusMarker.getNpcId();
+
+		this.attackRadius = radiusMarker.getAttackRadius();
+		this.attackColour = radiusMarker.getAttackColour();
+		this.attackType = radiusMarker.getAttackType();
+		this.attackVisible = radiusMarker.isAttackVisible();
+
+		this.huntRadius = radiusMarker.getHuntRadius();
+		this.huntColour = radiusMarker.getHuntColour();
+		this.huntVisible = radiusMarker.isHuntVisible();
+
+		this.interactionRadius = radiusMarker.getInteractionRadius();
+		this.interactionColour = radiusMarker.getInteractionColour();
+		this.interactionVisible = radiusMarker.isInteractionVisible();
+	}
+
+	public void setMaxRadius(int maxRadius)
+	{
+		this.maxRadius = maxRadius;
+		aggressionRadius = maxRadius + attackRadius;
+		retreatInteractionRadius = maxRadius + RETREAT_INTERACTION_RANGE;
+	}
+
+	public void setAttackRadius(int attackRadius)
+	{
+		this.attackRadius = attackRadius;
+		aggressionRadius = maxRadius + attackRadius;
+	}
+
+	public WorldPoint getWorldPoint()
+	{
+		return new WorldPoint(spawnX, spawnY, z);
+	}
+
+	@Override
+	public int compareTo(ColourRadiusMarker other)
+	{
+		return this.name.compareTo(other.name);
+	}
+
+	public boolean equals(RadiusMarker other)
+	{
+		return id == other.getId();
+	}
+}
+
+package com.radiusmarkers;
+
+import com.google.inject.Inject;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.geom.Area;
+import java.util.List;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.Point;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.worldmap.WorldMap;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+class RadiusMarkerMapOverlay extends Overlay
+{
+	private final Client client;
+	private final RadiusMarkerConfig config;
+	private final RadiusMarkerPlugin plugin;
+
+	@Inject
+	RadiusMarkerMapOverlay(Client client, RadiusMarkerConfig config, RadiusMarkerPlugin plugin)
+	{
+		this.client = client;
+		this.config = config;
+		this.plugin = plugin;
+
+		setPosition(OverlayPosition.DYNAMIC);
+		setPriority(Overlay.PRIORITY_LOW);
+		setLayer(OverlayLayer.MANUAL);
+		drawAfterLayer(ComponentID.WORLD_MAP_MAPVIEW);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (config.showWorldMap() && client.getWidget(ComponentID.WORLD_MAP_MAPVIEW) != null)
+		{
+			drawWorldMap(graphics);
+		}
+		return null;
+	}
+
+	private void drawWorldMap(Graphics2D graphics)
+	{
+		final Widget worldMapView = client.getWidget(ComponentID.WORLD_MAP_MAPVIEW);
+		if (worldMapView == null)
+		{
+			return;
+		}
+		final Rectangle bounds = worldMapView.getBounds();
+		if (bounds == null)
+		{
+			return;
+		}
+		final Area mapClipArea = getWorldMapClipArea(bounds);
+
+		final List<ColourRadiusMarker> markers = plugin.getMarkers();
+		final List<NPC> npcs = client.getNpcs();
+
+		for (final ColourRadiusMarker marker : markers)
+		{
+			if (!marker.isVisible())
+			{
+				continue;
+			}
+
+			final boolean excludeCorner = AttackType.MELEE.equals(marker.getAttackType());
+
+			final WorldPoint worldPoint = marker.getWorldPoint();
+
+			if (config.includeRetreatInteractionRange() && marker.isRetreatInteractionVisible())
+			{
+				drawSquare(graphics, worldPoint, marker.getRetreatInteractionColour(), mapClipArea,
+					marker.getRetreatInteractionRadius(), 1, false);
+			}
+
+			if (config.includeAggressionRange() && marker.isAggressionVisible())
+			{
+				drawSquare(graphics, worldPoint, marker.getAggressionColour(), mapClipArea,
+					marker.getAggressionRadius(), client.getNpcDefinition(marker.getNpcId()).getSize(), excludeCorner);
+			}
+
+			if (config.includeMaxRange() && marker.isMaxVisible())
+			{
+				drawSquare(graphics, worldPoint, marker.getMaxColour(), mapClipArea,
+					marker.getMaxRadius(), 1, false);
+			}
+
+			if (config.includeWanderRange() && marker.isWanderVisible())
+			{
+				drawSquare(graphics, worldPoint, marker.getWanderColour(), mapClipArea,
+					marker.getWanderRadius(), 1, false);
+			}
+
+			if (marker.isSpawnVisible())
+			{
+				drawSquare(graphics, worldPoint, marker.getSpawnColour(), mapClipArea, 0, 1, false);
+			}
+
+			for (NPC npc : npcs)
+			{
+				if (npc.getId() != marker.getNpcId() || plugin.exclude(npc))
+				{
+					continue;
+				}
+
+				final WorldPoint npcLocation = npc.getWorldLocation();
+				final int size = npc.getComposition().getSize();
+
+				if (config.includeInteractionRange() && marker.isInteractionVisible())
+				{
+					drawSquare(graphics, npcLocation, marker.getInteractionColour(), mapClipArea,
+						marker.getInteractionRadius(), size, false);
+				}
+
+				if (config.includeHuntRange() && marker.isHuntVisible())
+				{
+					drawSquare(graphics, npcLocation, marker.getHuntColour(), mapClipArea,
+						marker.getHuntRadius(), 1, false);
+				}
+
+				if (config.includeAttackRange() && marker.isAttackVisible())
+				{
+					drawSquare(graphics, npcLocation, marker.getAttackColour(), mapClipArea,
+						marker.getAttackRadius(), size, excludeCorner);
+				}
+			}
+		}
+	}
+
+	private void drawSquare(Graphics2D graphics, WorldPoint worldPoint, Color color, Area mapClipArea,
+		int radius, int size, boolean excludeCorner)
+	{
+		final Point start = mapWorldPointToGraphicsPoint(
+			worldPoint.getX() - radius, worldPoint.getY() + radius + size - 1);
+		final Point end = mapWorldPointToGraphicsPoint(
+			worldPoint.getX() + radius + size, worldPoint.getY() - (radius + 1));
+
+		if (start == null || end == null)
+		{
+			return;
+		}
+
+		float pixelsPerTile = client.getWorldMap().getWorldMapZoom();
+		final int tileSize = (int) pixelsPerTile;
+
+		int x = start.getX();
+		int y = start.getY();
+		final int width = end.getX() - x - 1;
+		final int height = end.getY() - y - 1;
+		x = x - tileSize / 2;
+		y = y - tileSize / 2 + 1;
+
+		graphics.setColor(color);
+		graphics.setClip(mapClipArea);
+
+		Area square = new Area(new Rectangle(x, y, width, height));
+		if (radius > 0 && excludeCorner)
+		{
+			Area corners = new Area(new Rectangle(x, y, tileSize, tileSize));
+			corners.add(new Area(new Rectangle(x, y + height - tileSize, tileSize, tileSize)));
+			corners.add(new Area(new Rectangle(x + width - tileSize, y, tileSize, tileSize)));
+			corners.add(new Area(new Rectangle(x + width - tileSize, y + height - tileSize, tileSize, tileSize)));
+			square.subtract(corners);
+		}
+
+		graphics.draw(square);
+	}
+
+	private Area getWorldMapClipArea(Rectangle baseRectangle)
+	{
+		final Widget overview = client.getWidget(ComponentID.WORLD_MAP_OVERVIEW_MAP);
+		final Widget surfaceSelector = client.getWidget(ComponentID.WORLD_MAP_SURFACE_SELECTOR);
+
+		Area clipArea = new Area(baseRectangle);
+
+		if (overview != null && !overview.isHidden())
+		{
+			clipArea.subtract(new Area(overview.getBounds()));
+		}
+		if (surfaceSelector != null && !surfaceSelector.isHidden())
+		{
+			clipArea.subtract(new Area(surfaceSelector.getBounds()));
+		}
+
+		return clipArea;
+	}
+
+	private Point mapWorldPointToGraphicsPoint(int worldPointX, int worldPointY)
+	{
+		WorldMap worldMap = client.getWorldMap();
+
+		float pixelsPerTile = worldMap.getWorldMapZoom();
+
+		Widget map = client.getWidget(ComponentID.WORLD_MAP_MAPVIEW);
+		if (map != null)
+		{
+			Rectangle worldMapRect = map.getBounds();
+
+			int widthInTiles = (int) Math.ceil(worldMapRect.getWidth() / pixelsPerTile);
+			int heightInTiles = (int) Math.ceil(worldMapRect.getHeight() / pixelsPerTile);
+
+			Point worldMapPosition = worldMap.getWorldMapPosition();
+
+			//Offset in tiles from anchor sides
+			int yTileMax = worldMapPosition.getY() - heightInTiles / 2;
+			int yTileOffset = (yTileMax - worldPointY - 1) * -1;
+			int xTileOffset = worldPointX + widthInTiles / 2 - worldMapPosition.getX();
+
+			int xGraphDiff = ((int) (xTileOffset * pixelsPerTile));
+			int yGraphDiff = (int) (yTileOffset * pixelsPerTile);
+
+			//Center on tile.
+			yGraphDiff -= pixelsPerTile - Math.ceil(pixelsPerTile / 2);
+			xGraphDiff += pixelsPerTile - Math.ceil(pixelsPerTile / 2);
+
+			yGraphDiff = worldMapRect.height - yGraphDiff;
+			yGraphDiff += (int) worldMapRect.getY();
+			xGraphDiff += (int) worldMapRect.getX();
+
+			return new Point(xGraphDiff, yGraphDiff);
+		}
+		return null;
 	}
 }
 
@@ -2812,608 +3404,6 @@ public interface RadiusMarkerConfig extends Config
 
 package com.radiusmarkers;
 
-import java.applet.Applet;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.FlowLayout;
-import java.awt.Rectangle;
-import java.awt.Toolkit;
-import java.awt.datatransfer.DataFlavor;
-import java.awt.datatransfer.StringSelection;
-import java.awt.datatransfer.UnsupportedFlavorException;
-import java.awt.event.KeyAdapter;
-import java.awt.event.KeyEvent;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.awt.image.BufferedImage;
-import java.io.IOException;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.ImageIcon;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.SwingUtilities;
-import javax.swing.border.EmptyBorder;
-import lombok.Getter;
-import net.runelite.api.Client;
-import net.runelite.client.ui.ColorScheme;
-import net.runelite.client.ui.FontManager;
-import net.runelite.client.ui.PluginPanel;
-import net.runelite.client.ui.components.IconTextField;
-import net.runelite.client.ui.components.PluginErrorPanel;
-import net.runelite.client.util.ImageUtil;
-
-class RadiusMarkerPluginPanel extends PluginPanel
-{
-	private static final ImageIcon COPY_ICON;
-	private static final ImageIcon COPY_HOVER_ICON;
-	private static final ImageIcon PASTE_ICON;
-	private static final ImageIcon PASTE_HOVER_ICON;
-	private static final ImageIcon ADD_ICON;
-	private static final ImageIcon ADD_HOVER_ICON;
-
-	private static final ImageIcon[] FILTER_ICONS;
-	private static final String[] FILTER_TEXT = {"ALL", "R", "", ""};
-	private static final String[] FILTER_DESCRIPTIONS;
-
-	private final JLabel copyMarkers = new JLabel(COPY_ICON);
-	private final JLabel pasteMarkers = new JLabel(PASTE_ICON);
-	private final JLabel markerAdd = new JLabel(ADD_ICON);
-	private final JLabel title = new JLabel();
-	private final JLabel filter = new JLabel(FILTER_ICONS[0]);
-	private final IconTextField searchBar = new IconTextField();
-	private final PluginErrorPanel noMarkersPanel = new PluginErrorPanel();
-	private final JPanel markerView = new JPanel();
-	private final JPanel searchPanel = new JPanel(new BorderLayout());
-
-	private final Client client;
-	private final RadiusMarkerPlugin plugin;
-	private final RadiusMarkerConfig config;
-
-	@Getter
-	private PanelFilter panelFilter = PanelFilter.ALL;
-
-	static
-	{
-		final BufferedImage copyIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "copy_icon.png");
-		COPY_ICON = new ImageIcon(copyIcon);
-		COPY_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(copyIcon, 0.53f));
-
-		final BufferedImage pasteIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "paste_icon.png");
-		PASTE_ICON = new ImageIcon(pasteIcon);
-		PASTE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(pasteIcon, 0.53f));
-
-		final BufferedImage addIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "add_icon.png");
-		ADD_ICON = new ImageIcon(addIcon);
-		ADD_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(addIcon, 0.53f));
-
-		final BufferedImage visibleImg = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "visible_icon.png");
-		final BufferedImage invisibleImg = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "invisible_icon.png");
-		final BufferedImage regionIcon = ImageUtil.loadImageResource(RadiusMarkerPlugin.class, "region_icon.png");
-
-		FILTER_ICONS = new ImageIcon[]
-		{
-			new ImageIcon(ImageUtil.alphaOffset(visibleImg, 0.0f)),
-			new ImageIcon(regionIcon),
-			new ImageIcon(visibleImg),
-			new ImageIcon(invisibleImg)
-		};
-
-		FILTER_DESCRIPTIONS = new String[]
-		{
-			"<html>Filter:<br>Listing all markers</html>",
-			"<html>Filter:<br>Listing only markers in the current region</html>",
-			"<html>Filter:<br>Listing only visible markers</html>",
-			"<html>Filter:<br>Listing only hidden markers</html>"
-		};
-	}
-
-	public RadiusMarkerPluginPanel(Client client, RadiusMarkerPlugin plugin, RadiusMarkerConfig config)
-	{
-		this.client = client;
-		this.plugin = plugin;
-		this.config = config;
-
-		setLayout(new BorderLayout());
-		setBorder(new EmptyBorder(10, 10, 10, 10));
-
-		JPanel northPanel = new JPanel(new BorderLayout());
-		northPanel.setBorder(new EmptyBorder(1, 0, 10, 0));
-
-		JPanel titlePanel = new JPanel(new BorderLayout());
-		titlePanel.setBorder(new EmptyBorder(1, 3, 10, 7));
-
-		JPanel markerButtons = new JPanel(new FlowLayout(FlowLayout.RIGHT, 7, 3));
-
-		searchPanel.setBorder(new EmptyBorder(1, 0, 0, 0));
-
-		searchBar.setIcon(IconTextField.Icon.SEARCH);
-		searchBar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		searchBar.setHoverBackgroundColor(ColorScheme.DARKER_GRAY_HOVER_COLOR);
-		searchBar.setPreferredSize(new Dimension(PluginPanel.PANEL_WIDTH - 43 - filter.getWidth(), 24));
-		searchBar.addActionListener(e -> rebuild());
-		searchBar.addClearListener(this::rebuild);
-		searchBar.addKeyListener(new KeyAdapter()
-		{
-			@Override
-			public void keyPressed(KeyEvent e)
-			{
-				if (e.getKeyCode() == KeyEvent.VK_ESCAPE)
-				{
-					searchBar.setText("");
-					rebuild();
-				}
-			}
-		});
-
-		filter.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		filter.setOpaque(true);
-		filter.setPreferredSize(new Dimension(28, 24));
-		filter.setText(FILTER_TEXT[0]);
-		filter.setToolTipText(FILTER_DESCRIPTIONS[0]);
-		filter.setHorizontalTextPosition(JLabel.CENTER);
-		filter.setFont(FontManager.getRunescapeSmallFont());
-		filter.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mousePressed(MouseEvent mouseEvent)
-			{
-				panelFilter = panelFilter.next();
-				filter.setText(FILTER_TEXT[panelFilter.ordinal()]);
-				filter.setIcon(FILTER_ICONS[panelFilter.ordinal()]);
-				filter.setToolTipText(FILTER_DESCRIPTIONS[panelFilter.ordinal()]);
-				rebuild();
-			}
-
-			@Override
-			public void mouseEntered(MouseEvent mouseEvent)
-			{
-				filter.setBackground(ColorScheme.DARKER_GRAY_HOVER_COLOR);
-			}
-
-			@Override
-			public void mouseExited(MouseEvent mouseEvent)
-			{
-				filter.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-			}
-		});
-
-		title.setText("Radius Markers");
-		title.setForeground(Color.WHITE);
-
-		titlePanel.add(title, BorderLayout.WEST);
-		titlePanel.add(markerButtons, BorderLayout.EAST);
-
-		searchPanel.add(searchBar, BorderLayout.WEST);
-		searchPanel.add(filter, BorderLayout.EAST);
-
-		northPanel.add(titlePanel, BorderLayout.NORTH);
-		northPanel.add(searchPanel, BorderLayout.CENTER);
-
-		JPanel centerPanel = new JPanel(new BorderLayout());
-		centerPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-
-		markerView.setLayout(new BoxLayout(markerView, BoxLayout.Y_AXIS));
-		markerView.setBackground(ColorScheme.DARK_GRAY_COLOR);
-
-		noMarkersPanel.setVisible(false);
-
-		markerView.add(noMarkersPanel);
-
-		copyMarkers.setToolTipText("Export all searched or filtered markers to your clipboard");
-		copyMarkers.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mousePressed(MouseEvent e)
-			{
-				copyMarkers();
-			}
-
-			@Override
-			public void mouseEntered(MouseEvent e)
-			{
-				copyMarkers.setIcon(COPY_HOVER_ICON);
-			}
-
-			@Override
-			public void mouseExited(MouseEvent e)
-			{
-				copyMarkers.setIcon(COPY_ICON);
-			}
-		});
-
-		pasteMarkers.setToolTipText("Import markers from your clipboard");
-		pasteMarkers.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mousePressed(MouseEvent e)
-			{
-				pasteMarkers();
-			}
-
-			@Override
-			public void mouseEntered(MouseEvent e)
-			{
-				pasteMarkers.setIcon(PASTE_HOVER_ICON);
-			}
-
-			@Override
-			public void mouseExited(MouseEvent e)
-			{
-				pasteMarkers.setIcon(PASTE_ICON);
-			}
-		});
-
-		markerAdd.setToolTipText("Add new radius marker");
-		markerAdd.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mousePressed(MouseEvent mouseEvent)
-			{
-				addMarker();
-			}
-
-			@Override
-			public void mouseEntered(MouseEvent mouseEvent)
-			{
-				markerAdd.setIcon(ADD_HOVER_ICON);
-			}
-
-			@Override
-			public void mouseExited(MouseEvent mouseEvent)
-			{
-				markerAdd.setIcon(ADD_ICON);
-			}
-		});
-
-		markerButtons.add(pasteMarkers);
-		markerButtons.add(copyMarkers);
-		markerButtons.add(markerAdd);
-
-		centerPanel.add(markerView, BorderLayout.NORTH);
-
-		add(northPanel, BorderLayout.NORTH);
-		add(centerPanel, BorderLayout.CENTER);
-	}
-
-	public void rebuild()
-	{
-		markerView.removeAll();
-
-		int regionId = client.getLocalPlayer() == null ? -1 : client.getLocalPlayer().getWorldLocation().getRegionID();
-
-		for (final ColourRadiusMarker marker : plugin.getMarkers())
-		{
-			if (marker.getName().toLowerCase().contains(getSearchText().toLowerCase()) &&
-				(PanelFilter.ALL.equals(panelFilter) ||
-				(PanelFilter.REGION.equals(panelFilter) && marker.getWorldPoint().getRegionID() == regionId) ||
-				(PanelFilter.VISIBLE.equals(panelFilter) && marker.isVisible()) ||
-				(PanelFilter.INVISIBLE.equals(panelFilter) && !marker.isVisible())))
-			{
-				markerView.add(new RadiusMarkerPanel(plugin, config, marker));
-				markerView.add(Box.createRigidArea(new Dimension(0, 10)));
-			}
-		}
-
-		boolean empty = markerView.getComponentCount() == 0;
-		noMarkersPanel.setContent("Radius Markers",
-			"Click the '+' button to add a radius marker at the feet of your character.");
-		noMarkersPanel.setVisible(empty);
-		searchPanel.setVisible(!empty);
-		if (empty && plugin.getMarkers().size() > 0)
-		{
-			noMarkersPanel.setContent("Radius Markers",
-				"No radius markers are available for the current search term and/or selected filter.");
-			searchPanel.setVisible(true);
-		}
-
-		markerView.add(noMarkersPanel);
-
-		repaint();
-		revalidate();
-	}
-
-	public String getSearchText()
-	{
-		return searchBar.getText();
-	}
-
-	private void addMarker()
-	{
-		noMarkersPanel.setVisible(false);
-		searchPanel.setVisible(true);
-		final ColourRadiusMarker marker = plugin.addMarker();
-		SwingUtilities.invokeLater(() ->
-		{
-			if (marker != null && marker.getPanel() != null)
-			{
-				Rectangle markerPosition = marker.getPanel().getBounds();
-				markerPosition.setLocation((int) markerPosition.getX(), (int) markerPosition.getY() - 10 -
-					(int) markerPosition.getHeight() / 2 + ((Applet) client).getParent().getHeight());
-				scrollRectToVisible(markerPosition);
-			}
-		});
-	}
-
-	private void copyMarkers()
-	{
-		if (plugin.copyMarkers() != null)
-		{
-			Toolkit.getDefaultToolkit().getSystemClipboard().setContents(new StringSelection(plugin.copyMarkers()), null);
-		}
-	}
-
-	private void pasteMarkers()
-	{
-		final String clipboardText;
-		try
-		{
-			clipboardText = Toolkit.getDefaultToolkit().getSystemClipboard().getData(DataFlavor.stringFlavor).toString();
-		}
-		catch (IOException | UnsupportedFlavorException ignore)
-		{
-			return;
-		}
-
-		if (plugin.pasteMarkers(clipboardText))
-		{
-			noMarkersPanel.setVisible(false);
-			searchPanel.setVisible(true);
-			rebuild();
-		}
-	}
-}
-
-package com.radiusmarkers;
-
-import com.google.inject.Inject;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.Graphics2D;
-import java.awt.Rectangle;
-import java.awt.geom.Area;
-import java.util.List;
-import net.runelite.api.Client;
-import net.runelite.api.NPC;
-import net.runelite.api.Point;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.widgets.ComponentID;
-import net.runelite.api.widgets.Widget;
-import net.runelite.api.worldmap.WorldMap;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayLayer;
-import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.worldmap.WorldMapOverlay;
-
-class RadiusMarkerMapOverlay extends Overlay
-{
-	private final Client client;
-	private final RadiusMarkerConfig config;
-	private final RadiusMarkerPlugin plugin;
-
-	@Inject
-	private WorldMapOverlay worldMapOverlay;
-
-	@Inject
-	RadiusMarkerMapOverlay(Client client, RadiusMarkerConfig config, RadiusMarkerPlugin plugin)
-	{
-		this.client = client;
-		this.config = config;
-		this.plugin = plugin;
-
-		setPosition(OverlayPosition.DYNAMIC);
-		setPriority(Overlay.PRIORITY_LOW);
-		setLayer(OverlayLayer.MANUAL);
-		drawAfterLayer(ComponentID.WORLD_MAP_MAPVIEW);
-	}
-
-	@Override
-	public Dimension render(Graphics2D graphics)
-	{
-		if (config.showWorldMap() && client.getWidget(ComponentID.WORLD_MAP_MAPVIEW) != null)
-		{
-			drawWorldMap(graphics);
-		}
-		return null;
-	}
-
-	private void drawWorldMap(Graphics2D graphics)
-	{
-		final Widget worldMapView = client.getWidget(ComponentID.WORLD_MAP_MAPVIEW);
-		if (worldMapView == null)
-		{
-			return;
-		}
-		final Rectangle bounds = worldMapView.getBounds();
-		if (bounds == null)
-		{
-			return;
-		}
-		final Area mapClipArea = getWorldMapClipArea(bounds);
-
-		final List<ColourRadiusMarker> markers = plugin.getMarkers();
-		final List<NPC> npcs = client.getNpcs();
-
-		for (final ColourRadiusMarker marker : markers)
-		{
-			if (!marker.isVisible())
-			{
-				continue;
-			}
-
-			final boolean excludeCorner = AttackType.MELEE.equals(marker.getAttackType());
-
-			final WorldPoint worldPoint = marker.getWorldPoint();
-
-			if (config.includeRetreatInteractionRange() && marker.isRetreatInteractionVisible())
-			{
-				drawSquare(graphics, worldPoint, marker.getRetreatInteractionColour(), mapClipArea,
-					marker.getRetreatInteractionRadius(), 1, false);
-			}
-
-			if (config.includeAggressionRange() && marker.isAggressionVisible())
-			{
-				drawSquare(graphics, worldPoint, marker.getAggressionColour(), mapClipArea,
-					marker.getAggressionRadius(), client.getNpcDefinition(marker.getNpcId()).getSize(), excludeCorner);
-			}
-
-			if (config.includeMaxRange() && marker.isMaxVisible())
-			{
-				drawSquare(graphics, worldPoint, marker.getMaxColour(), mapClipArea,
-					marker.getMaxRadius(), 1, false);
-			}
-
-			if (config.includeWanderRange() && marker.isWanderVisible())
-			{
-				drawSquare(graphics, worldPoint, marker.getWanderColour(), mapClipArea,
-					marker.getWanderRadius(), 1, false);
-			}
-
-			if (marker.isSpawnVisible())
-			{
-				drawSquare(graphics, worldPoint, marker.getSpawnColour(), mapClipArea, 0, 1, false);
-			}
-
-			for (NPC npc : npcs)
-			{
-				if (npc.getId() != marker.getNpcId() || plugin.exclude(npc))
-				{
-					continue;
-				}
-
-				final WorldPoint npcLocation = npc.getWorldLocation();
-				final int size = npc.getComposition().getSize();
-
-				if (config.includeInteractionRange() && marker.isInteractionVisible())
-				{
-					drawSquare(graphics, npcLocation, marker.getInteractionColour(), mapClipArea,
-						marker.getInteractionRadius(), size, false);
-				}
-
-				if (config.includeHuntRange() && marker.isHuntVisible())
-				{
-					drawSquare(graphics, npcLocation, marker.getHuntColour(), mapClipArea,
-						marker.getHuntRadius(), 1, false);
-				}
-
-				if (config.includeAttackRange() && marker.isAttackVisible())
-				{
-					drawSquare(graphics, npcLocation, marker.getAttackColour(), mapClipArea,
-						marker.getAttackRadius(), size, excludeCorner);
-				}
-			}
-		}
-	}
-
-	private void drawSquare(Graphics2D graphics, WorldPoint worldPoint, Color color, Area mapClipArea,
-		int radius, int size, boolean excludeCorner)
-	{
-		final Point start = mapWorldPointToGraphicsPoint(
-			worldPoint.getX() - radius, worldPoint.getY() + radius + size - 1);
-		final Point end = mapWorldPointToGraphicsPoint(
-			worldPoint.getX() + radius + size, worldPoint.getY() - (radius + 1));
-
-		if (start == null || end == null)
-		{
-			return;
-		}
-
-		float pixelsPerTile = client.getWorldMap().getWorldMapZoom();
-		final int tileSize = (int) pixelsPerTile;
-
-		int x = start.getX();
-		int y = start.getY();
-		final int width = end.getX() - x - 1;
-		final int height = end.getY() - y - 1;
-		x = x - tileSize / 2;
-		y = y - tileSize / 2 + 1;
-
-		graphics.setColor(color);
-		graphics.setClip(mapClipArea);
-
-		Area square = new Area(new Rectangle(x, y, width, height));
-		if (radius > 0 && excludeCorner)
-		{
-			Area corners = new Area(new Rectangle(x, y, tileSize, tileSize));
-			corners.add(new Area(new Rectangle(x, y + height - tileSize, tileSize, tileSize)));
-			corners.add(new Area(new Rectangle(x + width - tileSize, y, tileSize, tileSize)));
-			corners.add(new Area(new Rectangle(x + width - tileSize, y + height - tileSize, tileSize, tileSize)));
-			square.subtract(corners);
-		}
-
-		graphics.draw(square);
-	}
-
-	private Area getWorldMapClipArea(Rectangle baseRectangle)
-	{
-		final Widget overview = client.getWidget(ComponentID.WORLD_MAP_OVERVIEW_MAP);
-		final Widget surfaceSelector = client.getWidget(ComponentID.WORLD_MAP_SURFACE_SELECTOR);
-
-		Area clipArea = new Area(baseRectangle);
-
-		if (overview != null && !overview.isHidden())
-		{
-			clipArea.subtract(new Area(overview.getBounds()));
-		}
-		if (surfaceSelector != null && !surfaceSelector.isHidden())
-		{
-			clipArea.subtract(new Area(surfaceSelector.getBounds()));
-		}
-
-		return clipArea;
-	}
-
-	private Point mapWorldPointToGraphicsPoint(int worldPointX, int worldPointY)
-	{
-		WorldMap worldMap = client.getWorldMap();
-
-		float pixelsPerTile = worldMap.getWorldMapZoom();
-
-		Widget map = client.getWidget(ComponentID.WORLD_MAP_MAPVIEW);
-		if (map != null)
-		{
-			Rectangle worldMapRect = map.getBounds();
-
-			int widthInTiles = (int) Math.ceil(worldMapRect.getWidth() / pixelsPerTile);
-			int heightInTiles = (int) Math.ceil(worldMapRect.getHeight() / pixelsPerTile);
-
-			Point worldMapPosition = worldMap.getWorldMapPosition();
-
-			//Offset in tiles from anchor sides
-			int yTileMax = worldMapPosition.getY() - heightInTiles / 2;
-			int yTileOffset = (yTileMax - worldPointY - 1) * -1;
-			int xTileOffset = worldPointX + widthInTiles / 2 - worldMapPosition.getX();
-
-			int xGraphDiff = ((int) (xTileOffset * pixelsPerTile));
-			int yGraphDiff = (int) (yTileOffset * pixelsPerTile);
-
-			//Center on tile.
-			yGraphDiff -= pixelsPerTile - Math.ceil(pixelsPerTile / 2);
-			xGraphDiff += pixelsPerTile - Math.ceil(pixelsPerTile / 2);
-
-			yGraphDiff = worldMapRect.height - yGraphDiff;
-			yGraphDiff += (int) worldMapRect.getY();
-			xGraphDiff += (int) worldMapRect.getX();
-
-			return new Point(xGraphDiff, yGraphDiff);
-		}
-		return null;
-	}
-}
-
-package com.radiusmarkers;
-
-enum AttackType
-{
-	MELEE,
-	HALBERD,
-	MAGIC,
-	RANGED
-}
-
-package com.radiusmarkers;
-
 import java.awt.Color;
 import lombok.Value;
 
@@ -3482,3 +3472,16 @@ class RadiusMarker
 	}
 }
 
+package com.radiusmarkers;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class RadiusMarkerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(RadiusMarkerPlugin.class);
+		RuneLite.main(args);
+	}
+}
