@@ -38,7 +38,7 @@ public class StopWatchPlugin extends Plugin {
 
         navButton = NavigationButton.builder()
                 .tooltip("Stopwatch and Timer")
-                .icon(ImageUtil.loadImageResource(getClass(), "/stopwatch_icon.png"))
+                .icon(ImageUtil.loadImageResource(getClass(), "/images/stopwatch_icon.png"))
                 .priority(5)
                 .panel(panel)
                 .build();
