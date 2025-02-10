@@ -1,78 +1,329 @@
 package com.easylootsell;
 
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
 
-public class EasyLootSellTest
-{
-	public static void main(String[] args) throws Exception
-	{
-		ExternalPluginManager.loadBuiltin(EasyLootSellPlugin.class);
-		RuneLite.main(args);
-	}
+import static com.easylootsell.EasyLootSellConfig.GROUP;
+
+@ConfigGroup(GROUP)
+public interface EasyLootSellConfig extends Config {
+    String GROUP = "easylootsell";
+
+    @ConfigItem(
+            keyName = "lootTabName",
+            name = "Loot Tab Name",
+            description = "Name of the desired loot tab, only include the tab name and not the price estimate (ex: Tab 9), or blank for all items",
+            position = 0)
+    default String lootTabName() {
+        return "Tab 9";
+    }
+
+    @ConfigSection(
+            name = "Highlighting",
+            description = "Set which bank tab is the loot tab, and choose a highlight color",
+            position = 10
+    )
+    String SECTION_LOOT_TAB = "lootTabSection";
+
+    @ConfigItem(
+            keyName = "highlightColor",
+            name = "Highlight Color",
+            description = "The color items within the loot tab will be highlighted for easier viewing",
+            position = 11,
+            section = SECTION_LOOT_TAB
+    )
+    default DesiredHighlightColor desiredHighlightColor() {
+        return DesiredHighlightColor.GREEN;
+    }
+
+    @ConfigSection(
+            name = "Placeholder Hiding",
+            description = "Optionally hide placeholders to make grabbing loot even easier",
+            position = 20
+    )
+    String SECTION_ITEM_HIDING = "placeholderHidingSection";
+
+    String KEY_HIDE_PLACEHOLDERS = "hidePlaceholders";
+    @ConfigItem(
+            keyName = KEY_HIDE_PLACEHOLDERS,
+            name = "Hide Placeholders",
+            description = "Hide placeholders and shift all item stacks up and left to close the gaps between them for easier loot grabbing",
+            position = 21,
+            section = SECTION_ITEM_HIDING
+    )
+    default boolean hidePlaceholders() {
+        return false;
+    }
+
+    String KEY_HIDE_UNTRADABLES = "hideUntradables";
+    @ConfigItem(
+            keyName = KEY_HIDE_UNTRADABLES,
+            name = "Hide Untradables",
+            description = "Hide untradables and shift items up and left to close the gaps between them for easier loot grabbing",
+            position = 22,
+            section = SECTION_ITEM_HIDING
+    )
+    default boolean hideUntradables() {
+        return false;
+    }
 }
 
 package com.easylootsell;
 
+import lombok.NonNull;
+import net.runelite.api.Client;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.ScriptID;
+import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.bank.BankSearch;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Optional;
+
+import static com.easylootsell.EasyLootSellConfig.KEY_HIDE_PLACEHOLDERS;
+import static com.easylootsell.EasyLootSellConfig.KEY_HIDE_UNTRADABLES;
+
+@Singleton
+public class LootTabArranger {
+    private static final int BANK_ITEM_WIDTH = 36;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private EasyLootSellConfig config;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private BankSearch bankSearch;
+
+    private Map<Integer, Integer> itemIdToIndex = null;
+
+    public void shutDown() {
+        itemIdToIndex = null;
+        clientThread.invokeLater(bankSearch::layoutBank);
+    }
+
+    @Subscribe
+    public void onConfigChanged(final ConfigChanged event) {
+        if (!EasyLootSellConfig.GROUP.equals(event.getGroup()))
+            return;
+
+        final String key = event.getKey();
+        if (KEY_HIDE_PLACEHOLDERS.equals(key) || KEY_HIDE_UNTRADABLES.equals(key)) {
+            itemIdToIndex = null;
+            if (config.hidePlaceholders() || config.hideUntradables()) {
+                clientThread.invokeLater(() -> {
+                    // reset to un-hide items in cases where one of our hide settings was just disabled
+                    bankSearch.layoutBank();
+                    arrangeLootTabIfApplicableClientThreadAssumed();
+                });
+            } else {
+                clientThread.invokeLater(bankSearch::layoutBank);
+            }
+        }
+    }
+
+    @Subscribe
+    public void onScriptPostFired(final ScriptPostFired event) {
+        if (event.getScriptId() != ScriptID.BANKMAIN_BUILD)
+            return;
+        arrangeLootTabIfApplicableClientThreadAssumed();
+    }
+
+    public void arrangeLootTabIfApplicable() {
+        clientThread.invokeLater(this::arrangeLootTabIfApplicableClientThreadAssumed);
+    }
+
+    private void arrangeLootTabIfApplicableClientThreadAssumed() {
+        if (!config.hidePlaceholders() && !config.hideUntradables())
+            return;
+
+        final Optional<Widget> bankWidgetIfOnLootTab = WidgetUtils.getBankWidgetIfOnLootTab(client, config);
+        if (bankWidgetIfOnLootTab.isEmpty()) {
+            itemIdToIndex = null;
+            return;
+        }
+
+        final Widget bankWidget = bankWidgetIfOnLootTab.get();
+        if (itemIdToIndex == null)
+            itemIdToIndex = assignIndices(bankWidget);
+
+        for (final Widget itemWidget : bankWidget.getDynamicChildren()) {
+            if (itemWidget.isHidden())
+                continue;
+
+            final Integer assignedIndex = itemIdToIndex.get(itemWidget.getItemId());
+            if (assignedIndex == null) {
+                itemWidget.setHidden(true);
+                itemWidget.revalidate();
+            } else {
+                itemWidget.setOriginalX(getXForIndex(assignedIndex));
+                itemWidget.setOriginalY(getYForIndex(assignedIndex));
+                itemWidget.revalidate();
+            }
+        }
+    }
+
+    @NonNull
+    private Map<Integer, Integer> assignIndices(final Widget bankWidget) {
+        final Map<Integer, Integer> map = new HashMap<>();
+
+        int index = 0;
+        for (final Widget itemWidget : bankWidget.getDynamicChildren()) {
+            if (itemWidget.isHidden())
+                continue;
+
+            if (!shouldHide(itemWidget)) {
+                map.put(itemWidget.getItemId(), index++);
+            }
+        }
+
+        return map;
+    }
+
+    private boolean shouldHide(final Widget bankItem) {
+        final int quantity = bankItem.getItemQuantity();
+
+        if (config.hidePlaceholders() && quantity < 1)
+            return true;
+
+        if (config.hideUntradables() && quantity > 0) {
+            return !client.getItemDefinition(bankItem.getItemId()).isTradeable();
+        }
+
+        return false;
+    }
+
+    private static int getXForIndex(final int index) {
+        return (index % 8) * 48 + 51;
+    }
+
+    private static int getYForIndex(final int index) {
+        return (index / 8) * BANK_ITEM_WIDTH;
+    }
+}
+
+package com.easylootsell;
+
+import net.runelite.api.Client;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.Widget;
+
+import java.util.Optional;
+
+public final class WidgetUtils {
+    private WidgetUtils() {}
+
+    public static Optional<Widget> getBankWidgetIfOnLootTab(final Client client, final EasyLootSellConfig config) {
+        final Widget bankWidget = client.getWidget(ComponentID.BANK_ITEM_CONTAINER);
+        if (bankWidget == null)
+            return Optional.empty();
+
+        final Widget bankTitleBarWidget = client.getWidget(ComponentID.BANK_TITLE_BAR);
+        if (bankTitleBarWidget == null)
+            return Optional.empty();
+
+        final String bankTitle = bankTitleBarWidget.getText();
+        if (bankTitle == null || !bankTitle.contains(config.lootTabName()))
+            return Optional.empty();
+
+        return Optional.of(bankWidget);
+    }
+}
+
+package com.easylootsell;
 
 import com.google.inject.Provides;
-import net.runelite.api.Client;
 import net.runelite.client.config.ConfigManager;
-import net.runelite.client.menus.MenuManager;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
-
 
 import javax.inject.Inject;
 
 @PluginDescriptor(
         name = "Easy Loot Sell",
         description = "Highlights items with more than 0 qty for easy identification while selling off a loot tab",
-        tags = {"loot tab", "sell", "highlight", "loot", "prices", "deposit", "easy"}
+        tags = {"loot tab", "sell", "highlight", "loot", "prices", "deposit", "easy", "hide", "placeholder"}
 )
 public class EasyLootSellPlugin extends Plugin {
-    static final String CONFIG_GROUP = "easylootsell";
 
     @Inject
-    private Client client;
+    private EventBus eventBus;
 
     @Inject
-    private ConfigManager configManager;
-
-    @Inject
-    private EasyLootSellConfig config;
-
-    @Inject
-    private MenuManager menuManager;
+    private OverlayManager overlayManager;
 
     @Inject
     private EasyLootSellOverlay overlay;
 
     @Inject
-    private OverlayManager overlayManager;
+    private LootTabArranger lootTabArranger;
 
     @Provides
-    EasyLootSellConfig provideConfig(ConfigManager configManager) {
+    EasyLootSellConfig provideConfig(final ConfigManager configManager) {
         return configManager.getConfig(EasyLootSellConfig.class);
     }
 
     @Override
-    protected void startUp() throws Exception {
+    protected void startUp() {
+        eventBus.register(lootTabArranger);
+        lootTabArranger.arrangeLootTabIfApplicable();
+
         overlayManager.add(overlay);
     }
 
     @Override
-    protected void shutDown() throws Exception {
-        overlayManager.remove(overlay);
+    protected void shutDown() {
+        lootTabArranger.shutDown();
+        eventBus.unregister(lootTabArranger);
 
+        overlayManager.remove(overlay);
     }
 }
 
 package com.easylootsell;
+
+import java.awt.Color;
+
+public enum DesiredHighlightColor {
+    PINK,
+    BLUE,
+    YELLOW,
+    GREEN,
+    NONE,
+    ;
+
+    public Color toJavaColor() {
+        switch (this) {
+            case PINK:
+                return Color.PINK;
+            case BLUE:
+                return Color.BLUE;
+            case YELLOW:
+                return Color.YELLOW;
+            default:
+                return Color.GREEN;
+        }
+    }
+}
+
+package com.easylootsell;
+
 import net.runelite.api.Client;
-import net.runelite.api.widgets.ComponentID;
-import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetItem;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.overlay.WidgetItemOverlay;
@@ -88,9 +339,9 @@ public class EasyLootSellOverlay extends WidgetItemOverlay {
     private final Client client;
     private final ItemManager itemManager;
     private final EasyLootSellConfig config;
+
     @Inject
-    public EasyLootSellOverlay(Client client, ItemManager itemManager, EasyLootSellPlugin plugin, EasyLootSellConfig config)
-    {
+    public EasyLootSellOverlay(final Client client, final ItemManager itemManager, final EasyLootSellConfig config) {
         this.client = client;
         this.itemManager = itemManager;
         this.config = config;
@@ -100,109 +351,41 @@ public class EasyLootSellOverlay extends WidgetItemOverlay {
     }
 
     @Override
-    public void renderItemOverlay(Graphics2D graphics, int itemId, WidgetItem itemWidget)
-    {
-        if (checkInterfaceIsHighlightable(itemWidget)) {
-            int qty = itemWidget.getQuantity();
-            /* highlight item if we have at least 1 in the loot tab for easy identification when selling */
-            if (qty >= 1)
-            {
+    public void renderItemOverlay(final Graphics2D graphics, final int itemId, final WidgetItem itemWidget) {
+        final DesiredHighlightColor desiredHighlightColor = config.desiredHighlightColor();
+        if (desiredHighlightColor == DesiredHighlightColor.NONE)
+            return;
 
-                Color colorToUse =  getDesiredColor(config.desiredHighlightColor());
-                Rectangle bounds = itemWidget.getCanvasBounds();
-                final BufferedImage outline = itemManager.getItemOutline(itemId, itemWidget.getQuantity(), colorToUse);
-                graphics.drawImage(outline, (int) bounds.getX(), (int) bounds.getY(), null);
-            }
-        }
+        if (!interfaceIsHighlightable(itemWidget))
+            return;
+
+        final int qty = itemWidget.getQuantity();
+        if (qty < 1)
+            return;
+
+        // highlight item if we have at least 1 in the loot tab for easy identification when selling
+        final Color colorToUse = desiredHighlightColor.toJavaColor();
+        final Rectangle bounds = itemWidget.getCanvasBounds();
+        final BufferedImage outline = itemManager.getItemOutline(itemId, itemWidget.getQuantity(), colorToUse);
+        graphics.drawImage(outline, bounds.x, bounds.y, null);
     }
 
-    private boolean checkInterfaceIsHighlightable(WidgetItem itemWidget)
-    {
-            Widget bankWidget = client.getWidget(ComponentID.BANK_ITEM_CONTAINER);
-            if (bankWidget != null)
-            {
-                String bankTitle = client.getWidget(ComponentID.BANK_TITLE_BAR).getText();
-                /* if the item is within the desired tab, it should be highlighted */
-
-                if (bankTitle.contains(config.lootTabName()) && client.getWidget(ComponentID.BANK_ITEM_CONTAINER) != null) {
-                    //return true;
-                    return bankWidget.getId() == itemWidget.getWidget().getId();
-                }
-                return false;
-            }
-        return false;
+    private boolean interfaceIsHighlightable(final WidgetItem itemWidget) {
+        return WidgetUtils.getBankWidgetIfOnLootTab(client, config)
+                .map(bankWidget -> bankWidget.getId() == itemWidget.getWidget().getId())
+                .orElse(false);
     }
-
-    private Color getDesiredColor(EasyLootSellConfig.desiredHighlightColor value) {
-        switch (value.toString()){
-            case "PINK":
-                return Color.PINK;
-            case "BLUE":
-                return Color.BLUE;
-            case "YELLOW":
-                return Color.YELLOW;
-            default:
-                return Color.GREEN;
-        }
-    }
-
 }
 
 package com.easylootsell;
 
-import lombok.RequiredArgsConstructor;
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-import net.runelite.client.config.ConfigSection;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
 
-@ConfigGroup(EasyLootSellPlugin.CONFIG_GROUP)
-public interface EasyLootSellConfig extends Config {
-    @ConfigSection(
-            name = "Loot Tab Name",
-            description = "Determines what bank tab is the loot tab, only include name, not estimated price (ex: Tab 9)",
-            position = 0
-    )
-    String lootTabSection = "lootTabSection";
-
-    @ConfigItem(
-            keyName = "lootTabName",
-            name = "Loot Tab Name",
-            description = "Name of the desired loot tab, only include the tab name and not the price estimate (ex: Tab 9), or blank for all items",
-            position = 1,
-            section = "lootTabSection"
-    )
-    default String lootTabName() {return "Tab 9";}
-
-    @RequiredArgsConstructor
-    enum desiredHighlightColor {
-
-        GREEN("GREEN"),
-        BLUE("BLUE"),
-        YELLOW("YELLOW"),
-        PINK("PINK"),
-        ;
-
-        private final String value;
-
-        @Override
-        public String toString() {
-            return value;
-        }
+public class EasyLootSellTest {
+    public static void main(String[] args) throws Exception {
+        ExternalPluginManager.loadBuiltin(EasyLootSellPlugin.class);
+        RuneLite.main(args);
     }
-
-    @ConfigItem(
-            keyName = "highlightColor",
-            name = "Highlight Color",
-            description = "The color items within the loot tab will be highlighted for easier viewing",
-            position = 2,
-            section = "lootTabSection"
-    )
-    default desiredHighlightColor desiredHighlightColor() {return desiredHighlightColor.GREEN;}
-}
-
-package com.easylootsell;
-
-public interface EasyLootSell {
 }
 
