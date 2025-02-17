@@ -350,6 +350,7 @@ package com.lootfilters;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
+import com.lootfilters.model.PluginTileItem;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.SneakyThrows;
@@ -358,6 +359,7 @@ import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ItemDespawned;
@@ -379,6 +381,7 @@ import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
 
 import javax.inject.Inject;
+import javax.inject.Named;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -432,6 +435,10 @@ public class LootFiltersPlugin extends Plugin {
 	@Setter private int hoveredItem = -1;
 	@Setter private boolean hotkeyActive = false;
 	@Setter private boolean overlayEnabled = true;
+
+	@Inject @Named("developerMode") boolean developerMode;
+
+	@Getter private boolean debugEnabled = false;
 
 	public LootFilter getActiveFilter() {
 		return currentAreaFilter != null ? currentAreaFilter : activeFilter;
@@ -538,7 +545,7 @@ public class LootFiltersPlugin extends Plugin {
 	@Subscribe
 	public void onItemSpawned(ItemSpawned event) {
 		var tile = event.getTile();
-		var item = event.getItem();
+		var item = new PluginTileItem(this, event.getItem());
 		tileItemIndex.put(tile, item);
 
 		var match = getActiveFilter().findMatch(this, item);
@@ -558,7 +565,7 @@ public class LootFiltersPlugin extends Plugin {
 	@Subscribe
 	public void onItemDespawned(ItemDespawned event) {
 		var tile = event.getTile();
-		var item = event.getItem();
+		var item = new PluginTileItem(this, event.getItem());
 		tileItemIndex.remove(tile, item);
 		lootbeamIndex.remove(tile, item); // idempotent, we don't care if there wasn't a beam
 	}
@@ -584,6 +591,13 @@ public class LootFiltersPlugin extends Plugin {
 	@Subscribe
 	public void onMenuOpened(MenuOpened event) {
 		menuEntryComposer.onMenuOpened();
+	}
+
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted event) {
+		if (developerMode && event.getCommand().equals("lfDebug")) {
+			debugEnabled = !debugEnabled;
+		}
 	}
 
 	private void loadFilter() throws Exception {
@@ -974,6 +988,8 @@ public class RuleDeserializer implements JsonDeserializer<Rule> {
 
 package com.lootfilters;
 
+import com.lootfilters.model.DespawnTimerType;
+import com.lootfilters.model.PluginTileItem;
 import com.lootfilters.util.TextComponent;
 import net.runelite.api.Client;
 import net.runelite.api.ItemID;
@@ -982,6 +998,7 @@ import net.runelite.api.coords.LocalPoint;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.ProgressPieComponent;
 
 import javax.inject.Inject;
 import java.awt.Color;
@@ -989,6 +1006,8 @@ import java.awt.Dimension;
 import java.awt.Graphics2D;
 import java.awt.Point;
 import java.awt.Rectangle;
+import java.time.Duration;
+import java.time.Instant;
 
 import static com.lootfilters.util.TextUtil.abbreviate;
 import static java.util.stream.Collectors.counting;
@@ -1004,8 +1023,6 @@ public class LootFiltersOverlay extends Overlay {
     private final LootFiltersPlugin plugin;
     private final LootFiltersConfig config;
 
-    private final boolean debug = false;
-
     @Inject
     private ItemManager itemManager;
 
@@ -1019,7 +1036,7 @@ public class LootFiltersOverlay extends Overlay {
 
     @Override
     public Dimension render(Graphics2D g) {
-        if (debug) {
+        if (plugin.isDebugEnabled()) {
             renderDebugOverlay(g);
         }
 
@@ -1108,15 +1125,7 @@ public class LootFiltersOverlay extends Overlay {
                 text.render(g);
 
                 if (match.isShowDespawn()) {
-                    var ticksRemaining = item.getDespawnTime() - client.getTickCount();
-                    if (ticksRemaining < 0) { // doesn't despawn
-                        continue;
-                    }
-                    text.setColor(getDespawnTextColor(item));
-                    text.setAccentColor(Color.BLACK); // text color is r/y/g for despawn, fixed black accent is fine
-                    text.setText(Integer.toString(ticksRemaining));
-                    text.setPosition(new Point(textPoint.getX() + textWidth + 2 + 1, textPoint.getY() - currentOffset));
-                    text.render(g);
+                    renderDespawnTimer(g, item, textPoint, textWidth, fm.getHeight(), currentOffset);
                 }
 
                 currentOffset += textHeight + BOX_PAD + 3;
@@ -1127,11 +1136,11 @@ public class LootFiltersOverlay extends Overlay {
         return null;
     }
 
-    private Color getDespawnTextColor(TileItem item) {
+    private Color getDespawnTextColor(PluginTileItem item) {
         if (item.getDespawnTime() - client.getTickCount() < 100) {
             return Color.RED;
         }
-        if (item.getVisibleTime() <= client.getTickCount()) {
+        if (!item.isPrivate() && item.getVisibleTime() <= client.getTickCount()) {
             return Color.YELLOW;
         }
         return Color.GREEN;
@@ -1209,6 +1218,39 @@ public class LootFiltersOverlay extends Overlay {
         g.setColor(Color.WHITE);
         g.drawString("items: " + itemCount + "," + plugin.getTileItemIndex().pointIndexSize(), 0, 32);
         g.drawString("lootbeams: " + plugin.getLootbeamIndex().size(), 0, 48);
+    }
+
+    private void renderDespawnTimer(Graphics2D g, PluginTileItem item, net.runelite.api.Point textPoint, int textWidth, int textHeight, int yOffset) {
+        var ticksRemaining = item.getDespawnTime() - client.getTickCount();
+        if (ticksRemaining < 0) { // doesn't despawn
+            return;
+        }
+        if (config.despawnThreshold() > 0 && ticksRemaining > config.despawnThreshold()) {
+            return;
+        }
+
+        var type = config.despawnTimerType();
+        if (type == DespawnTimerType.TICKS || type == DespawnTimerType.SECONDS) {
+            var text = new TextComponent();
+            text.setText(type == DespawnTimerType.TICKS
+                    ? Integer.toString(ticksRemaining)
+                    : String.format("%.1f", (Duration.between(Instant.now(), item.getDespawnInstant())).toMillis() / 1000f));
+            text.setColor(getDespawnTextColor(item));
+            text.setPosition(new Point(textPoint.getX() + textWidth + 2 + 1, textPoint.getY() - yOffset));
+            text.render(g);
+        } else {
+            var timer = new ProgressPieComponent();
+            var total = item.getDespawnTime() - item.getSpawnTime();
+            var remaining = item.getDespawnTime() - plugin.getClient().getTickCount();
+            var radius = textHeight / 2;
+            timer.setPosition(new net.runelite.api.Point(textPoint.getX() + textWidth + 2 + 1 + radius,
+                    textPoint.getY() - yOffset - radius));
+            timer.setProgress(remaining / (double) total);
+            timer.setDiameter(textHeight);
+            timer.setFill(getDespawnTextColor(item));
+            timer.setBorderColor(getDespawnTextColor(item));
+            timer.render(g);
+        }
     }
 }
 
@@ -2582,11 +2624,74 @@ public class Lexer {
     }
 }
 
-package com.lootfilters;
+package com.lootfilters.model;
+
+import com.lootfilters.LootFiltersPlugin;
+import lombok.Getter;
+import net.runelite.api.Model;
+import net.runelite.api.Node;
+import net.runelite.api.TileItem;
+
+import java.time.Instant;
+
+public class PluginTileItem implements TileItem {
+    private final TileItem item;
+    @Getter private final int spawnTime;
+    @Getter private final Instant despawnInstant;
+
+    public PluginTileItem(LootFiltersPlugin plugin, TileItem item) {
+        this.item = item;
+        this.spawnTime = plugin.getClient().getTickCount();
+        this.despawnInstant = Instant.now().plusMillis((getDespawnTime() - spawnTime) * 600L);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        return other instanceof PluginTileItem && ((PluginTileItem) other).item == item;
+    }
+
+    @Override
+    public int hashCode() {
+        return item.hashCode();
+    }
+
+    @Override public int getId() { return item.getId(); }
+    @Override public int getQuantity() { return item.getQuantity(); }
+    @Override public int getVisibleTime() { return item.getVisibleTime(); }
+    @Override public int getDespawnTime() { return item.getDespawnTime(); }
+    @Override public int getOwnership() { return item.getOwnership(); }
+    @Override public boolean isPrivate() { return item.isPrivate(); }
+    @Override public Model getModel() { return item.getModel(); }
+    @Override public int getModelHeight() { return item.getModelHeight(); }
+    @Override public void setModelHeight(int i) { item.setModelHeight(i); }
+    @Override public Node getNext() { return item.getNext(); }
+    @Override public Node getPrevious() { return item.getPrevious(); }
+    @Override public long getHash() { return item.getHash(); }
+}
+
+package com.lootfilters.model;
 
 import lombok.AllArgsConstructor;
+
+@AllArgsConstructor
+public enum DespawnTimerType {
+    TICKS("ticks"),
+    SECONDS("seconds"),
+    PIE("pie");
+
+    private final String label;
+
+    @Override
+    public String toString() {
+        return label;
+    }
+}
+
+package com.lootfilters;
+
+import com.lootfilters.model.PluginTileItem;
+import lombok.AllArgsConstructor;
 import net.runelite.api.Tile;
-import net.runelite.api.TileItem;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -2595,7 +2700,7 @@ import java.util.Map;
 public class LootbeamIndex {
     private final LootFiltersPlugin plugin;
 
-    private final Map<Tile, Map<TileItem, Lootbeam>> index = new HashMap<>();
+    private final Map<Tile, Map<PluginTileItem, Lootbeam>> index = new HashMap<>();
 
     public int size() {
         return index.values().stream()
@@ -2603,7 +2708,7 @@ public class LootbeamIndex {
                 .sum();
     }
 
-    public void put(Tile tile, TileItem item, Lootbeam beam) {
+    public void put(Tile tile, PluginTileItem item, Lootbeam beam) {
         if (!index.containsKey(tile)) {
             index.put(tile, new HashMap<>());
         }
@@ -2612,7 +2717,7 @@ public class LootbeamIndex {
         beams.put(item, beam);
     }
 
-    public void remove(Tile tile, TileItem item) {
+    public void remove(Tile tile, PluginTileItem item) {
         if (!index.containsKey(tile)) {
             return; // what?
         }
@@ -2939,6 +3044,7 @@ public class MenuEntryComposer {
 
 package com.lootfilters;
 
+import com.lootfilters.model.DespawnTimerType;
 import com.lootfilters.rule.TextAccent;
 import com.lootfilters.rule.ValueTier;
 import com.lootfilters.rule.ValueType;
@@ -3043,8 +3149,8 @@ public interface LootFiltersConfig extends Config {
     default int hotkeyDoubleTapDelay() { return 250; }
 
     @ConfigSection(
-            name = "Display overrides",
-            description = "Configure global display overrides.",
+            name = "Display settings",
+            description = "Configure global display settings/overrides.",
             position = 2
     )
     String displayOverrides = "displayOverrides";
@@ -3065,11 +3171,28 @@ public interface LootFiltersConfig extends Config {
     )
     default boolean alwaysShowDespawn() { return false; }
     @ConfigItem(
+            keyName = "despawnTimerType",
+            name = "Despawn type",
+            description = "Type of despawn timer to render.",
+            section = displayOverrides,
+            position = 2
+    )
+    default DespawnTimerType despawnTimerType() { return DespawnTimerType.TICKS; }
+    @ConfigItem(
+            keyName = "despawnThreshold",
+            name = "Despawn threshold",
+            description = "Number of remaining ticks until despawn at which to show the despawn timer (0 to always show).",
+            section = displayOverrides,
+            position = 3
+    )
+    @Units(Units.TICKS)
+    default int despawnThreshold() { return 0; }
+    @ConfigItem(
             keyName = "textAccent",
             name = "Text accent",
             description = "Text accent type.",
             section = displayOverrides,
-            position = 2
+            position = 4
     )
     default TextAccent textAccent() { return TextAccent.USE_FILTER; }
 
@@ -3317,6 +3440,7 @@ public class LootFiltersMouseAdapter extends MouseAdapter {
 
 package com.lootfilters;
 
+import com.lootfilters.model.PluginTileItem;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
 import net.runelite.api.coords.WorldPoint;
@@ -3328,12 +3452,12 @@ import java.util.Map;
 import java.util.Set;
 
 public class TileItemIndex {
-    private final Map<Tile, List<TileItem>> itemIndex = new HashMap<>();
+    private final Map<Tile, List<PluginTileItem>> itemIndex = new HashMap<>();
 
     // Tile instances are not readily available in all contexts,
     private final Map<WorldPoint, Tile> pointIndex = new HashMap<>();
 
-    public Set<Map.Entry<Tile, List<TileItem>>> entrySet() {
+    public Set<Map.Entry<Tile, List<PluginTileItem>>> entrySet() {
         return itemIndex.entrySet();
     }
 
@@ -3354,7 +3478,7 @@ public class TileItemIndex {
                 : null;
     }
 
-    public void put(Tile tile, TileItem item) {
+    public void put(Tile tile, PluginTileItem item) {
         if (!itemIndex.containsKey(tile)) {
             itemIndex.put(tile, new ArrayList<>());
         }
@@ -3362,7 +3486,7 @@ public class TileItemIndex {
         pointIndex.put(tile.getWorldLocation(), tile);
     }
 
-    public void remove(Tile tile, TileItem item) {
+    public void remove(Tile tile, PluginTileItem item) {
         if (!itemIndex.containsKey(tile)) {
             return; // what?
         }
