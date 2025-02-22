@@ -137,7 +137,7 @@ public class PredictionTree {
         int precise;
         for(PredictionTree leaf : leaves) {
             Set<Integer> avail = leaf.available;
-            //log.info("Current guesses: " + avail);
+            //System.out.println("Current guesses: " + avail);
             assert (!avail.isEmpty()); // should never be empty, something is wrong
             int phigh = Predictor.computePrecise(hit.hit, properties);
             int plow = Predictor.computePrecise(hit.hit-1, properties);
@@ -272,6 +272,273 @@ public class PredictionTree {
 
 package com.example.utils;
 
+import com.example.enemydata.Enemy;
+import com.example.events.EntityDamaged;
+import com.example.raids.Toa;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.api.kit.KitType;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.party.PartyMember;
+import net.runelite.client.party.PartyService;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.*;
+import java.util.stream.Collectors;
+
+/**
+ * Damage handler manages the damaging of enemies, the raid classes places and removes enemies from here.
+ */
+@Singleton
+@Slf4j
+public class DamageHandler {
+    @Getter
+    private final Map<Integer, Enemy> activeEnemies = new HashMap<>();
+
+    @Getter
+    private final Predictor predictor = new Predictor();
+
+    @Inject
+    private Client client;
+
+    @Inject
+    ClientThread clientThread;
+
+    @Inject
+    DamageHandler damageHandler;
+
+    @Inject
+    private PartyService party;
+    /**
+     * Map of current XP amounts in each skill
+     */
+    private Map<Skill, Integer> previousXps;
+
+    private final Set<Skill> validSkills = Set.of(Skill.HITPOINTS);
+
+    private static final Set<Integer> POWERED_STAVES = new HashSet<>(Arrays.asList(
+            ItemID.SANGUINESTI_STAFF,
+            ItemID.TRIDENT_OF_THE_SEAS_FULL,
+            ItemID.TRIDENT_OF_THE_SEAS,
+            ItemID.TRIDENT_OF_THE_SWAMP,
+            ItemID.TRIDENT_OF_THE_SWAMP_E,
+            ItemID.HOLY_SANGUINESTI_STAFF,
+            ItemID.TUMEKENS_SHADOW,
+            ItemID.CORRUPTED_TUMEKENS_SHADOW,
+            ItemID.VOIDWAKER
+    ));
+    private static final Set<Integer> CHINCHOMPAS = Set.of(
+            ItemID.CHINCHOMPA_10033,
+            ItemID.BLACK_CHINCHOMPA,
+            ItemID.RED_CHINCHOMPA);
+
+
+    public void initXpMap() {
+        previousXps = new HashMap<>();
+        Arrays.stream(Skill.values()).forEach(skill -> previousXps.put(skill, client.getSkillExperience(skill)));
+    }
+
+    public boolean shouldProcess() {
+        return Toa.isAtToa(client);
+    }
+
+    @Subscribe
+    protected void onGameStateChanged(GameStateChanged state) {
+        if (Objects.requireNonNull(state.getGameState()) == GameState.LOGGED_IN) {
+            initXpMap();
+        }
+    }
+
+    /**
+     * Processes the xp drop and turns it into how much damage it did. Not entirely accurate due to fractional XP.
+     * Rounds down so that in case it does get fractional it should not give false positives.
+     *
+     * @param skill Skill that xp was received in.
+     * @param xp Amount of XP that was received.
+     */
+    private void processXpDrop(Skill skill, int xp) {
+        if (!validSkills.contains(skill)) {
+            return;
+        }
+
+        Player player = Objects.requireNonNull(client.getLocalPlayer());
+        Actor entity = player.getInteracting();
+        if (!(entity instanceof NPC) || !shouldProcess()) {
+            return;
+        }
+
+        PlayerComposition playerComposition = player.getPlayerComposition();
+        NPC npc = (NPC) entity;
+        int id = npc.getId();
+
+        if (Enemy.blacklist.contains(id)) {
+            predictor.reset();
+            // We actually always receive range xp, perhaps this can be used to
+            // calculate the magic xp, as you seem to always receive .3 xp from swarms
+            return;
+        }
+
+        Enemy enemy;
+        if (activeEnemies.containsKey(npc.getIndex())) {
+            enemy = activeEnemies.get(npc.getIndex());
+        } else {
+            //System.out.println("Unknown enemy \"" + npc.getName() + "\": " + npc.getId() + " (idx: " + npc.getIndex() + ")");
+            return;
+        }
+
+        int attackStyle = client.getVarpValue(VarPlayer.ATTACK_STYLE);
+        int weapon = playerComposition.getEquipmentId(KitType.WEAPON);
+
+        boolean isDefensiveCast = attackStyle == 3;
+        boolean isPoweredStaff = POWERED_STAVES.contains(weapon);
+        boolean isChinchompa = CHINCHOMPAS.contains(weapon);
+        double scaling = enemy.getModifier();
+        Predictor.Properties props = new Predictor.Properties(skill, isDefensiveCast, isPoweredStaff, npc, scaling);
+        if ((skill == Skill.RANGED || skill == Skill.MAGIC) && isDefensiveCast) {
+            // Ignore in order to not double hit, insert the drop into
+            // the tree in order to track the fraction
+            predictor.insertInto(xp, scaling, props);
+            return;
+        }
+        int damage = predictor.treePredict(xp, props);
+        assert (damage >= 0);
+        if (isChinchompa) {
+            // TODO: barrage? prio: low, tldr: check for barrage animation
+            handleAoe(props, damage);
+        } else {
+            sendDamage(player, damage);
+        }
+    }
+
+    private void handleAoe(Predictor.Properties properties, int damage) {
+        NPC npc = properties.npc;
+        List<Enemy> nearby = activeEnemies.values().stream()
+                .filter(enemy -> npc.getWorldLocation().distanceTo(enemy.getNpc().getWorldLocation()) <= 1)
+                .collect(Collectors.toList());
+
+        if (nearby.stream().anyMatch(e -> npc.getId() != e.getNpc().getId())) {
+            predictor.reset(); // can't determine how much each npc was damaged, reset instead
+        }
+
+        final int clumpHp = nearby.stream().mapToInt(Enemy::getCurrent_health).sum();
+        if (damage >= clumpHp) {
+            sendClumpDamage(nearby);
+        }
+    }
+
+    private void sendClumpDamage(List<Enemy> enemies) {
+        for (Enemy enemy : enemies) {
+            final int npcIndex = enemy.getNpc().getIndex();
+            final EntityDamaged ev = new EntityDamaged(npcIndex, enemy.getCurrent_health());
+            if (party.isInParty()) {
+                clientThread.invokeLater(() -> party.send(ev));
+            }
+            onEntityDamaged(ev);
+        }
+    }
+
+    private void sendDamage(Player player, int damage) {
+        if (damage <= 0) {
+            return;
+        }
+
+        NPC npc = (NPC) player.getInteracting();
+
+        final int npcIndex = npc.getIndex();
+        final EntityDamaged entityDamaged = new EntityDamaged(npcIndex, damage);
+
+        if (party.isInParty()) {
+            clientThread.invokeLater(() -> party.send(entityDamaged));
+        }
+        onEntityDamaged(entityDamaged);
+    }
+
+    /**
+     * Computes the difference between the updated xp drop and the previous one
+     * @param skill Skill XP was received in.
+     * @param xp Updated XP amount.
+     */
+    private void preProcessXpDrop(Skill skill, int xp) {
+        if (!shouldProcess()) {
+            predictor.reset();
+            return;
+        }
+
+        int diff = xp - previousXps.getOrDefault(skill, 0);
+        previousXps.put(skill, xp);
+        processXpDrop(skill, diff);
+    }
+
+    /**
+     * Queues damage on an entity. If the entity is a shadow, it hides the shadow.
+     * If the entity is Akkha, it will highlight her.
+     * @param entityDamaged event
+     */
+    @Subscribe
+    public void onEntityDamaged(EntityDamaged entityDamaged) {
+        if (!shouldProcess()) {
+            return;
+        }
+
+        PartyMember localPlayer = party.getLocalMember();
+
+        if (localPlayer != null) {
+            if (localPlayer.getMemberId() == entityDamaged.getMemberId()) {
+                return; // Don't process your own events
+            }
+        }
+
+        Integer npcIndex = entityDamaged.getNpcIndex();
+        Enemy enemy = activeEnemies.getOrDefault(npcIndex, null);
+        if (enemy != null) {
+            enemy.queueDamage(entityDamaged.getDamage());
+        }
+    }
+
+    @Subscribe
+    public void onStatChanged(StatChanged xpDrop) {
+        preProcessXpDrop(xpDrop.getSkill(), xpDrop.getXp());
+    }
+
+    @Subscribe
+    public void onFakeXpDrop(FakeXpDrop xpDrop) {
+        //TODO hopefully this works. I don't have 200m in magic to find out.
+        processXpDrop(xpDrop.getSkill(), xpDrop.getXp());
+    }
+
+    /**
+     * Removes the hit from queued damage.
+     * @param hit hitsplat
+     */
+    @Subscribe
+    public void onHitsplatApplied(HitsplatApplied hit) {
+        Hitsplat hitsplat = hit.getHitsplat();
+        if (!shouldProcess() || hitsplat.getHitsplatType() == HitsplatID.HEAL || hitsplat.getAmount() <= 0) {
+            return;
+        }
+
+        Actor actor = hit.getActor();
+        if (actor instanceof NPC) {
+            NPC npc = (NPC) actor;
+            Enemy enemy = activeEnemies.getOrDefault(npc.getIndex(), null);
+            if (enemy == null) {
+                //log.info("Unknown target: " + npc.getId() + " index: " + npc.getIndex());
+                return;
+            }
+
+            int amount = hitsplat.getAmount();
+            int hp = enemy.hit(amount);
+            //log.info("Damage: " + amount + " " + hit.getActor().getName() + " (" + hp +")");
+        }
+    }
+}
+
+package com.example.utils;
+
 import lombok.AllArgsConstructor;
 import lombok.NonNull;
 import net.runelite.api.NPC;
@@ -331,7 +598,7 @@ public class Predictor {
      * Resets all skill prediction trees.
      */
     public void reset() {
-        roots = new HashMap<>();
+        roots.clear();
     }
 
     /**
@@ -525,9 +792,10 @@ public interface AkkhaPredictorConfig extends Config
 package com.example.enemydata.toa.het;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class AkkhaShadow extends Enemy {
+public class AkkhaShadow extends ToaEnemy {
     public AkkhaShadow(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 70, 100, 140, 30,
@@ -563,7 +831,7 @@ public class AkkhaShadow extends Enemy {
 
 package com.example.enemydata.toa.het;
 
-import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.experimental.Accessors;
@@ -575,7 +843,7 @@ import net.runelite.api.NpcID;
 @Getter
 @Setter
 @Accessors(fluent = true)
-public class Akkha  extends Enemy {
+public class Akkha extends ToaEnemy {
     private boolean canPhase;
 
     public Akkha(NPC npc, int invocation, int partySize, int pathLevel) {
@@ -624,9 +892,10 @@ public class Akkha  extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Kephri extends Enemy {
+public class Kephri extends ToaEnemy {
     // TODO: might need extra handling due to shield? Probably just to ignore the damage queueing
     public Kephri(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
@@ -658,9 +927,10 @@ public class Kephri extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Kephri721 extends Enemy {
+public class Kephri721 extends ToaEnemy {
     public Kephri721(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 80, 0, 0, 80,
@@ -681,9 +951,10 @@ public class Kephri721 extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Arcane extends Enemy {
+public class Arcane extends ToaEnemy {
     public Arcane(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 40, 75, 80, 80,
@@ -695,9 +966,10 @@ public class Arcane extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Spitter extends Enemy {
+public class Spitter extends ToaEnemy {
     public Spitter(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 40, 1, 80, 80,
@@ -710,9 +982,10 @@ public class Spitter extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Scarab extends Enemy {
+public class Scarab extends ToaEnemy {
     public Scarab(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 12, 20, 32, 28,
@@ -725,9 +998,10 @@ public class Scarab extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Soldier extends Enemy {
+public class Soldier extends ToaEnemy {
     public Soldier(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 40, 75, 80, 80,
@@ -739,23 +1013,25 @@ public class Soldier extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class AgileScarab extends Enemy {
+public class AgileScarab extends ToaEnemy {
     public AgileScarab(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 30, 60, 20, 5,
                 0, 25,
-                0, 0, 0);
+                0, 0, 0, true);
     }
 }
 
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class EmptyEgg extends Enemy {
+public class EmptyEgg extends ToaEnemy {
     public EmptyEgg(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 35, 0, 0, 80,
@@ -767,9 +1043,10 @@ public class EmptyEgg extends Enemy {
 package com.example.enemydata.toa.scabaras;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Swarm extends Enemy {
+public class Swarm extends ToaEnemy {
     public Swarm(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 10, 1, 1, 0,
@@ -781,9 +1058,10 @@ public class Swarm extends Enemy {
 package com.example.enemydata.toa.wardens;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class ElidinisWarden extends Enemy {
+public class ElidinisWarden extends ToaEnemy {
     public ElidinisWarden(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 140, 300, 150, 100,
@@ -795,9 +1073,10 @@ public class ElidinisWarden extends Enemy {
 package com.example.enemydata.toa.wardens;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class Obelisk extends Enemy {
+public class Obelisk extends ToaEnemy {
     public Obelisk(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 260, 200, 150, 100,
@@ -809,9 +1088,10 @@ public class Obelisk extends Enemy {
 package com.example.enemydata.toa.wardens;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class TumekensWarden762 extends Enemy {
+public class TumekensWarden762 extends ToaEnemy {
 
     public TumekensWarden762(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
@@ -824,9 +1104,10 @@ public class TumekensWarden762 extends Enemy {
 package com.example.enemydata.toa.wardens;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class TumekensWarden extends Enemy {
+public class TumekensWarden extends ToaEnemy {
     public TumekensWarden(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 140, 300, 150, 100,
@@ -838,9 +1119,10 @@ public class TumekensWarden extends Enemy {
 package com.example.enemydata.toa.wardens;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import net.runelite.api.NPC;
 
-public class ElidinisWarden761 extends Enemy {
+public class ElidinisWarden761 extends ToaEnemy {
     public ElidinisWarden761(NPC npc, int invocation, int partySize, int pathLevel) {
         super(npc, invocation, partySize, pathLevel,
                 880, 150, 150, 150,
@@ -849,218 +1131,9 @@ public class ElidinisWarden761 extends Enemy {
     }
 }
 
-package com.example.enemydata.toa.ampken;
+package com.example.enemydata.toa;
 
 import com.example.enemydata.Enemy;
-import net.runelite.api.*;
-
-public class Thrower extends Enemy {
-    public Thrower(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                npc.getId() == NpcID.BABOON_THROWER ? 30 : 35, npc.getId() == NpcID.BABOON_THROWER ? 40 : 60,
-                npc.getId() == NpcID.BABOON_THROWER ? 40 : 60, npc.getId() == NpcID.BABOON_THROWER ? 12 : 20,
-                npc.getId() == NpcID.BABOON_THROWER ? 20 : 25, 0,
-                -50, -50, -50, true);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Baboon extends Enemy {
-    // Baba baboon
-    public Baboon(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                35, 0, 0, 50,
-                0, 0,
-                10, 50, 50);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Volatile extends Enemy {
-    public Volatile(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                8, 60, 60, 20,
-                25, 0,
-                900, 900, 900, true);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-import net.runelite.api.NpcID;
-
-public class Mage extends Enemy {
-    public Mage(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                npc.getId() == NpcID.BABOON_MAGE ? 20 : 25, // health
-                npc.getId() == NpcID.BABOON_MAGE ? 40 : 60, // attack
-                npc.getId() == NpcID.BABOON_MAGE ? 40 : 60, // str
-                npc.getId() == NpcID.BABOON_MAGE ? 12 : 20, // def
-                npc.getId() == NpcID.BABOON_MAGE ? 20 : 25, // offatt
-                0, 900, 900, 900, true);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Cursed extends Enemy {
-    public Cursed(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                10, 60, 60, 20,
-                25, 0,
-                900, 900, 900, true);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-import java.util.HashMap;
-import java.util.Map;
-
-public class Boulder extends Enemy {
-    // team size -> path level -> hp
-    private static final int [][] hpMap = {
-                    {25, 25, 27, 27, 31},
-                    {36, 36, 39, 39, 45},
-                    {47, 47, 51, 51, 58},
-                    {55, 55, 60, 60, 68},
-                    {62, 62, 68, 68, 77},
-                    {70, 70, 77, 77, 87},
-                    {77, 77, 84, 84, 96},
-                    {85, 85, 93, 93, 106}
-            };
-    public Boulder(NPC npc, int invocation, int partySize, int pathLevel) {
-        // TODO revisit this, seems that a new npc is spawned on phase?
-        super(npc, invocation, partySize, pathLevel,
-                hpMap[partySize-1][pathLevel], 0, 0, 0,
-                0, 0,
-                0, 0, 0);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Shaman extends Enemy {
-    public Shaman(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                16, 60, 60, 20,
-                25, 0,
-                900, 900, 900, true);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Thrall extends Enemy {
-    public Thrall(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                2, 40, 40, 12,
-                20, 0,
-                0, 0, 0, false); // HP does indeed seem to scale by invocation?
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Baba extends Enemy {
-    public Baba(NPC npc, int invocation, int partySize, int pathLevel) {
-        // TODO revisit this, seems that a new npc is spawned on phase?
-        super(npc, invocation, partySize, pathLevel,
-                380, 150, 160, 80,
-                0, 26,
-                80, 160, 240);
-    }
-}
-
-package com.example.enemydata.toa.ampken;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-import net.runelite.api.NpcID;
-
-public class Brawler extends Enemy {
-    public Brawler(NPC npc, int invocation, int partySize, int pathLevel) {
-        // For solo 380, this should likely be have a scaling of 1.12?
-        super(npc, invocation, partySize, pathLevel,
-                npc.getId() == NpcID.BABOON_BRAWLER ? 25 : 30, // health
-                npc.getId() == NpcID.BABOON_BRAWLER ? 40 : 60, // att
-                npc.getId() == NpcID.BABOON_BRAWLER ? 40 : 60, // str
-                npc.getId() == NpcID.BABOON_BRAWLER ? 12 : 20, // def
-                npc.getId() == NpcID.BABOON_BRAWLER ? 20 : 25, // offatt
-                0, 900, 900, 900, true);
-    }
-}
-
-package com.example.enemydata.toa.crondis;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Zebak extends Enemy {
-    public Zebak(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                580, 250, 140, 70,
-                160, 100,
-                160, 160, 260);
-    }
-}
-
-package com.example.enemydata.toa.crondis;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Crocodile extends Enemy {
-    public Crocodile(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                30, 150, 60, 100,
-                0, 100,
-                150, 350, 350);
-    }
-}
-
-package com.example.enemydata.toa.crondis;
-
-import com.example.enemydata.Enemy;
-import net.runelite.api.NPC;
-
-public class Jug extends Enemy {
-
-    public Jug(NPC npc, int invocation, int partySize, int pathLevel) {
-        super(npc, invocation, partySize, pathLevel,
-                5, 0, 0, 0,
-                0, 0,
-                0, 0, 0);
-    }
-}
-
-package com.example.enemydata;
-
 import com.example.enemydata.toa.ampken.*;
 import com.example.enemydata.toa.crondis.Crocodile;
 import com.example.enemydata.toa.crondis.Zebak;
@@ -1069,55 +1142,21 @@ import com.example.enemydata.toa.het.AkkhaShadow;
 import com.example.enemydata.toa.scabaras.*;
 import com.example.enemydata.toa.wardens.*;
 import com.example.utils.TriFunction;
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
 import net.runelite.api.NPC;
 import net.runelite.api.NpcID;
 
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Set;
 
-@Slf4j
-public abstract class Enemy implements IEnemy {
+public class ToaEnemy extends Enemy {
     public static final Map<Integer, TriFunction<NPC, Integer, Integer, Integer, Enemy>> enemies;
-    public static final Set<Integer> blacklist = Set.of(NpcID.SCARAB_SWARM_11723, NpcID.JUG, NpcID.JUG_11736);
-    public int queuedDamage;
-    public boolean shouldDraw;
-    protected boolean hideOnDeath;
-
-    public int invocation;
-    public int partySize;
-    public int pathLevel;
-
-    public final int base_health;
-    // TODO: this may require some rework, akkha for example computes the xp modifier before rounding hp
-    public int scaled_health;
-    @Getter
-    public int current_health;
-
-    private final int attack;
-    private final int str;
-    private final int def;
-    private final int offAtt;
-    private final int offStr;
-    private final int defStab;
-    private final int defSlash;
-    private final int defCrush;
-    private final boolean isPuzzle;
-
     private static final Map<Integer, Double> teamScaling;
     private static final Map<Integer, Double> pathScaling;
 
-    @Getter
-    @Setter
-    NPC npc;
-
-    @Setter
-    @Getter
-    Client client;
+    protected final boolean isPuzzle;
+    public int invocation;
+    public int partySize;
+    public int pathLevel;
 
     static {
         teamScaling = new HashMap<>();
@@ -1195,13 +1234,18 @@ public abstract class Enemy implements IEnemy {
         enemies.put(NpcID.TUMEKENS_WARDEN_11762, TumekensWarden762::new);
     }
 
-    protected Enemy(NPC npc, int invocation, int partySize, int pathLevel,
-          int baseHealth, int attack, int str, int def,
-          int offAtt, int offStr,
-          int defStab, int defSlash, int defCrush, boolean isPuzzle) {
+    public ToaEnemy(NPC npc, int invocation, int partySize, int pathLevel,
+                    int baseHealth, int attack, int str, int def,
+                    int offAtt, int offStr,
+                    int defStab, int defSlash, int defCrush, boolean isPuzzle) {
+        super(npc, baseHealth, attack, str, def, offAtt, offStr, defStab, defSlash, defCrush);
         assert(partySize <= 8 && partySize >= 1);
         assert((invocation % 5) == 0);
-        this.npc = npc;
+
+        this.isPuzzle = isPuzzle;
+        this.shouldDraw = false;
+        this.hideOnDeath = true;
+        this.queuedDamage = 0;
 
         if (pathLevel >= 0) {
             this.invocation = invocation;
@@ -1212,6 +1256,312 @@ public abstract class Enemy implements IEnemy {
             this.current_health = this.scaled_health;
         }
 
+    }
+    public ToaEnemy(NPC npc, int invocation, int partySize, int pathLevel,
+                    int baseHealth, int attack, int str, int def,
+                    int offAtt, int offStr,
+                    int defStab, int defSlash, int defCrush
+    ) {
+        this(npc, invocation, partySize, pathLevel,
+                baseHealth, attack, str, def,
+                offAtt, offStr,
+                defStab, defSlash, defCrush, false);
+    }
+
+    private static int getScaledHealth(int invocation, int partySize, int pathLevel, int base_health, boolean isPuzzle) {
+        double scale = (1 + 0.004 * invocation);
+        double teamScale = teamScaling.get(partySize);
+        double pathScale;
+        if (isPuzzle) {
+            pathScale = 1d;
+            teamScale = 1d;
+            scale = 1d;
+        } else {
+            pathScale = pathScaling.get(pathLevel);
+        }
+
+        return (int) (base_health * scale * teamScale * pathScale);
+    }
+
+    public void fixupStats(int invocation, int partySize, int pathLevel) {
+        // Should only happen before any npcs actually have been damaged
+        this.invocation = invocation;
+        this.partySize = partySize;
+        this.pathLevel = pathLevel;
+        scaled_health = getScaledHealth(invocation, partySize, pathLevel, base_health, isPuzzle);
+        current_health = scaled_health;
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.*;
+
+public class Thrower extends ToaEnemy {
+    public Thrower(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                npc.getId() == NpcID.BABOON_THROWER ? 30 : 35, npc.getId() == NpcID.BABOON_THROWER ? 40 : 60,
+                npc.getId() == NpcID.BABOON_THROWER ? 40 : 60, npc.getId() == NpcID.BABOON_THROWER ? 12 : 20,
+                npc.getId() == NpcID.BABOON_THROWER ? 20 : 25, 0,
+                -50, -50, -50, true);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Baboon extends ToaEnemy {
+    // Baba baboon
+    public Baboon(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                35, 0, 0, 50,
+                0, 0,
+                10, 50, 50);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Volatile extends ToaEnemy {
+    public Volatile(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                8, 60, 60, 20,
+                25, 0,
+                900, 900, 900, true);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+import net.runelite.api.NpcID;
+
+public class Mage extends ToaEnemy {
+    public Mage(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                npc.getId() == NpcID.BABOON_MAGE ? 20 : 25, // health
+                npc.getId() == NpcID.BABOON_MAGE ? 40 : 60, // attack
+                npc.getId() == NpcID.BABOON_MAGE ? 40 : 60, // str
+                npc.getId() == NpcID.BABOON_MAGE ? 12 : 20, // def
+                npc.getId() == NpcID.BABOON_MAGE ? 20 : 25, // offatt
+                0, 900, 900, 900, true);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Cursed extends ToaEnemy {
+    public Cursed(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                10, 60, 60, 20,
+                25, 0,
+                900, 900, 900, true);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+import java.util.HashMap;
+import java.util.Map;
+
+public class Boulder extends ToaEnemy {
+    // team size -> path level -> hp
+    private static final int [][] hpMap = {
+                    {25, 25, 27, 27, 31},
+                    {36, 36, 39, 39, 45},
+                    {47, 47, 51, 51, 58},
+                    {55, 55, 60, 60, 68},
+                    {62, 62, 68, 68, 77},
+                    {70, 70, 77, 77, 87},
+                    {77, 77, 84, 84, 96},
+                    {85, 85, 93, 93, 106}
+            };
+    public Boulder(NPC npc, int invocation, int partySize, int pathLevel) {
+        // TODO revisit this, seems that a new npc is spawned on phase?
+        super(npc, invocation, partySize, pathLevel,
+                hpMap[partySize-1][pathLevel], 0, 0, 0,
+                0, 0,
+                0, 0, 0);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Shaman extends ToaEnemy {
+    public Shaman(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                16, 60, 60, 20,
+                25, 0,
+                900, 900, 900, true);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Thrall extends ToaEnemy {
+    public Thrall(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                2, 40, 40, 12,
+                20, 0,
+                0, 0, 0, false); // HP does indeed seem to scale by invocation?
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Baba extends ToaEnemy {
+    public Baba(NPC npc, int invocation, int partySize, int pathLevel) {
+        // TODO revisit this, seems that a new npc is spawned on phase?
+        super(npc, invocation, partySize, pathLevel,
+                380, 150, 160, 80,
+                0, 26,
+                80, 160, 240);
+    }
+}
+
+package com.example.enemydata.toa.ampken;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+import net.runelite.api.NpcID;
+
+public class Brawler extends ToaEnemy {
+    public Brawler(NPC npc, int invocation, int partySize, int pathLevel) {
+        // For solo 380, this should likely be have a scaling of 1.12?
+        super(npc, invocation, partySize, pathLevel,
+                npc.getId() == NpcID.BABOON_BRAWLER ? 25 : 30, // health
+                npc.getId() == NpcID.BABOON_BRAWLER ? 40 : 60, // att
+                npc.getId() == NpcID.BABOON_BRAWLER ? 40 : 60, // str
+                npc.getId() == NpcID.BABOON_BRAWLER ? 12 : 20, // def
+                npc.getId() == NpcID.BABOON_BRAWLER ? 20 : 25, // offatt
+                0, 900, 900, 900, true);
+    }
+}
+
+package com.example.enemydata.toa.crondis;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Zebak extends ToaEnemy {
+    public Zebak(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                580, 250, 140, 70,
+                160, 100,
+                160, 160, 260);
+    }
+}
+
+package com.example.enemydata.toa.crondis;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Crocodile extends ToaEnemy {
+    public Crocodile(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                30, 150, 60, 100,
+                0, 100,
+                150, 350, 350);
+    }
+}
+
+package com.example.enemydata.toa.crondis;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import net.runelite.api.NPC;
+
+public class Jug extends ToaEnemy {
+    public Jug(NPC npc, int invocation, int partySize, int pathLevel) {
+        super(npc, invocation, partySize, pathLevel,
+                5, 0, 0, 0,
+                0, 0,
+                0, 0, 0);
+    }
+}
+
+package com.example.enemydata;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.NpcID;
+
+import java.util.Set;
+
+@Slf4j
+public abstract class Enemy implements IEnemy {
+    public static final Set<Integer> blacklist = Set.of(NpcID.SCARAB_SWARM_11723, NpcID.JUG, NpcID.JUG_11736);
+    public int queuedDamage;
+    public boolean shouldDraw;
+    protected boolean hideOnDeath;
+
+    public final int base_health;
+    // TODO: this may require some rework, akkha for example computes the xp modifier before rounding hp
+    public int scaled_health;
+    @Getter
+    public int current_health;
+
+    protected final int attack;
+    protected final int str;
+    protected final int def;
+    protected final int offAtt;
+    protected final int offStr;
+    protected final int defStab;
+    protected final int defSlash;
+    protected final int defCrush;
+
+    @Getter
+    @Setter
+    NPC npc;
+
+    @Setter
+    @Getter
+    Client client;
+
+
+    protected Enemy(NPC npc, int baseHealth, int attack, int str, int def,
+          int offAtt, int offStr,
+          int defStab, int defSlash, int defCrush) {
+        this.npc = npc;
+
         this.base_health = baseHealth;
         this.attack = attack;
         this.str = str;
@@ -1221,20 +1571,9 @@ public abstract class Enemy implements IEnemy {
         this.defStab = defStab;
         this.defSlash = defSlash;
         this.defCrush = defCrush;
-        this.isPuzzle = isPuzzle;
         this.shouldDraw = false;
         this.hideOnDeath = true;
         this.queuedDamage = 0;
-    }
-    protected Enemy(NPC npc, int invocation, int partySize, int pathLevel,
-          int baseHealth, int attack, int str, int def,
-          int offAtt, int offStr,
-          int defStab, int defSlash, int defCrush
-    ) {
-        this(npc, invocation, partySize, pathLevel,
-                baseHealth, attack, str, def,
-                offAtt, offStr,
-                defStab, defSlash, defCrush, false);
     }
 
     public void setCurrentHealth(int hp) {
@@ -1274,15 +1613,6 @@ public abstract class Enemy implements IEnemy {
         return shouldDraw;
     }
 
-    public void fixupStats(int invocation, int partySize, int pathLevel) {
-        // Should only happen before any npcs actually have been damaged
-        this.invocation = invocation;
-        this.partySize = partySize;
-        this.pathLevel = pathLevel;
-        scaled_health = getScaledHealth(invocation, partySize, pathLevel, base_health, isPuzzle);
-        current_health = scaled_health;
-    }
-
     public double getModifier() {
         double avgs = Math.floor((getAvgLevel() * (getAvgDef() + offStr + offAtt)) / 5120d);
         avgs /= 40d;
@@ -1293,20 +1623,6 @@ public abstract class Enemy implements IEnemy {
         return scaled_health;
     }
 
-    private static int getScaledHealth(int invocation, int partySize, int pathLevel, int base_health, boolean isPuzzle) {
-        double scale = (1 + 0.004 * invocation);
-        double teamScale = teamScaling.get(partySize);
-        double pathScale;
-        if (isPuzzle) {
-            pathScale = 1d;
-            teamScale = 1d;
-            scale = 1d;
-        } else {
-            pathScale = pathScaling.get(pathLevel);
-        }
-
-        return (int) (base_health * scale * teamScale * pathScale);
-    }
     private int getAvgLevel() {
         return (attack + str + def + Math.min(getScaledHealth(), 2000)) / 4;
     }
@@ -1323,40 +1639,231 @@ public interface IEnemy {
     int hit(int damage);
 }
 
+package com.example.raids;
+
+import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
+import com.example.enemydata.toa.het.Akkha;
+import com.example.utils.DamageHandler;
+import com.example.utils.TriFunction;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.Varbits;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.NpcDespawned;
+import net.runelite.api.events.NpcSpawned;
+import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.widgets.InterfaceID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.eventbus.Subscribe;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.Arrays;
+
+@Singleton
+@Slf4j
+public class Toa {
+    @Inject
+    private Client client;
+
+    @Inject
+    private DamageHandler damageHandler;
+
+    public static boolean isAtToa(Client client) {
+        final int []TOA_REGIONS = {
+                //13455, // Lobby
+                //14160, // Nexus
+
+                //15698, // Crondis
+                //15700, // Zebak
+
+                //14162, // Scabaras
+                14164, // Kephri
+
+                15186, // Apmken
+                //15188, // Baba
+
+                14674, // Het
+                14676, // Akkha
+
+                //15184, // Wardens
+                //15696, // Wardens
+
+                //14672, // Tomb
+        };
+
+        return Arrays.stream(client.getTopLevelWorldView().getMapRegions()).anyMatch(current -> Arrays.stream(TOA_REGIONS).anyMatch(reg -> reg == current));
+    }
+
+    public boolean isAtToa() {
+        return isAtToa(client);
+    }
+
+    /**
+     * @return TOA invocation level
+     */
+    private int getInvocation() {
+        return client.getVarbitValue(Varbits.TOA_RAID_LEVEL);
+    }
+
+    /**
+     * Fetches the path level from the TOA widget
+     * @return Path level
+     */
+    private int getPathLevel() {
+        Widget pathLevelWidget = client.getWidget(481, 45);
+        if (pathLevelWidget == null) {
+            return -1;
+        }
+        return Integer.parseInt(pathLevelWidget.getText());
+    }
+
+    /**
+     * Gets amount of people in the raid, amount makes the enemy health scale with 90%
+     * @return Amount of people in the raid
+     */
+    private int getPartySize()
+    {
+        int partySize = 1;
+        for (int i = 1; i < 8; i++) {
+            if (client.getVarbitValue(Varbits.TOA_MEMBER_0_HEALTH + i) != 0) {
+                partySize++;
+            }
+        }
+        return partySize;
+    }
+
+    private boolean partyDead() {
+
+        for (int i = Varbits.TOA_MEMBER_0_HEALTH; i <= Varbits.TOA_MEMBER_7_HEALTH; i++) {
+            int value = client.getVarbitValue(i);
+            if (value != 30 && value != 0) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    /**
+     * Create the new Akkha object when the TOA path widget has loaded, we aren't able to get the path level otherwise.
+     * @param event
+     */
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded event) {
+        // 481 is the TOA path/time/etc. widget
+        if (event.getGroupId() != InterfaceID.TOA_RAID) {
+            return;
+        }
+        int invo = getInvocation();
+        int pathLevel = getPathLevel();
+        int partySize = getPartySize();
+        if (pathLevel < 0 || invo < 0 || partySize <= 0) {
+            return;
+        }
+        for (Enemy enemy : damageHandler.getActiveEnemies().values()) {
+            if (enemy instanceof ToaEnemy) {
+                ToaEnemy e = (ToaEnemy) enemy;
+                e.fixupStats(invo, partySize, pathLevel);
+            }
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick tick) {
+        if (partyDead()) {
+            // TODO: does this need to be done each tick?
+            damageHandler.getActiveEnemies().clear();
+        }
+    }
+
+    @Subscribe
+    protected void onNpcDespawned(NpcDespawned event) {
+        if (!isAtToa()) {
+            return; // only handle toa enemies
+        }
+        NPC npc = event.getNpc();
+        boolean isAkkha = Akkha.isAkkha(npc.getId());
+        boolean isPartyDead = partyDead();
+        if (isAkkha && !isPartyDead) {
+            return;
+        }
+        damageHandler.getActiveEnemies().remove(npc.getIndex());
+    }
+
+    @Subscribe
+    protected void onNpcSpawned(NpcSpawned event) {
+        if (!isAtToa()) {
+            return;
+        }
+        var activeEnemies = damageHandler.getActiveEnemies();
+        NPC npc = event.getNpc();
+        if (activeEnemies.containsKey(npc.getIndex())) {
+            Enemy enemy = activeEnemies.get(npc.getIndex());
+            enemy.setNpc(npc);
+            // Re-sync the health of the enemy (akkha) when it re-appears in case of hits during invuln
+            // TODO should akkha be subscribed to the event bus?
+            int newHealth = client.getVarbitValue(Varbits.BOSS_HEALTH_CURRENT);
+            enemy.setCurrentHealth(newHealth);
+            enemy.setQueuedDamage(0);
+
+            return;
+        }
+
+        TriFunction<NPC, Integer, Integer, Integer, Enemy> constructor = ToaEnemy.enemies.getOrDefault(npc.getId(), null);
+        if (constructor == null) {
+            return;
+        }
+
+        Enemy enemy = constructor.apply(npc, getInvocation(), getPartySize(), getPathLevel());
+        enemy.setClient(client);
+
+        activeEnemies.put(npc.getIndex(), enemy);
+    }
+}
+
 package com.example;
 
 import com.example.enemydata.Enemy;
+import com.example.utils.DamageHandler;
+import com.example.utils.Predictor;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.NPC;
 import net.runelite.api.Skill;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.outline.ModelOutlineRenderer;
 
 import javax.inject.Inject;
 import java.awt.*;
 
 @Slf4j
 public class AkkhaPredictorOverlay extends Overlay {
-    private final AkkhaPredictor plugin;
-    private final AkkhaPredictorConfig config;
-    private final Client client;
+    @Inject
+    private AkkhaPredictor plugin;
 
     @Inject
-    public AkkhaPredictorOverlay(AkkhaPredictor plugin, AkkhaPredictorConfig config, Client client, ModelOutlineRenderer renderer) {
-        this.plugin = plugin;
-        this.config = config;
-        this.client = client;
+    private AkkhaPredictorConfig config;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private DamageHandler damageHandler;
+
+    @Inject
+    public void initialize() {
         setPosition(OverlayPosition.DYNAMIC);
     }
 
     @Override
     public Dimension render(Graphics2D graphics) {
-        if (!plugin.isAtToa()) {
+        if (!damageHandler.shouldProcess()) {
             return null;
         }
-        var enemies = plugin.getActiveEnemies();
+        var enemies = damageHandler.getActiveEnemies();
 
         for (Enemy enemy : enemies.values()) {
             if (enemy.shouldHighlight()) {
@@ -1367,11 +1874,13 @@ public class AkkhaPredictorOverlay extends Overlay {
 
         Skill []skills = new Skill[]{Skill.HITPOINTS};
         int start = 20;
+        Predictor predictor = damageHandler.getPredictor();
+
         for (Skill skill : skills) {
-            if (plugin.getPredictor().isAccurate(skill)) {
+            if (predictor.isAccurate(skill)) {
                 graphics.setColor(Color.green);
                 graphics.fillRect(10, start, 10, 10);
-            } else if (plugin.getPredictor().isDead(skill)) {
+            } else if (predictor.isDead(skill)) {
                 graphics.setColor(Color.pink);
                 graphics.fillRect(10, start, 10, 10);
             } else {
@@ -1413,48 +1922,26 @@ public class EntityDamaged extends PartyMemberMessage
 
 package com.example;
 
-import com.example.enemydata.Enemy;
-import com.example.enemydata.toa.het.Akkha;
 import com.example.events.EntityDamaged;
-import com.example.utils.Predictor;
-import com.example.utils.TriFunction;
+import com.example.raids.Toa;
+import com.example.utils.DamageHandler;
 import com.google.inject.Provides;
-import javax.inject.Inject;
-
-import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.*;
-import net.runelite.api.events.*;
-import net.runelite.api.kit.KitType;
-import net.runelite.api.widgets.*;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.party.PartyMember;
-import net.runelite.client.party.PartyService;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.party.WSClient;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
 
-import java.util.*;
-import java.util.stream.Collectors;
+import javax.inject.Inject;
 
 @Slf4j
 @PluginDescriptor(
 	name = "Raid Death Indicator"
 )
-public class AkkhaPredictor extends Plugin
-{
-	@Inject
-	private Client client;
-
-	@Inject
-	ClientThread clientThread;
-
-	@Inject
-	private AkkhaPredictorConfig config;
-
+public class AkkhaPredictor extends Plugin {
 	@Inject
 	private AkkhaPredictorOverlay overlay;
 
@@ -1462,389 +1949,37 @@ public class AkkhaPredictor extends Plugin
 	private OverlayManager overlayManager;
 
 	@Inject
-	private PartyService party;
-
-	@Inject
 	private WSClient wsClient;
 
-	private final Set<Skill> validSkills = Set.of(Skill.HITPOINTS);
+	@Inject
+	private DamageHandler damageHandler;
 
+	@Inject
+	private Toa toa;
 
-	/**
-	 * Map of current XP amounts in each skill
-	 */
-	private Map<Skill, Integer> previousXps;
+	@Inject
+	private ClientThread clientThread;
 
-	@Getter
-	private final Map<Integer, Enemy> activeEnemies = new HashMap<>();
-
-	@Getter
-	private final Predictor predictor = new Predictor();
-
-	private static final Set<Integer> POWERED_STAVES = new HashSet<>(Arrays.asList(
-			ItemID.SANGUINESTI_STAFF,
-			ItemID.TRIDENT_OF_THE_SEAS_FULL,
-			ItemID.TRIDENT_OF_THE_SEAS,
-			ItemID.TRIDENT_OF_THE_SWAMP,
-			ItemID.TRIDENT_OF_THE_SWAMP_E,
-			ItemID.HOLY_SANGUINESTI_STAFF,
-			ItemID.TUMEKENS_SHADOW,
-			ItemID.CORRUPTED_TUMEKENS_SHADOW,
-			ItemID.VOIDWAKER
-	));
-	private static final Set<Integer> CHINCHOMPAS = Set.of(
-			ItemID.CHINCHOMPA,
-			ItemID.BLACK_CHINCHOMPA,
-			ItemID.RED_CHINCHOMPA);
+	@Inject
+	private EventBus eventBus;
 
 	@Override
 	protected void startUp() throws Exception
 	{
-		clientThread.invoke(this::initXpMap);
+		eventBus.register(damageHandler);
+		eventBus.register(toa);
+		clientThread.invoke(damageHandler::initXpMap);
 		overlayManager.add(overlay);
 		wsClient.registerMessage(EntityDamaged.class);
 	}
-
-	private void initXpMap() {
-		previousXps = new HashMap<>();
-		Arrays.stream(Skill.values()).forEach(skill -> previousXps.put(skill, client.getSkillExperience(skill)));
-	}
-
-	/**
-	 * @return TOA invocation level
-	 */
-	private int getInvocation() {
-		return client.getVarbitValue(Varbits.TOA_RAID_LEVEL);
-	}
-
-	/**
-	 * Fetches the path level from the TOA widget
-	 * @return Path level
-	 */
-	private int getPathLevel() {
-		Widget pathLevelWidget = client.getWidget(481, 45);
-		if (pathLevelWidget == null) {
-			return -1;
-		}
-		return Integer.parseInt(pathLevelWidget.getText());
-	}
-
-	/**
-	 * Gets amount of people in the raid, amount makes the enemy health scale with 90%
-	 * @return Amount of people in the raid
-	 */
-	private int getPartySize()
-	{
-		int partySize = 1;
-		for (int i = 1; i < 8; i++) {
-			if (client.getVarbitValue(Varbits.TOA_MEMBER_0_HEALTH + i) != 0) {
-				partySize++;
-			}
-		}
-		return partySize;
-	}
-
-	private boolean partyDead() {
-
-		for (int i = Varbits.TOA_MEMBER_0_HEALTH; i <= Varbits.TOA_MEMBER_7_HEALTH; i++) {
-			int value = client.getVarbitValue(i);
-			 if (value != 30 && value != 0) {
-				 return false;
-			 }
-		}
-
-		return true;
-	}
-
-	@Subscribe
-	public void onGameTick(GameTick tick) {
-		if (partyDead()) {
-			// TODO: does this need to be done each tick?
-			activeEnemies.clear();
-		}
-	}
-
-	@Subscribe
-	protected void onGameStateChanged(GameStateChanged state) {
-        if (Objects.requireNonNull(state.getGameState()) == GameState.LOGGED_IN) {
-            initXpMap();
-        }
-	}
-
-	@Subscribe
-	protected void onNpcDespawned(NpcDespawned event) {
-		NPC npc = event.getNpc();
-		boolean isAkkha = Akkha.isAkkha(npc.getId());
-		boolean isPartyDead = partyDead();
-		if (isAkkha && !isPartyDead) {
-			return;
-		}
-        activeEnemies.remove(npc.getIndex());
-	}
-
-	@Subscribe
-	protected void onNpcSpawned(NpcSpawned event) {
-		NPC npc = event.getNpc();
-		if (activeEnemies.containsKey(npc.getIndex())) {
-			Enemy enemy = activeEnemies.get(npc.getIndex());
-			enemy.setNpc(npc);
-			// Re-sync the health of the enemy (akkha) when it re-appears in case of hits during invuln
-			// TODO should akkha be subscribed to the event bus?
-			int newHealth = client.getVarbitValue(Varbits.BOSS_HEALTH_CURRENT);
-			enemy.setCurrentHealth(newHealth);
-			enemy.setQueuedDamage(0);
-
-			return;
-		}
-
-		TriFunction<NPC, Integer, Integer, Integer, Enemy> constructor = Enemy.enemies.getOrDefault(npc.getId(), null);
-		if (constructor == null) {
-			return;
-		}
-
-		Enemy enemy = constructor.apply(npc, getInvocation(), getPartySize(), getPathLevel());
-		enemy.setClient(client);
-
-		activeEnemies.put(npc.getIndex(), enemy);
-	}
-
-	/**
-	 * Create the new Akkha object when the TOA path widget has loaded, we aren't able to get the path level otherwise.
-	 * @param event
-	 */
-	@Subscribe
-	public void onWidgetLoaded(WidgetLoaded event) {
-		// 481 is the TOA path/time/etc. widget
-		if (event.getGroupId() != InterfaceID.TOA_RAID) {
-			return;
-		}
-		int invo = getInvocation();
-		int pathLevel = getPathLevel();
-		int partySize = getPartySize();
-		if (pathLevel < 0 || invo < 0 || partySize <= 0) {
-			return;
-		}
-		for (Enemy enemy : activeEnemies.values()) {
-			enemy.fixupStats(invo, partySize, pathLevel);
-		}
-	}
-
 	@Override
 	protected void shutDown() throws Exception
 	{
-		previousXps = null;
 		overlayManager.remove(overlay);
+		eventBus.unregister(damageHandler);
+		eventBus.unregister(toa);
 		wsClient.unregisterMessage(EntityDamaged.class);
-	}
-
-	public boolean isAtToa() {
-		final int []TOA_REGIONS = {
-				//13455, // Lobby
-				//14160, // Nexus
-
-				//15698, // Crondis
-				//15700, // Zebak
-
-				//14162, // Scabaras
-				14164, // Kephri
-
-				15186, // Apmken
-				//15188, // Baba
-
-				14674, // Het
-				14676, // Akkha
-
-				//15184, // Wardens
-				//15696, // Wardens
-
-				//14672, // Tomb
-		};
-
-		return Arrays.stream(client.getTopLevelWorldView().getMapRegions()).anyMatch(current -> Arrays.stream(TOA_REGIONS).anyMatch(reg -> reg == current));
-	}
-
-	/**
-	 * Processes the xp drop and turns it into how much damage it did. Not entirely accurate due to fractional XP.
-	 * Rounds down so that in case it does get fractional it should not give false positives.
-	 *
-	 * @param skill Skill that xp was received in.
-	 * @param xp Amount of XP that was received.
-	 */
-	private void processXpDrop(Skill skill, int xp) {
-		if (!validSkills.contains(skill)) {
-			return;
-		}
-
-		Player player = Objects.requireNonNull(client.getLocalPlayer());
-		Actor entity = player.getInteracting();
-		if (!(entity instanceof NPC) || !isAtToa()) {
-			return;
-		}
-
-		PlayerComposition playerComposition = player.getPlayerComposition();
-		NPC npc = (NPC) entity;
-		int id = npc.getId();
-
-		if (Enemy.blacklist.contains(id)) {
-			predictor.reset();
-			// We actually always receive range xp, perhaps this can be used to
-			// calculate the magic xp, as you seem to always receive .3 xp from swarms
-			return;
-		}
-
-		Enemy enemy;
-		if (activeEnemies.containsKey(npc.getIndex())) {
-			enemy = activeEnemies.get(npc.getIndex());
-		} else {
-			// Construct a new enemy
-			enemy = Enemy.enemies.get(id).apply(npc, getInvocation(), getPartySize(), getPathLevel());
-			if (enemy == null) {
-				return;
-			}
-			enemy.setClient(client);
-			activeEnemies.put(npc.getIndex(), enemy);
-		}
-
-		int attackStyle = client.getVarpValue(VarPlayer.ATTACK_STYLE);
-		int weapon = playerComposition.getEquipmentId(KitType.WEAPON);
-
-		boolean isDefensiveCast = attackStyle == 3;
-		boolean isPoweredStaff = POWERED_STAVES.contains(weapon);
-		boolean isChinchompa = CHINCHOMPAS.contains(weapon);
-		double scaling = enemy.getModifier();
-		Predictor.Properties props = new Predictor.Properties(skill, isDefensiveCast, isPoweredStaff, npc, scaling);
-		if ((skill == Skill.RANGED || skill == Skill.MAGIC) && isDefensiveCast) {
-			// Ignore in order to not double hit, insert the drop into
-			// the tree in order to track the fraction
-			predictor.insertInto(xp, scaling, props);
-			return;
-		}
-		int damage = predictor.treePredict(xp, props);
-		assert (damage >= 0);
-		if (isChinchompa) {
-			// TODO: barrage? prio: low, tldr: check for barrage animation
-			handleAoe(props, damage);
-		} else {
-			sendDamage(player, damage);
-		}
-	}
-
-	private void handleAoe(Predictor.Properties properties, int damage) {
-		NPC npc = properties.npc;
-		List<Enemy> nearby = activeEnemies.values().stream()
-				.filter(enemy -> npc.getWorldLocation().distanceTo(enemy.getNpc().getWorldLocation()) <= 1)
-				.collect(Collectors.toList());
-
-		final int clumpHp = nearby.stream().mapToInt(Enemy::getCurrent_health).sum();
-		if (damage >= clumpHp) {
-			sendClumpDamage(nearby);
-		}
-	}
-
-	private void sendClumpDamage(List<Enemy> enemies) {
-		for (Enemy enemy : enemies) {
-			final int npcIndex = enemy.getNpc().getIndex();
-			final EntityDamaged ev = new EntityDamaged(npcIndex, enemy.getCurrent_health());
-			if (party.isInParty()) {
-				clientThread.invokeLater(() -> party.send(ev));
-			}
-			onEntityDamaged(ev);
-		}
-	}
-
-	private void sendDamage(Player player, int damage) {
-		if (damage <= 0) {
-			return;
-		}
-
-		NPC npc = (NPC) player.getInteracting();
-
-		final int npcIndex = npc.getIndex();
-		final EntityDamaged entityDamaged = new EntityDamaged(npcIndex, damage);
-
-		if (party.isInParty()) {
-			clientThread.invokeLater(() -> party.send(entityDamaged));
-		}
-		onEntityDamaged(entityDamaged);
-	}
-
-	/**
-	 * Computes the difference between the updated xp drop and the previous one
-	 * @param skill Skill XP was received in.
-	 * @param xp Updated XP amount.
-	 */
-	private void preProcessXpDrop(Skill skill, int xp) {
-		if (!isAtToa()) {
-			predictor.reset();
-			return;
-		}
-
-		int diff = xp - previousXps.getOrDefault(skill, 0);
-		previousXps.put(skill, xp);
-		processXpDrop(skill, diff);
-	}
-
-	/**
-	 * Queues damage on an entity. If the entity is a shadow, it hides the shadow.
-	 * If the entity is Akkha, it will highlight her.
-	 * @param entityDamaged event
-	 */
-	@Subscribe
-	public void onEntityDamaged(EntityDamaged entityDamaged) {
-		if (!isAtToa()) {
-			return;
-		}
-
-		PartyMember localPlayer = party.getLocalMember();
-
-		if (localPlayer != null) {
-			if (localPlayer.getMemberId() == entityDamaged.getMemberId()) {
-				return; // Don't process your own events
-			}
-		}
-
-		Integer npcIndex = entityDamaged.getNpcIndex();
-		Enemy enemy = activeEnemies.getOrDefault(npcIndex, null);
-		enemy.queueDamage(entityDamaged.getDamage());
-	}
-
-	@Subscribe
-	public void onStatChanged(StatChanged xpDrop) {
-		preProcessXpDrop(xpDrop.getSkill(), xpDrop.getXp());
-	}
-
-	@Subscribe
-	public void onFakeXpDrop(FakeXpDrop xpDrop) {
-		//TODO hopefully this works. I don't have 200m in magic to find out.
-		processXpDrop(xpDrop.getSkill(), xpDrop.getXp());
-	}
-
-	/**
-	 * Removes the hit from queued damage.
-	 * @param hit hitsplat
-	 */
-	@Subscribe
-	public void onHitsplatApplied(HitsplatApplied hit) {
-		Hitsplat hitsplat = hit.getHitsplat();
-		if (!isAtToa() || (hitsplat.getHitsplatType() == HitsplatID.HEAL && hitsplat.getAmount() > 0)) {
-			return;
-		}
-		Actor actor = hit.getActor();
-		if (actor instanceof NPC) {
-			NPC npc = (NPC) actor;
-			Enemy enemy = activeEnemies.getOrDefault(npc.getIndex(), null);
-			if (enemy == null) {
-				//log.info("Unknown target: " + npc.getId() + " index: " + npc.getIndex());
-				return;
-			}
-			int amount = hitsplat.getAmount();
-			int hp = enemy.hit(amount);
-			//log.info("Damage: " + amount + " " + hit.getActor().getName() + " (" + hp +")");
-
-			if (hp <= 0) {
-				activeEnemies.remove(npc.getIndex());
-			}
-		}
+		damageHandler.getPredictor().reset();
 	}
 
 	@Provides
@@ -1996,6 +2131,7 @@ public class TreeTests {
 package com.example;
 
 import com.example.enemydata.Enemy;
+import com.example.enemydata.toa.ToaEnemy;
 import com.example.enemydata.toa.ampken.*;
 import com.example.enemydata.toa.het.Akkha;
 import com.example.enemydata.toa.scabaras.Kephri;
@@ -2461,7 +2597,7 @@ public class ScalingTests {
     @Test
     public void akkhaScalingTest() {
         TestNPC akkhaNpc = new TestNPC(NpcID.AKKHA_11790);
-        Enemy akkha = new Akkha(akkhaNpc, 305, 2, 0);
+        ToaEnemy akkha = new Akkha(akkhaNpc, 305, 2, 0);
         assertEquals(1.575, akkha.getModifier(), delta);
         akkha.fixupStats(305, 2, 0);
         assertEquals(1.575, akkha.getModifier(), delta);
