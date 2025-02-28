@@ -266,6 +266,17 @@ public interface PartyHitsConfig extends Config
 	{
 		return 0.2;
 	}
+	@ConfigItem(
+			position = 17,
+			keyName = "Update on tick only",
+			name = "Update on tick only",
+			description = "Only update maidens health every tick, instead of on xp drop",
+			section = maidenSettings
+	)
+	default boolean onTickOnly()
+	{
+		return false;
+	}
 }
 
 package com.partyhits;
@@ -384,6 +395,7 @@ public class MaidenOverlay extends Overlay
 
 package com.partyhits.maiden;
 
+import com.partyhits.PartyHitsConfig;
 import com.partyhits.XpToDamage;
 import com.partyhits.util.Hit;
 import lombok.Getter;
@@ -400,6 +412,8 @@ import java.util.List;
 
 public class MaidenHandler
 {
+    @Inject
+    PartyHitsConfig config;
     @Inject
     private XpToDamage xpToDamage;
     @Inject
@@ -522,12 +536,14 @@ public class MaidenHandler
             if (ownHit)
             {
                 queuedDamage.add(Pair.of(hit.getDamage(), hit.getTickDelay()));
-                updatePredictedHp(1);
+                if (!config.onTickOnly())
+                    updatePredictedHp(1);
             }
             else
             {
                 queuedDamage.add(Pair.of(hit.getDamage(), hit.getTickDelay() - 1));
-                updatePredictedHp(0);
+                if (!config.onTickOnly())
+                    updatePredictedHp(0);
             }
         }
     }
@@ -556,10 +572,7 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
 import org.apache.commons.lang3.ArrayUtils;
 
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 
 @Slf4j
 @PluginDescriptor(
@@ -590,7 +603,9 @@ public class PartyHitsPlugin extends Plugin
 	@Inject
 	private EventBus eventBus;
 	private static final int[] previousExp = new int[Skill.values().length];
+	private final List<Integer> hitBuffer = new ArrayList<>();
 	private boolean resetXpTrackerLingerTimerFlag = false;
+	private boolean inTob = false;
 	private final int MAIDEN_REGIONID = 12613;
 	private final int MAX_XP = 20000000;
 	private static final Set<Integer> RANGED_BOWS = new HashSet<>(Arrays.asList(
@@ -622,6 +637,7 @@ public class PartyHitsPlugin extends Plugin
 		overlayManager.add(partyHitsOverlay);
 		wsClient.registerMessage(Hit.class);
 		eventBus.register(maidenHandler);
+		inTob = false;
 		if (client.getGameState() == GameState.LOGGED_IN)
 		{
 			clientThread.invokeLater(() ->
@@ -648,16 +664,16 @@ public class PartyHitsPlugin extends Plugin
 	}
 
 	@Subscribe
-	protected void onStatChanged(StatChanged event)
+	protected void onVarbitChanged(VarbitChanged event)
 	{
-		int currentXp = event.getXp();
-		int previousXp = previousExp[event.getSkill().ordinal()];
-		int xpDiff = currentXp - previousXp;
-		if (previousXp > 0 && xpDiff > 0)
+		if (event.getVarbitId() == Varbits.THEATRE_OF_BLOOD)
 		{
-			processXP(event.getSkill(), xpDiff);
+			int tobVar = event.getValue();
+			inTob = tobVar == 2 || tobVar == 3;
+
+			if (!inTob && maidenHandler.isMaidenActive())
+				maidenHandler.deactivate();
 		}
-		previousExp[event.getSkill().ordinal()] = event.getXp();
 	}
 
 	@Subscribe
@@ -677,7 +693,7 @@ public class PartyHitsPlugin extends Plugin
 	@Subscribe
 	protected void onNpcSpawned(NpcSpawned event)
 	{
-		if (!inTob() || !inMaidenRegion())
+		if (!inTob || !inMaidenRegion())
 			return;
 
 		NPC npc = event.getNpc();
@@ -696,7 +712,7 @@ public class PartyHitsPlugin extends Plugin
 	@Subscribe
 	protected void onNpcDespawned(NpcDespawned event)
 	{
-		if (!inTob() || !inMaidenRegion())
+		if (!inTob || !inMaidenRegion())
 			return;
 
 		String npcName = event.getNpc().getName();
@@ -708,64 +724,91 @@ public class PartyHitsPlugin extends Plugin
 	}
 
 	@Subscribe
+	protected void onGameTick(GameTick event)
+	{
+		if (!inTob)
+			return;
+
+		if (!hitBuffer.isEmpty())
+		{
+			int totalXp = 0;
+			for (int xp : hitBuffer)
+			{
+				totalXp += xp;
+			}
+			processXP(totalXp);
+			hitBuffer.clear();
+		}
+	}
+
+	@Subscribe
+	protected void onStatChanged(StatChanged event)
+	{
+		int currentXp = event.getXp();
+		int previousXp = previousExp[event.getSkill().ordinal()];
+		int xpDiff = currentXp - previousXp;
+		if (previousXp > 0 && xpDiff > 0)
+		{
+			if (event.getSkill() == Skill.HITPOINTS)
+				hitBuffer.add(xpDiff);
+		}
+		previousExp[event.getSkill().ordinal()] = event.getXp();
+	}
+
+	@Subscribe
 	protected void onFakeXpDrop(FakeXpDrop event)
 	{
 		if (event.getXp() >= MAX_XP)
 			return;
 
-		processXP(event.getSkill(), event.getXp());
+		if (event.getSkill() == Skill.HITPOINTS)
+			hitBuffer.add(event.getXp());
 	}
 
-	private void processXP(Skill skill, int xpDrop)
+	private void processXP(int xpDrop)
 	{
-		if (!inTob())
+		if (!inTob)
 			return;
 
-		if (config.maidenOnly() && !inMaidenRegion())
+		Player player = client.getLocalPlayer();
+		if (player == null)
 			return;
 
-		if (skill == Skill.HITPOINTS)
+		Actor actor = player.getInteracting();
+		if (!(actor instanceof NPC))
+			return;
+
+		int npcId = ((NPC) actor).getId();
+
+		int dmg = xpToDamage.calculateHit(npcId, xpDrop);
+		if (dmg > 0)
 		{
-			Player player = client.getLocalPlayer();
-			if (player == null)
-				return;
-
-			Actor actor = player.getInteracting();
-			if (actor instanceof NPC)
+			int projectileDelay = 0;
+			if (Objects.equals(actor.getName(), "The Maiden of Sugadinti"))
 			{
-				int npcId = ((NPC) actor).getId();
+				WorldPoint maidenLoc = actor.getWorldLocation();
+				int minDistance = 10;
 
-				int dmg = xpToDamage.calculateHit(npcId, xpDrop);
-				if (dmg > 0)
+				for (int x = 0; x < 6; x++)
 				{
-					int projectileDelay = 0;
-					if (Objects.equals(actor.getName(), "The Maiden of Sugadinti"))
+					for (int y = 0; y < 6; y++)
 					{
-						WorldPoint maidenLoc = actor.getWorldLocation();
-						int minDistance = 10;
+						WorldPoint tileLocation = new WorldPoint(maidenLoc.getX() + x, maidenLoc.getY() + y, maidenLoc.getPlane());
+						int distance = player.getWorldLocation().distanceTo(tileLocation);
 
-						for (int x = 0; x < 6; x++)
+						if (distance < minDistance)
 						{
-							for (int y = 0; y < 6; y++)
-							{
-								WorldPoint tileLocation = new WorldPoint(maidenLoc.getX() + x, maidenLoc.getY() + y, maidenLoc.getPlane());
-								int distance = player.getWorldLocation().distanceTo(tileLocation);
-
-								if (distance < minDistance)
-								{
-									minDistance = distance;
-								}
-							}
+							minDistance = distance;
 						}
-						projectileDelay = getTickDelay(minDistance);
 					}
-
-					Hit hit = new Hit(dmg, player.getName(), projectileDelay);
-					sendHit(hit);
-					if (config.maidenHP() && !config.syncHits())
-						maidenHandler.queueDamage(hit, true);
 				}
+				projectileDelay = getTickDelay(minDistance);
 			}
+
+			Hit hit = new Hit(dmg, player.getName(), projectileDelay);
+			sendHit(hit);
+			if (config.maidenHP() && !config.syncHits())
+				maidenHandler.queueDamage(hit, true);
 		}
 	}
 
@@ -823,26 +866,27 @@ public class PartyHitsPlugin extends Plugin
 		{
 			return 2;
 		}
-		return 1; // Assuming all other weapons have a delay of 1, later fix for multi tick weapons like claws/dualies
+		else if (weaponUsed == ItemID.DRAGON_CLAWS || weaponUsed == ItemID.BURNING_CLAWS || weaponUsed == ItemID.DUAL_MACUAHUITL)
+		{
+			return 0; // later fix these multi hitsplat weapons to work for maiden damage queue, for now just exclude them
+		}
+		return 1;
 	}
 
 	private void sendHit(Hit hit)
 	{
 		if (party.isInParty())
 		{
+			clientThread.invokeLater(() -> party.send(hit));
+
+			if (config.maidenOnly() && !inMaidenRegion())
+				return;
+
 			if (config.ownHits() && Objects.equals(hit.getPlayer(), client.getLocalPlayer().getName()))
 				partyHitsOverlay.addHit(hit, config.duration());
 
-			clientThread.invokeLater(() -> party.send(hit));
 		}
 	}
-
-	private boolean inTob()
-	{
-		int tobVar = client.getVarbitValue(Varbits.THEATRE_OF_BLOOD);
-		return tobVar == 2 || tobVar == 3;
-	}
-
 	private boolean inMaidenRegion()
 	{
 		return ArrayUtils.contains(client.getTopLevelWorldView().getMapRegions(), MAIDEN_REGIONID);
@@ -957,8 +1001,7 @@ import net.runelite.client.ui.overlay.OverlayPosition;
 
 import javax.inject.Inject;
 import java.awt.*;
-import java.util.HashMap;
-import java.util.Iterator;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -968,7 +1011,7 @@ public class PartyHitsOverlay extends Overlay
     private final PartyHitsConfig config;
     @Inject
     private Client client;
-    private final Map<Hit, Integer> hits = new HashMap<>();
+    private final Map<Hit, Integer> hits = new ConcurrentHashMap<>();
 
     @Inject
     PartyHitsOverlay(PartyHitsPlugin plugin, PartyHitsConfig config)
@@ -982,27 +1025,23 @@ public class PartyHitsOverlay extends Overlay
     @Override
     public Dimension render(Graphics2D graphics)
     {
-		graphics.setFont(new Font(config.font().toString(), Font.BOLD, config.size()));
+        graphics.setFont(new Font(config.font().toString(), Font.BOLD, config.size()));
 
-        Map<Hit, Integer> updatedHits = new HashMap<>();
-
-        Iterator<Map.Entry<Hit, Integer>> iterator = hits.entrySet().iterator();
-
-        while (iterator.hasNext())
+        for (Map.Entry<Hit, Integer> entry : hits.entrySet())
         {
-            Map.Entry<Hit, Integer> entry = iterator.next();
             Hit hit = entry.getKey();
             int duration = entry.getValue();
-            if (duration <= 0)
-            {
-                iterator.remove();
-                continue;
-            }
-            renderHit(graphics, hit);
-            updatedHits.put(hit, duration - 1);
-        }
-        hits.putAll(updatedHits);
 
+            if (duration > 0)
+            {
+                renderHit(graphics, hit);
+                hits.replace(hit, duration - 1);
+            }
+            else
+            {
+                hits.remove(hit, duration);
+            }
+        }
         return null;
     }
 
