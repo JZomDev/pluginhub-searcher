@@ -7,6 +7,7 @@ import dinkplugin.domain.ClueTier;
 import dinkplugin.domain.CombatAchievementTier;
 import dinkplugin.domain.ConfigImportPolicy;
 import dinkplugin.domain.ExceptionalDeath;
+import dinkplugin.domain.ExternalScreenshotPolicy;
 import dinkplugin.domain.FilterMode;
 import dinkplugin.domain.LeagueTaskDifficulty;
 import dinkplugin.domain.PlayerLookupService;
@@ -179,6 +180,14 @@ public interface DinkPluginConfig extends Config {
         closedByDefault = true
     )
     String chatSection = "Custom Chat Messages";
+
+    @ConfigSection(
+        name = "External Plugin Requests",
+        description = "Settings for notifying when other plugins request Dink notifications to be fired",
+        position = 180,
+        closedByDefault = true
+    )
+    String externalSection = "External Plugin Requests";
 
     @ConfigSection(
         name = "Leagues",
@@ -699,11 +708,22 @@ public interface DinkPluginConfig extends Config {
     }
 
     @ConfigItem(
+        keyName = "externalWebhook",
+        name = "External Webhook Override",
+        description = "If non-empty, external plugin messages that don't provide a custom URL are by default sent to this URL, instead of the primary URL",
+        position = -1,
+        section = webhookSection
+    )
+    default String externalWebhook() {
+        return "";
+    }
+
+    @ConfigItem(
         keyName = "leaguesWebhook",
         name = "Leagues Webhook Override",
         description = "If non-empty, Leagues messages are sent to this URL, instead of the primary URL.<br/>" +
             "Note: this only applies to the Leagues notifier, not every notifier in a seasonal world",
-        position = -1,
+        position = 0,
         section = webhookSection
     )
     default String leaguesWebhook() {
@@ -2035,6 +2055,28 @@ public interface DinkPluginConfig extends Config {
     }
 
     @ConfigItem(
+        keyName = "notifyExternal",
+        name = "Enable External Plugin Notifications",
+        description = "Enable notifications upon requests by other plugins",
+        position = 180,
+        section = externalSection
+    )
+    default boolean notifyExternal() {
+        return false;
+    }
+
+    @ConfigItem(
+        keyName = "externalSendImage",
+        name = "Send Image",
+        description = "Controls whether screenshots should be included with the notification",
+        position = 181,
+        section = externalSection
+    )
+    default ExternalScreenshotPolicy externalSendImage() {
+        return ExternalScreenshotPolicy.REQUESTED;
+    }
+
+    @ConfigItem(
         keyName = "notifyLeagues",
         name = "Enable Leagues",
         description = "Enable notifications upon various leagues events",
@@ -2955,11 +2997,13 @@ import net.runelite.api.Actor;
 import net.runelite.api.Client;
 import net.runelite.api.Varbits;
 import net.runelite.api.WorldType;
+import net.runelite.api.WorldView;
 import net.runelite.api.annotations.Varbit;
 import net.runelite.api.annotations.Varp;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.widgets.ComponentID;
 import net.runelite.api.widgets.Widget;
+import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.VisibleForTesting;
 
 import java.util.Collections;
@@ -3008,13 +3052,19 @@ public class WorldUtils {
      */
     private final int DRAGON_SLAYER_II_COMPLETED = 215;
 
+    @Nullable
     public static WorldPoint getLocation(Client client) {
         return getLocation(client, client.getLocalPlayer());
     }
 
+    @Nullable
     public static WorldPoint getLocation(Client client, Actor actor) {
-        if (client.isInInstancedRegion())
-            return WorldPoint.fromLocalInstance(client, actor.getLocalLocation());
+        if (actor == null)
+            return null;
+
+        WorldView wv = actor.getWorldView();
+        if (wv.isInstance())
+            return WorldPoint.fromLocalInstance(client, actor.getLocalLocation(), wv.getPlane());
 
         return actor.getWorldLocation();
     }
@@ -3373,8 +3423,10 @@ public class Utils {
      * @param client {@link Client}
      * @return the name of the local player
      */
+    @Nullable
     public String getPlayerName(Client client) {
-        return client.getLocalPlayer().getName();
+        var player = client.getLocalPlayer();
+        return player != null ? player.getName() : null;
     }
 
     /**
@@ -3778,6 +3830,27 @@ public class SerializedOffer {
     public boolean equalsOffer(@NotNull GrandExchangeOffer o) {
         return state == o.getState() && id == o.getItemId() && quantity == o.getTotalQuantity()
             && price == o.getPrice() && spent == o.getSpent();
+    }
+}
+
+package dinkplugin.util;
+
+import com.google.gson.TypeAdapter;
+import com.google.gson.stream.JsonReader;
+import com.google.gson.stream.JsonWriter;
+import okhttp3.HttpUrl;
+
+import java.io.IOException;
+
+public class HttpUrlAdapter extends TypeAdapter<HttpUrl> {
+    @Override
+    public void write(JsonWriter out, HttpUrl url) throws IOException {
+        out.value(url != null ? url.toString() : null);
+    }
+
+    @Override
+    public HttpUrl read(JsonReader in) throws IOException {
+        return in.hasNext() ? HttpUrl.parse(in.nextString()) : null;
     }
 }
 
@@ -5384,6 +5457,140 @@ public class GrandExchangeNotifier extends BaseNotifier {
             ItemID.WATERING_CAN, ItemID.OLD_SCHOOL_BOND
         );
     }
+}
+
+package dinkplugin.notifiers;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+import dinkplugin.domain.ExternalNotificationRequest;
+import dinkplugin.domain.ExternalScreenshotPolicy;
+import dinkplugin.message.NotificationBody;
+import dinkplugin.message.NotificationType;
+import dinkplugin.message.templating.Replacements;
+import dinkplugin.message.templating.Template;
+import dinkplugin.notifiers.data.ExternalNotificationData;
+import dinkplugin.util.HttpUrlAdapter;
+import dinkplugin.util.Utils;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.GameState;
+import net.runelite.client.callback.ClientThread;
+import okhttp3.HttpUrl;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+
+@Slf4j
+@Singleton
+public class ExternalPluginNotifier extends BaseNotifier {
+
+    private ClientThread clientThread;
+    private Gson gson;
+
+    @Override
+    public boolean isEnabled() {
+        return config.notifyExternal() && super.isEnabled();
+    }
+
+    @Override
+    protected String getWebhookUrl() {
+        return config.externalWebhook();
+    }
+
+    @Inject
+    void init(ClientThread clientThread, Gson gson) {
+        this.clientThread = clientThread;
+        this.gson = gson.newBuilder()
+            .registerTypeAdapter(HttpUrl.class, new HttpUrlAdapter())
+            .create();
+    }
+
+    public void onNotify(Map<String, Object> data) {
+        if (!isEnabled()) {
+            log.debug("Skipping requested external dink since notifier is disabled: {}", data);
+            return;
+        }
+
+        // ensure input urls are specified correctly
+        if (!isUrlInputValid(data.get("urls"))) {
+            log.warn("Skipping externally-requested dink due to invalid 'urls' format from {}", data.get("sourcePlugin"));
+            return;
+        }
+
+        // parse request
+        ExternalNotificationRequest input;
+        try {
+            input = gson.fromJson(gson.toJsonTree(data), ExternalNotificationRequest.class);
+        } catch (JsonSyntaxException e) {
+            log.warn("Failed to parse requested webhook notification from an external plugin: {}", data, e);
+            return;
+        }
+
+        // validate request
+        if (input.getSourcePlugin() == null || input.getSourcePlugin().isBlank()) {
+            log.info("Skipping externally-requested dink due to missing 'sourcePlugin': {}", data);
+            return;
+        }
+
+        if (input.getText() == null || input.getText().isBlank()) {
+            log.info("Skipping externally-requested dink due to missing 'text': {}", data);
+            return;
+        }
+
+        if (input.getThumbnail() != null && HttpUrl.parse(input.getThumbnail()) == null) {
+            log.debug("Replacing invalid thumbnail url: {}", input.getThumbnail());
+            input.setThumbnail(NotificationType.EXTERNAL_PLUGIN.getThumbnail());
+        }
+
+        // process request
+        this.handleNotify(input);
+    }
+
+    private void handleNotify(ExternalNotificationRequest input) {
+        var player = Utils.getPlayerName(client);
+        var template = Template.builder()
+            .template(input.getText())
+            .replacements(Objects.requireNonNullElseGet(input.getReplacements(), () -> new HashMap<>(2)))
+            .replacement("%USERNAME%", Replacements.ofText(player))
+            .build();
+
+        var footer = String.format("Sent by %s via Dink", input.getSourcePlugin());
+
+        var policy = config.externalSendImage();
+        boolean image = policy != ExternalScreenshotPolicy.NEVER
+            && client.getGameState().getState() >= GameState.LOGGING_IN.getState()
+            && (policy == ExternalScreenshotPolicy.ALWAYS || input.isImageRequested());
+        var body = NotificationBody.builder()
+            .type(NotificationType.EXTERNAL_PLUGIN)
+            .playerName(player)
+            .text(template)
+            .customTitle(input.getTitle())
+            .customFooter(footer)
+            .thumbnailUrl(input.getThumbnail())
+            .extra(new ExternalNotificationData(input.getSourcePlugin(), input.getFields(), input.getMetadata()))
+            .build();
+
+        var urls = input.getUrls(this::getWebhookUrl);
+        clientThread.invoke(() -> createMessage(urls, image, body));
+    }
+
+    private static boolean isUrlInputValid(Object urls) {
+        if (urls == null) {
+            return true; // use urls specified in dink's config
+        }
+        if (!(urls instanceof Iterable)) {
+            return false; // we try to convert to list in ExternalNotificationRequest
+        }
+        for (Object url : (Iterable<?>) urls) {
+            if (!(url instanceof HttpUrl))
+                return false; // received non-HttpUrl; input should be rejected
+        }
+        return true; // all elements are HttpUrl instances; proceed as normal
+    }
+
 }
 
 package dinkplugin.notifiers;
@@ -7494,6 +7701,24 @@ public class PlayerKillNotificationData extends NotificationData {
 
         return fields;
     }
+}
+
+package dinkplugin.notifiers.data;
+
+import dinkplugin.message.Field;
+import lombok.EqualsAndHashCode;
+import lombok.Value;
+
+import java.util.List;
+import java.util.Map;
+
+@Value
+@EqualsAndHashCode(callSuper = false)
+public class ExternalNotificationData extends NotificationData {
+    String sourcePlugin;
+    @EqualsAndHashCode.Include
+    transient List<Field> fields;
+    Map<String, Object> metadata;
 }
 
 package dinkplugin.notifiers.data;
@@ -11617,6 +11842,7 @@ import dinkplugin.notifiers.CollectionNotifier;
 import dinkplugin.notifiers.CombatTaskNotifier;
 import dinkplugin.notifiers.DeathNotifier;
 import dinkplugin.notifiers.DiaryNotifier;
+import dinkplugin.notifiers.ExternalPluginNotifier;
 import dinkplugin.notifiers.GambleNotifier;
 import dinkplugin.notifiers.GrandExchangeNotifier;
 import dinkplugin.notifiers.GroupStorageNotifier;
@@ -11660,6 +11886,7 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.events.NotificationFired;
 import net.runelite.client.events.NpcLootReceived;
 import net.runelite.client.events.PlayerLootReceived;
+import net.runelite.client.events.PluginMessage;
 import net.runelite.client.events.ProfileChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -11708,6 +11935,7 @@ public class DinkPlugin extends Plugin {
     private @Inject MetaNotifier metaNotifier;
     private @Inject TradeNotifier tradeNotifier;
     private @Inject ChatNotifier chatNotifier;
+    private @Inject ExternalPluginNotifier externalNotifier;
 
     private final AtomicReference<GameState> gameState = new AtomicReference<>();
 
@@ -11961,6 +12189,13 @@ public class DinkPlugin extends Plugin {
         tradeNotifier.onWidgetClose(event);
     }
 
+    @Subscribe
+    public void onPluginMessage(PluginMessage event) {
+        if ("dink".equalsIgnoreCase(event.getNamespace()) && "notify".equalsIgnoreCase(event.getName())) {
+            externalNotifier.onNotify(event.getData());
+        }
+    }
+
     public void addChatSuccess(String message) {
         addChatMessage("Success", Utils.GREEN, message);
     }
@@ -12152,6 +12387,45 @@ public enum FilterMode {
 
 package dinkplugin.domain;
 
+import dinkplugin.message.Field;
+import dinkplugin.message.templating.impl.SimpleReplacement;
+import lombok.Data;
+import org.jetbrains.annotations.Nullable;
+
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.function.Supplier;
+import java.util.stream.Collectors;
+
+@Data
+public class ExternalNotificationRequest {
+
+    private String sourcePlugin;
+    private String text;
+    private boolean imageRequested;
+    private @Nullable String title;
+    private @Nullable String thumbnail;
+    private @Nullable List<Field> fields;
+    private @Nullable Map<String, SimpleReplacement> replacements;
+    private @Nullable Map<String, Object> metadata;
+    private @Nullable List<String> urls;
+
+    public String getUrls(Supplier<String> defaultValue) {
+        return urls != null
+            ? urls.stream().filter(Objects::nonNull).collect(Collectors.joining("\n"))
+            : defaultValue.get();
+    }
+
+    public List<Field> getFields() {
+        return this.fields != null ? this.fields : Collections.emptyList();
+    }
+
+}
+
+package dinkplugin.domain;
+
 import lombok.RequiredArgsConstructor;
 
 /**
@@ -12166,6 +12440,24 @@ public enum ExceptionalDeath {
     JAD_CHALLENGES("Jad challenges"),
     TOB("Theatre of Blood"),
     TOA("Tombs of Amascut");
+
+    private final String displayName;
+
+    @Override
+    public String toString() {
+        return this.displayName;
+    }
+}
+
+package dinkplugin.domain;
+
+import lombok.RequiredArgsConstructor;
+
+@RequiredArgsConstructor
+public enum ExternalScreenshotPolicy {
+    ALWAYS("Always"),
+    REQUESTED("When requested"),
+    NEVER("Never");
 
     private final String displayName;
 
@@ -12494,6 +12786,7 @@ public class Template implements Evaluable {
     }
 
     private String evaluateFast(boolean rich) {
+        assert replacementBoundary != null;
         StringBuilder message = new StringBuilder(template);
         int i = message.indexOf(replacementBoundary);
         while (i != -1) {
@@ -12608,6 +12901,34 @@ public class Replacements {
 package dinkplugin.message.templating.impl;
 
 import dinkplugin.message.templating.Evaluable;
+import lombok.AccessLevel;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+import org.jetbrains.annotations.Nullable;
+
+@Data
+@Setter(AccessLevel.PRIVATE)
+@NoArgsConstructor
+@AllArgsConstructor
+public class SimpleReplacement implements Evaluable {
+
+    private String value;
+
+    @Nullable
+    private String richValue;
+
+    @Override
+    public String evaluate(boolean rich) {
+        return rich && richValue != null ? richValue : value;
+    }
+
+}
+
+package dinkplugin.message.templating.impl;
+
+import dinkplugin.message.templating.Evaluable;
 import lombok.Builder;
 import lombok.Singular;
 import lombok.Value;
@@ -12661,6 +12982,7 @@ import java.util.List;
 public class Embed {
     // The max size of the image before we rescale it to fit Discords file upload limits https://discord.com/developers/docs/reference#uploading-files
     public static final int MAX_IMAGE_SIZE = 8_000_000; // 8MB
+    public static final int MAX_TITLE_LENGTH = 256;
     public static final int MAX_DESCRIPTION_LENGTH = 4096;
     public static final int MAX_FOOTER_LENGTH = 2048;
     public static final int MAX_EMBEDS = 10;
@@ -12786,7 +13108,8 @@ public enum NotificationType {
     LOGOUT("Player Logout", "logout.png", WIKI_IMG_BASE_URL + "Prop_sword.png"),
     TRADE("Player Trade", "trade.png", WIKI_IMG_BASE_URL + "Inventory.png"),
     CHAT("Chat Notification", "chat.png", WIKI_IMG_BASE_URL + "Toggle_Chat_effects.png"),
-    XP_MILESTONE("XP Milestone", "xpImage.png", WIKI_IMG_BASE_URL + "Lamp.png");
+    XP_MILESTONE("XP Milestone", "xpImage.png", WIKI_IMG_BASE_URL + "Lamp.png"),
+    EXTERNAL_PLUGIN("External Plugin", "externalImage.png", "https://raw.githubusercontent.com/runelite/runelite/refs/heads/master/runelite-client/src/main/resources/net/runelite/client/plugins/config/plugin_hub_icon.png");
 
     private final String title;
 
@@ -12936,6 +13259,22 @@ public class NotificationBody<T extends NotificationData> {
     String computedDiscordContent;
 
     /**
+     * An optional title to override that of {@link NotificationType#getThumbnail}
+     * within the embed constructed by {@link DiscordMessageHandler#createMessage}
+     */
+    @Nullable
+    @EqualsAndHashCode.Include
+    transient String customTitle;
+
+    /**
+     * An optional footer text to override that of {@link DinkPluginConfig#embedFooterText}
+     * within the embed constructed by {@link DiscordMessageHandler#createMessage}
+     */
+    @Nullable
+    @EqualsAndHashCode.Include
+    transient String customFooter;
+
+    /**
      * An optional thumbnail to override that of {@link NotificationType#getThumbnail}
      * within the embed constructed by {@link DiscordMessageHandler#createMessage}
      */
@@ -12974,9 +13313,12 @@ public class NotificationBody<T extends NotificationData> {
 package dinkplugin.message;
 
 import dinkplugin.util.MathUtils;
+import lombok.AccessLevel;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
-import lombok.Value;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
 import org.apache.commons.lang3.StringUtils;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -12986,13 +13328,15 @@ import org.jetbrains.annotations.Nullable;
  *
  * @see <a href="https://birdie0.github.io/discord-webhooks-guide/structure/embed/fields.html">Example</a>
  */
-@Value
+@Data
+@Setter(AccessLevel.PRIVATE)
 @Builder
+@NoArgsConstructor
 @AllArgsConstructor
 public class Field {
-    @NotNull String name;
-    @NotNull String value;
-    @Nullable Boolean inline;
+    private @NotNull String name;
+    private @NotNull String value;
+    private @Nullable Boolean inline;
 
     public Field(String name, String value) {
         this(name, value, true);
@@ -13156,6 +13500,7 @@ public class DiscordMessageHandler {
             .filter(StringUtils::isNotBlank)
             .map(HttpUrl::parse)
             .filter(Objects::nonNull)
+            .filter(url -> !"example.com".equalsIgnoreCase(url.host()))
             .collect(Collectors.toList());
         if (urlList.isEmpty()) return;
 
@@ -13282,7 +13627,10 @@ public class DiscordMessageHandler {
             }
 
             if (mBody.getRegionId() == null) {
-                builder.regionId(WorldUtils.getLocation(client).getRegionID());
+                var loc = WorldUtils.getLocation(client);
+                if (loc != null) {
+                    builder.regionId(loc.getRegionID());
+                }
             }
         }
 
@@ -13404,7 +13752,7 @@ public class DiscordMessageHandler {
     private static List<Embed> computeEmbeds(@NotNull NotificationBody<?> body, boolean screenshot, DinkPluginConfig config) {
         NotificationType type = body.getType();
         NotificationData extra = body.getExtra();
-        String footerText = config.embedFooterText();
+        String footerText = body.getCustomFooter() != null ? body.getCustomFooter() : config.embedFooterText();
         String footerIcon = config.embedFooterIcon();
         PlayerLookupService playerLookupService = config.playerLookupService();
 
@@ -13417,6 +13765,7 @@ public class DiscordMessageHandler {
             .text(Utils.truncate(footerText, Embed.MAX_FOOTER_LENGTH))
             .iconUrl(StringUtils.isBlank(footerIcon) ? null : footerIcon)
             .build();
+        String title = body.getCustomTitle() != null ? body.getCustomTitle() : type.getTitle();
         String thumbnail = body.getThumbnailUrl() != null
             ? body.getThumbnailUrl()
             : type.getThumbnail();
@@ -13426,7 +13775,7 @@ public class DiscordMessageHandler {
             Embed.builder()
                 .author(author)
                 .color(config.embedColor())
-                .title(body.isSeasonalWorld() ? "[Seasonal] " + type.getTitle() : type.getTitle())
+                .title(Utils.truncate(body.isSeasonalWorld() ? "[Seasonal] " + title : title, Embed.MAX_TITLE_LENGTH))
                 .description(Utils.truncate(body.getText().evaluate(config.discordRichEmbeds()), Embed.MAX_DESCRIPTION_LENGTH))
                 .image(screenshot ? new Embed.UrlEmbed("attachment://" + type.getScreenshot()) : null)
                 .thumbnail(new Embed.UrlEmbed(thumbnail))
@@ -16307,6 +16656,7 @@ abstract class MockedNotifierTest extends MockedTestBase {
         when(client.getGameState()).thenReturn(GameState.LOGGED_IN);
         when(localPlayer.getName()).thenReturn(PLAYER_NAME);
         when(localPlayer.getWorldLocation()).thenReturn(new WorldPoint(2500, 2500, 0));
+        when(localPlayer.getWorldView()).thenReturn(worldView);
 
         doAnswer(invocation -> {
             Consumer<Image> callback = invocation.getArgument(0);
@@ -16360,7 +16710,7 @@ abstract class MockedNotifierTest extends MockedTestBase {
         Mockito.verify(messageHandler).createMessage(url, image, body);
 
         // wait for http calls to complete
-        if (url != null && !url.isEmpty()) {
+        if (url != null && !url.isEmpty() && !"https://example.com/".equals(url)) {
             Dispatcher dispatcher = httpClient.dispatcher();
             while (dispatcher.queuedCallsCount() > 0 || dispatcher.runningCallsCount() > 0) {
                 // noinspection BusyWait - comply with discord's undocumented 30/60s ratelimit
@@ -21356,12 +21706,13 @@ public class PlayerKillNotifierTest extends MockedNotifierTest {
         verify(messageHandler, never()).createMessage(any(), anyBoolean(), any());
     }
 
-    private static Player mockPlayer() {
+    private Player mockPlayer() {
         Player target = mock(Player.class);
         when(target.getName()).thenReturn(TARGET);
         when(target.isDead()).thenReturn(true);
         when(target.getCombatLevel()).thenReturn(LEVEL);
         when(target.getWorldLocation()).thenReturn(LOCATION);
+        when(target.getWorldView()).thenReturn(worldView);
         PlayerComposition comp = mock(PlayerComposition.class);
         when(target.getPlayerComposition()).thenReturn(comp);
         int[] equipment = new int[KitType.values().length];
@@ -21386,6 +21737,341 @@ public class PlayerKillNotifierTest extends MockedNotifierTest {
         m.put(KitType.SHIELD, new SerializedItemStack(ItemID.UNHOLY_BOOK, 1, SHIELD_PRICE, "Unholy book"));
         EQUIPMENT = Collections.unmodifiableMap(m);
     }
+}
+
+package dinkplugin.notifiers;
+
+import com.google.inject.testing.fieldbinder.Bind;
+import dinkplugin.domain.ExternalScreenshotPolicy;
+import dinkplugin.message.Field;
+import dinkplugin.message.NotificationBody;
+import dinkplugin.message.NotificationType;
+import dinkplugin.message.templating.Replacements;
+import dinkplugin.message.templating.Template;
+import dinkplugin.message.templating.impl.SimpleReplacement;
+import dinkplugin.notifiers.data.ExternalNotificationData;
+import net.runelite.client.events.PluginMessage;
+import okhttp3.HttpUrl;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.InjectMocks;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+public class ExternalPluginNotifierTest extends MockedNotifierTest {
+
+    @Bind
+    @InjectMocks
+    ExternalPluginNotifier notifier;
+
+    @Override
+    @BeforeEach
+    protected void setUp() {
+        super.setUp();
+
+        // update config mocks
+        when(config.notifyExternal()).thenReturn(true);
+        when(config.externalSendImage()).thenReturn(ExternalScreenshotPolicy.REQUESTED);
+    }
+
+    @Test
+    void testNotify() {
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", samplePayload(null)));
+
+        // verify notification
+        verifyCreateMessage(
+            PRIMARY_WEBHOOK_URL,
+            false,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("Hello %TARGET% from %USERNAME%")
+                        .replacement("%TARGET%", Replacements.ofText("world"))
+                        .replacement("%USERNAME%", Replacements.ofText(PLAYER_NAME))
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testNoReplacements() {
+        // fire event
+        var payload = samplePayload(null);
+        payload.remove("replacements");
+        payload.put("text", "text with no replacements");
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", payload));
+
+        // verify notification
+        verifyCreateMessage(
+            PRIMARY_WEBHOOK_URL,
+            false,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("text with no replacements")
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testMissingReplacement() {
+        // fire event
+        var payload = samplePayload(null);
+        payload.remove("replacements");
+        payload.put("text", "text with no custom replacement %USERNAME%");
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", payload));
+
+        // verify notification
+        verifyCreateMessage(
+            PRIMARY_WEBHOOK_URL,
+            false,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("text with no custom replacement %USERNAME%")
+                        .replacement("%USERNAME%", Replacements.ofText(PLAYER_NAME))
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testPatternWithoutReplacement() {
+        // fire event
+        var payload = samplePayload(null);
+        payload.remove("replacements");
+        payload.put("text", "text with no custom replacement %XD%");
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", payload));
+
+        // verify notification
+        verifyCreateMessage(
+            PRIMARY_WEBHOOK_URL,
+            false,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("text with no custom replacement %XD%")
+                        .replacement("%USERNAME%", Replacements.ofText(PLAYER_NAME))
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testFallbackUrl() {
+        // update config mocks
+        String url = "https://example.com/";
+        when(config.externalWebhook()).thenReturn(url);
+
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", samplePayload(null)));
+
+        // verify notification
+        verifyCreateMessage(
+            url,
+            false,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("Hello %TARGET% from %USERNAME%")
+                        .replacement("%TARGET%", Replacements.ofText("world"))
+                        .replacement("%USERNAME%", Replacements.ofText(PLAYER_NAME))
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testImage() {
+        // update config mocks
+        when(config.externalSendImage()).thenReturn(ExternalScreenshotPolicy.ALWAYS);
+
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", samplePayload(null)));
+
+        // verify notification
+        verifyCreateMessage(
+            PRIMARY_WEBHOOK_URL,
+            true,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("Hello %TARGET% from %USERNAME%")
+                        .replacement("%TARGET%", Replacements.ofText("world"))
+                        .replacement("%USERNAME%", Replacements.ofText(PLAYER_NAME))
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testRequestImage() {
+        // prepare payload
+        var data = samplePayload(null);
+        data.put("imageRequested", true);
+
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", data));
+
+        // verify notification
+        verifyCreateMessage(
+            PRIMARY_WEBHOOK_URL,
+            true,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("Hello %TARGET% from %USERNAME%")
+                        .replacement("%TARGET%", Replacements.ofText("world"))
+                        .replacement("%USERNAME%", Replacements.ofText(PLAYER_NAME))
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testRequestImageDenied() {
+        // update config mocks
+        when(config.externalSendImage()).thenReturn(ExternalScreenshotPolicy.NEVER);
+
+        // prepare payload
+        var data = samplePayload(null);
+        data.put("imageRequested", true);
+
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", data));
+
+        // verify notification
+        verifyCreateMessage(
+            PRIMARY_WEBHOOK_URL,
+            false,
+            NotificationBody.builder()
+                .type(NotificationType.EXTERNAL_PLUGIN)
+                .playerName(PLAYER_NAME)
+                .customTitle("My Title")
+                .customFooter("Sent by MyExternalPlugin via Dink")
+                .text(
+                    Template.builder()
+                        .template("Hello %TARGET% from %USERNAME%")
+                        .replacement("%TARGET%", Replacements.ofText("world"))
+                        .replacement("%USERNAME%", Replacements.ofText(PLAYER_NAME))
+                        .build()
+                )
+                .extra(new ExternalNotificationData("MyExternalPlugin", List.of(new Field("sample key", "sample value")), Collections.singletonMap("hello", "world")))
+                .build()
+        );
+    }
+
+    @Test
+    void testIgnoreNamespace() {
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("DANK", "notify", samplePayload("https://example.com/")));
+
+        // ensure no notification
+        verify(messageHandler, never()).createMessage(any(), anyBoolean(), any());
+    }
+
+    @Test
+    void testIgnoreName() {
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "donk", samplePayload("https://example.com/")));
+
+        // ensure no notification
+        verify(messageHandler, never()).createMessage(any(), anyBoolean(), any());
+    }
+
+    @Test
+    void testIgnoreBadUrls() {
+        // prepare payload
+        var data = samplePayload(null);
+        data.put("urls", List.of("https://example.com/"));
+
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", data));
+
+        // ensure no notification
+        verify(messageHandler, never()).createMessage(any(), anyBoolean(), any());
+    }
+
+    @Test
+    void testDisabled() {
+        // update config mocks
+        when(config.notifyExternal()).thenReturn(false);
+
+        // fire event
+        plugin.onPluginMessage(new PluginMessage("dink", "notify", samplePayload("https://example.com/")));
+
+        // ensure no notification
+        verify(messageHandler, never()).createMessage(any(), anyBoolean(), any());
+    }
+
+    private static Map<String, Object> samplePayload(String url) {
+        Map<String, Object> data = new HashMap<>();
+        data.put("text", "Hello %TARGET% from %USERNAME%");
+        data.put("title", "My Title");
+        data.put("thumbnail", "not a url . com");
+        data.put("fields", List.of(new Field("sample key", "sample value")));
+        data.put("replacements", Map.of("%TARGET%", new SimpleReplacement("world", null)));
+        data.put("metadata", Map.of("hello", "world"));
+        data.put("sourcePlugin", "MyExternalPlugin");
+        if (url != null) {
+            data.put("urls", Collections.singletonList(HttpUrl.parse(url)));
+        }
+        return data;
+    }
+
 }
 
 package dinkplugin.notifiers;
