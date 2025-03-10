@@ -417,6 +417,7 @@ import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
@@ -424,7 +425,6 @@ import net.runelite.api.events.ItemDespawned;
 import net.runelite.api.events.ItemQuantityChanged;
 import net.runelite.api.events.ItemSpawned;
 import net.runelite.api.events.MenuEntryAdded;
-import net.runelite.api.events.MenuOpened;
 import net.runelite.client.Notifier;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
@@ -443,8 +443,12 @@ import javax.inject.Inject;
 import javax.inject.Named;
 import java.io.File;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static com.lootfilters.util.FilterUtil.withConfigMatchers;
 import static com.lootfilters.util.TextUtil.quote;
@@ -495,6 +499,8 @@ public class LootFiltersPlugin extends Plugin {
 	private final MenuEntryComposer menuEntryComposer = new MenuEntryComposer(this);
 	private final LootFilterManager filterManager = new LootFilterManager(this);
 	private final AudioPlayer audioPlayer = new AudioPlayer(); // remove when https://github.com/runelite/runelite/pull/18745 is merged
+	private final ExecutorService audioDispatcher = Executors.newSingleThreadExecutor();
+	private final Set<String> queuedAudio = new HashSet<>();
 
 	private LootFilter activeFilter;
 	private LootFilter currentAreaFilter;
@@ -666,16 +672,10 @@ public class LootFiltersPlugin extends Plugin {
 			lootbeamIndex.put(tile, item, beam);
 		}
 		if (match.isNotify()) {
-			notifier.notify(getItemName(item.getId()));
+			notifier.notify(item.getName());
 		}
 		if (match.getSound() != null && config.soundVolume() > 0) {
-			try {
-				var soundFile = new File(SOUND_DIRECTORY, match.getSound());
-				var gain = 20f * (float) Math.log10(config.soundVolume() / 100f);
-				audioPlayer.play(soundFile, gain);
-			} catch (Exception e) {
-				log.warn("play audio {}", match.getSound(), e);
-			}
+			queuedAudio.add(match.getSound());
 		}
 	}
 
@@ -712,8 +712,12 @@ public class LootFiltersPlugin extends Plugin {
 	}
 
 	@Subscribe
-	public void onMenuOpened(MenuOpened event) {
-		menuEntryComposer.onMenuOpened();
+	public void onClientTick(ClientTick event) {
+		menuEntryComposer.onClientTick();
+
+		if (!queuedAudio.isEmpty()) {
+			flushAudio();
+		}
 	}
 
 	@Subscribe
@@ -721,6 +725,21 @@ public class LootFiltersPlugin extends Plugin {
 		if (developerMode && event.getCommand().equals("lfDebug")) {
 			debugEnabled = !debugEnabled;
 		}
+	}
+
+	private void flushAudio() {
+		for (var filename : queuedAudio) {
+			audioDispatcher.execute(() -> {
+				try {
+					var soundFile = new File(SOUND_DIRECTORY, filename);
+					var gain = 20f * (float) Math.log10(config.soundVolume() / 100f);
+					audioPlayer.play(soundFile, gain);
+				} catch (Exception e) {
+					log.warn("play audio {}", filename, e);
+				}
+			});
+		}
+		queuedAudio.clear();
 	}
 
 	private void loadFilter() throws Exception {
@@ -1231,7 +1250,6 @@ import net.runelite.api.ItemID;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
 import net.runelite.api.coords.LocalPoint;
-import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.ui.overlay.components.ProgressPieComponent;
@@ -1246,9 +1264,9 @@ import java.awt.Rectangle;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
-import java.util.List;
 
 import static com.lootfilters.util.TextUtil.abbreviate;
 import static com.lootfilters.util.TextUtil.abbreviateValue;
@@ -1266,9 +1284,6 @@ public class LootFiltersOverlay extends Overlay {
     private final Client client;
     private final LootFiltersPlugin plugin;
     private final LootFiltersConfig config;
-
-    @Inject
-    private ItemManager itemManager;
 
     @Inject
     public LootFiltersOverlay(Client client, LootFiltersPlugin plugin, LootFiltersConfig config) {
@@ -1405,8 +1420,8 @@ public class LootFiltersOverlay extends Overlay {
         return Color.GREEN;
     }
 
-    private String buildDisplayText(TileItem item, long unstackedCount, DisplayConfig display) {
-        var text = itemManager.getItemComposition(item.getId()).getName();
+    private String buildDisplayText(PluginTileItem item, long unstackedCount, DisplayConfig display) {
+        var text = item.getName();
 
         if (item.getQuantity() > 1) {
             text += " (" + abbreviate(item.getQuantity()) + ")";
@@ -1420,8 +1435,8 @@ public class LootFiltersOverlay extends Overlay {
             return text;
         }
 
-        var ge = itemManager.getItemPrice(item.getId()) * item.getQuantity();
-        var ha = itemManager.getItemComposition(item.getId()).getHaPrice() * item.getQuantity();
+        var ge = item.getGePrice() * item.getQuantity();
+        var ha = item.getHaPrice() * item.getQuantity();
         switch (showBecauseHotkey ? ValueDisplayType.BOTH : config.valueDisplayType()) {
             case HIGHEST:
                 return ge == 0 && ha == 0 ? text
@@ -1460,7 +1475,7 @@ public class LootFiltersOverlay extends Overlay {
 
     private void renderDebugOverlay(Graphics2D g) {
         int itemCount = 0;
-        int screenY = 80;
+        int screenY = 96;
         for (var entry : plugin.getTileItemIndex().entrySet()) {
             var tile = entry.getKey();
             var items = entry.getValue();
@@ -1490,6 +1505,7 @@ public class LootFiltersOverlay extends Overlay {
         g.drawString("items: " + itemCount + "," + plugin.getTileItemIndex().pointIndexSize(), 0, 32);
         g.drawString("lootbeams: " + plugin.getLootbeamIndex().size(), 0, 48);
         g.drawString("displays: " + plugin.getDisplayIndex().size(), 0, 64);
+        g.drawString("audio: " + plugin.getQueuedAudio().size(), 0, 80);
     }
 
     private void renderDespawnTimer(Graphics2D g, DespawnTimerType type, PluginTileItem item, net.runelite.api.Point textPoint, int textWidth, int textHeight, int yOffset) {
@@ -1800,9 +1816,9 @@ public enum ValueTier {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
-import net.runelite.api.TileItem;
 
 import java.util.List;
 
@@ -1822,9 +1838,8 @@ public class ItemNameRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
-        var itemName = plugin.getItemName(item.getId());
-        return names.stream().anyMatch(it -> test(itemName, it));
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
+        return names.stream().anyMatch(it -> test(item.getName(), it));
     }
 
     private boolean test(String name, String target) {
@@ -1875,9 +1890,9 @@ public enum TextAccent {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
-import net.runelite.api.TileItem;
 
 import java.util.List;
 
@@ -1897,7 +1912,7 @@ public class OrRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         return rules.stream().anyMatch(it -> it.test(plugin, item));
     }
 }
@@ -1926,7 +1941,7 @@ public enum Comparator {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
-import net.runelite.api.TileItem;
+import com.lootfilters.model.PluginTileItem;
 
 public abstract class Rule {
     protected final String discriminator; // serde discriminator
@@ -1935,15 +1950,15 @@ public abstract class Rule {
         this.discriminator = discriminator;
     }
 
-    public abstract boolean test(LootFiltersPlugin plugin, TileItem item);
+    public abstract boolean test(LootFiltersPlugin plugin, PluginTileItem item);
 }
 
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
-import net.runelite.api.TileItem;
 
 @EqualsAndHashCode(callSuper = false)
 @ToString
@@ -1956,7 +1971,7 @@ public class ItemNotedRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         var comp = plugin.getItemManager().getItemComposition(item.getId());
 
         boolean isNote = comp.getNote() != -1;
@@ -1967,10 +1982,9 @@ public class ItemNotedRule extends Rule {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
-import net.runelite.api.ItemID;
-import net.runelite.api.TileItem;
 
 @EqualsAndHashCode(callSuper = false)
 @ToString
@@ -1983,7 +1997,7 @@ public class ItemStackableRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         var comp = plugin.getItemManager().getItemComposition(item.getId());
 
         return target == comp.isStackable();
@@ -1993,6 +2007,7 @@ public class ItemStackableRule extends Rule {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.ToString;
 import net.runelite.api.TileItem;
 
@@ -2008,7 +2023,7 @@ public abstract class ComparatorRule extends Rule {
     }
 
     @Override
-    public final boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public final boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         var lhs = getLhs(plugin, item);
         switch (cmp) {
             case GT:
@@ -2069,9 +2084,9 @@ public class ItemValueRule extends ComparatorRule {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
-import net.runelite.api.TileItem;
 
 @EqualsAndHashCode(callSuper = false)
 @ToString
@@ -2085,7 +2100,7 @@ public class NotRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         return !inner.test(plugin, item);
     }
 }
@@ -2123,10 +2138,10 @@ public enum FontType {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.ToString;
-import net.runelite.api.TileItem;
 
 import java.util.List;
 
@@ -2147,7 +2162,7 @@ public class ItemIdRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         return ids.stream().anyMatch(it -> item.getId() == it);
     }
 }
@@ -2155,10 +2170,10 @@ public class ItemIdRule extends Rule {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
 import net.runelite.api.ItemID;
-import net.runelite.api.TileItem;
 
 @EqualsAndHashCode(callSuper = false)
 @ToString
@@ -2171,7 +2186,7 @@ public class ItemTradeableRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         if (item.getId() == ItemID.COINS_995 || item.getId() == ItemID.PLATINUM_TOKEN) {
             return target;
         }
@@ -2202,9 +2217,9 @@ public enum ValueType {
 package com.lootfilters.rule;
 
 import com.lootfilters.LootFiltersPlugin;
+import com.lootfilters.model.PluginTileItem;
 import lombok.EqualsAndHashCode;
 import lombok.ToString;
-import net.runelite.api.TileItem;
 
 import java.util.List;
 
@@ -2224,7 +2239,7 @@ public class AndRule extends Rule {
     }
 
     @Override
-    public boolean test(LootFiltersPlugin plugin, TileItem item) {
+    public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
         return rules.stream().allMatch(it -> it.test(plugin, item));
     }
 }
@@ -2562,9 +2577,12 @@ public class Parser {
                         rulesPostfix.add(new AndRule(null));
                     } else if (op.is(OP_OR)) {
                         rulesPostfix.add(new OrRule(null));
-                    } else if (op.is(OP_NOT)) {
-                        rulesPostfix.add(new NotRule(null));
                     }
+                }
+                operators.pop(); // the (
+                if (!operators.isEmpty() && operators.peek().is(OP_NOT)) {
+                    operators.pop();
+                    rulesPostfix.add(new NotRule(null));
                 }
             } else if (it.is(OP_AND)) {
                 operators.push(it);
@@ -2578,6 +2596,10 @@ public class Parser {
                 operators.push(it);
             } else if (it.is(IDENTIFIER)) {
                 rulesPostfix.add(parseRule(it));
+                if (!operators.isEmpty() && operators.peek().is(OP_NOT)) {
+                    operators.pop();
+                    rulesPostfix.add(new NotRule(null));
+                }
             } else {
                 throw new ParseException("unexpected token in expression", it);
             }
@@ -3428,11 +3450,19 @@ import java.time.Instant;
 
 public class PluginTileItem implements TileItem {
     private final TileItem item;
+    @Getter private final String name;
+    @Getter private final int gePrice;
+    @Getter private final int haPrice;
     @Getter private final int spawnTime;
     @Getter private final Instant despawnInstant;
 
     public PluginTileItem(LootFiltersPlugin plugin, TileItem item) {
+        var composition = plugin.getItemManager().getItemComposition(item.getId());
+
         this.item = item;
+        this.name = composition.getName();
+        this.gePrice = plugin.getItemManager().getItemPrice(item.getId());
+        this.haPrice = composition.getHaPrice();
         this.spawnTime = plugin.getClient().getTickCount();
         this.despawnInstant = Instant.now().plusMillis((getDespawnTime() - spawnTime) * 600L);
     }
@@ -3637,6 +3667,7 @@ import com.lootfilters.lang.Parser;
 import com.lootfilters.lang.Preprocessor;
 import com.lootfilters.lang.Sources;
 import com.lootfilters.lang.TokenStream;
+import com.lootfilters.model.PluginTileItem;
 import com.lootfilters.rule.Rule;
 import com.lootfilters.serde.ColorDeserializer;
 import com.lootfilters.serde.ColorSerializer;
@@ -3646,7 +3677,6 @@ import lombok.EqualsAndHashCode;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.ToString;
-import net.runelite.api.TileItem;
 import net.runelite.api.coords.WorldPoint;
 
 import java.awt.Color;
@@ -3724,7 +3754,7 @@ public class LootFilter {
         return ggson.toJson(this);
     }
 
-    public DisplayConfig findMatch(LootFiltersPlugin plugin, TileItem item) {
+    public DisplayConfig findMatch(LootFiltersPlugin plugin, PluginTileItem item) {
         DisplayConfig display = null;
         for (var matcher : matchers) {
             if (!matcher.getRule().test(plugin, item)) {
@@ -3755,6 +3785,7 @@ public class LootFilter {
 
 package com.lootfilters;
 
+import com.lootfilters.model.PluginTileItem;
 import com.lootfilters.rule.AndRule;
 import com.lootfilters.rule.Comparator;
 import com.lootfilters.rule.ItemNameRule;
@@ -3797,7 +3828,7 @@ public class MatcherConfig {
 
     public static MatcherConfig ownershipFilter(boolean enabled) {
         var rule = new Rule("") {
-            @Override public boolean test(LootFiltersPlugin plugin, TileItem item) {
+            @Override public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
                 var accountType = plugin.getClient().getVarbitValue(Varbits.ACCOUNT_TYPE);
                 return enabled && accountType != 0 && item.getOwnership() == TileItem.OWNERSHIP_OTHER;
             }
@@ -3810,7 +3841,7 @@ public class MatcherConfig {
 
     public static MatcherConfig itemSpawnFilter(boolean enabled) {
         var rule = new Rule("") {
-            @Override public boolean test(LootFiltersPlugin plugin, TileItem item) {
+            @Override public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
                 return enabled && item.getOwnership() == TileItem.OWNERSHIP_NONE;
             }
         };
@@ -3822,7 +3853,7 @@ public class MatcherConfig {
 
     public static MatcherConfig showUnmatched(boolean enabled) {
         var rule = new Rule("") {
-            @Override public boolean test(LootFiltersPlugin plugin, TileItem item) {
+            @Override public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
                 return enabled;
             }
         };
@@ -3835,7 +3866,7 @@ public class MatcherConfig {
     public static MatcherConfig valueTier(boolean enabled, int value, Color color, boolean showLootbeam, boolean notify) {
         var inner = new ItemValueRule(value, Comparator.GT_EQ);
         var rule = new Rule("") {
-            @Override public boolean test(LootFiltersPlugin plugin, TileItem item) {
+            @Override public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
                 return enabled && inner.test(plugin, item);
             }
         };
@@ -3853,7 +3884,7 @@ public class MatcherConfig {
                 ? new AndRule(valueRule, new ItemTradeableRule(true))
                 : valueRule;
         var rule = new Rule("") {
-            @Override public boolean test(LootFiltersPlugin plugin, TileItem item) {
+            @Override public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
                 return enabled && inner.test(plugin, item);
             }
         };
@@ -3892,10 +3923,10 @@ public class MatcherConfig {
 
 package com.lootfilters;
 
+import com.lootfilters.model.PluginTileItem;
 import lombok.AllArgsConstructor;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
-import net.runelite.api.TileItem;
 import net.runelite.api.coords.WorldPoint;
 
 import java.awt.Color;
@@ -3929,7 +3960,7 @@ public class MenuEntryComposer {
         entry.setTarget(buildTargetText(item, color));
     }
 
-    public void onMenuOpened() { // collapse
+    public void onClientTick() { // collapse
         var menu = plugin.getClient().getMenu();
         var entries = menu.getMenuEntries();
 
@@ -3952,14 +3983,14 @@ public class MenuEntryComposer {
                 : entry;
     }
 
-    private TileItem getItemForEntry(MenuEntry entry) {
+    private PluginTileItem getItemForEntry(MenuEntry entry) {
         var wv = plugin.getClient().getTopLevelWorldView();
         var point = WorldPoint.fromScene(wv, entry.getParam0(), entry.getParam1(), wv.getPlane());
         return plugin.getTileItemIndex().findItem(point, entry.getIdentifier());
     }
 
-    private String buildTargetText(TileItem item, Color color) {
-        var text = plugin.getItemName(item.getId());
+    private String buildTargetText(PluginTileItem item, Color color) {
+        var text = item.getName();
         if (item.getQuantity() > 1) {
             text += " (" + abbreviate(item.getQuantity()) + ")";
         }
@@ -4562,7 +4593,6 @@ package com.lootfilters;
 
 import com.lootfilters.model.PluginTileItem;
 import net.runelite.api.Tile;
-import net.runelite.api.TileItem;
 import net.runelite.api.coords.WorldPoint;
 
 import java.util.ArrayList;
@@ -4573,15 +4603,13 @@ import java.util.Set;
 
 public class TileItemIndex {
     private final Map<Tile, List<PluginTileItem>> itemIndex = new HashMap<>();
-
-    // Tile instances are not readily available in all contexts,
     private final Map<WorldPoint, Tile> pointIndex = new HashMap<>();
 
     public Set<Map.Entry<Tile, List<PluginTileItem>>> entrySet() {
         return itemIndex.entrySet();
     }
 
-    public TileItem findItem(Tile tile, int id) {
+    public PluginTileItem findItem(Tile tile, int id) {
         if (!itemIndex.containsKey(tile)) {
             return null;
         }
@@ -4592,7 +4620,7 @@ public class TileItemIndex {
                 .orElse(null);
     }
 
-    public TileItem findItem(WorldPoint point, int id) {
+    public PluginTileItem findItem(WorldPoint point, int id) {
         return pointIndex.containsKey(point)
                 ? findItem(pointIndex.get(point), id)
                 : null;
@@ -4807,7 +4835,8 @@ public class LootFilterManager {
 
     public List<LootFilter> loadFilters() {
         var filters = new ArrayList<LootFilter>();
-        for (var file : LootFiltersPlugin.FILTER_DIRECTORY.listFiles()) {
+        var files = LootFiltersPlugin.FILTER_DIRECTORY.listFiles();
+        for (var file : files) {
             String src;
             try {
                 src = Files.readString(file.toPath());
@@ -4834,6 +4863,8 @@ public class LootFilterManager {
 
             filters.add(filter);
         }
+        plugin.addChatMessage(String.format("Reloaded <col=%s>%d/%d</col> loot filters.",
+                filters.size() == files.length ? "00FF00" : "FF0000", filters.size(), files.length));
         return filters;
     }
 
@@ -4955,7 +4986,6 @@ package com.lootfilters;
 
 import com.lootfilters.lang.Lexer;
 import com.lootfilters.lang.Parser;
-import com.lootfilters.lang.TokenStream;
 import com.lootfilters.rule.AndRule;
 import com.lootfilters.rule.Comparator;
 import com.lootfilters.rule.ItemNameRule;
@@ -5016,17 +5046,17 @@ public class ParserTest {
                         DisplayConfig.builder().hidden(true).build()),
                 new MatcherConfig(new NotRule(new ItemNameRule("foo")),
                         DisplayConfig.builder().hidden(true).build()),
-                new MatcherConfig(new OrRule(new NotRule(new ItemNameRule("bar")), new ItemNameRule("foo")),
+                new MatcherConfig(new OrRule(new ItemNameRule("bar"), new NotRule(new ItemNameRule("foo"))),
                         DisplayConfig.builder().hidden(true).build()),
                 new MatcherConfig(
                         new AndRule(
+                                new ItemNameRule("foo"),
                                 new NotRule(
                                         new AndRule(
                                                 new NotRule(new ItemNameRule("baz")),
                                                 new ItemNameRule("bar")
                                         )
-                                ),
-                                new ItemNameRule("foo")
+                                )
                         ),
                         DisplayConfig.builder().hidden(true).build())
         );
