@@ -1,0 +1,1320 @@
+package com.chanceman;
+
+import net.runelite.api.Client;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.callback.ClientThread;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Random;
+import java.util.Queue;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Manages the roll animation for unlocking items.
+ * It processes roll requests asynchronously and handles the roll animation through the overlay.
+ */
+public class RollAnimationManager
+{
+    private final Queue<Integer> rollQueue = new ConcurrentLinkedQueue<>();
+    private final UnlockedItemsManager unlockedManager;
+    private final ChanceManOverlay overlay;
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private volatile boolean isRolling = false;
+    private final int rollDuration = 8000; // Continuous phase duration (ms)
+    private final int highlightDuration = 2000; // Highlight phase (ms)
+    private final List<Integer> allTradeableItems;
+    private final Random random = new Random();
+    private final ItemManager itemManager;
+    private final Client client;
+    private final ChatMessageManager chatMessageManager;
+    private final ChanceManPlugin plugin;
+    private final ClientThread clientThread;
+
+    /**
+     * Constructs a RollAnimationManager.
+     *
+     * @param unlockedManager The manager for unlocked items.
+     * @param overlay The overlay displaying the roll animation.
+     * @param allTradeableItems List of all tradeable item IDs.
+     * @param itemManager The item manager.
+     * @param client The game client.
+     * @param chatMessageManager The chat message manager.
+     * @param plugin The parent plugin.
+     * @param clientThread The client thread for scheduling tasks.
+     */
+    public RollAnimationManager(UnlockedItemsManager unlockedManager, ChanceManOverlay overlay,
+                                List<Integer> allTradeableItems, ItemManager itemManager, Client client,
+                                ChatMessageManager chatMessageManager, ChanceManPlugin plugin,
+                                ClientThread clientThread)
+    {
+        this.unlockedManager = unlockedManager;
+        this.overlay = overlay;
+        this.allTradeableItems = allTradeableItems;
+        this.itemManager = itemManager;
+        this.client = client;
+        this.chatMessageManager = chatMessageManager;
+        this.plugin = plugin;
+        this.clientThread = clientThread;
+    }
+
+    /**
+     * Enqueues an item ID for the roll animation.
+     *
+     * @param itemId The item ID to be rolled.
+     */
+    public void enqueueRoll(int itemId)
+    {
+        rollQueue.offer(itemId);
+    }
+
+    /**
+     * Processes the roll queue by initiating a roll animation if not already rolling.
+     */
+    public void process()
+    {
+        if (!isRolling && !rollQueue.isEmpty())
+        {
+            int queuedItemId = rollQueue.poll();
+            isRolling = true;
+            executor.submit(() -> performRoll(queuedItemId));
+        }
+    }
+
+    /**
+     * Performs the roll animation, unlocking the final item and sending a chat message.
+     */
+    private void performRoll(int queuedItemId)
+    {
+        overlay.startRollAnimation(0, rollDuration, this::getRandomLockedItem);
+        try {
+            Thread.sleep(rollDuration + highlightDuration);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        int finalRolledItem = overlay.getFinalItem();
+        unlockedManager.unlockItem(finalRolledItem);
+        // Using clientThread.invoke since the chat message queue is thread-safe
+        clientThread.invoke(() -> {
+            String message = new ChatMessageBuilder()
+                    .append(ChatColorType.HIGHLIGHT)
+                    .append("Unlocked " + plugin.getItemName(finalRolledItem) + " by rolling " +
+                            plugin.getItemName(queuedItemId))
+                    .build();
+            chatMessageManager.queue(QueuedMessage.builder()
+                    .type(net.runelite.api.ChatMessageType.GAMEMESSAGE)
+                    .runeLiteFormattedMessage(message)
+                    .build());
+        });
+        isRolling = false;
+    }
+
+    /**
+     * Checks if a roll animation is currently in progress.
+     *
+     * @return true if a roll is in progress, false otherwise.
+     */
+    public boolean isRolling() {
+        return isRolling;
+    }
+
+    /**
+     * Retrieves a random locked item from the list of tradeable items.
+     *
+     * @return A random locked item ID, or a fallback if all items are unlocked.
+     */
+    public int getRandomLockedItem()
+    {
+        List<Integer> locked = new ArrayList<>();
+        for (int id : allTradeableItems)
+        {
+            if (!unlockedManager.isUnlocked(id))
+            {
+                locked.add(id);
+            }
+        }
+        if (locked.isEmpty())
+        {
+            int fallback = overlay.getFinalItem();
+            return fallback;
+        }
+        int selected = locked.get(random.nextInt(locked.size()));
+        return selected;
+    }
+
+    /**
+     * Shuts down the roll animation executor service.
+     */
+    public void shutdown()
+    {
+        executor.shutdownNow();
+    }
+}
+
+package com.chanceman;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+
+/**
+ * Manages the set of rolled items.
+ * This class persists the rolled item IDs to a JSON file so that rolled items remain tracked across sessions.
+ */
+@Slf4j
+public class RolledItemsManager
+{
+    private final Set<Integer> rolledItems = Collections.synchronizedSet(new HashSet<>());
+    private final String filePath;
+    private final Gson gson;
+    private final ExecutorService executor;
+
+    /**
+     * Constructs a RolledItemsManager for a given player.
+     *
+     * @param playerName The player's name.
+     */
+    public RolledItemsManager(String playerName, Gson gson, ExecutorService executor)
+    {
+        this.gson = gson;
+        this.executor = executor;
+        filePath = RuneLite.RUNELITE_DIR + File.separator +
+                "chanceman" + File.separator +
+                playerName + File.separator +
+                "chanceman_rolled.json";
+    }
+
+
+    /**
+     * Checks if an item has been rolled.
+     *
+     * @param itemId The item ID.
+     * @return true if the item has been rolled, false otherwise.
+     */
+    public boolean isRolled(int itemId)
+    {
+        return rolledItems.contains(itemId);
+    }
+
+    /**
+     * Marks an item as rolled and saves the state.
+     *
+     * @param itemId The item ID to mark as rolled.
+     */
+    public void markRolled(int itemId)
+    {
+        rolledItems.add(itemId);
+        saveRolledItems();
+    }
+
+    /**
+     * Loads the set of rolled items from the JSON file.
+     */
+    public void loadRolledItems()
+    {
+        executor.submit(() -> {
+            File file = new File(filePath);
+            if (!file.exists())
+            {
+                file.getParentFile().mkdirs();
+                return;
+            }
+            try (FileReader reader = new FileReader(file))
+            {
+                Type setType = new TypeToken<Set<Integer>>() {}.getType();
+                Set<Integer> loaded = gson.fromJson(reader, setType);
+                if (loaded != null)
+                {
+                    rolledItems.addAll(loaded);
+                }
+            }
+            catch (IOException e)
+            {
+                log.error("Error loading rolled items", e);
+            }
+        });
+    }
+
+    /**
+     * Saves the current set of rolled items to the JSON file.
+     */
+    public synchronized void saveRolledItems()
+    {
+        executor.submit(() -> {
+            File file = new File(filePath);
+            file.getParentFile().mkdirs();
+            try (FileWriter writer = new FileWriter(file))
+            {
+                gson.toJson(rolledItems, writer);
+            }
+            catch (IOException e)
+            {
+                log.error("Error saving rolled items", e);
+            }
+        });
+    }
+
+    /**
+     * Retrieves an unmodifiable set of rolled item IDs.
+     *
+     * @return An unmodifiable set of rolled item IDs.
+     */
+    public Set<Integer> getRolledItems()
+    {
+        return Collections.unmodifiableSet(rolledItems);
+    }
+}
+
+package com.chanceman;
+
+import com.google.gson.Gson;
+import net.runelite.api.Client;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.WorldType;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ItemSpawned;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.TileItem;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.eventbus.Subscribe;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.image.BufferedImage;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * ChanceManPlugin locks tradeable items until unlocked via a random roll.
+ * It handles the initialization of managers for rolled and unlocked items,
+ * as well as the UI overlay and panel.
+ */
+@PluginDescriptor(
+        name = "ChanceMan",
+        description = "Locks tradeable items until unlocked via a random roll.",
+        tags = {"osrs", "chance", "roll", "lock", "unlock"}
+)
+public class ChanceManPlugin extends Plugin
+{
+    @Inject
+    private Client client;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private ClientToolbar clientToolbar;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private ChatMessageManager chatMessageManager;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private ChanceManOverlay chanceManOverlay;
+
+    @Inject
+    private Gson gson;
+
+    private UnlockedItemsManager unlockedItemsManager;
+    private RolledItemsManager rolledItemsManager;
+    private RollAnimationManager rollAnimationManager;
+
+    private ChanceManPanel chanceManPanel;
+    private NavigationButton navButton;
+
+    private ExecutorService fileExecutor;
+
+    // List of tradeable item IDs (excluding coins)
+    private final List<Integer> allTradeableItems = new ArrayList<>();
+
+    @Override
+    protected void startUp() throws Exception
+    {
+        if (!isNormalWorld())
+        {
+            return;
+        }
+
+        fileExecutor = Executors.newSingleThreadExecutor();
+
+        clientThread.invokeLater(() -> {
+            for (int i = 0; i < 30000; i++)
+            {
+                ItemComposition comp = itemManager.getItemComposition(i);
+                if (comp != null && comp.isTradeable() && i != 995)
+                {
+                    allTradeableItems.add(i);
+                }
+            }
+        });
+        // Managers and UI will be initialized in onGameTick.
+    }
+
+    @Override
+    protected void shutDown() throws Exception
+    {
+        if (clientToolbar != null && navButton != null)
+        {
+            clientToolbar.removeNavigation(navButton);
+        }
+        if (overlayManager != null)
+        {
+            overlayManager.remove(chanceManOverlay);
+        }
+        if (rollAnimationManager != null)
+        {
+            rollAnimationManager.shutdown();
+        }
+        if (fileExecutor != null)
+        {
+            fileExecutor.shutdownNow();
+        }
+    }
+
+    /**
+     * Processes game ticks, initializing managers and UI when the local player is available,
+     * updating the roll animation.
+     *
+     * @param event The game tick event.
+     */
+    @Subscribe
+    public void onGameTick(GameTick event)
+    {
+        if (client.getLocalPlayer() != null && chanceManPanel == null)
+        {
+            String playerName = client.getLocalPlayer().getName();
+            unlockedItemsManager = new UnlockedItemsManager(playerName, gson, fileExecutor);
+            unlockedItemsManager.loadUnlockedItems();
+
+            rolledItemsManager = new RolledItemsManager(playerName, gson, fileExecutor);
+            rolledItemsManager.loadRolledItems();
+
+            rollAnimationManager = new RollAnimationManager(
+                    unlockedItemsManager,
+                    chanceManOverlay,
+                    allTradeableItems,
+                    itemManager,
+                    client,
+                    chatMessageManager,
+                    this,
+                    clientThread
+            );
+
+            chanceManPanel = new ChanceManPanel(unlockedItemsManager, rolledItemsManager, itemManager, allTradeableItems, clientThread, rollAnimationManager);
+
+            BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/net/runelite/client/plugins/chanceman/icon.png");
+            navButton = NavigationButton.builder()
+                    .tooltip("ChanceMan")
+                    .icon(icon)
+                    .priority(5)
+                    .panel(chanceManPanel)
+                    .build();
+            clientToolbar.addNavigation(navButton);
+            overlayManager.add(chanceManOverlay);
+        }
+
+        if (rollAnimationManager != null)
+        {
+            rollAnimationManager.process();
+        }
+
+        if (chanceManPanel != null)
+        {
+            SwingUtilities.invokeLater(() -> chanceManPanel.updatePanel());
+        }
+    }
+
+    /**
+     * Handles the event when an item spawns on the ground.
+     * If the item has not been rolled (by item ID), it enqueues a roll.
+     *
+     * @param event The item spawned event.
+     */
+    @Subscribe
+    public void onItemSpawned(ItemSpawned event)
+    {
+        if (!isNormalWorld())
+        {
+            return;
+        }
+        TileItem tileItem = (TileItem) event.getItem();
+        int itemId = tileItem.getId();
+        if (!isTradeable(itemId) || isCoin(itemId))
+        {
+            return;
+        }
+        if (tileItem.getOwnership() != TileItem.OWNERSHIP_SELF)
+        {
+            return;
+        }
+        // Use the item ID as the unique key.
+        if (!rolledItemsManager.isRolled(itemId))
+        {
+            if (rollAnimationManager != null)
+            {
+                rollAnimationManager.enqueueRoll(itemId);
+            }
+            rolledItemsManager.markRolled(itemId);
+        }
+    }
+
+    /**
+     * Handles inventory changes. When items are added to the inventory,
+     * this method checks for items (by item ID) that have not been rolled and enqueues a roll.
+     *
+     * @param event The item container changed event.
+     */
+    @Subscribe
+    public void onItemContainerChanged(ItemContainerChanged event)
+    {
+        // Check if the rolledItemsManager is initialized; if not, skip processing.
+        if (rolledItemsManager == null)
+        {
+            return;
+        }
+
+        if (event.getContainerId() == 93)
+        {
+            Set<Integer> processed = new HashSet<>();
+            for (net.runelite.api.Item item : event.getItemContainer().getItems())
+            {
+                int itemId = item.getId();
+                if (!isTradeable(itemId) || isCoin(itemId))
+                {
+                    continue;
+                }
+                if (!processed.contains(itemId) && !rolledItemsManager.isRolled(itemId))
+                {
+                    if (rollAnimationManager != null)
+                    {
+                        rollAnimationManager.enqueueRoll(itemId);
+                    }
+                    rolledItemsManager.markRolled(itemId);
+                    processed.add(itemId);
+                }
+            }
+        }
+    }
+
+    /**
+     * Handles menu option clicks.
+     * For ground items, it consumes actions if the item is locked.
+     * For inventory items, if the item is locked, only the "examine" and "drop" actions are allowed.
+     *
+     * @param event The menu option clicked event.
+     */
+    @Subscribe
+    public void onMenuOptionClicked(net.runelite.api.events.MenuOptionClicked event)
+    {
+        String option = event.getMenuEntry().getOption().toLowerCase();
+
+        // Handle ground item actions.
+        if (event.getMenuAction() != null &&
+                (event.getMenuAction().toString().contains("GROUND_ITEM") ||
+                        option.contains("take") || option.contains("pick-up") || option.contains("pickup")))
+        {
+            int groundItemId = event.getId() != -1 ? event.getId() : event.getMenuEntry().getItemId();
+            if (isTradeable(groundItemId) && !isCoin(groundItemId)
+                    && unlockedItemsManager != null && !unlockedItemsManager.isUnlocked(groundItemId))
+            {
+                event.consume();
+                return;
+            }
+        }
+
+        // Handle inventory item actions.
+        if (event.getMenuEntry().getItemId() != -1)
+        {
+            int itemId = event.getMenuEntry().getItemId();
+            String itemName = getItemName(itemId).toLowerCase();
+
+            // Skip non-tradeable items, coins, coin pouches, and clue scrolls.
+            if (!isTradeable(itemId)
+                    || isCoin(itemId)
+                    || itemName.contains("coin pouch")
+                    || itemName.contains("clue scroll"))
+            {
+                return;
+            }
+
+            // For locked inventory items, allow only "examine" and "drop" actions.
+            if (unlockedItemsManager != null && !unlockedItemsManager.isUnlocked(itemId))
+            {
+                if (!option.equals("examine") && !option.equals("drop"))
+                {
+                    event.consume();
+                }
+            }
+        }
+    }
+
+    private boolean isNormalWorld()
+    {
+        EnumSet<WorldType> worldTypes = client.getWorldType();
+        return !(worldTypes.contains(WorldType.DEADMAN)
+                || worldTypes.contains(WorldType.SEASONAL)
+                || worldTypes.contains(WorldType.HIGH_RISK)
+                || worldTypes.contains(WorldType.PVP));
+    }
+
+    private boolean isTradeable(int itemId)
+    {
+        ItemComposition comp = itemManager.getItemComposition(itemId);
+        return comp != null && comp.isTradeable();
+    }
+
+    private boolean isCoin(int itemId)
+    {
+        return itemId == 995;
+    }
+
+    public String getItemName(int itemId)
+    {
+        ItemComposition comp = itemManager.getItemComposition(itemId);
+        return comp != null ? comp.getName() : "Unknown";
+    }
+}
+
+package com.chanceman;
+
+import net.runelite.api.ItemComposition;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.PluginPanel;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+import java.awt.image.BufferedImage;
+import java.util.*;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+
+/**
+ * Panel for displaying rolled and unlocked items.
+ * It provides UI for manual roll actions and displays item icons.
+ */
+public class ChanceManPanel extends PluginPanel
+{
+    private final UnlockedItemsManager unlockedItemsManager;
+    private final RolledItemsManager rolledItemsManager;
+    private final ItemManager itemManager;
+    private final List<Integer> allTradeableItems;
+    private final Random random = new Random();
+    private final ClientThread clientThread;
+    private final RollAnimationManager rollAnimationManager;
+
+    // Cache item images to prevent redundant fetching
+    private final Map<Integer, ImageIcon> itemIconCache = new HashMap<>();
+
+    // Panels for displaying icons (their content scrolls via individual scroll panes)
+    private final JPanel rolledPanel = new JPanel();
+    private final JPanel unlockedPanel = new JPanel();
+    private final JButton rollButton = new JButton("Roll");
+
+    // Holds the search text
+    private String searchText = "";
+
+    /**
+     * Constructs a ChanceManPanel.
+     *
+     * @param unlockedItemsManager Manager for unlocked items.
+     * @param rolledItemsManager   Manager for rolled items.
+     * @param itemManager          The item manager.
+     * @param allTradeableItems    List of all tradeable item IDs.
+     * @param clientThread         The client thread for scheduling UI updates.
+     * @param rollAnimationManager The roll animation manager to trigger animations.
+     */
+    public ChanceManPanel(
+            UnlockedItemsManager unlockedItemsManager,
+            RolledItemsManager rolledItemsManager,
+            ItemManager itemManager,
+            List<Integer> allTradeableItems,
+            ClientThread clientThread,
+            RollAnimationManager rollAnimationManager
+    )
+    {
+        this.unlockedItemsManager = unlockedItemsManager;
+        this.rolledItemsManager = rolledItemsManager;
+        this.itemManager = itemManager;
+        this.allTradeableItems = allTradeableItems;
+        this.clientThread = clientThread;
+        this.rollAnimationManager = rollAnimationManager;
+        init();
+    }
+
+    /**
+     * Initializes the panel UI components.
+     */
+    private void init()
+    {
+        // Use BorderLayout so that header, search bar, and Roll button remain fixed.
+        setLayout(new BorderLayout(0, 0));
+        setBorder(new EmptyBorder(10, 10, 10, 10));
+        setBackground(new Color(45, 45, 45));
+
+        // Header at the top (NORTH)
+        JPanel headerPanel = buildHeaderPanel();
+
+        // Search bar for filtering items
+        JPanel searchBarPanel = buildSearchBar();
+
+        // Combine header and search bar into a top panel
+        JPanel topPanel = new JPanel();
+        topPanel.setLayout(new BoxLayout(topPanel, BoxLayout.Y_AXIS));
+        topPanel.setBackground(getBackground());
+        topPanel.add(headerPanel);
+        topPanel.add(searchBarPanel);
+        add(topPanel, BorderLayout.NORTH);
+
+        // Center: a panel with two columns side by side (rolled & unlocked)
+        // Each column is wrapped in its own JScrollPane so that only the column scrolls.
+        JPanel columnsPanel = new JPanel(new GridLayout(1, 2, 10, 10));
+        columnsPanel.setBackground(getBackground());
+
+        // Configure the rolled panel
+        rolledPanel.setLayout(new BoxLayout(rolledPanel, BoxLayout.Y_AXIS));
+        rolledPanel.setBackground(Color.DARK_GRAY);
+        JScrollPane rolledScrollPane = new JScrollPane(
+                rolledPanel,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
+                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+        );
+        // Optionally set a preferred size on the scroll pane (e.g., width)
+        rolledScrollPane.setPreferredSize(new Dimension(150, 300));
+
+        // Rolled container with titled border
+        JPanel rolledContainer = new JPanel(new BorderLayout());
+        rolledContainer.setBorder(BorderFactory.createTitledBorder("Rolled Items"));
+        rolledContainer.setBackground(getBackground());
+        rolledContainer.add(rolledScrollPane, BorderLayout.CENTER);
+
+        // Configure the unlocked panel
+        unlockedPanel.setLayout(new BoxLayout(unlockedPanel, BoxLayout.Y_AXIS));
+        unlockedPanel.setBackground(Color.DARK_GRAY);
+        JScrollPane unlockedScrollPane = new JScrollPane(
+                unlockedPanel,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
+                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+        );
+        unlockedScrollPane.setPreferredSize(new Dimension(150, 300));
+
+        // Unlocked container with titled border
+        JPanel unlockedContainer = new JPanel(new BorderLayout());
+        unlockedContainer.setBorder(BorderFactory.createTitledBorder("Unlocked Items"));
+        unlockedContainer.setBackground(getBackground());
+        unlockedContainer.add(unlockedScrollPane, BorderLayout.CENTER);
+
+        // Add both containers to the columns panel
+        columnsPanel.add(rolledContainer);
+        columnsPanel.add(unlockedContainer);
+        add(columnsPanel, BorderLayout.CENTER);
+
+        // Roll button at the bottom (SOUTH)
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
+        buttonPanel.setBackground(getBackground());
+        rollButton.addActionListener(this::performManualRoll);
+        buttonPanel.add(rollButton);
+        add(buttonPanel, BorderLayout.SOUTH);
+
+        // Populate the UI
+        updatePanel();
+    }
+
+    /**
+     * Builds the header panel with icon and title.
+     */
+    private JPanel buildHeaderPanel()
+    {
+        JPanel headerPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        headerPanel.setBackground(getBackground());
+
+        ImageIcon headerIcon = new ImageIcon(getClass().getResource("/net/runelite/client/plugins/chanceman/icon.png"));
+        JLabel iconLabel = new JLabel(headerIcon);
+
+        JLabel titleLabel = new JLabel("Chance Man");
+        titleLabel.setFont(new Font("SansSerif", Font.BOLD, 16));
+        titleLabel.setForeground(new Color(200, 200, 200));
+
+        headerPanel.add(iconLabel);
+        headerPanel.add(titleLabel);
+        return headerPanel;
+    }
+
+    /**
+     * Builds the search bar panel
+     */
+    private JPanel buildSearchBar()
+    {
+        JPanel searchBarPanel = new JPanel(new BorderLayout());
+        searchBarPanel.setBackground(new Color(45, 45, 45));
+        searchBarPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+
+        // Create a container for the search icon and search field
+        JPanel searchContainer = new JPanel(new BorderLayout());
+        searchContainer.setBackground(new Color(30, 30, 30));
+        searchContainer.setBorder(BorderFactory.createEmptyBorder(2, 5, 2, 5));
+
+        // Search icon
+        JLabel searchIcon = new JLabel("🔍");
+        searchIcon.setForeground(new Color(200, 200, 200));
+        searchIcon.setBorder(new EmptyBorder(0, 5, 0, 5));
+
+        // Search field
+        JTextField searchField = new JTextField();
+        searchField.setBackground(new Color(30, 30, 30));
+        searchField.setForeground(Color.LIGHT_GRAY);
+        searchField.setBorder(BorderFactory.createEmptyBorder(0, 5, 0, 5));
+        searchField.setCaretColor(Color.LIGHT_GRAY);
+
+        // Listen for key releases to trigger real-time filtering
+        searchField.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyReleased(KeyEvent e) {
+                SwingUtilities.invokeLater(() -> {
+                    searchText = searchField.getText().toLowerCase();
+                    updatePanel();
+                });
+            }
+        });
+
+        searchContainer.add(searchIcon, BorderLayout.WEST);
+        searchContainer.add(searchField, BorderLayout.CENTER);
+        searchBarPanel.add(searchContainer, BorderLayout.CENTER);
+
+        return searchBarPanel;
+    }
+
+    /**
+     * Triggers a manual roll animation when the Roll button is clicked.
+     * If a roll is already in progress or if there are no locked items, it does nothing.
+     *
+     * @param e The action event.
+     */
+    private void performManualRoll(java.awt.event.ActionEvent e)
+    {
+        // Prevent triggering if a roll is already in progress.
+        if (rollAnimationManager.isRolling())
+        {
+            return;
+        }
+
+        // Get list of locked items.
+        List<Integer> locked = allTradeableItems.stream()
+                .filter(id -> !unlockedItemsManager.isUnlocked(id))
+                .collect(Collectors.toList());
+
+        if (locked.isEmpty())
+        {
+            JOptionPane.showMessageDialog(
+                    this,
+                    "All items are unlocked!",
+                    "ChanceMan",
+                    JOptionPane.INFORMATION_MESSAGE
+            );
+            return;
+        }
+
+        // Choose a random locked item.
+        int randomItemId = locked.get(random.nextInt(locked.size()));
+
+        // Enqueue a roll request for this item.
+        rollAnimationManager.enqueueRoll(randomItemId);
+    }
+
+    /**
+     * Updates the panel UI with the current rolled and unlocked items.
+     * This method fetches item definitions on the client thread to avoid thread errors,
+     * then updates the UI on the Swing thread.
+     */
+    public void updatePanel()
+    {
+        clientThread.invokeLater(() -> {
+            List<Integer> filteredRolled = new ArrayList<>();
+            for (Integer id : rolledItemsManager.getRolledItems())
+            {
+                ItemComposition comp = itemManager.getItemComposition(id);
+                if (comp != null)
+                {
+                    String name = comp.getName().toLowerCase();
+                    if (searchText.isEmpty() || name.contains(searchText))
+                    {
+                        filteredRolled.add(id);
+                    }
+                }
+            }
+            List<Integer> filteredUnlocked = new ArrayList<>();
+            for (Integer id : unlockedItemsManager.getUnlockedItems())
+            {
+                ItemComposition comp = itemManager.getItemComposition(id);
+                if (comp != null)
+                {
+                    String name = comp.getName().toLowerCase();
+                    if (searchText.isEmpty() || name.contains(searchText))
+                    {
+                        filteredUnlocked.add(id);
+                    }
+                }
+            }
+            // Update UI on the Swing thread
+            SwingUtilities.invokeLater(() -> {
+                rolledPanel.removeAll();
+                for (Integer id : filteredRolled)
+                {
+                    ImageIcon icon = getItemIcon(id);
+                    if (icon != null)
+                    {
+                        JLabel label = new JLabel(icon);
+                        label.setToolTipText("Loading...");
+                        rolledPanel.add(label);
+                        getItemNameAsync(id, name -> {
+                            label.setToolTipText(name);
+                            label.repaint();
+                        });
+                    }
+                }
+                unlockedPanel.removeAll();
+                for (Integer id : filteredUnlocked)
+                {
+                    ImageIcon icon = getItemIcon(id);
+                    if (icon != null)
+                    {
+                        JLabel label = new JLabel(icon);
+                        label.setToolTipText("Loading...");
+                        unlockedPanel.add(label);
+                        getItemNameAsync(id, name -> {
+                            label.setToolTipText(name);
+                            label.repaint();
+                        });
+                    }
+                }
+                rolledPanel.revalidate();
+                rolledPanel.repaint();
+                unlockedPanel.revalidate();
+                unlockedPanel.repaint();
+            });
+        });
+    }
+
+    /**
+     * Retrieves the item icon for a given item ID, caching the result.
+     *
+     * @param itemId The item ID.
+     * @return The ImageIcon of the item, or null if not available.
+     */
+    private ImageIcon getItemIcon(int itemId)
+    {
+        if (itemIconCache.containsKey(itemId))
+        {
+            return itemIconCache.get(itemId);
+        }
+
+        BufferedImage image = itemManager.getImage(itemId, 1, false);
+        if (image == null)
+        {
+            return null;
+        }
+
+        ImageIcon icon = new ImageIcon(image);
+        itemIconCache.put(itemId, icon);
+        return icon;
+    }
+
+    /**
+     * Asynchronously retrieves the item name for a given item ID and passes it to the provided callback.
+     *
+     * @param itemId   The item ID.
+     * @param callback Consumer to receive the item name.
+     */
+    private void getItemNameAsync(int itemId, Consumer<String> callback)
+    {
+        clientThread.invokeLater(() -> {
+            ItemComposition comp = itemManager.getItemComposition(itemId);
+            String name = (comp != null) ? comp.getName() : "Unknown";
+            SwingUtilities.invokeLater(() -> callback.accept(name));
+        });
+    }
+}
+
+package com.chanceman;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+
+import java.io.File;
+import java.io.FileReader;
+import java.io.FileWriter;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+/**
+ * Manages the set of unlocked items.
+ * This class persists the unlocked item IDs to a JSON file so that items remain unlocked across sessions.
+ * It uses an asynchronous executor for saving the data.
+ */
+@Slf4j
+public class UnlockedItemsManager
+{
+    private final Set<Integer> unlockedItems = Collections.synchronizedSet(new HashSet<>());
+    private final String filePath;
+    private final Gson gson;
+    private final ExecutorService executor;
+
+    /**
+     * Constructs an UnlockedItemsManager for a given player.
+     *
+     * @param playerName The player's name.
+     */
+    public UnlockedItemsManager(String playerName, Gson gson, ExecutorService executor)
+    {
+        this.gson = gson;
+        this.executor = executor;
+        filePath = RuneLite.RUNELITE_DIR + File.separator +
+                "chanceman" + File.separator +
+                playerName + File.separator +
+                "chanceman_unlocked.json";
+    }
+
+    /**
+     * Checks if an item is unlocked.
+     *
+     * @param itemId The item ID.
+     * @return true if the item is unlocked, false otherwise.
+     */
+    public boolean isUnlocked(int itemId)
+    {
+        return unlockedItems.contains(itemId);
+    }
+
+    /**
+     * Unlocks an item and saves the state.
+     *
+     * @param itemId The item ID to unlock.
+     */
+    public void unlockItem(int itemId)
+    {
+        unlockedItems.add(itemId);
+        saveUnlockedItems();
+    }
+
+    /**
+     * Loads the set of unlocked items from the JSON file.
+     */
+    public void loadUnlockedItems()
+    {
+        executor.submit(() -> {
+            File file = new File(filePath);
+            if (!file.exists())
+            {
+                file.getParentFile().mkdirs();
+                return;
+            }
+            try (FileReader reader = new FileReader(file))
+            {
+                Type setType = new TypeToken<Set<Integer>>() {}.getType();
+                Set<Integer> loaded = gson.fromJson(reader, setType);
+                if (loaded != null)
+                {
+                    unlockedItems.addAll(loaded);
+                }
+            }
+            catch (IOException e)
+            {
+                log.error("Error loading unlocked items", e);
+            }
+        });
+    }
+
+    /**
+     * Saves the current set of unlocked items asynchronously to the JSON file.
+     */
+    public synchronized void saveUnlockedItems()
+    {
+        executor.submit(() -> {
+            File file = new File(filePath);
+            file.getParentFile().mkdirs();
+            try (FileWriter writer = new FileWriter(file))
+            {
+                gson.toJson(unlockedItems, writer);
+            }
+            catch (IOException e)
+            {
+                log.error("Error saving unlocked items", e);
+            }
+        });
+    }
+
+    /**
+     * Retrieves an unmodifiable set of unlocked item IDs.
+     *
+     * @return An unmodifiable set of unlocked item IDs.
+     */
+    public Set<Integer> getUnlockedItems()
+    {
+        return Collections.unmodifiableSet(unlockedItems);
+    }
+}
+
+package com.chanceman;
+
+import net.runelite.api.Client;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.awt.geom.RoundRectangle2D;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
+import java.util.function.Supplier;
+
+/**
+ * Overlay for displaying the roll animation.
+ * It renders a scrolling set of item icons and highlights the final item.
+ */
+public class ChanceManOverlay extends Overlay
+{
+    private final Client client;
+    private final ItemManager itemManager;
+
+    // Animation state
+    private volatile boolean isAnimating = false;
+    private long rollDuration;             // spin duration (ms)
+    private long highlightDuration = 2000; // highlight duration (ms)
+    private long rollStartTime = 0;
+
+    // Spin parameters
+    private float rollOffset = 0f;
+    private float currentSpeed;
+    private final float initialSpeed = 1200f;   // start speed (px/sec)
+    private final float deceleration = 900f;    // px/sec^2
+    private final float minSpeed = 300f;        // never go below this speed
+
+    // Icon layout
+    private final int iconCount = 5;
+    private final int iconWidth = 32;
+    private final int iconHeight = 32;
+    private final int spacing = 5;
+
+    // Extra width so icons don't spill out mid-scroll
+    private final int extraWidthBuffer = 17;
+
+    // Overall bounding box padding (internal margin)
+    private final int outerPad = 5;
+
+    // Vertical offset from the top of the 3D viewport
+    private final int offsetFromTop = 20;
+
+    // Shift the entire background box left by 20 pixels
+    private final int boxShift = -20;
+
+    // For drawing the background
+    private final int cornerRadius = 10;
+    private final float borderStrokeWidth = 2f;
+
+    // List of rolling items (synchronized for thread safety)
+    private final List<Integer> rollingItems = Collections.synchronizedList(new ArrayList<>());
+    private Supplier<Integer> randomLockedItemSupplier;
+
+    @Inject
+    public ChanceManOverlay(Client client, ItemManager itemManager)
+    {
+        this.client = client;
+        this.itemManager = itemManager;
+        setPosition(OverlayPosition.DYNAMIC);
+        setLayer(OverlayLayer.ABOVE_WIDGETS);
+    }
+
+    /**
+     * Starts the roll animation.
+     *
+     * @param dummy Unused parameter.
+     * @param rollDurationMs The duration of the roll phase in milliseconds.
+     * @param randomLockedItemSupplier Supplier for obtaining random locked items.
+     */
+    public void startRollAnimation(int dummy, int rollDurationMs, Supplier<Integer> randomLockedItemSupplier)
+    {
+        this.rollDuration = rollDurationMs;
+        this.rollStartTime = System.currentTimeMillis();
+        this.rollOffset = 0f;
+        this.currentSpeed = initialSpeed;
+        this.randomLockedItemSupplier = randomLockedItemSupplier;
+        this.isAnimating = true;
+
+        synchronized (rollingItems) {
+            rollingItems.clear();
+            for (int i = 0; i < iconCount; i++)
+            {
+                rollingItems.add(randomLockedItemSupplier.get());
+            }
+        }
+    }
+
+    /**
+     * Retrieves the final item ID based on the center icon after the roll animation finishes.
+     *
+     * @return The final item ID.
+     */
+    public int getFinalItem()
+    {
+        synchronized (rollingItems) {
+            int centerIndex = iconCount / 2;
+            if (rollingItems.size() > centerIndex)
+            {
+                return rollingItems.get(centerIndex);
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Renders the roll animation overlay.
+     *
+     * @param g The graphics context.
+     * @return null (no preferred size).
+     */
+    @Override
+    public Dimension render(Graphics2D g)
+    {
+        if (!isAnimating)
+        {
+            return null;
+        }
+
+        g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        g.setRenderingHint(RenderingHints.KEY_INTERPOLATION, RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+
+        long now = System.currentTimeMillis();
+        long elapsed = now - rollStartTime;
+        boolean inHighlightPhase = (elapsed > rollDuration);
+
+        if (elapsed > rollDuration + highlightDuration)
+        {
+            isAnimating = false;
+            return null;
+        }
+
+        int vpX = client.getViewportXOffset();
+        int vpY = client.getViewportYOffset();
+        int vpWidth = client.getViewportWidth();
+        int centerX = vpX + (vpWidth / 2);
+        int boxTopY = vpY + offsetFromTop;
+
+        int totalIconsWidth = iconCount * iconWidth + (iconCount - 1) * spacing;
+        int totalWidthWithBuffer = totalIconsWidth + extraWidthBuffer;
+        int boxWidth = totalWidthWithBuffer + outerPad * 2;
+        int boxHeight = iconHeight + outerPad * 2;
+        int boxLeftX = centerX - (boxWidth / 2) + boxShift;
+
+        Shape backgroundRect = new RoundRectangle2D.Float(
+                boxLeftX, boxTopY, boxWidth, boxHeight,
+                cornerRadius, cornerRadius
+        );
+        g.setColor(new Color(0, 0, 0, 180));
+        g.fill(backgroundRect);
+        g.setColor(new Color(0, 0, 0, 255));
+        g.setStroke(new BasicStroke(borderStrokeWidth));
+        g.draw(backgroundRect);
+
+        synchronized (rollingItems) {
+            if (!inHighlightPhase)
+            {
+                float dt = 1f / 60f;
+                rollOffset += currentSpeed * dt;
+                currentSpeed = Math.max(currentSpeed - deceleration * dt, minSpeed);
+
+                if (rollOffset >= (iconWidth + spacing))
+                {
+                    rollOffset -= (iconWidth + spacing);
+                    if (!rollingItems.isEmpty())
+                    {
+                        rollingItems.remove(0);
+                    }
+                    rollingItems.add(randomLockedItemSupplier.get());
+                }
+            }
+
+            int iconsLeftX = centerX - (totalIconsWidth / 2);
+            int iconsY = boxTopY + outerPad;
+            for (int i = 0; i < rollingItems.size(); i++)
+            {
+                int itemId = rollingItems.get(i);
+                BufferedImage image = itemManager.getImage(itemId, 1, false);
+                if (image != null)
+                {
+                    int drawX = (int) (iconsLeftX + i * (iconWidth + spacing) - rollOffset);
+                    g.drawImage(image, drawX, iconsY, iconWidth, iconHeight, null);
+                }
+            }
+
+            if (inHighlightPhase)
+            {
+                int centerIndex = iconCount / 2;
+                int highlightX = (int) (iconsLeftX + centerIndex * (iconWidth + spacing) - rollOffset);
+                g.setColor(Color.YELLOW);
+                g.setStroke(new BasicStroke(3f));
+                g.drawRect(highlightX, iconsY, iconWidth, iconHeight);
+            }
+        }
+        return null;
+    }
+}
+
+package com.chanceman;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ExamplePluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ChanceManPlugin.class);
+		RuneLite.main(args);
+	}
+}
