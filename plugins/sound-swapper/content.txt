@@ -263,7 +263,7 @@ public class SoundSwapperPlugin extends Plugin
             }
         }
 
-        if (config.consumeAreaSounds() || blacklistedSounds.contains(soundId))
+        if (config.consumeAreaSounds() || blacklistedAreaSounds.contains(soundId))
         {
             if (!whitelistedAreaSounds.isEmpty() && whitelistedAreaSounds.contains(soundId))
             {
