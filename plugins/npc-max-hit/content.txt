@@ -1,0 +1,833 @@
+package com.npcmaxhit;
+
+import com.google.inject.Provides;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.Hitsplat;
+import net.runelite.api.NPC;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.HitsplatApplied;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.SpriteManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
+
+@Slf4j
+@PluginDescriptor(
+	name = "NPC Max Hit",
+	description = "Displays the max hits of the NPC you are fighting",
+	tags = {"maxhit", "monster", "boss", "npc", "opponent", "hit", "damage", "overlay", "combat", "pvm", "pve", "max hit", "infobox"}
+)
+public class NpcMaxHitPlugin extends Plugin
+{
+	private Actor player;
+	private long lastHitsplatTime = 0;
+	private ExecutorService executor;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private WikiService wikiService;
+
+	@Inject
+	private NpcMaxHitOverlay overlay;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private NpcMaxHitConfig config;
+
+	@Inject
+	private InfoBoxManager infoBoxManager;
+
+	@Inject
+	private SpriteManager spriteManager;
+
+	private NpcMaxHitInfoBox infoBox;
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		executor = Executors.newSingleThreadExecutor();
+		overlay.updateNpcDataList(List.of());
+		overlayManager.add(overlay);
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		shutdownExecutor();
+		overlayManager.remove(overlay);
+		overlay.updateNpcDataList(List.of());
+		removeInfoBox();
+
+	}
+
+	private void shutdownExecutor()
+	{
+		if (executor != null)
+		{
+			executor.shutdown();
+			try
+			{
+				if (!executor.awaitTermination(1, TimeUnit.SECONDS))
+				{
+					executor.shutdownNow();
+				}
+			}
+			catch (InterruptedException e)
+			{
+				executor.shutdownNow();
+				Thread.currentThread().interrupt();
+			}
+			executor = null;
+		}
+	}
+
+	private void removeInfoBox()
+	{
+		if (infoBox != null)
+		{
+			infoBoxManager.removeInfoBox(infoBox);
+			infoBox = null;
+		}
+	}
+
+	private void updateInfoBox(List<NpcMaxHitData> dataList)
+	{
+		removeInfoBox();
+		if (!dataList.isEmpty())
+		{
+			infoBox = new NpcMaxHitInfoBox(dataList, config, spriteManager, this);
+			infoBoxManager.addInfoBox(infoBox);
+		}
+	}
+
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied event)
+	{
+		Actor actor = event.getActor();
+		Hitsplat hitsplat = event.getHitsplat();
+
+		// Only interested in NPC hitsplats caused by the player
+		if (!(actor instanceof NPC) || !hitsplat.isMine())
+		{
+			return;
+		}
+
+		NPC npc = (NPC) actor;
+		int npcId = npc.getId();
+
+		// Update last hitsplat time
+		lastHitsplatTime = System.currentTimeMillis();
+
+		// dont attempt to re-fetch data if the same npc is being attacked and overlay includes the npc
+		if (player.getInteracting() == npc && overlay.getCurrentNpcList().stream().anyMatch(data -> data.getNpcId() == npcId))
+		{
+			return;
+		}
+
+		executor.submit(() -> {
+			List<NpcMaxHitData> dataList = wikiService.getMaxHitData(npcId);
+			if (!dataList.isEmpty())
+			{
+				clientThread.invoke(() -> {
+					overlay.updateNpcDataList(dataList);
+					updateInfoBox(dataList);
+				});
+			}
+		});
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		long currentTime = System.currentTimeMillis();
+		int timeoutMs = config.timeout() * 1000;
+		if (currentTime - lastHitsplatTime >= timeoutMs)
+		{
+			if (!overlay.getCurrentNpcList().isEmpty())
+			{
+				clientThread.invoke(() -> {
+					overlay.updateNpcDataList(List.of());
+					removeInfoBox();
+				});
+			}
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		if (gameStateChanged.getGameState() == GameState.LOGGED_IN)
+		{
+			player = client.getLocalPlayer();
+
+			// testing
+			/*executor.submit(() -> {
+				List<Integer> testNpcs = List.of(
+					2042,
+					12191,
+					12079,
+					13668
+				);
+
+				for (int npcId : testNpcs)
+				{
+					List<NpcMaxHitData> dataList = wikiService.getMaxHitData(npcId);
+					if (!dataList.isEmpty())
+					{
+						clientThread.invoke(() -> {
+							overlay.updateNpcDataList(dataList);
+							updateInfoBox(dataList);
+						});
+					}
+				}
+			});*/
+
+		}
+	}
+
+	@Provides
+	NpcMaxHitConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(NpcMaxHitConfig.class);
+	}
+}
+
+package com.npcmaxhit;
+
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.Graphics2D;
+import java.util.ArrayList;
+import java.util.List;
+import lombok.Getter;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+import javax.inject.Inject;
+
+public class NpcMaxHitOverlay extends Overlay
+{
+	private final PanelComponent panelComponent = new PanelComponent();
+	private final NpcMaxHitConfig config;
+
+	@Getter
+	private List<NpcMaxHitData> currentNpcList = new ArrayList<>();
+
+	@Inject
+	public NpcMaxHitOverlay(NpcMaxHitConfig config)
+	{
+		this.config = config;
+		setResizable(true);
+		setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
+		panelComponent.setWrap(true);
+		panelComponent.setPreferredSize(new Dimension(150, 0));
+	}
+
+	public void updateNpcDataList(List<NpcMaxHitData> dataList)
+	{
+		this.currentNpcList = dataList;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (currentNpcList.isEmpty() || !config.showOverlay())
+		{
+			return null;
+		}
+
+		panelComponent.getChildren().clear();
+		panelComponent.setBackgroundColor(config.overlayBackgroundColor());
+
+		// Create font with configured family, style and size
+		graphics.setFont(new Font(
+			config.fontFamily().getFamily(),
+			config.fontStyle().getStyle(),
+			config.overlayFontSize()
+		));
+
+		for (NpcMaxHitData data : currentNpcList)
+		{
+			// Add form/version title
+			panelComponent.getChildren().add(TitleComponent.builder()
+				.text(data.getDisplayName())
+				.color(config.overlayTextColor())
+				.build());
+
+			// Add max hits based on compact mode
+			if (config.compact())
+			{
+				panelComponent.getChildren().add(LineComponent.builder()
+					.left("Max Hit")
+					.right(Integer.toString(data.getHighestMaxHit()))
+					.leftColor(config.overlayTextColor())
+					.rightColor(config.overlayValueColor())
+					.build());
+			}
+			else
+			{
+				data.getMaxHits().forEach((style, hit) ->
+					panelComponent.getChildren().add(LineComponent.builder()
+						.left(style)
+						.right(Integer.toString(hit))
+						.leftColor(config.overlayTextColor())
+						.rightColor(config.overlayValueColor())
+						.build())
+				);
+			}
+		}
+
+		return panelComponent.render(graphics);
+	}
+}
+
+package com.npcmaxhit;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.Collections;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@Singleton
+public class WikiService
+{
+	private static final String WIKI_API_URL = "https://oldschool.runescape.wiki/api.php?action=ask&format=json&query=[[NPC ID::%d]]|?Max hit";
+	private static final Pattern MAX_HIT_VALUE_PATTERN = Pattern.compile("(\\d+)\\s*\\(([^)]+)\\)");
+	private final Map<Integer, List<NpcMaxHitData>> maxHitCache = new HashMap<>();
+
+	@Inject
+	private OkHttpClient httpClient;
+
+	@Inject
+	private Gson gson;
+
+	public List<NpcMaxHitData> getMaxHitData(int npcId)
+	{
+		// Check cache first
+		if (maxHitCache.containsKey(npcId))
+		{
+			return maxHitCache.get(npcId);
+		}
+
+		try
+		{
+			String url = String.format(WIKI_API_URL, npcId);
+
+			Request request = new Request.Builder()
+				.url(url)
+				.header("User-Agent", "RuneLite npc-max-hit plugin")
+				.build();
+
+			try (Response response = httpClient.newCall(request).execute())
+			{
+				if (!response.isSuccessful() || response.body() == null)
+				{
+					return Collections.emptyList();
+				}
+
+				String responseBody = response.body().string();
+				JsonObject jsonResponse = gson.fromJson(responseBody, JsonObject.class);
+
+				if (!jsonResponse.has("query") || !jsonResponse.getAsJsonObject("query").has("results"))
+				{
+					return Collections.emptyList();
+				}
+
+				List<NpcMaxHitData> results = new ArrayList<>();
+				JsonObject resultsObj = jsonResponse.getAsJsonObject("query").getAsJsonObject("results");
+
+				for (Map.Entry<String, JsonElement> entry : resultsObj.entrySet())
+				{
+					String fullName = entry.getKey();
+					JsonObject result = entry.getValue().getAsJsonObject();
+					JsonObject printouts = result.getAsJsonObject("printouts");
+
+					if (printouts.has("Max hit") && printouts.getAsJsonArray("Max hit").size() > 0)
+					{
+						Map<String, Integer> maxHits = new HashMap<>();
+						var maxHitArray = printouts.getAsJsonArray("Max hit");
+
+						if (maxHitArray.size() > 1)
+						{
+							// Process each element in the array directly
+							for (JsonElement maxHitElement : maxHitArray)
+							{
+								String maxHitString = maxHitElement.getAsString().trim();
+								parseMaxHitValues(maxHitString, maxHits);
+							}
+						}
+						else
+						{
+							// Single element - might contain multiple hits
+							String maxHitString = maxHitArray.get(0).getAsString();
+							parseMaxHitValues(maxHitString, maxHits);
+						}
+
+						if (!maxHits.isEmpty())
+						{
+							results.add(new NpcMaxHitData(fullName, npcId, maxHits));
+						}
+					}
+				}
+
+				if (!results.isEmpty())
+				{
+					maxHitCache.put(npcId, results);
+					return results;
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			log.warn("Error fetching wiki data for (ID: {}): {}", npcId, e.getMessage());
+		}
+
+		return Collections.emptyList();
+	}
+
+	private void parseMaxHitValues(String maxHitString, Map<String, Integer> maxHits)
+	{
+		// Remove HTML line break tags and split on commas
+		String[] hits = maxHitString.replaceAll("<br/?>", ",").split(",");
+
+		for (String hit : hits)
+		{
+			hit = hit.trim();
+			Matcher matcher = MAX_HIT_VALUE_PATTERN.matcher(hit);
+
+			if (matcher.find())
+			{
+				int value = Integer.parseInt(matcher.group(1));
+				String style = matcher.group(2).trim();
+				maxHits.put(style, value);
+			}
+			else
+			{
+				try
+				{
+					int value = Integer.parseInt(hit);
+					maxHits.put("Max Hit", value);
+				}
+				catch (NumberFormatException ignored)
+				{
+					log.warn("Invalid max hit value: {}", hit);
+				}
+			}
+		}
+	}
+}
+
+package com.npcmaxhit;
+
+import java.awt.Color;
+import java.awt.Font;
+import lombok.Getter;
+import net.runelite.client.config.Alpha;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+@ConfigGroup("npcmaxhit")
+public interface NpcMaxHitConfig extends Config
+{
+	@ConfigSection(
+		name = "General",
+		description = "General plugin settings",
+		position = 0
+	)
+	String generalSection = "general";
+
+	@ConfigSection(
+		name = "Overlay",
+		description = "Overlay appearance settings",
+		position = 1
+	)
+	String overlaySection = "overlay";
+
+	@ConfigSection(
+		name = "Infobox",
+		description = "Infobox appearance settings",
+		position = 2
+	)
+	String infoboxSection = "infobox";
+
+	@ConfigItem(
+		keyName = "showOverlay",
+		name = "Show Overlay",
+		description = "Show the max hit overlay",
+		section = generalSection,
+		position = 0
+	)
+	default boolean showOverlay()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "showInfobox",
+		name = "Show Infobox",
+		description = "Show max hit information in an infobox",
+		section = generalSection,
+		position = 1
+	)
+	default boolean showInfobox()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "timeout",
+		name = "Display Timeout",
+		description = "Time in seconds before the displays are hidden after the player stops attacking",
+		section = generalSection,
+		position = 2
+	)
+	default int timeout()
+	{
+		return 6;
+	}
+
+	@ConfigItem(
+		keyName = "compact",
+		name = "Compact Mode",
+		description = "Only show the highest max hit value when multiple attack styles are present",
+		section = overlaySection,
+		position = 0
+	)
+	default boolean compact()
+	{
+		return false;
+	}
+	
+	@ConfigItem(
+		keyName = "fontFamily",
+		name = "Font",
+		description = "Font to use in the overlay",
+		section = overlaySection,
+		position = 93
+	)
+	default FontFamily fontFamily()
+	{
+		return FontFamily.REGULAR;
+	}
+
+	@Getter
+	enum FontFamily
+	{
+		REGULAR("RuneScape"),
+		PLAIN("RuneScape Plain"),
+		BOLD("RuneScape Bold"),
+		SMALL("RuneScape Small");
+
+		private final String family;
+
+		FontFamily(String family)
+		{
+			this.family = family;
+		}
+
+	}
+
+	@ConfigItem(
+		keyName = "fontStyle",
+		name = "Font Style",
+		description = "Style of the font in the overlay",
+		section = overlaySection,
+		position = 94
+	)
+	default FontStyle fontStyle()
+	{
+		return FontStyle.PLAIN;
+	}
+
+	@Getter
+	enum FontStyle
+	{
+		PLAIN(Font.PLAIN),
+		BOLD(Font.BOLD),
+		ITALIC(Font.ITALIC),
+		BOLD_ITALIC(Font.BOLD + Font.ITALIC);
+
+		private final int style;
+
+		FontStyle(int style)
+		{
+			this.style = style;
+		}
+
+	}
+
+	@ConfigItem(
+		keyName = "overlayFontSize",
+		name = "Font Size",
+		description = "Size of the text in the overlay",
+		section = overlaySection,
+		position = 95
+	)
+	default int overlayFontSize()
+	{
+		return 16;
+	}
+
+	@ConfigItem(
+		keyName = "overlayTextColor",
+		name = "Text Color",
+		description = "Color of the text in the overlay (NPC name, attack style/type)",
+		section = overlaySection,
+		position = 96
+	)
+	default Color overlayTextColor()
+	{
+		return Color.WHITE;
+	}
+
+	@ConfigItem(
+		keyName = "overlayValueColor",
+		name = "Max Hit Color",
+		description = "Color of the max hit values in the overlay",
+		section = overlaySection,
+		position = 97
+	)
+	default Color overlayValueColor()
+	{
+		return Color.YELLOW;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "overlayBackgroundColor",
+		name = "Background Color",
+		description = "Color of the overlay background",
+		section = overlaySection,
+		position = 98
+	)
+	default Color overlayBackgroundColor()
+	{
+		return new Color(70, 61, 50, 156);
+	}
+
+	@ConfigItem(
+		keyName = "infoboxTextColor",
+		name = "Max Hit Color",
+		description = "Color of the highest max hit value in the infobox",
+		section = infoboxSection,
+		position = 97
+	)
+	default Color infoboxTextColor()
+	{
+		return Color.WHITE;
+	}
+
+	@ConfigItem(
+		keyName = "infoboxTooltipTextColor",
+		name = "Tooltip Text Color",
+		description = "Color of the text in the infobox tooltip (NPC name, attack style/type)",
+		section = infoboxSection,
+		position = 98
+	)
+	default Color infoboxTooltipTextColor()
+	{
+		return Color.WHITE;
+	}
+
+	@ConfigItem(
+		keyName = "infoboxTooltipValueColor",
+		name = "Tooltip Max Hits Color",
+		description = "Color of the max hit values in the infobox tooltip",
+		section = infoboxSection,
+		position = 99
+	)
+	default Color infoboxTooltipValueColor()
+	{
+		return Color.YELLOW;
+	}
+
+}
+
+package com.npcmaxhit;
+
+import java.awt.Color;
+import java.util.Map;
+import java.util.List;
+import net.runelite.client.ui.overlay.infobox.InfoBox;
+import net.runelite.client.ui.overlay.infobox.InfoBoxPriority;
+import net.runelite.client.util.ColorUtil;
+import net.runelite.client.game.SpriteManager;
+import net.runelite.client.plugins.Plugin;
+
+public class NpcMaxHitInfoBox extends InfoBox
+{
+	private final List<NpcMaxHitData> dataList;
+	private static final int RED_HITSPLAT = 1359;
+	private final NpcMaxHitConfig config;
+
+	public NpcMaxHitInfoBox(List<NpcMaxHitData> dataList, NpcMaxHitConfig config, SpriteManager spriteManager, Plugin plugin)
+	{
+		super(spriteManager.getSprite(RED_HITSPLAT, 0), plugin);
+		this.dataList = dataList;
+		this.config = config;
+		setPriority(InfoBoxPriority.HIGH);
+	}
+
+	@Override
+	public String getText()
+	{
+		return String.valueOf(dataList.stream()
+			.mapToInt(NpcMaxHitData::getHighestMaxHit)
+			.max()
+			.orElse(0));
+	}
+
+	@Override
+	public Color getTextColor()
+	{
+		return config.infoboxTextColor();
+	}
+
+	@Override
+	public String getTooltip()
+	{
+		StringBuilder tooltip = new StringBuilder();
+
+		for (NpcMaxHitData data : dataList)
+		{
+			if (tooltip.length() > 0)
+			{
+				tooltip.append("</br>").append("</br>");
+			}
+
+			tooltip.append(ColorUtil.wrapWithColorTag(data.getDisplayName(), config.infoboxTooltipTextColor()));
+
+			for (Map.Entry<String, Integer> entry : data.getMaxHits().entrySet())
+			{
+				tooltip.append("</br>")
+					.append(entry.getKey())
+					.append(": ")
+					.append(ColorUtil.wrapWithColorTag(String.valueOf(entry.getValue()), config.infoboxTooltipValueColor()));
+			}
+		}
+
+		return tooltip.toString();
+	}
+
+	@Override
+	public boolean render()
+	{
+		return config.showInfobox();
+	}
+}
+
+package com.npcmaxhit;
+
+import java.util.Map;
+import java.util.TreeMap;
+
+import lombok.Value;
+
+@Value
+public class NpcMaxHitData
+{
+	String npcName;
+	String version;
+	int npcId;
+	Map<String, Integer> maxHits;
+
+	public NpcMaxHitData(String fullName, int npcId, Map<String, Integer> maxHits)
+	{
+		String[] parts = fullName.split("#", 2);
+		this.npcName = parts[0].trim().replaceAll("_", " ");
+		this.version = parts.length > 1 ? parts[1].split(",")[0] : null;
+		this.npcId = npcId;
+		this.maxHits = new TreeMap<>((a, b) -> toTitleCase(a).compareTo(toTitleCase(b)));
+		maxHits.forEach((style, value) -> this.maxHits.put(toTitleCase(style), value));
+	}
+
+	private String toTitleCase(String input)
+	{
+		if (input == null || input.isEmpty())
+		{
+			return input;
+		}
+		String[] words = input.toLowerCase().split("\\s+");
+		StringBuilder titleCase = new StringBuilder();
+		for (String word : words)
+		{
+			if (!word.isEmpty())
+			{
+				titleCase.append(Character.toUpperCase(word.charAt(0)))
+					.append(word.substring(1))
+					.append(" ");
+			}
+		}
+		return titleCase.toString().trim();
+	}
+
+	public String getDisplayName()
+	{
+		if (version == null || version.isEmpty())
+		{
+			return npcName;
+		}
+		return npcName + " (" + version + ")";
+	}
+
+	public int getHighestMaxHit()
+	{
+		return maxHits.values().stream()
+			.mapToInt(Integer::intValue)
+			.max()
+			.orElse(0);
+	}
+}
+
+package com.npcmaxhit;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class NpcMaxHitPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(NpcMaxHitPlugin.class);
+		RuneLite.main(args);
+	}
+}
