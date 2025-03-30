@@ -29,19 +29,21 @@ import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
-import net.runelite.api.Constants;
+import net.runelite.api.GameState;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.client.chat.ChatMessageBuilder;
 import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.DrawManager;
 import net.runelite.client.util.Text;
-
 import java.awt.Color;
 import java.util.ArrayList;
 import java.util.Collection;
@@ -58,33 +60,42 @@ public class LoadTimePlugin extends Plugin
 	@Inject
 	private Client client;
 	@Inject
-	private LoadTimeConfig config;
+	private FrameListener frameListener;
+	@Inject
+	private EventBus eventBus;
 	@Inject
 	private ChatMessageManager chatMessageManager;
+	@Inject
+	private DrawManager drawManager;
+	@Inject
+	private LoadTimeConfig config;
 
 	private Collection<Integer> regions;
 
 	private WorldPoint lastWp;
-	private long lastGameTickTime;
 	private int lastRegionId;
+	private boolean shouldAnnounce;
 
 	@Subscribe
 	public void onGameTick(GameTick tick)
 	{
-		final long currentTime = System.currentTimeMillis();
 		final WorldPoint currentWp = client.getLocalPlayer().getWorldLocation();
 		final int currentRegionId = currentWp.getRegionID();
 
-		if (lastWp != null && lastWp.distanceTo(currentWp) >= config.distanceThreshold() && includeRegion())
-		{
-			final long loadTime = Math.max(0,
-				currentTime - lastGameTickTime - Constants.GAME_TICK_LENGTH);
-			announceLoadTime(loadTime);
-		}
+		shouldAnnounce = lastWp != null &&
+				lastWp.distanceTo(currentWp) >= config.distanceThreshold() && includeRegion();
 
-		lastGameTickTime = currentTime;
 		lastWp = currentWp;
 		lastRegionId = currentRegionId;
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		if (event.getGameState() == GameState.LOGIN_SCREEN)
+		{
+			lastWp = null;
+		}
 	}
 
 	@Subscribe
@@ -101,12 +112,16 @@ public class LoadTimePlugin extends Plugin
 	protected void startUp() throws Exception
 	{
 		parseRegionIds();
+		drawManager.registerEveryFrameListener(frameListener);
+		eventBus.register(frameListener);
 	}
 
 	@Override
 	protected void shutDown() throws Exception
 	{
-
+		drawManager.unregisterEveryFrameListener(frameListener);
+		eventBus.unregister(frameListener);
+		lastWp = null;
 	}
 
 	@Provides
@@ -136,8 +151,13 @@ public class LoadTimePlugin extends Plugin
 		return true;
 	}
 
-	private void announceLoadTime(long time)
+	boolean announceLoadTime(long time)
 	{
+		if (!shouldAnnounce)
+		{
+			return false;
+		}
+
 		final Color color;
 		if (time < config.fastLoadTime())
 		{
@@ -159,6 +179,8 @@ public class LoadTimePlugin extends Plugin
 			.type(ChatMessageType.CONSOLE)
 			.runeLiteFormattedMessage(runeliteMsg)
 			.build());
+
+		return true;
 	}
 
 	private void parseRegionIds()
@@ -325,6 +347,95 @@ public interface LoadTimeConfig extends Config
     {
         return Color.RED;
     }
+}
+
+/*
+ * Copyright (c) 2025, rsfost <https://github.com/rsfost>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package rsfost.loadtime;
+
+import net.runelite.api.Client;
+import net.runelite.api.Player;
+import net.runelite.api.Scene;
+import net.runelite.api.events.PreMapLoad;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.Subscribe;
+
+import javax.inject.Inject;
+
+class FrameListener implements Runnable
+{
+	private static final long NANOS_PER_MILLI = 1_000_000L;
+
+	private final LoadTimePlugin plugin;
+	private final Client client;
+	private final ClientThread clientThread;
+
+	private Thread mapLoader;
+	private Scene lastScene;
+	private long mapLoadStartTime;
+
+	@Inject
+	public FrameListener(LoadTimePlugin plugin, Client client, ClientThread clientThread)
+	{
+		this.plugin = plugin;
+		this.client = client;
+		this.clientThread = clientThread;
+	}
+
+	@Subscribe
+	public void onPreMapLoad(PreMapLoad event)
+	{
+		mapLoader = Thread.currentThread();
+	}
+
+	@Override
+	public void run()
+	{
+		final long currentTime = System.nanoTime();
+		Player player = client.getLocalPlayer();
+		if (player == null)
+		{
+			lastScene = null;
+			return;
+		}
+
+		Scene scene = player.getWorldView().getScene();
+		if (lastScene != null && lastScene != scene)
+		{
+			final long loadTime = (currentTime - mapLoadStartTime) / NANOS_PER_MILLI;
+			final int startTick = client.getTickCount();
+			clientThread.invokeLater(() ->
+				plugin.announceLoadTime(loadTime) || client.getTickCount() != startTick);
+			mapLoadStartTime = -1;
+		}
+		else if (mapLoader != null && mapLoader.getState() == Thread.State.RUNNABLE && mapLoadStartTime < 0)
+		{
+			mapLoadStartTime = currentTime;
+		}
+		lastScene = scene;
+	}
 }
 
 /*
