@@ -298,8 +298,8 @@ package com.lootfilters;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 import com.lootfilters.migration.Migrate_133_140;
-import com.lootfilters.model.BufferedImageProvider;
 import com.lootfilters.model.DisplayConfigIndex;
+import com.lootfilters.model.IconIndex;
 import com.lootfilters.model.PluginTileItem;
 import com.lootfilters.model.SoundProvider;
 import com.lootfilters.util.AudioPlayer;
@@ -334,12 +334,9 @@ import net.runelite.client.ui.overlay.OverlayManager;
 
 import javax.inject.Inject;
 import javax.inject.Named;
-import java.awt.image.BufferedImage;
 import java.io.File;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
-import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
@@ -391,12 +388,13 @@ public class LootFiltersPlugin extends Plugin {
 	private final TileItemIndex tileItemIndex = new TileItemIndex();
 	private final LootbeamIndex lootbeamIndex = new LootbeamIndex(this);
 	private final DisplayConfigIndex displayIndex = new DisplayConfigIndex(this);
+	private final IconIndex iconIndex = new IconIndex(this);
+
 	private final MenuEntryComposer menuEntryComposer = new MenuEntryComposer(this);
 	private final LootFilterManager filterManager = new LootFilterManager(this);
 	private final AudioPlayer audioPlayer = new AudioPlayer(); // remove when https://github.com/runelite/runelite/pull/18745 is merged
 	private final ExecutorService audioDispatcher = Executors.newSingleThreadExecutor();
 	private final Set<SoundProvider> queuedAudio = new HashSet<>();
-	private final Map<BufferedImageProvider, BufferedImage> iconCache = new HashMap<>();
 
 	private LootFilter activeFilter;
 	private LootFilter currentAreaFilter;
@@ -498,6 +496,11 @@ public class LootFiltersPlugin extends Plugin {
 			return;
 		}
 
+		if (event.getKey().equals(LootFiltersConfig.CONFIG_KEY_OVERLAY_PRIORITY)) {
+			overlay.setPriority(config.overlayPriority().getValue());
+			overlayManager.resetOverlay(overlay);
+		}
+
 		loadSelectedFilter();
 		if (!config.autoToggleFilters()) {
 			currentAreaFilter = null;
@@ -527,15 +530,22 @@ public class LootFiltersPlugin extends Plugin {
 		if (match.getSound() != null && config.soundVolume() > 0) {
 			queuedAudio.add(match.getSound());
 		}
+		if (match.getIcon() != null) {
+			iconIndex.inc(match.getIcon(), item);
+		}
 	}
 
 	@Subscribe
 	public void onItemDespawned(ItemDespawned event) {
 		var tile = event.getTile();
 		var item = new PluginTileItem(this, tile, event.getItem());
+		var display = displayIndex.get(item);
 		tileItemIndex.remove(tile, item); // all of these are ultimately idempotent
 		lootbeamIndex.remove(tile, item);
 		displayIndex.remove(item);
+		if (display != null && display.getIcon() != null) {
+			iconIndex.dec(display.getIcon(), item);
+		}
 	}
 
 	@Subscribe
@@ -607,6 +617,7 @@ public class LootFiltersPlugin extends Plugin {
 		tileItemIndex.clear();
 		lootbeamIndex.clear();
 		displayIndex.clear();
+		iconIndex.clear();
 	}
 
 	public void reloadFilters() {
@@ -617,23 +628,13 @@ public class LootFiltersPlugin extends Plugin {
 
 	private void loadSelectedFilter() {
 		activeFilter = withConfigRules(getSelectedFilter(), config);
-		clientThread.invoke(this::seedImageCache);
-	}
-
-	private void seedImageCache() {
-		iconCache.clear();
-		for (var rule : activeFilter.getMatchers()) {
-			var provider = rule.getDisplay().getIcon();
-			if (provider != null && !iconCache.containsKey(provider)) {
-				iconCache.put(provider, provider.get(this));
-			}
-		}
 	}
 
 	private void resetDisplay() {
 		clientThread.invoke(() -> {
 			displayIndex.reset();
 			lootbeamIndex.reset();
+			iconIndex.reset();
 		});
 	}
 }
@@ -1194,7 +1195,7 @@ public class LootFiltersOverlay extends Overlay {
     public LootFiltersOverlay(Client client, LootFiltersPlugin plugin, LootFiltersConfig config) {
         setPosition(OverlayPosition.DYNAMIC);
         setLayer(OverlayLayer.ABOVE_SCENE);
-        setPriority(0.59f);
+        setPriority(config.overlayPriority().getValue());
         this.client = client;
         this.plugin = plugin;
         this.config = config;
@@ -1305,7 +1306,8 @@ public class LootFiltersOverlay extends Overlay {
                 text.render(g);
 
                 if (match.getIcon() != null) {
-                    var d = renderIcon(g, match.getIcon(), textPoint, currentOffset);
+                    var cacheKey = match.getIcon().getCacheKey(item);
+                    var d = renderIcon(g, cacheKey, textPoint, currentOffset);
                     leftOffset += d.width;
                 }
                 if (match.isShowDespawn() || plugin.isHotkeyActive()) {
@@ -1419,7 +1421,7 @@ public class LootFiltersOverlay extends Overlay {
         g.drawString("items: " + itemCount + "," + plugin.getTileItemIndex().pointIndexSize(), 0, 32);
         g.drawString("lootbeams: " + plugin.getLootbeamIndex().size(), 0, 48);
         g.drawString("displays: " + plugin.getDisplayIndex().size(), 0, 64);
-        g.drawString("audio: " + plugin.getQueuedAudio().size() + ", icon: " + plugin.getIconCache().size(), 0, 80);
+        g.drawString("audio: " + plugin.getQueuedAudio().size() + ", icon: " + plugin.getIconIndex().size(), 0, 80);
     }
 
     private void renderDespawnTimer(Graphics2D g, DespawnTimerType type, PluginTileItem item, net.runelite.api.Point textPoint, int textWidth, int textHeight, int yOffset, int leftOffset) {
@@ -1484,7 +1486,7 @@ public class LootFiltersOverlay extends Overlay {
     }
 
     private void highlightTiles(Graphics2D g, Tile tile, List<PluginTileItem> items) {
-        if (tile.getLocalLocation() == null) {
+        if (tile.getLocalLocation() == null || tile.getPlane() != client.getTopLevelWorldView().getPlane()) {
             return;
         }
 
@@ -1513,8 +1515,8 @@ public class LootFiltersOverlay extends Overlay {
         g.setStroke(origStroke);
     }
 
-    private Dimension renderIcon(Graphics2D g, BufferedImageProvider provider, net.runelite.api.Point textPoint, int yOffset) {
-        var image = plugin.getIconCache().get(provider);
+    private Dimension renderIcon(Graphics2D g, BufferedImageProvider.CacheKey cacheKey, net.runelite.api.Point textPoint, int yOffset) {
+        var image = plugin.getIconIndex().get(cacheKey);
         if (image == null) {
             return new Dimension(0, 0);
         }
@@ -1881,6 +1883,18 @@ public enum Comparator {
             case OP_LTEQ: return LT_EQ;
             default:
                 throw new ParseException("unrecognized token", t);
+        }
+    }
+
+    public static Comparator fromString(String str) {
+        switch (str) {
+            case ">": return GT;
+            case "<": return LT;
+            case "==": return EQ;
+            case ">=": return GT_EQ;
+            case "<=": return LT_EQ;
+            default:
+                throw new IllegalArgumentException("unrecognized comparator string " + str);
         }
     }
 }
@@ -2877,6 +2891,11 @@ public class Parser {
             }
             var filename = args.get(0).take().expectString();
             builder.icon(new BufferedImageProvider.File(filename));
+        } else if (type.getValue().equals("CurrentItem")) {
+            if (!args.isEmpty()) {
+                throw new ParseException("incorrect arg length in icon CurrentItem() expr", type);
+            }
+            builder.icon(new BufferedImageProvider.CurrentItem());
         } else {
             throw new ParseException("unrecognized icon type", type);
         }
@@ -3616,6 +3635,7 @@ package com.lootfilters.model;
 import com.lootfilters.LootFiltersPlugin;
 import lombok.AllArgsConstructor;
 import lombok.EqualsAndHashCode;
+import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.util.ImageUtil;
 
@@ -3626,7 +3646,9 @@ import static com.lootfilters.LootFiltersPlugin.ICON_DIRECTORY;
 
 @Slf4j
 public abstract class BufferedImageProvider {
-    public abstract BufferedImage get(LootFiltersPlugin plugin);
+    public abstract BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item);
+
+    public abstract CacheKey getCacheKey(PluginTileItem item);
 
     @AllArgsConstructor
     @EqualsAndHashCode(callSuper = false)
@@ -3635,13 +3657,18 @@ public abstract class BufferedImageProvider {
         private final int index;
 
         @Override
-        public BufferedImage get(LootFiltersPlugin plugin) {
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
             try {
                 return plugin.getSpriteManager().getSprite(spriteId, index);
             } catch (ArrayIndexOutOfBoundsException e) {
                 log.warn("sprite index out of bounds", e);
                 return null;
             }
+        }
+
+        @Override
+        public CacheKey getCacheKey(PluginTileItem item) {
+            return new CacheKey(0, spriteId, index, "");
         }
     }
 
@@ -3651,9 +3678,14 @@ public abstract class BufferedImageProvider {
         private final int itemId;
 
         @Override
-        public BufferedImage get(LootFiltersPlugin plugin) {
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
             var image = plugin.getItemManager().getImage(itemId);
             return ImageUtil.resizeImage(image, image.getWidth() / 2, image.getHeight() / 2);
+        }
+
+        @Override
+        public CacheKey getCacheKey(PluginTileItem item) {
+            return new CacheKey(1, itemId, 0, "");
         }
     }
 
@@ -3663,7 +3695,7 @@ public abstract class BufferedImageProvider {
         private final String filename;
 
         @Override
-        public BufferedImage get(LootFiltersPlugin plugin) {
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
             try {
                 return ImageIO.read(new java.io.File(ICON_DIRECTORY, filename));
             } catch (Exception e) {
@@ -3671,7 +3703,90 @@ public abstract class BufferedImageProvider {
                 return null;
             }
         }
+
+        @Override
+        public CacheKey getCacheKey(PluginTileItem item) {
+            return new CacheKey(2, 0, 0, filename);
+        }
     }
+
+    @EqualsAndHashCode(callSuper = false)
+    public static final class CurrentItem extends BufferedImageProvider {
+        @Override
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
+            var image = plugin.getItemManager().getImage(item.getId(), item.getQuantity(), false);
+            return ImageUtil.resizeImage(image, image.getWidth() / 2, image.getHeight() / 2);
+        }
+
+        @Override
+        public CacheKey getCacheKey(PluginTileItem item) {
+            return new CacheKey(3, item.getId(), item.getQuantity(), "");
+        }
+    }
+
+    @Value
+    public static class CacheKey {
+        int type;
+        int param0, param1;
+        String param2;
+    }
+}
+
+package com.lootfilters.model;
+
+import com.lootfilters.rule.Comparator;
+import lombok.Value;
+
+import static java.lang.Integer.parseInt;
+
+@Value
+public class NamedQuantity {
+    String name;
+    Comparator comparator;
+    int quantity;
+
+    public static NamedQuantity fromString(String str) {
+        if (str.contains(">")) {
+            return fromString(str, ">");
+        } else if (str.contains("<")) {
+            return fromString(str, "<");
+        }
+        return new NamedQuantity(str, Comparator.GT, 0);
+    }
+
+    private static NamedQuantity fromString(String str, String cmp) {
+        var parts = str.split(cmp);
+        if (parts.length != 2) {
+            return new NamedQuantity(str, Comparator.GT, 0);
+        }
+
+        int quantity;
+        try {
+            quantity = parseInt(parts[1].trim());
+        } catch (Exception ignored) {
+            return new NamedQuantity(str, Comparator.GT, 0);
+        }
+
+        return new NamedQuantity(parts[0].trim(), Comparator.fromString(cmp), quantity);
+    }
+}
+
+package com.lootfilters.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import net.runelite.client.ui.overlay.Overlay;
+
+@Getter
+@AllArgsConstructor
+public enum OverlayPriority {
+    LOW(Overlay.PRIORITY_LOW),
+    DEFAULT(Overlay.PRIORITY_DEFAULT),
+    MED(Overlay.PRIORITY_MED),
+    HIGH(Overlay.PRIORITY_HIGH),
+    HIGHEST(Overlay.PRIORITY_HIGHEST);
+
+    private final float value;
 }
 
 package com.lootfilters.model;
@@ -3758,6 +3873,73 @@ public enum DespawnTimerType {
     @Override
     public String toString() {
         return label;
+    }
+}
+
+package com.lootfilters.model;
+
+import com.lootfilters.LootFiltersPlugin;
+import lombok.RequiredArgsConstructor;
+
+import java.awt.image.BufferedImage;
+import java.util.HashMap;
+import java.util.Map;
+
+@RequiredArgsConstructor
+public class IconIndex {
+    private final LootFiltersPlugin plugin;
+    private final Map<BufferedImageProvider.CacheKey, CacheEntry> index = new HashMap<>();
+
+    public BufferedImage get(BufferedImageProvider.CacheKey key) {
+        return index.containsKey(key) ? index.get(key).image : null;
+    }
+
+    public void inc(BufferedImageProvider provider, PluginTileItem item) {
+        index.compute(provider.getCacheKey(item), (k, entry) -> {
+            if (entry == null) {
+                return new CacheEntry(provider.getImage(plugin, item));
+            }
+
+            ++entry.refCount;
+            return entry;
+        });
+    }
+
+    public void dec(BufferedImageProvider provider, PluginTileItem item) {
+        index.compute(provider.getCacheKey(item), (k, entry) -> {
+            if (entry == null) {
+                return null;
+            }
+
+            --entry.refCount;
+            return entry.refCount == 0 ? null : entry;
+        });
+    }
+
+    public int size() {
+        return index.size();
+    }
+
+    public void clear() {
+        index.clear();
+    }
+
+    public void reset() {
+        clear();
+        for (var entry : plugin.getTileItemIndex().entrySet()) {
+            for (var item : entry.getValue()) {
+                var match = plugin.getActiveFilter().findMatch(plugin, item);
+                if (match != null && match.getIcon() != null) {
+                    inc(match.getIcon(), item);
+                }
+            }
+        }
+    }
+
+    @RequiredArgsConstructor
+    private static final class CacheEntry {
+        final BufferedImage image;
+        int refCount = 1;
     }
 }
 
@@ -4063,10 +4245,12 @@ public class LootFilter {
 
 package com.lootfilters;
 
+import com.lootfilters.model.NamedQuantity;
 import com.lootfilters.model.PluginTileItem;
 import com.lootfilters.rule.AndRule;
 import com.lootfilters.rule.Comparator;
 import com.lootfilters.rule.ItemNameRule;
+import com.lootfilters.rule.ItemQuantityRule;
 import com.lootfilters.rule.ItemTradeableRule;
 import com.lootfilters.rule.ItemValueRule;
 import com.lootfilters.rule.OrRule;
@@ -4176,7 +4360,8 @@ public class MatcherConfig {
     public static MatcherConfig highlight(String rawNames, Color color, boolean showLootbeam, boolean notify) {
         var rule = new OrRule(
                 Arrays.stream(rawNames.split(","))
-                        .map(ItemNameRule::new)
+                        .map(NamedQuantity::fromString)
+                        .map(it -> new AndRule(new ItemNameRule(it.getName()), new ItemQuantityRule(it.getQuantity(), it.getComparator())))
                         .collect(Collectors.toList())
         );
         var display = DisplayConfig.builder()
@@ -4190,7 +4375,8 @@ public class MatcherConfig {
     public static MatcherConfig hide(String rawNames) {
         var rule = new OrRule(
                 Arrays.stream(rawNames.split(","))
-                        .map(ItemNameRule::new)
+                        .map(NamedQuantity::fromString)
+                        .map(it -> new AndRule(new ItemNameRule(it.getName()), new ItemQuantityRule(it.getQuantity(), it.getComparator())))
                         .collect(Collectors.toList())
         );
         var display = DisplayConfig.builder()
@@ -4389,6 +4575,7 @@ import com.lootfilters.model.DespawnTimerType;
 import com.lootfilters.model.DualValueDisplayType;
 import com.lootfilters.model.FontMode;
 import com.lootfilters.model.ItemValueRulesMode;
+import com.lootfilters.model.OverlayPriority;
 import com.lootfilters.model.ValueDisplayType;
 import com.lootfilters.rule.TextAccent;
 import com.lootfilters.rule.ValueTier;
@@ -4623,6 +4810,17 @@ public interface LootFiltersConfig extends Config {
             position = 92
     )
     default Color hiddenColor() { return Color.GRAY; }
+
+    String CONFIG_KEY_OVERLAY_PRIORITY = "overlayPriority";
+    @ConfigItem(
+            keyName = CONFIG_KEY_OVERLAY_PRIORITY,
+            name = "Overlay priority",
+            description = "Changes the draw priority of the overlay." +
+            "<br>Only relative to overlays with the same order as this one.",
+            section = displayOverrides,
+            position = 94
+    )
+    default OverlayPriority overlayPriority() { return OverlayPriority.DEFAULT; }
 
     @ConfigSection(
             name = "Item lists",
