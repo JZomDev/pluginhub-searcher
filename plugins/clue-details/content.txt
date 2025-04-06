@@ -24,7 +24,6 @@
  */
 package com.cluedetails;
 
-import com.cluedetails.filters.ClueTier;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
 import java.awt.Color;
@@ -99,29 +98,10 @@ public class ClueDetailsItemsOverlay extends WidgetItemOverlay
 		ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
 		if (inventory == null || clueInventoryManager == null ) return;
 
-		// Highlight for easy-elite clues
-		for (Clues clue : clueInventoryManager.getCluesInInventory())
-		{
-			if (clue == null) continue;
-
-			if (clue.isEnabled(config))
-			{
-				if (config.highlightInventoryClueScrolls())
-				{
-					cacheClueScrolls(clue);
-				}
-				if (config.highlightInventoryClueItems())
-				{
-					cacheClueItems(clue);
-				}
-			}
-		}
-
-		// Highlight for beginner and master clues
-		for (Integer itemID : clueInventoryManager.getTrackedCluesInInventory())
+		for (Integer itemID : clueInventoryManager.getCluesInInventory())
 		{
 			if (itemID == null) continue;
-			ClueInstance instance = clueInventoryManager.getTrackedClueByClueItemId(itemID);
+			ClueInstance instance = clueInventoryManager.getClueByClueItemId(itemID);
 			if (instance == null) continue;
 
 			instance.getClueIds().forEach((clueId) ->
@@ -306,7 +286,6 @@ import com.cluedetails.filters.ClueTier;
 import java.util.stream.Collectors;
 import lombok.Getter;
 import net.runelite.api.*;
-import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.ItemDespawned;
 import net.runelite.api.events.ItemSpawned;
@@ -321,16 +300,16 @@ public class ClueGroundManager
 	private final ClueDetailsPlugin clueDetailsPlugin;
 	@Getter
 	private final ClueGroundSaveDataManager clueGroundSaveDataManager;
-	@Getter
-	private final Map<WorldPoint, List<ClueInstance>> groundClues = new HashMap<>();
-	private final List<PendingGroundClue> pendingGroundClues = new ArrayList<>();
 	private final Set<Tile> itemHasSpawnedOnTileThisTick = new HashSet<>();
-
 	@Getter
 	private final List<ClueInstance> despawnedClueQueueForInventoryCheck = new ArrayList<>();
 	private final int MAX_DESPAWN_TIMER = 6100;
 	private Zone lastZone;
 	private Zone currentZone;
+	private WorldPointToClueInstances trackedClues;
+	private boolean loggedInStateOccuredThisTick;
+	private Set<WorldPoint> tileClearedThisTick = new HashSet<>();
+	private Set<Tile> easyToEliteClueSpawnedThisTick = new HashSet<>();
 
 	public ClueGroundManager(Client client, ConfigManager configManager, ClueDetailsPlugin clueDetailsPlugin)
 	{
@@ -338,28 +317,60 @@ public class ClueGroundManager
 		this.clueDetailsPlugin = clueDetailsPlugin;
 		this.clueGroundSaveDataManager = new ClueGroundSaveDataManager(configManager, clueDetailsPlugin.gson);
 		clueGroundSaveDataManager.loadStateFromConfig(client);
+
+		trackedClues = new WorldPointToClueInstances(client, clueDetailsPlugin);
+	}
+
+	public SortedSet<ClueInstance> getAllGroundCluesOnWp(WorldPoint worldPoint)
+	{
+		return trackedClues.getAllCluesAtWorldPoint(worldPoint);
 	}
 
 	public void onItemSpawned(ItemSpawned event)
 	{
-		// On item spawned, check if is in known tile stack
-		// If log in on tile with clues on it, spawned. Won't be dropped, but could be dropped?
-		// Main issue is we don't want to create a new groundClue if it was dropped, as we will then also be doing another new one after.
 		TileItem item = event.getItem();
-		if (!Clues.isClue(item.getId(), clueDetailsPlugin.isDeveloperMode())) return;
-		if (checkIfItemMatchesKnownItem(event.getTile(), item, event.getTile().getWorldLocation())) return;
+		Tile tile = event.getTile();
 
-		// New despawn timer, probably been dropped. Track to see what it was.
-		if (item.getDespawnTime() - client.getTickCount() >= MAX_DESPAWN_TIMER || (
-			clueDetailsPlugin.isDeveloperMode() && Clues.DEV_MODE_IDS.contains(item.getId()) && item.getDespawnTime() - client.getTickCount() >= 300))
+		if (!Clues.isClue(item.getId(), clueDetailsPlugin.isDeveloperMode())) return;
+
+		// If easy-elite task, we just override
+		// TODO: Maybe also means torn clues and such?
+		if (!Clues.isBeginnerOrMasterClue(item.getId(), clueDetailsPlugin.isDeveloperMode()))
 		{
-			pendingGroundClues.add(new PendingGroundClue(item, event.getTile().getWorldLocation(), client.getTickCount()));
+			// We don't get items removed when a loading->logged in state occurs. This clears the tile
+			if (loggedInStateOccuredThisTick && !tileClearedThisTick.contains(tile.getWorldLocation()))
+			{
+				tileClearedThisTick.add(tile.getWorldLocation());
+				clearEasyToEliteCluesAtWorldPoint(tile.getWorldLocation());
+			}
+			ClueInstance clueInstance = new ClueInstance(List.of(), item.getId(), tile.getWorldLocation(), item, client.getTickCount());
+			trackedClues.addClue(clueInstance);
+			easyToEliteClueSpawnedThisTick.add(tile);
+			return;
 		}
-		else
+
+		ClueInstance inventoryClue = clueDetailsPlugin.getClueInventoryManager().getClueByClueItemId(item.getId());
+		// If clue in inventory AND new clue appeared with fresh despawn timer, it must be the inventory item being dropped
+		if (isNewGroundClue(item.getId(), item.getDespawnTime()) && inventoryClue != null)
 		{
-			// Handle items spawned on tile without aligned times and not dropped
-			itemHasSpawnedOnTileThisTick.add(event.getTile());
+			ClueInstance newGroundClue = new ClueInstance(inventoryClue.getClueIds(), inventoryClue.getItemId(), tile.getWorldLocation(), item, client.getTickCount());
+			trackedClues.addClue(newGroundClue);
+			return;
 		}
+
+		// Handle items spawned on tile without aligned times and not dropped
+		itemHasSpawnedOnTileThisTick.add(tile);
+	}
+
+	private boolean isNewGroundClue(int itemID, int despawnTick)
+	{
+		int ticksToDespawn = despawnTick - client.getTickCount();
+
+		if (ticksToDespawn == MAX_DESPAWN_TIMER) return true;
+
+		return clueDetailsPlugin.isDeveloperMode() &&
+			Clues.DEV_MODE_IDS.contains(itemID) &&
+			despawnTick >= 300;
 	}
 
 	public void onItemDespawned(ItemDespawned event)
@@ -367,7 +378,15 @@ public class ClueGroundManager
 		TileItem item = event.getItem();
 		if (!Clues.isClue(item.getId(), clueDetailsPlugin.isDeveloperMode())) return;
 		WorldPoint location = event.getTile().getWorldLocation();
-		List<ClueInstance> cluesAtLocation = groundClues.get(location);
+
+		if (!Clues.isBeginnerOrMasterClue(item.getId(), clueDetailsPlugin.isDeveloperMode()))
+		{
+			ClueInstance clueInstance = new ClueInstance(List.of(), item.getId(), location, item, client.getTickCount());
+			trackedClues.removeClue(clueInstance);
+			return;
+		}
+
+		List<ClueInstance> cluesAtLocation = trackedClues.getBeginnerAndMasterCluesAtWorldPoint(location);
 
 		// Catch despawn in vicinity
 		if (cluesAtLocation == null) return;
@@ -378,11 +397,11 @@ public class ClueGroundManager
 			Optional<ClueInstance> optionalClue = cluesAtLocation.stream()
 				.filter((clue) -> clue.getTileItem() == item)
 				.findFirst();
-			optionalClue.ifPresent(this::removeClue);
+			optionalClue.ifPresent((clueInstance -> trackedClues.removeClue(clueInstance)));
 			return;
 		}
 
-		if (getTileAtWorldPoint(location) == null)
+		if (trackedClues.getTileAtWorldPoint(location) == null)
 		{
 			return;
 		}
@@ -408,149 +427,56 @@ public class ClueGroundManager
 			.filter((clue) -> clue.getTileItem() == item)
 			.findFirst();
 		optionalClue.ifPresent(despawnedClueQueueForInventoryCheck::add);
-
-		// Remove the clue with matching tileItem
-		cluesAtLocation.removeIf(clue -> clue.getTileItem() == item);
-
-		// Clue despawned, don't know if it will spawn again as a new TileItem, or if it is gonezo
-		// If it does respawn, we need it still in groundItems to check
-		// If it doesn't respawn, we have nothing which is checking the tile
-
-		if (cluesAtLocation.isEmpty())
-		{
-			groundClues.remove(location);
-		}
+		optionalClue.ifPresent((clueInstance -> trackedClues.removeClue(clueInstance)));
 	}
 
-	private void addClue(ClueInstance clue)
+	public Set<WorldPoint> getTrackedWorldPoints()
 	{
-		groundClues.computeIfAbsent(clue.getLocation(), k -> new ArrayList<>()).add(clue);
-	}
-
-	private void removeClue(ClueInstance clue)
-	{
-		groundClues.get(clue.getLocation()).remove(clue);
-	}
-
-	public boolean checkIfItemMatchesKnownItem(Tile tile, TileItem tileItem, WorldPoint tileWp)
-	{
-		List<ClueInstance> knownItemsOnTile = groundClues.get(tileWp);
-		if (knownItemsOnTile == null) return false;
-
-		for (ClueInstance clueInstance : knownItemsOnTile)
-		{
-			int currentTick = client.getTickCount();
-			if (getTrackedItemsAtTile(tile).contains(clueInstance.getTileItem())) continue;
-
-			// For some reason this is always off by 1? IDK, but need to allow for it
-			if (Math.abs(tileItem.getDespawnTime() - clueInstance.getDespawnTick(currentTick)) <= 1)
-			{
-				clueInstance.setTileItem(tileItem);
-				return true;
-			}
-		}
-		return false;
+		return trackedClues.getAllTrackedWorldPoints();
 	}
 
 	public void onGameTick()
 	{
+		loggedInStateOccuredThisTick = false;
+		tileClearedThisTick.clear();
 		currentZone = new Zone(client.getLocalPlayer().getWorldLocation());
-		processPendingGroundCluesOnGameTick();
-		processEmptyTiles();
+		trackedClues.clearEmptyTiles(currentZone);
 
 		for (Tile tile : itemHasSpawnedOnTileThisTick)
 		{
 			checkClueThroughRelativeDespawnTimers(tile);
 		}
 		itemHasSpawnedOnTileThisTick.clear();
-		removeDespawnedClues();
+		trackedClues.removeDespawnedClues();
+		sortClues();
 
 		lastZone = currentZone;
 	}
 
-	private void processEmptyTiles()
+	private void sortClues()
 	{
-		groundClues.entrySet().removeIf(entry ->
+		for (Tile tile : easyToEliteClueSpawnedThisTick)
 		{
-			Tile tile = getTileAtWorldPoint(entry.getKey());
-			if (tile == null) return false;
-
-			Zone clueZone = new Zone(tile.getWorldLocation());
-			// Item won't have potentially spawned if too far, so don't remove
-			int zonesDistance = clueZone.maxDistanceTo(currentZone);
-			if (zonesDistance >= 4) return false;
-			return tile.getGroundItems() == null || tile.getGroundItems().isEmpty();
-		});
-	}
-
-	public void processPendingGroundCluesFromInventoryChanged(ClueInstance removedClue)
-	{
-		Iterator<PendingGroundClue> groundClueIterator = pendingGroundClues.iterator();
-		while (groundClueIterator.hasNext())
-		{
-			PendingGroundClue pendingGroundClue = groundClueIterator.next();
-			// This should be enough, as a player shouldn't be able to drop two of the same item in the same tick
-			// As you can only have one of each item on you at once
-			if (removedClue.getItemId() == pendingGroundClue.getItem().getId())
+			List<TileItem> tileItems = getClueItemsAtTile(tile);
+			SortedSet<ClueInstance> cluesAtWp = trackedClues.getAllCluesAtWorldPoint(tile.getWorldLocation());
+			for (int i=0; i<tileItems.size(); i++)
 			{
-				// Found a match
-				ClueInstance groundClueInstance = new ClueInstance(
-					removedClue.getClueIds(),
-					pendingGroundClue.getItem().getId(),
-					pendingGroundClue.getLocation(),
-					pendingGroundClue.getItem(),
-					client.getTickCount()
-				);
-
-				addClue(groundClueInstance);
-
-				// Remove matched clues from pending lists
-				groundClueIterator.remove();
-				break;
+				TileItem tileItem = tileItems.get(i);
+				int finalI = i + 1;
+				cluesAtWp.stream()
+					.filter((clueInstance -> clueInstance.getTileItem() == tileItem))
+					.findFirst()
+					.ifPresent((clueInstance -> clueInstance.setSequenceNumber(finalI)));
+			}
+			List<ClueInstance> clues = new ArrayList<>(cluesAtWp);
+			for (ClueInstance clueInstance : clues)
+			{
+				// Re-sorts the order of clues
+				trackedClues.removeClue(clueInstance);
+				trackedClues.addClue(clueInstance);
 			}
 		}
-	}
-
-	public void processPendingGroundCluesOnGameTick()
-	{
-		// Remove any with TileItem matching a properly tracked tile item
-		pendingGroundClues.removeIf(pendingGroundClue ->
-		{
-			List<ClueInstance> groundCluesOnTile = groundClues.get(pendingGroundClue.getLocation());
-			if (groundCluesOnTile == null) return false;
-			return groundCluesOnTile
-				.stream()
-				.anyMatch(clueInstance -> clueInstance.getTileItem() == pendingGroundClue.getItem());
-		});
-
-		// If a tick has passed, and we've not associated the pending clue yet, mark it unknown
-		pendingGroundClues.removeIf(pendingGroundClue ->
-		{
-			if (pendingGroundClue.getSpawnTick() < client.getTickCount())
-			{
-				ClueInstance groundClueInstance = new ClueInstance(
-					List.of(),
-					pendingGroundClue.getItem().getId(),
-					pendingGroundClue.getLocation(),
-					pendingGroundClue.getItem(),
-					client.getTickCount()
-				);
-
-				addClue(groundClueInstance);
-				return true;
-			}
-			return false;
-		});
-	}
-
-	private void removeDespawnedClues()
-	{
-		groundClues.entrySet().removeIf(entry ->
-		{
-			List<ClueInstance> cluesList = entry.getValue();
-			cluesList.removeIf(clueInstance -> clueInstance.getDespawnTick(client.getTickCount()) <= client.getTickCount());
-			return cluesList.isEmpty();
-		});
+		easyToEliteClueSpawnedThisTick.clear();
 	}
 
 	private void checkClueThroughRelativeDespawnTimers(Tile tile)
@@ -563,26 +489,26 @@ public class ClueGroundManager
 			return;
 		}
 
-		if (!groundClues.containsKey(tileWp))
-		{
-			groundClues.put(tileWp, new ArrayList<>());
-		}
-
-		List<ClueInstance> storedClues = groundClues.get(tileWp);
+		List<ClueInstance> storedClues = trackedClues.getBeginnerAndMasterCluesAtWorldPoint(tileWp);
 
 		List<ClueInstance> updatedStoredClues = generateNewCluesOnTile(tileWp, storedClues, itemsOnTile);
 
 		if (updatedStoredClues.isEmpty())
 		{
-			groundClues.remove(tileWp);
+			trackedClues.clearBeginnerAndMasterCluesAtWorldPoint(tileWp);
 		}
 		else
 		{
 			// If we didn't find an item for it on the tile, remove it
 			updatedStoredClues.removeIf((clue) -> clue.getTileItem() == null);
 
+			trackedClues.clearBeginnerAndMasterCluesAtWorldPoint(tileWp);
+
 			// Update the stored clues
-			groundClues.put(tileWp, updatedStoredClues);
+			for (ClueInstance updatedStoredClue : updatedStoredClues)
+			{
+				trackedClues.addClue(updatedStoredClue);
+			}
 		}
 	}
 
@@ -646,12 +572,7 @@ public class ClueGroundManager
 			.map(tileItem -> sortedStoredClues.stream()
 				.filter(clue -> clue.getTileItem() == tileItem)
 				.findFirst()
-				.orElseGet(() ->
-				{
-					ClueInstance clueInstance = new ClueInstance(List.of(), tileItem.getId(), tileWp, tileItem, client.getTickCount());
-					clueInstance.setTileItem(tileItem);
-					return clueInstance;
-				}))
+				.orElseGet(() -> new ClueInstance(List.of(), tileItem.getId(), tileWp, tileItem, client.getTickCount())))
 			.forEach(foundClues::add);
 
 		return foundClues;
@@ -665,6 +586,18 @@ public class ClueGroundManager
 		// For items with the same ID, no matter what item you click in a stack, you will always pick up the first item dropped in the stack
 		// This means we don't need to worry about considering gaps where a clue has been taken from the middle of a stack.
 		int minGroundItemFound = 0;
+
+		if (sortedStoredClues.size() == 1 && sortedGroundClues.size() == 1)
+		{
+			// We assume it is the same clue. It is possible for it to be swapped with another clue though in
+			// another client/mobile, and this will be wrong
+			if (sortedStoredClues.get(0).getDespawnTick(currentTick) >= sortedGroundClues.get(0).getDespawnTime())
+			{
+				sortedStoredClues.get(0).setTileItem(sortedGroundClues.get(0));
+				return;
+			}
+		}
+
 		for (int i = 0; i < sortedStoredClues.size() - 1; i++)
 		{
 			ClueInstance clueInstance1 = sortedStoredClues.get(i);
@@ -687,18 +620,7 @@ public class ClueGroundManager
 		}
 	}
 
-	private Tile getTileAtWorldPoint(WorldPoint tileWp)
-	{
-		WorldView worldView = client.getTopLevelWorldView();
-		LocalPoint tileLp = LocalPoint.fromWorld(worldView, tileWp);
-		if (tileLp == null)
-		{
-			return null;
-		}
-		return worldView.getScene().getTiles()[tileWp.getPlane()][tileLp.getSceneX()][tileLp.getSceneY()];
-	}
-
-	private List<TileItem> getTrackedItemsAtTile(Tile tile)
+	private List<TileItem> getClueItemsAtTile(Tile tile)
 	{
 		List<TileItem> items = tile.getGroundItems();
 		if (items == null)
@@ -710,31 +632,35 @@ public class ClueGroundManager
 			.collect(Collectors.toList());
 	}
 
+	private List<TileItem> getTrackedItemsAtTile(Tile tile)
+	{
+		List<TileItem> items = tile.getGroundItems();
+		if (items == null)
+		{
+			return Collections.emptyList();
+		}
+		return items.stream()
+			.filter(item -> Clues.isBeginnerOrMasterClue(item.getId(), clueDetailsPlugin.isDeveloperMode()))
+			.collect(Collectors.toList());
+	}
+
 	class ClueInstanceComparator implements Comparator<ClueInstance>
 	{
 		@Override
 		public int compare(ClueInstance o1, ClueInstance o2)
 		{
-			// Primary comparison: Compare by despawn time
-			int despawnComparison = Integer.compare(o1.getTicksToDespawnConsideringTileItem(client.getTickCount()),
-				o2.getTicksToDespawnConsideringTileItem(client.getTickCount()));
-			if (despawnComparison != 0)
-			{
-				return despawnComparison;
-			}
-			else
-			{
-				// Secondary comparison: If despawn times are the same, compare by itemId
-				return Integer.compare(o1.getItemId(), o2.getItemId());
-			}
+			return Comparator
+				.comparingLong(ClueInstance::getSequenceNumber)
+				.thenComparingInt((ClueInstance oc) -> oc.getDespawnTick(client.getTickCount()))
+				.compare(o1, o2);
 		}
 	}
 
 	public TreeMap<ClueInstance, Integer> getClueInstancesWithQuantityAtWp(ClueDetailsConfig config, WorldPoint wp, int currentTick)
 	{
-		if (groundClues.get(wp).isEmpty()) return null;
+		if (!trackedClues.getAllTrackedWorldPoints().contains(wp)) return null;
 
-		List<ClueInstance> groundItemList = groundClues.get(wp);
+		SortedSet<ClueInstance> groundItemList = trackedClues.getAllCluesAtWorldPoint(wp);
 		Map<ClueInstance, Integer> groundItemMap = new HashMap<>();
 
 		if (config.collapseGroundCluesByTier())
@@ -761,7 +687,7 @@ public class ClueGroundManager
 	}
 
 	// Remove duplicate step clues, maintaining a count of the original amount of each
-	public static Map<ClueInstance, Integer> keepOldestUniqueClues(List<ClueInstance> items, int currentTick)
+	public static Map<ClueInstance, Integer> keepOldestUniqueClues(SortedSet<ClueInstance> items, int currentTick)
 	{
 		Map<List<Integer>, ClueInstance> lowestValueItems = new HashMap<>();
 		Map<List<Integer>, Integer> uniqueCount = new HashMap<>();
@@ -787,7 +713,7 @@ public class ClueGroundManager
 	}
 
 	// Remove duplicate tier clues, maintaining a count of the original amount of each
-	public static Map<ClueInstance, Integer> keepOldestTierClues(List<ClueInstance> items, int currentTick)
+	public static Map<ClueInstance, Integer> keepOldestTierClues(SortedSet<ClueInstance> items, int currentTick)
 	{
 		Map<ClueTier, ClueInstance> lowestValueItems = new HashMap<>();
 		Map<ClueTier, Integer> uniqueCount = new HashMap<>();
@@ -812,15 +738,37 @@ public class ClueGroundManager
 			.collect(Collectors.toMap(item -> item, item ->	uniqueCount.get(item.getTier())));
 	}
 
+	public void clearEasyToEliteCluesAtWorldPoint(WorldPoint wp)
+	{
+		trackedClues.clearEasyToEliteCluesAtWorldPoint(wp);
+	}
+
+	public void setLoggedInOccuredThisTick(boolean loggedIn)
+	{
+		loggedInStateOccuredThisTick = loggedIn;
+	}
+
 	public void saveStateToConfig()
 	{
-		clueGroundSaveDataManager.saveStateToConfig(client, groundClues);
+		clueGroundSaveDataManager.saveStateToConfig(client, trackedClues.getAllClues());
 	}
 
 	public void loadStateFromConfig()
 	{
-		groundClues.clear();
-		groundClues.putAll(clueGroundSaveDataManager.loadStateFromConfig(client));
+		trackedClues.clearAllClues();
+		overwriteGroundClues(clueGroundSaveDataManager.loadStateFromConfig(client));
+	}
+
+	private void overwriteGroundClues(Map<WorldPoint, List<ClueInstance>> newGroundClues)
+	{
+		// Iterate over each list of ClueInstances in the map.
+		for (List<ClueInstance> clueInstances : newGroundClues.values())
+		{
+			for (ClueInstance clueInstance : clueInstances)
+			{
+					trackedClues.addClue(clueInstance);
+			}
+		}
 	}
 }
 
@@ -942,9 +890,13 @@ import com.google.common.collect.ImmutableList;
 import com.google.gson.reflect.TypeToken;
 import java.awt.Color;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
+
 import lombok.Getter;
 import lombok.Setter;
 import net.runelite.api.ItemID;
@@ -1987,9 +1939,37 @@ public class Clues
 		ItemID.DAEYALT_ESSENCE
 	);
 
-	public static List<Clues> filteredClues()
+	private static Map<Integer, List<Clues>> itemIdClueCache = new HashMap<>();
+	private static Map<Integer, Clues> clueIdClueCache = new HashMap<>();
+	private static Map<Integer, Clues> unfilteredClueCache = new HashMap<>();
+
+	public static void rebuildFilteredCluesCache()
 	{
-		if (config == null) return Clues.CLUES;
+		List<ClueTier> enabledClueTiers = getEnabledClueTiers();
+
+		List<Clues> enabledClues = Clues.CLUES.stream()
+				.filter(c -> enabledClueTiers.contains(c.getClueTier()))
+				.collect(Collectors.toList());
+
+		itemIdClueCache = enabledClues
+				.stream()
+				.collect(Collectors.groupingBy(Clues::getItemID));
+
+		clueIdClueCache = enabledClues
+				.stream()
+				.collect(Collectors.toMap(Clues::getClueID, clue -> clue));
+
+		unfilteredClueCache = Clues.CLUES
+				.stream()
+				.collect(Collectors.toMap(Clues::getClueID, clue -> clue));
+	}
+
+	private static List<ClueTier> getEnabledClueTiers()
+	{
+		if (config == null)
+		{
+			return Arrays.asList(ClueTier.values());
+		}
 
 		List<ClueTier> enabledClues = new ArrayList<>();
 		if (config.beginnerDetails()) enabledClues.add(ClueTier.BEGINNER);
@@ -2012,45 +1992,27 @@ public class Clues
 		}
 		if (config.masterDetails()) enabledClues.add(ClueTier.MASTER);
 
-		return Clues.CLUES.stream()
-			.filter(c -> enabledClues.contains(c.getClueTier()))
-			.collect(Collectors.toList());
+		return enabledClues;
 	}
 
 	public static Clues forItemId(int itemId)
 	{
-		for (Clues clue : filteredClues())
+		Clues clue = clueIdClueCache.get(itemId);
+		if (clue != null && clue.clueID == -1)
 		{
-			if (clue.clueID == -1 && clue.getItemID() == itemId)
-			{
-				return clue;
-			}
+			return clue;
 		}
 		return null;
 	}
 
 	public static Clues forClueId(int clueId)
 	{
-		for (Clues clue : CLUES)
-		{
-			if (clue.getClueID() == clueId)
-			{
-				return clue;
-			}
-		}
-		return null;
+		return unfilteredClueCache.get(clueId);
 	}
 
 	public static Clues forClueIdFiltered(int clueId)
 	{
-		for (Clues clue : filteredClues())
-		{
-			if (clue.getClueID() == clueId)
-			{
-				return clue;
-			}
-		}
-		return null;
+		return clueIdClueCache.get(clueId);
 	}
 
 	public Integer getClueID()
@@ -2066,7 +2028,7 @@ public class Clues
 	{
 		final String text = Text.sanitizeMultilineText(rawText).toLowerCase();
 
-		for (Clues clue : filteredClues())
+		for (Clues clue : clueIdClueCache.values())
 		{
 			if (text.equalsIgnoreCase(clue.getClueText()))
 			{
@@ -2079,14 +2041,10 @@ public class Clues
 
 	public static Integer forInterfaceIdGetId(int interfaceId)
 	{
-		// Only check beginner map clues
-		for (int i = 21; i < 26; i++)
+		List<Clues> clues = itemIdClueCache.get(interfaceId);
+		if (!clues.isEmpty())
 		{
-			List<Clues> filteredClues = filteredClues();
-			if (filteredClues.get(i).getItemID() == interfaceId)
-			{
-				return filteredClues.get(i).getClueID();
-			}
+			return clues.get(0).clueID;
 		}
 		return null;
 	}
@@ -2119,12 +2077,17 @@ public class Clues
 
 	public static boolean isClue(int itemId, boolean isDeveloperMode)
 	{
-		return filteredClues().stream().anyMatch((clue) -> clue.getItemID() == itemId) || (isDeveloperMode && DEV_MODE_IDS.contains(itemId));
+		return itemIdClueCache.containsKey(itemId) || (isDeveloperMode && DEV_MODE_IDS.contains(itemId));
+	}
+
+	public static boolean isBeginnerOrMasterClue(int itemId, boolean isDeveloperMode)
+	{
+		return TRACKED_CLUE_IDS.contains(itemId) || (isDeveloperMode && DEV_MODE_IDS.contains(itemId));
 	}
 
 	public static boolean isTrackedClueOrTornClue(int itemId, boolean isDeveloperMode)
 	{
-		return isClue(itemId, isDeveloperMode) || TRACKED_TORN_CLUE_IDS.contains(itemId) || (isDeveloperMode && DEV_MODE_IDS.contains(itemId));
+		return TRACKED_CLUE_IDS.contains(itemId) || TRACKED_TORN_CLUE_IDS.contains(itemId) || (isDeveloperMode && DEV_MODE_IDS.contains(itemId));
 	}
 
 	public static Collection<Integer> getTrackedClueAndTornClueIds(boolean isDevMode)
@@ -2200,6 +2163,8 @@ import com.cluedetails.filters.ClueTier;
 import java.awt.Color;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
+import java.util.concurrent.atomic.AtomicLong;
 import lombok.Data;
 import lombok.Getter;
 import lombok.Setter;
@@ -2213,10 +2178,16 @@ import org.apache.commons.text.WordUtils;
 @Data
 public class ClueInstance
 {
+	private static final AtomicLong sequenceGenerator = new AtomicLong();
+
 	@Setter
 	private List<Integer> clueIds; // Fake ID from ClueText
 	private final int itemId; // Clue item ID
 	private final WorldPoint location; // Null if in inventory
+
+	@Getter
+	@Setter
+	private long sequenceNumber;
 
 	@Getter
 	private final Integer timeToDespawnFromDataInTicks;
@@ -2232,6 +2203,8 @@ public class ClueInstance
 		// Ticks go forward even when logged into other game modes. For simplicity we assume when
 		// Loaded we just are starting from the exact same despawn time remaining.
 		this.timeToDespawnFromDataInTicks = data.getDespawnTick();
+
+		this.sequenceNumber = sequenceGenerator.getAndIncrement();
 	}
 
 	// Constructor for inventory clues from inventory changed event
@@ -2241,6 +2214,8 @@ public class ClueInstance
 		this.itemId = itemId;
 		this.location = null;
 		this.timeToDespawnFromDataInTicks = -1;
+
+		this.sequenceNumber = sequenceGenerator.getAndIncrement();
 	}
 
 	// Constructor for ground clues
@@ -2251,11 +2226,13 @@ public class ClueInstance
 		this.location = location;
 		this.tileItem = tileItem;
 		this.timeToDespawnFromDataInTicks = currentTick;
+
+		this.sequenceNumber = sequenceGenerator.getAndIncrement();
 	}
 
 	public List<Integer> getClueIds()
 	{
-		if (clueIds.isEmpty() && !(itemId == ItemID.CLUE_SCROLL_BEGINNER || itemId == ItemID.CLUE_SCROLL_MASTER))
+		if (clueIds.isEmpty() && !Clues.isBeginnerOrMasterClue(itemId, true))
 		{
 			return Collections.singletonList(itemId);
 		}
@@ -2281,7 +2258,7 @@ public class ClueInstance
 		}
 		return clue.getClueTier();
 	}
-	
+
 	public String getGroundText(ClueDetailsPlugin plugin, ClueDetailsConfig config, ConfigManager configManager, int quantity)
 	{
 		StringBuilder itemStringBuilder = new StringBuilder();
@@ -2373,7 +2350,7 @@ public class ClueInstance
 		return timeToDespawnFromDataInTicks == null ? -1 : timeToDespawnFromDataInTicks;
 	}
 
-	public String getCombinedClueText(ClueDetailsPlugin plugin, ConfigManager configManager, boolean showColor, boolean isFloorText)
+	public String getCombinedClueText(ConfigManager configManager, boolean showColor, boolean isFloorText)
 	{
 		StringBuilder returnText = new StringBuilder();
 		boolean isFirst = true;
@@ -2404,7 +2381,7 @@ public class ClueInstance
 
 			returnText.append(cluePart.getDetail(configManager));
 		}
-		if (returnText.length() == 0) return getItemName(plugin);
+		if (returnText.length() == 0) return null;
 		return returnText.toString();
 	}
 
@@ -2415,7 +2392,7 @@ public class ClueInstance
 
 	public boolean isEnabled(ClueDetailsConfig config)
 	{
-		if (itemId == ItemID.CLUE_SCROLL_BEGINNER)
+		if (itemId == ItemID.CLUE_SCROLL_BEGINNER || Clues.DEV_MODE_IDS.contains(itemId))
 		{
 			return config.beginnerDetails();
 		}
@@ -2440,6 +2417,47 @@ public class ClueInstance
 			return config.masterDetails();
 		}
 		else return getTier() != null;
+	}
+
+	@Override
+	public boolean equals(Object o)
+	{
+		if (this == o) return true;
+		if (!(o instanceof ClueInstance)) return false;
+		ClueInstance clueInstance = (ClueInstance) o;
+
+		int diff1;
+		int diff2;
+		if (tileItem != null && clueInstance.tileItem != null)
+		{
+			diff1 = tileItem.getDespawnTime();
+			diff2 = clueInstance.tileItem.getDespawnTime();
+		}
+		else if (tileItem == null && clueInstance.tileItem == null)
+		{
+			diff1 = getDespawnTick(ClueDetailsPlugin.getCurrentTick());
+			diff2 = clueInstance.getDespawnTick(ClueDetailsPlugin.getCurrentTick());
+		}
+		else
+		{
+			return false;
+		}
+		// Should this really be considering it equal without consideration for the clueIds?
+		return itemId == clueInstance.itemId && diff1 == diff2 && location.equals(clueInstance.location);
+	}
+
+	@Override
+	public int hashCode()
+	{
+		int despawnTime = getDespawnTick(ClueDetailsPlugin.getCurrentTick());
+		return Objects.hash(itemId, despawnTime, location);
+	}
+
+	@Override
+	public String toString()
+	{
+		int despawnTime = getDespawnTick(ClueDetailsPlugin.getCurrentTick());
+		return "ClueInstance{" + "itemId=" + itemId + ", despawnTick=" + despawnTime + ", worldPoint=" + location + ", orderId=" + sequenceNumber + "}";
 	}
 }
 
@@ -2545,6 +2563,246 @@ public class PendingGroundClue
 		this.spawnTick = spawnTick;
 	}
 }
+/*
+ * Copyright (c) 2025, Zoinkwiz <https://github.com/Zoinkwiz>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.cluedetails;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import net.runelite.api.Client;
+import net.runelite.api.Tile;
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+
+public class WorldPointToClueInstances
+{
+	private final Client client;
+	private final ClueDetailsPlugin clueDetailsPlugin;
+	private final Comparator<ClueInstance> clueComparator;
+
+	private final Map<WorldPoint, SortedSet<ClueInstance>> cluesByWorldPoint = new HashMap<>();
+	private final Map<WorldPoint, List<ClueInstance>> groundCluesBeginnerAndMaster = new HashMap<>();
+	private final Map<WorldPoint, List<ClueInstance>> groundCluesEasyToElite = new HashMap<>();
+
+	public WorldPointToClueInstances(Client client, ClueDetailsPlugin clueDetailsPlugin)
+	{
+		this.client = client;
+		this.clueDetailsPlugin = clueDetailsPlugin;
+
+		clueComparator = Comparator
+			.comparingLong(ClueInstance::getSequenceNumber)
+			.thenComparingInt((ClueInstance oc) -> oc.getDespawnTick(client.getTickCount()));
+	}
+
+	private void createGroupedSet(WorldPoint wp)
+	{
+		if (cluesByWorldPoint.get(wp) != null)
+		{
+			cluesByWorldPoint.get(wp).clear();
+		}
+
+		if (groundCluesBeginnerAndMaster.get(wp) != null)
+		{
+			for (ClueInstance clueInstance : groundCluesBeginnerAndMaster.get(wp))
+			{
+				cluesByWorldPoint.computeIfAbsent(wp, k -> new TreeSet<>(clueComparator)).add(clueInstance);
+			}
+		}
+
+		if (groundCluesEasyToElite.get(wp) != null)
+		{
+			for (ClueInstance clueInstance : groundCluesEasyToElite.get(wp))
+			{
+				cluesByWorldPoint.computeIfAbsent(wp, k -> new TreeSet<>(clueComparator)).add(clueInstance);
+			}
+		}
+
+		if (cluesByWorldPoint.get(wp).isEmpty())
+		{
+			cluesByWorldPoint.remove(wp);
+		}
+	}
+
+	public List<ClueInstance> getAllClues()
+	{
+		SortedSet<ClueInstance> allClues = new TreeSet<>(clueComparator);
+
+		cluesByWorldPoint.values().forEach(allClues::addAll);
+		return new ArrayList<>(allClues);
+	}
+
+	public SortedSet<ClueInstance> getAllCluesAtWorldPoint(WorldPoint wp)
+	{
+		return cluesByWorldPoint.getOrDefault(wp, Collections.emptySortedSet());
+	}
+
+	public List<ClueInstance> getBeginnerAndMasterCluesAtWorldPoint(WorldPoint wp)
+	{
+		return new ArrayList<>(groundCluesBeginnerAndMaster.getOrDefault(wp, new ArrayList<>()));
+	}
+
+	public void addClue(ClueInstance clueInstance)
+	{
+		if (Clues.isBeginnerOrMasterClue(clueInstance.getItemId(), clueDetailsPlugin.isDeveloperMode()))
+		{
+			addBeginnerMasterClue(clueInstance);
+		}
+		else if (Clues.isClue(clueInstance.getItemId(), clueDetailsPlugin.isDeveloperMode()))
+		{
+			addEasyToEliteClue(clueInstance);
+		}
+
+		createGroupedSet(clueInstance.getLocation());
+	}
+
+	public void removeClue(ClueInstance clueInstance)
+	{
+		if (Clues.isBeginnerOrMasterClue(clueInstance.getItemId(), clueDetailsPlugin.isDeveloperMode()))
+		{
+			removeBeginnerMasterClue(clueInstance);
+		}
+		else if (Clues.isClue(clueInstance.getItemId(), clueDetailsPlugin.isDeveloperMode()))
+		{
+			removeEasyToEliteClue(clueInstance);
+		}
+
+		createGroupedSet(clueInstance.getLocation());
+	}
+
+	private void addBeginnerMasterClue(ClueInstance clue)
+	{
+		groundCluesBeginnerAndMaster.computeIfAbsent(clue.getLocation(), k -> new ArrayList<>()).add(clue);
+	}
+
+	private void addEasyToEliteClue(ClueInstance clueInstance)
+	{
+		groundCluesEasyToElite.computeIfAbsent(clueInstance.getLocation(), k -> new ArrayList<>()).add(clueInstance);
+	}
+
+	private void removeBeginnerMasterClue(ClueInstance clueInstance)
+	{
+		List<ClueInstance> list = groundCluesBeginnerAndMaster.get(clueInstance.getLocation());
+		if (list != null)
+		{
+			list.remove(clueInstance);
+			if (list.isEmpty())
+			{
+				groundCluesBeginnerAndMaster.remove(clueInstance.getLocation());
+			}
+		}
+	}
+
+	private void removeEasyToEliteClue(ClueInstance clueInstance)
+	{
+		List<ClueInstance> list = groundCluesEasyToElite.get(clueInstance.getLocation());
+		if (list != null)
+		{
+			list.remove(clueInstance);
+
+			if (groundCluesEasyToElite.get(clueInstance.getLocation()) != null && groundCluesEasyToElite.get(clueInstance.getLocation()).isEmpty())
+			{
+				groundCluesEasyToElite.remove(clueInstance.getLocation());
+			}
+		}
+	}
+
+	public void clearEasyToEliteCluesAtWorldPoint(WorldPoint wp)
+	{
+		List<ClueInstance> clues = groundCluesEasyToElite.get(wp);
+		if (clues == null) return;
+		new ArrayList<>(clues).forEach(this::removeClue);
+	}
+
+	public void clearBeginnerAndMasterCluesAtWorldPoint(WorldPoint wp)
+	{
+		List<ClueInstance> clues = groundCluesBeginnerAndMaster.get(wp);
+		if (clues == null) return;
+		new ArrayList<>(clues).forEach(this::removeClue);
+	}
+
+	public void clearEmptyTiles(Zone currentZone)
+	{
+		for (ClueInstance clueInstance : getAllClues())
+		{
+			Tile tile = getTileAtWorldPoint(clueInstance.getLocation());
+			if (tile == null) continue;
+
+			Zone clueZone = new Zone(tile.getWorldLocation());
+			// Item won't have potentially spawned if too far, so don't remove
+			int zonesDistance = clueZone.maxDistanceTo(currentZone);
+			if (zonesDistance >= 4) continue;
+			if (tile.getGroundItems() == null || tile.getGroundItems().isEmpty())
+			{
+				removeClue(clueInstance);
+			}
+		}
+	}
+
+	public void clearAllClues()
+	{
+		groundCluesEasyToElite.clear();
+		groundCluesBeginnerAndMaster.clear();
+		cluesByWorldPoint.clear();
+	}
+
+	public void removeDespawnedClues()
+	{
+		for (ClueInstance clueInstance : getAllClues())
+		{
+			if (clueInstance.getDespawnTick(client.getTickCount()) <= client.getTickCount())
+			{
+				removeClue(clueInstance);
+			}
+		}
+	}
+
+	public Set<WorldPoint> getAllTrackedWorldPoints()
+	{
+		return cluesByWorldPoint.keySet();
+	}
+
+	public Tile getTileAtWorldPoint(WorldPoint tileWp)
+	{
+		WorldView worldView = client.getTopLevelWorldView();
+		LocalPoint tileLp = LocalPoint.fromWorld(worldView, tileWp);
+		if (tileLp == null)
+		{
+			return null;
+		}
+		return worldView.getScene().getTiles()[tileWp.getPlane()][tileLp.getSceneX()][tileLp.getSceneY()];
+	}
+}
+
 /*
  * Copyright (c) 2024, TheLope <https://github.com/TheLope>
  * All rights reserved.
@@ -2784,10 +3042,8 @@ package com.cluedetails;
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.Graphics2D;
-import java.util.Arrays;
 import javax.inject.Inject;
 
-import com.cluedetails.filters.ClueTier;
 import lombok.Setter;
 import net.runelite.api.Client;
 import net.runelite.api.InventoryID;
@@ -2835,7 +3091,7 @@ public class ClueDetailsInventoryOverlay extends OverlayPanel
 
 		for (Item item : inventory.getItems())
 		{
-			ClueInstance clueInstance = clueInventoryManager.getTrackedClueByClueItemId(item.getId());
+			ClueInstance clueInstance = clueInventoryManager.getClueByClueItemId(item.getId());
 			if (clueInstance == null || clueInstance.getClueIds().isEmpty()) continue;
 
 			for (Integer clueId : clueInstance.getClueIds())
@@ -4235,7 +4491,7 @@ public class ClueGroundSaveDataManager
 		this.gson = gson;
 	}
 
-	public void saveStateToConfig(Client client, Map<WorldPoint, List<ClueInstance>> groundClues)
+	public void saveStateToConfig(Client client, List<ClueInstance> groundClues)
 	{
 		// Serialize groundClues save to config
 		updateData(client, groundClues);
@@ -4243,18 +4499,14 @@ public class ClueGroundSaveDataManager
 		configManager.setConfiguration(CONFIG_GROUP, GROUND_CLUES_KEY, groundCluesJson);
 	}
 
-	private void updateData(Client client, Map<WorldPoint, List<ClueInstance>> groundClues)
+	private void updateData(Client client, List<ClueInstance> groundClues)
 	{
 		int currentTick = client.getTickCount();
 
 		List<ClueInstanceData> newData = new ArrayList<>();
-		for (Map.Entry<WorldPoint, List<ClueInstance>> entry : groundClues.entrySet())
+		for (ClueInstance groundClue : groundClues)
 		{
-			List<ClueInstance> clueDataList = entry.getValue();
-			for (ClueInstance data : clueDataList)
-			{
-				newData.add(new ClueInstanceData(data, currentTick));
-			}
+			newData.add(new ClueInstanceData(groundClue, currentTick));
 		}
 		clueInstanceData.clear();
 		clueInstanceData.addAll(newData);
@@ -4297,7 +4549,7 @@ public class ClueGroundSaveDataManager
 			} catch (Exception err)
 			{
 				groundClues.clear();
-				saveStateToConfig(client, groundClues);
+				saveStateToConfig(client, new ArrayList<>());
 			}
 		}
 
@@ -4407,7 +4659,7 @@ public class ClueBankManager
 		ClueInstance clueFromBank = cluesInBank.get(trackedClueId);
 		if (clueFromBank == null) return;
 
-		ClueInstance clue = clueInventoryManager.getTrackedClueByClueItemId(trackedClueId);
+		ClueInstance clue = clueInventoryManager.getClueByClueItemId(trackedClueId);
 		clue.setClueIds(clueFromBank.getClueIds());
 
 		cluesInBank.remove(trackedClueId);
@@ -4933,6 +5185,7 @@ public class ClueDetailsOverlay extends OverlayPanel
 
 	private void showMenuItem()
 	{
+		if (!(config.showHoverText() && !config.changeClueText())) return;
 		Menu menu = client.getMenu();
 		MenuEntry[] currentMenuEntries = menu.getMenuEntries();
 
@@ -4944,57 +5197,50 @@ public class ClueDetailsOverlay extends OverlayPanel
 			return;
 		}
 
-		List<MenuEntryAndPos> entriesByTile = getEntriesByTile(currentMenuEntries);
-
-		if (config.showHoverText() && !config.changeClueText())
-		{
-			addTooltip(entriesByTile);
-		}
+		addTooltip(getEntriesByTile(currentMenuEntries));
 	}
 
-	// Using onClientTick for compatability with Ground Items "Collapse ground item menu"
+	// Using onClientTick for compatibility with Ground Items "Collapse ground item menu"
 	@Subscribe
 	public void onClientTick(ClientTick event)
 	{
-		final MenuEntry[] menuEntries = client.getMenuEntries();
+		if (!(config.changeClueText() || config.colorChangeClueText())) return;
+		final MenuEntry[] menuEntries = client.getMenu().getMenuEntries();
+
 		if (Arrays.stream(menuEntries).noneMatch(this::isTakeClue))
 		{
 			return;
 		}
 
-		List<MenuEntryAndPos> entriesByTile = getEntriesByTile(menuEntries);
-
-		if (config.changeClueText() || config.colorChangeClueText())
+		// Don't run when client.isMenuOpen due to conflict with Ground Items "Collapse ground item menu"
+		if (!client.isMenuOpen())
 		{
-			changeGroundItemMenu(entriesByTile);
+			changeGroundItemMenu(getEntriesByTile(menuEntries));
 		}
 	}
 
 	@Subscribe
 	public void onMenuOpened(MenuOpened event)
 	{
+		if (!config.changeClueText()) return;
+
 		MenuEntry[] entries = event.getMenuEntries();
 		if (Arrays.stream(entries).noneMatch(this::isTakeClue))
 		{
 			return;
 		}
 
-		List<MenuEntryAndPos> entriesByTile = getEntriesByTile(entries);
-
-		if (config.changeClueText())
-		{
-			addClueSubmenus(entriesByTile);
-		}
+		addClueSubmenus(getEntriesByTile(entries));
 	}
 
 	private void changeGroundItemMenu(List<MenuEntryAndPos> entriesByTile)
 	{
+		int threeStepCount = 0;
 		// Change ground item menu text
 		for (MenuEntryAndPos entryAndPos : entriesByTile)
 		{
 			MenuEntry menuEntry = entryAndPos.getMenuEntry();
 			if (!isTakeOrMarkClue(menuEntry)) continue;
-
 			boolean showColor = shouldShowColor(menuEntry);
 			String regex = "(Clue scroll \\(.*?\\)( x [0-9]+)?|Challenge scroll \\(.*?\\)( x [0-9]+)?)";
 			if (clueDetailsPlugin.isDeveloperMode())
@@ -5023,7 +5269,9 @@ public class ClueDetailsOverlay extends OverlayPanel
 			// Handle master three-step cryptic
 			if (newText.split("<br>").length > 1)
 			{
-				newText = "Three-step (master)";
+				// Add unique col tag for compatibility with Ground Items "Collapse ground item menu"
+				newText = "Three-step (master)<col=" + String.format("%0" + 8 + "d", threeStepCount) + ">";
+				threeStepCount++;
 			}
 			// Replace the matched text with the new text
 			String newTarget = matcher.replaceAll(newText);
@@ -5147,7 +5395,7 @@ public class ClueDetailsOverlay extends OverlayPanel
 			LocalPoint itemLp = new LocalPoint(x, y, wv);
 			WorldPoint itemWp = WorldPoint.fromLocal(client, itemLp);
 			int currentPosForTile = foundPosForWp.getOrDefault(itemWp, 0);
-			if (Clues.isTrackedClueOrTornClue(menuEntries[i].getIdentifier(), clueDetailsPlugin.isDeveloperMode()))
+			if (Clues.isClue(menuEntries[i].getIdentifier(), clueDetailsPlugin.isDeveloperMode()))
 			{
 				mappedEntries.add(new MenuEntryAndPos(menuEntries[i], menuEntries.length - i - 1, currentPosForTile));
 				if (isTakeClue(menuEntries[i])) foundPosForWp.put(itemWp, currentPosForTile + 1);
@@ -5219,32 +5467,14 @@ public class ClueDetailsOverlay extends OverlayPanel
 	private String getText(MenuEntryAndPos menuEntryAndPos, boolean showColor, boolean isFloorText)
 	{
 		MenuEntry menuEntry = menuEntryAndPos.getMenuEntry();
-		int scrollID = getScrollID(menuEntry);
-
-		Clues matchingClue = Clues.forItemId(scrollID);
-		if (matchingClue != null)
-		{
-			String text = matchingClue.getDetail(configManager);
-			if (showColor)
-			{
-				Color color = matchingClue.getDetailColor(configManager);
-
-				// Only change floor text color if it's not the default
-				if (!(isFloorText && color == Color.WHITE))
-				{
-					String hexColor = Integer.toHexString(color.getRGB()).substring(2);
-					return "<col=" + hexColor + ">" + text;
-				}
-			}
-			return text;
-		}
 
 		if (isReadClue(menuEntry))
 		{
-			ClueInstance clueInstance = clueInventoryManager.getTrackedClueByClueItemId(scrollID);
+			int scrollID = getScrollID(menuEntry);
+			ClueInstance clueInstance = clueInventoryManager.getClueByClueItemId(scrollID);
 			if (clueInstance != null && !clueInstance.getClueIds().isEmpty())
 			{
-				return clueInstance.getCombinedClueText(clueDetailsPlugin, configManager, showColor, isFloorText);
+				return clueInstance.getCombinedClueText(configManager, showColor, isFloorText);
 			}
 		}
 
@@ -5290,9 +5520,8 @@ public class ClueDetailsOverlay extends OverlayPanel
 		int wv = menuEntry.getWorldViewId();
 		LocalPoint itemLp = new LocalPoint(sceneX * SCENE_TO_LOCAL, sceneY * SCENE_TO_LOCAL, wv);
 		WorldPoint itemWp = WorldPoint.fromLocalInstance(client, itemLp);
-		List<ClueInstance> trackedClues = clueGroundManager.getGroundClues().get(itemWp);
-		if (trackedClues == null) return null;
-		if (trackedClues.size() <= entry.getPosOnTile()) return trackedClues.get(entry.getPosOnTile() - 1);
+		List<ClueInstance> trackedClues = new ArrayList<>(clueGroundManager.getAllGroundCluesOnWp(itemWp));
+		if (trackedClues.size() <= entry.getPosOnTile()) return null;
 		return trackedClues.get(entry.getPosOnTile());
 	}
 
@@ -5301,7 +5530,7 @@ public class ClueDetailsOverlay extends OverlayPanel
 		ClueInstance clueInstance = getTrackedClueInstance(entry);
 		if (clueInstance == null) return null;
 
-		return clueInstance.getCombinedClueText(clueDetailsPlugin, configManager, showColor, isFloorText);
+		return clueInstance.getCombinedClueText(configManager, showColor, isFloorText);
 	}
 
 	private Color getTrackedClueColor(MenuEntryAndPos entry)
@@ -5476,7 +5705,6 @@ import java.util.*;
 import javax.inject.Singleton;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
-import lombok.Getter;
 import net.runelite.api.Client;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
@@ -5504,10 +5732,8 @@ public class ClueInventoryManager
 	private final ClueGroundManager clueGroundManager;
 	private final ClueBankManager clueBankManager;
 	private final ChatboxPanelManager chatboxPanelManager;
-	private final Map<Integer, ClueInstance> trackedCluesInInventory = new HashMap<>();
-	private final Map<Integer, ClueInstance> previousTrackedCluesInInventory = new HashMap<>();
-	@Getter
-	private Clues[] cluesInInventory = new Clues[6];
+	private final Map<Integer, ClueInstance> cluesInInventory = new HashMap<>();
+	private final Map<Integer, ClueInstance> previousCluesInInventory = new HashMap<>();
 
 	// To be initialized to avoid passing around
 	@Setter
@@ -5526,15 +5752,12 @@ public class ClueInventoryManager
 
 	public void updateInventory(ItemContainer inventoryContainer)
 	{
-		// Copy current tracked clues to previous
-		previousTrackedCluesInInventory.clear();
-		previousTrackedCluesInInventory.putAll(trackedCluesInInventory);
+		// Copy current clues to previous
+		previousCluesInInventory.clear();
+		previousCluesInInventory.putAll(cluesInInventory);
 
-		// Clear current tracked clues
-		trackedCluesInInventory.clear();
-
-		// Clear current clues in inventory
-		cluesInInventory = new Clues[6];
+		// Clear current clues
+		cluesInInventory.clear();
 
 		Item[] inventoryItems = inventoryContainer.getItems();
 
@@ -5542,48 +5765,31 @@ public class ClueInventoryManager
 		{
 			if (item == null) continue;
 
-			int itemId = item.getId();
-			
-			if (Clues.isTrackedClueOrTornClue(itemId, clueDetailsPlugin.isDeveloperMode()))
-			{
-				checkItemAsBeginnerOrMasterClue(itemId);
-			}
-			else
-			{
-				checkItemAsEasyToMediumClue(itemId);
-			}
+			checkItemAsClueInstance(item.getId());
 		}
 
 		clueGroundManager.getDespawnedClueQueueForInventoryCheck().clear();
 
 		// Compare previous and current to find removed clues
-		for (Integer itemId : previousTrackedCluesInInventory.keySet())
+		for (Integer itemId : previousCluesInInventory.keySet())
 		{
-			if (!trackedCluesInInventory.containsKey(itemId) || trackedCluesInInventory.get(itemId) != previousTrackedCluesInInventory.get(itemId))
+			if (!cluesInInventory.containsKey(itemId) || cluesInInventory.get(itemId) != previousCluesInInventory.get(itemId))
 			{
 				// Clue was removed from inventory (possibly dropped)
-				ClueInstance removedClue = previousTrackedCluesInInventory.get(itemId);
+				ClueInstance removedClue = previousCluesInInventory.get(itemId);
 				if (removedClue != null)
 				{
-					clueGroundManager.processPendingGroundCluesFromInventoryChanged(removedClue);
 					clueBankManager.addToRemovedClues(removedClue);
 				}
 			}
 		}
 	}
 
-	private void checkItemAsEasyToMediumClue(int id)
-	{
-		Clues clue = Clues.forItemId(id);
-		if (clue != null)
-		{
-			cluesInInventory[clue.getClueTier().getValue()] = clue;
-		}
-	}
-
-	private void checkItemAsBeginnerOrMasterClue(int itemId)
+	private void checkItemAsClueInstance(int itemId)
 	{
 		ClueInstance clueInstance;
+
+		if (!Clues.isClue(itemId, clueDetailsPlugin.isDeveloperMode())) return;
 
 		// If we have a clue we've picked up this tick, we've probably dropped and picked up a clue same tick
 		Optional<ClueInstance> clueFromFloorInInv = clueGroundManager.getDespawnedClueQueueForInventoryCheck().stream()
@@ -5591,21 +5797,21 @@ public class ClueInventoryManager
 			.findFirst();
 		if (clueFromFloorInInv.isPresent())
 		{
-			trackedCluesInInventory.put(itemId, new ClueInstance(clueFromFloorInInv.get().getClueIds(), itemId));
+			cluesInInventory.put(itemId, new ClueInstance(clueFromFloorInInv.get().getClueIds(), itemId));
 			return;
 		}
 
 		// If clue is already in previous, keep the same ClueInstance
 		// This check is after the floor check as you could drop and pick up a clue in the same tick
-		clueInstance = previousTrackedCluesInInventory.get(itemId);
+		clueInstance = previousCluesInInventory.get(itemId);
 		if (clueInstance != null && Clues.isClue(clueInstance.getItemId(), clueDetailsPlugin.isDeveloperMode()))
 		{
-			trackedCluesInInventory.put(itemId, clueInstance);
+			cluesInInventory.put(itemId, clueInstance);
 		}
 		else
 		{
 			clueInstance = new ClueInstance(new ArrayList<>(), itemId);
-			trackedCluesInInventory.put(itemId, clueInstance);
+			cluesInInventory.put(itemId, clueInstance);
 		}
 	}
 
@@ -5619,7 +5825,7 @@ public class ClueInventoryManager
 			for (Integer devModeId : Clues.DEV_MODE_IDS)
 			{
 				int randomTestId = (int) (Math.random() * 20);
-				trackedCluesInInventory.put(devModeId, new ClueInstance(List.of(randomTestId), devModeId));
+				cluesInInventory.put(devModeId, new ClueInstance(List.of(randomTestId), devModeId));
 			}
 		}
 
@@ -5638,10 +5844,10 @@ public class ClueInventoryManager
 
 		if (clueIds.get(0) == null) return;
 
-		Set<Integer> itemIDs = trackedCluesInInventory.keySet();
+		Set<Integer> itemIDs = cluesInInventory.keySet();
 		for (Integer itemID : itemIDs)
 		{
-			ClueInstance clueInstance = trackedCluesInInventory.get(itemID);
+			ClueInstance clueInstance = cluesInInventory.get(itemID);
 			// Check that at least one part of the clue text matches the clue tier we're looking at
 			if (clueInstance == null) continue;
 			Clues clueInfo = Clues.forClueIdFiltered(clueIds.get(0));
@@ -5661,24 +5867,19 @@ public class ClueInventoryManager
 		clueIds.add(Clues.forInterfaceIdGetId(interfaceId));
 
 		// Assume can only be beginner for now
-		ClueInstance beginnerClueInInv = trackedCluesInInventory.get(ItemID.CLUE_SCROLL_BEGINNER);
+		ClueInstance beginnerClueInInv = cluesInInventory.get(ItemID.CLUE_SCROLL_BEGINNER);
 		if (beginnerClueInInv == null) return;
 		beginnerClueInInv.setClueIds(clueIds);
 	}
 
-	public Set<Integer> getTrackedCluesInInventory()
+	public Set<Integer> getCluesInInventory()
 	{
-		return trackedCluesInInventory.keySet();
+		return cluesInInventory.keySet();
 	}
 
-	public ClueInstance getTrackedClueByClueItemId(Integer clueItemID)
+	public ClueInstance getClueByClueItemId(Integer clueItemID)
 	{
-		return trackedCluesInInventory.get(clueItemID);
-	}
-
-	public boolean hasTrackedClues()
-	{
-		return !trackedCluesInInventory.isEmpty();
+		return cluesInInventory.get(clueItemID);
 	}
 
 	public void onMenuEntryAdded(MenuEntryAdded event, CluePreferenceManager cluePreferenceManager, ClueDetailsParentPanel panel)
@@ -5735,15 +5936,14 @@ public class ClueInventoryManager
 		// Add item highlight menu
 		if (!hasClueName(menuEntry.getTarget()))
 		{
-			if (Arrays.stream(cluesInInventory).allMatch(Objects::isNull) && trackedCluesInInventory.isEmpty()) return;
+			if (cluesInInventory.isEmpty()) return;
 
 			MenuEntry clueDetailsEntry = client.getMenu().createMenuEntry(-1)
 				.setOption("Clue details")
 				.setTarget(menuEntry.getTarget())
 				.setType(MenuAction.RUNELITE);
 			Menu submenu = clueDetailsEntry.createSubMenu();
-			Arrays.stream(cluesInInventory).forEach((clue) -> addHighlightItemMenu(cluePreferenceManager, submenu, clue, itemId, event));
-			trackedCluesInInventory.forEach((id, instance) -> instance.getClueIds().forEach((clueId) -> addHighlightItemMenu(cluePreferenceManager, submenu, Clues.forClueIdFiltered(clueId), itemId, event)));
+			cluesInInventory.forEach((id, instance) -> instance.getClueIds().forEach((clueId) -> addHighlightItemMenu(cluePreferenceManager, submenu, Clues.forClueIdFiltered(clueId), itemId, event)));
 			return;
 		}
 
@@ -5756,7 +5956,7 @@ public class ClueInventoryManager
 		boolean isMarked = cluePreferenceManager.getHighlightPreference(itemId);
 
 		// Mark Option
-		if (!Clues.isTrackedClueOrTornClue(itemId, clueDetailsPlugin.isDeveloperMode()))
+		if (!Clues.isBeginnerOrMasterClue(itemId, clueDetailsPlugin.isDeveloperMode()))
 		{
 			toggleMarkClue(cluePreferenceManager, panel, itemId, isMarked, name);
 		}
@@ -5769,10 +5969,9 @@ public class ClueInventoryManager
 		String option = null;
 		String target = null;
 
-		// If beginner or master clue
-		if (Clues.isTrackedClueOrTornClue(itemId, clueDetailsPlugin.isDeveloperMode()))
+		if (Clues.isBeginnerOrMasterClue(itemId, clueDetailsPlugin.isDeveloperMode()))
 		{
-			ClueInstance clueSelected = trackedCluesInInventory.get(itemId);
+			ClueInstance clueSelected = cluesInInventory.get(itemId);
 			if (clueSelected == null || clueSelected.getClueIds().isEmpty()) return;
 
 			clueIds.addAll(clueSelected.getClueIds());
@@ -5914,16 +6113,18 @@ public class ClueInventoryManager
 		if (isNewBeginnerClue(chatDialogClueItemWidget)
 			|| (isUriBeginnerClue(headModelWidget) && isUriStandardDialogue(npcChatWidget)))
 		{
-			ClueInstance clue = trackedCluesInInventory.get(ItemID.CLUE_SCROLL_BEGINNER);
+			ClueInstance clue = cluesInInventory.get(ItemID.CLUE_SCROLL_BEGINNER);
 			if (clue == null) return;
 			clue.setClueIds(List.of());
+			clueDetailsPlugin.getItemsOverlay().invalidateCache();
 		}
 		else if (isNewMasterClue(chatDialogClueItemWidget)
 			|| (isUriMasterClue(headModelWidget) && isUriStandardDialogue(npcChatWidget)))
 		{
-			ClueInstance clue =  trackedCluesInInventory.get(ItemID.CLUE_SCROLL_MASTER);
+			ClueInstance clue =  cluesInInventory.get(ItemID.CLUE_SCROLL_MASTER);
 			if (clue == null) return;
 			clue.setClueIds(List.of());
+			clueDetailsPlugin.getItemsOverlay().invalidateCache();
 		}
 	}
 
@@ -6006,6 +6207,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
+import java.util.TimerTask;
 import java.util.TreeMap;
 import javax.inject.Inject;
 import javax.inject.Named;
@@ -6016,6 +6218,7 @@ import net.runelite.api.GameState;
 import net.runelite.api.InventoryID;
 import net.runelite.api.ItemID;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ItemContainerChanged;
@@ -6039,7 +6242,6 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.events.RuneScapeProfileChanged;
 import net.runelite.client.game.ItemManager;
-import net.runelite.client.input.KeyManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
@@ -6048,7 +6250,6 @@ import net.runelite.client.ui.components.colorpicker.ColorPickerManager;
 import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
 import net.runelite.client.util.ImageUtil;
-import net.runelite.client.util.RSTimeUnit;
 
 @Slf4j
 @PluginDescriptor(
@@ -6082,6 +6283,7 @@ public class ClueDetailsPlugin extends Plugin
 	@Inject
 	private ClueDetailsInventoryOverlay inventoryOverlay;
 
+	@Getter
 	@Inject
 	private ClueDetailsItemsOverlay itemsOverlay;
 
@@ -6099,9 +6301,6 @@ public class ClueDetailsPlugin extends Plugin
 
 	@Inject
 	private ConfigManager configManager;
-
-	@Inject
-	private KeyManager keyManager;
 
 	@Getter
 	@Inject
@@ -6139,6 +6338,7 @@ public class ClueDetailsPlugin extends Plugin
 	private ChatboxItemSearch itemSearch;
 
 	@Inject
+	@Getter
 	private Notifier notifier;
 
 	@Inject
@@ -6153,6 +6353,9 @@ public class ClueDetailsPlugin extends Plugin
 	private NavigationButton navButton;
 
 	private boolean profileChanged;
+
+	@Getter
+	public static int currentTick;
 
 	@Override
 	protected void startUp() throws Exception
@@ -6172,6 +6375,7 @@ public class ClueDetailsPlugin extends Plugin
 		eventBus.register(itemsOverlay);
 
 		Clues.setConfig(config);
+		Clues.rebuildFilteredCluesCache();
 		ClueInventoryManager.setConfig(config);
 
 		cluePreferenceManager = new CluePreferenceManager(this, configManager);
@@ -6276,11 +6480,20 @@ public class ClueDetailsPlugin extends Plugin
 			profileChanged = true;
 		}
 
-		if (event.getGameState() == GameState.LOGGED_IN && profileChanged)
+		if (event.getGameState() == GameState.LOADING)
 		{
-			profileChanged = false;
-			clueGroundManager.loadStateFromConfig();
-			clueBankManager.loadStateFromConfig();
+			clueGroundManager.setLoggedInOccuredThisTick(true);
+		}
+
+		if (event.getGameState() == GameState.LOGGED_IN)
+		{
+			clueGroundManager.setLoggedInOccuredThisTick(true);
+			if (profileChanged)
+			{
+				profileChanged = false;
+				clueGroundManager.loadStateFromConfig();
+				clueBankManager.loadStateFromConfig();
+			}
 		}
 	}
 
@@ -6288,6 +6501,12 @@ public class ClueDetailsPlugin extends Plugin
 	public void onRuneScapeProfileChanged(RuneScapeProfileChanged event)
 	{
 		profileChanged = true;
+	}
+
+	@Subscribe
+	public void onClientTick(ClientTick event)
+	{
+		currentTick = client.getTickCount();
 	}
 
 	@Subscribe
@@ -6305,10 +6524,21 @@ public class ClueDetailsPlugin extends Plugin
 			{
 				for (ClueGroundTimer timer : clueGroundTimers)
 				{
-					if (!timer.isNotified() && timer.getDuration().compareTo(Duration.ofSeconds(config.groundClueTimersNotificationTime())) < 0)
+					if (!timer.isNotified() && timer.shouldNotify() && !timer.isRenotifying())
 					{
 						notifier.notify("Your clue scroll is about to disappear!");
-						timer.setNotified(true);
+						if (config.groundClueTimersRenotificationTime() != 0)
+						{
+							timer.startRenotification();
+						}
+						else
+						{
+							timer.setNotified(true);
+						}
+					}
+					else if (timer.isNotified() && !timer.shouldNotify())
+					{
+						timer.setNotified(false);
 					}
 				}
 			}
@@ -6347,6 +6577,16 @@ public class ClueDetailsPlugin extends Plugin
 			infoOverlay.refreshHighlights();
 		}
 
+		if (event.getKey().equals("beginnerDetails")
+			|| event.getKey().equals("easyDetails")
+			|| event.getKey().equals("mediumDetails")
+			|| event.getKey().equals("hardDetails")
+			|| event.getKey().equals("eliteDetails")
+			|| event.getKey().equals("masterDetails"))
+		{
+			Clues.rebuildFilteredCluesCache();
+		}
+
 		if (event.getGroup().equals("clue-details-color")
 			|| event.getGroup().equals("clue-details-items")
 			|| event.getKey().equals("highlightInventoryClueScrolls")
@@ -6373,22 +6613,15 @@ public class ClueDetailsPlugin extends Plugin
 			}
 		}
 
-		// renderGroundClueTimers if showGroundClueTimers toggled or tier toggled
-		if ("showGroundClueTimers".equals(event.getKey()) || event.getKey().contains("Details"))
+		// Reset clueGroundTimers when showGroundClueTimers toggled off
+		if ("showGroundClueTimers".equals(event.getKey()) && "false".equals(event.getNewValue()))
 		{
-			if ("showGroundClueTimers".equals(event.getKey()) && "false".equals(event.getNewValue()))
+			// Reset timers
+			for (ClueGroundTimer timer : clueGroundTimers)
 			{
-				// Reset timers
-				for (ClueGroundTimer timer : clueGroundTimers)
-				{
-					infoBoxManager.removeInfoBox(timer);
-				}
-				clueGroundTimers.clear();
+				infoBoxManager.removeInfoBox(timer);
 			}
-			else
-			{
-				renderGroundClueTimers();
-			}
+			clueGroundTimers.clear();
 		}
 
 		panel.refresh();
@@ -6416,7 +6649,7 @@ public class ClueDetailsPlugin extends Plugin
 	{
 		if (!config.showGroundClueTimers()) return;
 
-		Set<WorldPoint> worldPoints = clueGroundManager.getGroundClues().keySet();
+		Set<WorldPoint> worldPoints = clueGroundManager.getTrackedWorldPoints();
 
 		// Remove timers if worldPoint not managed by clueGroundManager
 		clueGroundTimers.removeIf(timer-> !worldPoints.contains(timer.getWorldPoint()));
@@ -6426,7 +6659,7 @@ public class ClueDetailsPlugin extends Plugin
 		{
 			TreeMap<ClueInstance, Integer> clueInstancesWithQuantityAtWp = clueGroundManager.getClueInstancesWithQuantityAtWp(config, worldPoint, client.getTickCount());
 
-			if (clueInstancesWithQuantityAtWp != null)
+			if (clueInstancesWithQuantityAtWp != null && clueInstancesWithQuantityAtWp.firstEntry() != null)
 			{
 				// Find oldest enabled clue instance at the world point
 				ClueInstance oldestEnabledClueInstance = clueInstancesWithQuantityAtWp.firstEntry().getKey();
@@ -6439,10 +6672,7 @@ public class ClueDetailsPlugin extends Plugin
 					}
 				}
 
-				Duration duration = Duration.of(
-					oldestEnabledClueInstance.getTicksToDespawnConsideringTileItem(client.getTickCount()),
-					RSTimeUnit.GAME_TICKS
-				);
+				int despawnTick = oldestEnabledClueInstance.getDespawnTick(client.getTickCount());
 
 				boolean createNewTimer = true;
 
@@ -6451,8 +6681,8 @@ public class ClueDetailsPlugin extends Plugin
 				{
 					if (worldPoint.equals(timer.getWorldPoint()))
 					{
-						timer.updateDuration(duration);
 						timer.setClueInstancesWithQuantity(clueInstancesWithQuantityAtWp);
+						timer.setDespawnTick(despawnTick);
 						createNewTimer = false;
 						break;
 					}
@@ -6461,10 +6691,11 @@ public class ClueDetailsPlugin extends Plugin
 				if (createNewTimer)
 				{
 					ClueGroundTimer timer = new ClueGroundTimer(
+						client,
 						this,
 						config,
 						configManager,
-						duration,
+						despawnTick,
 						worldPoint,
 						clueInstancesWithQuantityAtWp,
 						itemManager.getImage(ItemID.CLUE_SCROLL_23815)
@@ -6482,22 +6713,24 @@ package com.cluedetails;
 import java.awt.Color;
 import java.awt.image.BufferedImage;
 
-import java.time.Duration;
-import java.time.Instant;
-import java.time.temporal.ChronoUnit;
 import java.util.Map;
 import java.util.Set;
+import java.util.TimerTask;
 import lombok.Getter;
 import lombok.Setter;
+import net.runelite.api.Client;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.config.ConfigManager;
-import net.runelite.client.ui.overlay.infobox.Timer;
+import net.runelite.client.ui.overlay.infobox.InfoBox;
 
-class ClueGroundTimer extends Timer
+class ClueGroundTimer extends InfoBox
 {
+	private final Client client;
 	private final ClueDetailsPlugin plugin;
 	private final ClueDetailsConfig config;
 	private final ConfigManager configManager;
+	@Setter
+	private int despawnTick;
 	@Setter
 	@Getter
 	private Map<ClueInstance, Integer> clueInstancesWithQuantity;
@@ -6507,35 +6740,51 @@ class ClueGroundTimer extends Timer
 	@Setter
 	@Getter
 	private boolean notified = false;
+	@Setter
+	@Getter
+	private boolean renotifying = false;
 
 	ClueGroundTimer(
+		Client client,
 		ClueDetailsPlugin plugin,
 		ClueDetailsConfig config,
 		ConfigManager configManager,
-		Duration duration,
+		int despawnTick,
 		WorldPoint worldPoint,
 		Map<ClueInstance, Integer> clueInstancesWithQuantityAtWp,
 		BufferedImage image
 	)
 	{
-		super(duration.toMillis(), ChronoUnit.MILLIS, image, plugin);
+		super(image, plugin);
+		this.client = client;
 		this.plugin = plugin;
 		this.config = config;
 		this.configManager = configManager;
+		this.despawnTick = despawnTick;
 		this.worldPoint = worldPoint;
 		this.clueInstancesWithQuantity = clueInstancesWithQuantityAtWp;
+	}
+
+	private int getSecondsLeft()
+	{
+		int ticksLeft = despawnTick - client.getTickCount();
+		int millisLeft = ticksLeft * 600;
+		return (int) (millisLeft / 1000L);
 	}
 
 	@Override
 	public String getText()
 	{
-		Duration timeLeft = Duration.between(Instant.now(), this.getEndTime());
-		int seconds = (int)(timeLeft.toMillis() / 1000L);
+		int seconds = getSecondsLeft();
 		int minutes = seconds / 60;
 		int secs = seconds % 60;
-		if (minutes < 1)
+		if (minutes < 10)
 		{
-			return String.format("%ds", secs);
+			if (minutes < 1)
+			{
+				return String.format("%ds", secs);
+			}
+			return String.format("%d:%02d", minutes, secs);
 		}
 		return String.format("%dm", minutes);
 	}
@@ -6571,7 +6820,7 @@ class ClueGroundTimer extends Timer
 	@Override
 	public Color getTextColor()
 	{
-		return getDuration().compareTo(Duration.ofSeconds(config.groundClueTimersNotificationTime())) < 0
+		return shouldNotify()
 			? Color.RED
 			: Color.WHITE;
 	}
@@ -6580,13 +6829,20 @@ class ClueGroundTimer extends Timer
 	public boolean cull()
 	{
 		// Remove timers if worldPoint no managed by clueGroundManager
-		Set<WorldPoint> worldPoints = plugin.getClueGroundManager().getGroundClues().keySet();
+		Set<WorldPoint> worldPoints = plugin.getClueGroundManager().getTrackedWorldPoints();
 		if (!worldPoints.contains(worldPoint))
 		{
 			return true;
 		}
-		Duration timeLeft = Duration.between(Instant.now(), getEndTime());
-		return timeLeft.isZero() || timeLeft.isNegative();
+		int timeLeft = getSecondsLeft();
+		return timeLeft == 0 || timeLeft < 0;
+	}
+
+	private boolean activeWorldPoint()
+	{
+		// Remove timers if worldPoint not managed by clueGroundManager
+		Set<WorldPoint> worldPoints = plugin.getClueGroundManager().getTrackedWorldPoints();
+		return worldPoints.contains(worldPoint);
 	}
 
 	@Override
@@ -6604,6 +6860,29 @@ class ClueGroundTimer extends Timer
 			}
 		}
 		return false;
+	}
+
+	public boolean shouldNotify()
+	{
+		return activeWorldPoint() && (getSecondsLeft() < config.groundClueTimersNotificationTime());
+	}
+
+	public void startRenotification()
+	{
+		setRenotifying(true);
+
+		// Start renotification timer
+		java.util.Timer t = new java.util.Timer();
+		TimerTask task = new TimerTask()
+		{
+			@Override
+			public void run()
+			{
+				setNotified(!shouldNotify());
+				setRenotifying(false);
+			}
+		};
+		t.schedule(task, config.groundClueTimersRenotificationTime() * 1000L);
 	}
 }
 
@@ -7294,7 +7573,7 @@ public interface ClueDetailsConfig extends Config
 		keyName = "showGroundClueTimers",
 		name = "Show ground clue timers",
 		description = "Toggle whether to show timer infoboxes for ground clues",
-		warning = "Experimental feature! Behavior is not correct across logouts, notifications misbehave, etc.",
+		warning = "Experimental feature! Timers may not behave as expected. Please use caution",
 		section = groundCluesSection,
 		position = 6
 	)
@@ -7306,13 +7585,26 @@ public interface ClueDetailsConfig extends Config
 	@ConfigItem(
 		keyName = "groundClueTimersNotificationTime",
 		name = "Timer notifications",
-		description = "Time remaining (seconds) until despawn to send notification. Set to 0 to disable the notification.",
+		description = "Seconds remaining until despawn per tile to send notification. Set to 0 to disable the notification.",
 		section = groundCluesSection,
 		position = 7
 	)
 	default int groundClueTimersNotificationTime()
 	{
 		return 60;
+	}
+
+	@ConfigItem(
+		keyName = "groundClueTimersRenotificationTime",
+		name = "Timer renotifications",
+		description = "Seconds after initial notificiaton to periodically renotify. Set to 0 to disable the notification." +
+			"<br> This also acts as a cooldown between notifications for clues in the same tile",
+		section = groundCluesSection,
+		position = 8
+	)
+	default int groundClueTimersRenotificationTime()
+	{
+		return 0;
 	}
 
 	@ConfigSection(name = "Tier Toggles", description = "Options to enable particular clue tiers", position = 7)
@@ -8006,7 +8298,9 @@ import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FontMetrics;
 import java.awt.Graphics2D;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import javax.inject.Inject;
 import net.runelite.api.Client;
@@ -8078,15 +8372,15 @@ public class ClueGroundOverlay extends Overlay
 		offsetMap.clear();
 		final LocalPoint localLocation = player.getLocalLocation();
 
-		if (clueGroundManager.getGroundClues().keySet().isEmpty())
+		if (clueGroundManager.getTrackedWorldPoints().isEmpty())
 		{
 			return null;
 		}
 
-		for (WorldPoint wp : clueGroundManager.getGroundClues().keySet())
+		for (WorldPoint wp : clueGroundManager.getTrackedWorldPoints())
 		{
 			// Check if wp in clueGroundManager is within range of the player
-			final LocalPoint groundPoint = LocalPoint.fromWorld(client, wp);
+			final LocalPoint groundPoint = LocalPoint.fromWorld(client.getTopLevelWorldView(), wp);
 
 			if (groundPoint == null || localLocation.distanceTo(groundPoint) > MAX_DISTANCE)
 			{
@@ -8101,7 +8395,8 @@ public class ClueGroundOverlay extends Overlay
 				continue;
 			}
 
-			for (Map.Entry<ClueInstance, Integer> entry : clueInstancesWithQuantityAtWp.entrySet())
+			List<Map.Entry<ClueInstance, Integer>> entrySet = new ArrayList<>(clueInstancesWithQuantityAtWp.entrySet());
+			for (Map.Entry<ClueInstance, Integer> entry : entrySet)
 			{
 				ClueInstance item = entry.getKey();
 
@@ -8114,6 +8409,36 @@ public class ClueGroundOverlay extends Overlay
 		}
 
 		return null;
+	}
+
+	private int getSecondsLeft(ClueInstance item)
+	{
+		int ticksLeft = item.getDespawnTick(client.getTickCount()) - client.getTickCount();
+		int millisLeft = ticksLeft * 600;
+		return (int) (millisLeft / 1000L);
+	}
+
+	public String getDespawnText(ClueInstance item)
+	{
+		int seconds = getSecondsLeft(item);
+		int minutes = seconds / 60;
+		int secs = seconds % 60;
+		if (minutes < 10)
+		{
+			if (minutes < 1)
+			{
+				return String.format("%ds", secs);
+			}
+			return String.format("%d:%02d", minutes, secs);
+		}
+		return String.format("%dm", minutes);
+	}
+
+	public Color getTextColor(ClueInstance item)
+	{
+		return getSecondsLeft(item) < config.groundClueTimersNotificationTime()
+			? Color.RED
+			: Color.WHITE;
 	}
 
 	private void renderClueInstanceGroundOverlay(Graphics2D graphics, ClueInstance item, int quantity, LocalPoint groundPoint, FontMetrics fm)
@@ -8138,10 +8463,9 @@ public class ClueGroundOverlay extends Overlay
 
 		if (config.showGroundCluesDespawn())
 		{
-			Integer despawnTime = item.getDespawnTick(client.getTickCount()) - client.getTickCount();
-			Color timerColor = Color.WHITE;
+			Color timerColor = getTextColor(item);
 
-			final String timerText = String.format(" - %d", despawnTime);
+			final String timerText = String.format(" - %s", getDespawnText(item));
 
 			// The timer text is drawn separately to have its own color, and is intentionally not included
 			// in the getCanvasTextLocation() call because the timer text can change per frame and we do not
@@ -8378,7 +8702,7 @@ public class ClueDetailsTagsOverlay extends WidgetItemOverlay
 		}
 
 		// Check if it's a beginner/master clue
-		ClueInstance readClues = clueDetailsPlugin.getClueInventoryManager().getTrackedClueByClueItemId(itemId);
+		ClueInstance readClues = clueDetailsPlugin.getClueInventoryManager().getClueByClueItemId(itemId);
 		if (readClues == null || !readClues.isEnabled(config)) return;
 
 		List<Integer> ids = readClues.getClueIds();
@@ -8416,7 +8740,7 @@ public class ClueDetailsTagsOverlay extends WidgetItemOverlay
 		final ThreeStepCrypticClue threeStepCrypticClue = ThreeStepCrypticClue.forText(text.toString());
 		if (threeStepCrypticClue != null)
 		{
-			threeStepCrypticClue.update(clueDetailsPlugin.getClueInventoryManager().getTrackedCluesInInventory());
+			threeStepCrypticClue.update(clueDetailsPlugin.getClueInventoryManager().getCluesInInventory());
 			clueDetail = threeStepCrypticClue.getDetail(configManager, config);
 			clueDetailColor = Color.WHITE;
 		}
