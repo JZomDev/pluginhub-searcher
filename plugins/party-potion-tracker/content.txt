@@ -1,0 +1,675 @@
+package com.PartyPotionTracker;
+import net.runelite.api.*;
+import net.runelite.api.Point;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import lombok.extern.slf4j.Slf4j;
+import javax.inject.Inject;
+import java.awt.*;
+
+@Slf4j
+public class PotionTrackerOverlay extends Overlay {
+    private final Client client;
+    private final PotionTrackerPlugin plugin;
+
+    @Inject
+    public PotionTrackerOverlay(Client client, PotionTrackerPlugin plugin) {
+
+        this.client = client;
+        this.plugin = plugin;
+        setPosition(OverlayPosition.DYNAMIC);
+        setLayer(OverlayLayer.ABOVE_SCENE);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        for (TrackedItem trackedItem : plugin.getPickupManager().getMyDroppedItems())
+        {
+            WorldPoint worldPoint = trackedItem.getWorldPoint();
+            if (worldPoint == null) continue;
+
+            // Convert WorldPoint to LocalPoint
+            LocalPoint localPoint = LocalPoint.fromWorld(client.getTopLevelWorldView(), worldPoint);
+            if (localPoint == null) continue;
+
+            // OPTIONAL: Draw a small dot in center using text location trick
+            Point canvasPoint = Perspective.getCanvasTextLocation(client, graphics, localPoint, ".", 0);
+            if (canvasPoint  != null)
+            {
+                Color potionColor = plugin.getColorForPartyMember(trackedItem.getOwnerName());
+                graphics.setColor(potionColor);
+                graphics.fillOval(canvasPoint.getX() - 3, canvasPoint.getY() - 3, 6, 6);
+            }
+        }
+
+        return null;
+    }
+}
+
+package com.PartyPotionTracker;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.party.PartyService;
+import javax.inject.Inject;
+import java.util.*;
+
+@Slf4j
+public class PickupManager {
+     static class PendingDespawn {
+        final TrackedItem item;
+        int ageTicks = 0;
+
+        PendingDespawn(TrackedItem item) {
+            this.item = item;
+        }
+    }
+
+
+    private Client client;
+    private PartyService partyService;
+    private ClientThread clientThread;
+
+    public PickupManager(Client client, PartyService partyService, ClientThread clientThread) {
+        this.client = client;
+        this.partyService = partyService;
+        this.clientThread = clientThread;
+
+    }
+
+    public final List<PickupManager.PendingDespawn> pendingDespawnItem = new ArrayList<>();
+
+    @Getter
+    public final List<TrackedItem> myDroppedItems= new ArrayList<>();
+
+    private Map<Integer, Integer> previousInventory = null;
+
+    public void gameTick(){
+
+        if (pendingDespawnItem.isEmpty()) return;
+
+        Iterator<PickupManager.PendingDespawn> iter = pendingDespawnItem.iterator();
+        while (iter.hasNext())
+        {
+            PickupManager.PendingDespawn pd = iter.next();
+            pd.ageTicks++;
+
+            // Give it time for PickedUpItemMessage to arrive
+            if (pd.ageTicks < 2)
+                continue;
+
+            if (myDroppedItems.contains(pd.item))
+            {
+
+                myDroppedItems.remove(pd.item);
+                String itemName = client.getItemDefinition(pd.item.getItemId()).getName();
+                String msg = String.format("%s was picked up by someone outside your party.", itemName);
+                client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", msg, null);
+            }
+
+            iter.remove();
+        }
+    }
+
+
+    public void onPickedUpItemMessage(PickedUpItemMessage msg){
+
+        TrackedItem matchedItem = null;
+        for (TrackedItem cur : myDroppedItems)
+        {
+            if (cur.getItemId() == msg.getItemId() &&
+                    cur.getWorldPoint().equals(msg.getWorldPoint()) &&
+                    cur.getOwnerName().equalsIgnoreCase(msg.getPickerName()))
+            {
+                matchedItem = cur;
+                break;
+            }
+        }
+
+        if (matchedItem != null)
+        {
+            // Decrement quantity or remove
+            myDroppedItems.remove(matchedItem);
+            Iterator<PickupManager.PendingDespawn> iter = pendingDespawnItem.iterator();
+            while (iter.hasNext())
+            {
+                PickupManager.PendingDespawn pd = iter.next();
+                if (pd.item.equals(matchedItem))
+                {
+                    iter.remove();
+                    break;
+                }
+            }
+            return;
+        }
+
+        for (TrackedItem cur : myDroppedItems)
+        {
+            if (cur.getItemId() == msg.getItemId() &&
+                    cur.getWorldPoint().equals(msg.getWorldPoint()))
+            {
+                matchedItem = cur;
+                break;
+            }
+        }
+
+        if (matchedItem != null){
+            Iterator<PickupManager.PendingDespawn> iter = pendingDespawnItem.iterator();
+            while (iter.hasNext())
+            {
+                PickupManager.PendingDespawn pd = iter.next();
+                if (pd.item.equals(matchedItem))
+                {
+                    iter.remove();
+                    break;
+                }
+            }
+            String ownerName = matchedItem.getOwnerName();
+            myDroppedItems.remove(matchedItem);
+            clientThread.invokeLater(() ->
+            {
+                String itemName = client.getItemDefinition(msg.getItemId()).getName();
+                String chatMessage = String.format("%s picked up a %s dropped by %s!", msg.getPickerName(), itemName, ownerName);
+                client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMessage, null);
+            });
+        }
+    }
+
+    public void itemContainerChanged(ItemContainerChanged event) {
+
+        // Return early if it's not an inventory update
+        if (event.getContainerId() != InventoryID.INVENTORY.getId()) {
+            return;
+        }
+
+        ItemContainer itemContainer = event.getItemContainer();
+        Item[] currentItems = itemContainer.getItems();
+        Map<Integer, Integer> currentInventory = new HashMap<>();
+
+        for (Item item : currentItems)
+        {
+            if (item.getId() != -1)
+            {
+                currentInventory.merge(item.getId(), item.getQuantity(), Integer::sum);
+            }
+        }
+
+        // If this is the first time we're seeing inventory, just set inventory and return
+        if (previousInventory == null)
+        {
+            previousInventory = currentInventory;
+            return;
+        }
+
+        // Combine all unique item IDs from both inventories to catch missing (zeroed) items
+        Set<Integer> allItemIds = new HashSet<>();
+        allItemIds.addAll(previousInventory.keySet());
+        allItemIds.addAll(currentInventory.keySet());
+
+        for (int itemId : allItemIds)
+        {
+            if (itemId == -1 || !ToaPotions.isPotion(itemId))
+                continue;
+
+            int oldQty = previousInventory.getOrDefault(itemId, 0);
+            int newQty = currentInventory.getOrDefault(itemId, 0);
+
+            if (newQty > oldQty)
+            {
+                // Potion pickup detected
+                WorldPoint location = client.getLocalPlayer().getWorldLocation();
+                String localName = client.getLocalPlayer().getName();
+                if (partyService != null) {
+                    partyService.send(new PickedUpItemMessage(itemId, location, localName));
+                }
+            }
+        }
+
+        // Update inventory snapshot after processing
+        previousInventory = currentInventory;
+    }
+}
+
+package com.PartyPotionTracker;
+
+import lombok.RequiredArgsConstructor;
+import net.runelite.api.ItemID;
+
+import java.util.Arrays;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@RequiredArgsConstructor
+public enum ToaPotions {
+    PRAYER_POTION_4(ItemID.PRAYER_POTION4),
+    PRAYER_POTION_3(ItemID.PRAYER_POTION3),
+    PRAYER_POTION_2(ItemID.PRAYER_POTION2),
+    PRAYER_POTION_1(ItemID.PRAYER_POTION1),
+    SUPER_RESTORE_4(ItemID.SUPER_RESTORE4),
+    SUPER_RESTORE_3(ItemID.SUPER_RESTORE3),
+    SUPER_RESTORE_2(ItemID.SUPER_RESTORE2),
+    SUPER_RESTORE_1(ItemID.SUPER_RESTORE1),
+    SARADOMIN_BREW_4(ItemID.SARADOMIN_BREW4),
+    SARADOMIN_BREW_3(ItemID.SARADOMIN_BREW3),
+    SARADOMIN_BREW_2(ItemID.SARADOMIN_BREW2),
+    SARADOMIN_BREW_1(ItemID.SARADOMIN_BREW1),
+    SANFEW_SERUM_4(ItemID.SANFEW_SERUM4),
+    SANFEW_SERUM_3(ItemID.SANFEW_SERUM3),
+    SANFEW_SERUM_2(ItemID.SANFEW_SERUM2),
+    SANFEW_SERUM_1(ItemID.SANFEW_SERUM1),
+    DIVINE_SUPER_COMBAT_POTION_4(ItemID.DIVINE_SUPER_COMBAT_POTION4),
+    DIVINE_SUPER_COMBAT_POTION_3(ItemID.DIVINE_SUPER_COMBAT_POTION3),
+    DIVINE_SUPER_COMBAT_POTION_2(ItemID.DIVINE_SUPER_COMBAT_POTION2),
+    DIVINE_SUPER_COMBAT_POTION_1(ItemID.DIVINE_SUPER_COMBAT_POTION1),
+    DIVINE_RANGING_POTION_4(ItemID.DIVINE_RANGING_POTION4),
+    DIVINE_RANGING_POTION_3(ItemID.DIVINE_RANGING_POTION3),
+    DIVINE_RANGING_POTION_2(ItemID.DIVINE_RANGING_POTION2),
+    DIVINE_RANGING_POTION_1(ItemID.DIVINE_RANGING_POTION1),
+    NECTAR_1(ItemID.NECTAR_1),
+    NECTAR_2(ItemID.NECTAR_2),
+    NECTAR_3(ItemID.NECTAR_3),
+    NECTAR_4(ItemID.NECTAR_4),
+    BLESSED_CRYSTAL_SCARAB_1(ItemID.BLESSED_CRYSTAL_SCARAB_1),
+    BLESSED_CRYSTAL_SCARAB_2(ItemID.BLESSED_CRYSTAL_SCARAB_2),
+    TEARS_OF_ELIDINIS_1(ItemID.TEARS_OF_ELIDINIS_1),
+    TEARS_OF_ELIDINIS_2(ItemID.TEARS_OF_ELIDINIS_2),
+    TEARS_OF_ELIDINIS_3(ItemID.TEARS_OF_ELIDINIS_3),
+    TEARS_OF_ELIDINIS_4(ItemID.TEARS_OF_ELIDINIS_4),
+    AMBROSIA_1(ItemID.AMBROSIA_1),
+    AMBROSIA_2(ItemID.AMBROSIA_2),
+    SILK_DRESSING_1(ItemID.SILK_DRESSING_1),
+    SILK_DRESSING_2(ItemID.SILK_DRESSING_2);
+
+
+    public final int itemID;
+    private static final Set<Integer> ITEM_IDS = Arrays.stream(values())
+            .map(p -> p.itemID)
+            .collect(Collectors.toSet());
+
+    public static Boolean isPotion(int itemID){
+        return ITEM_IDS.contains(itemID);
+    }
+}
+
+package com.PartyPotionTracker;
+
+import lombok.AllArgsConstructor;
+import lombok.Data;
+import lombok.EqualsAndHashCode;
+import lombok.NoArgsConstructor;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+@EqualsAndHashCode(callSuper = false)
+@Data
+@NoArgsConstructor
+@AllArgsConstructor
+public class PickedUpItemMessage extends PartyMemberMessage {
+    private int itemId;
+    private WorldPoint worldPoint;
+    private String pickerName;
+}
+
+package com.PartyPotionTracker;
+
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.party.messages.PartyMemberMessage;
+
+@Getter
+@Setter
+@NoArgsConstructor
+public class TrackedItemMessage extends PartyMemberMessage
+{
+    private int itemId;
+    private WorldPoint worldPoint;
+    private String ownerName;
+
+    public TrackedItemMessage(int itemId, WorldPoint worldPoint, String ownerName)
+    {
+        this.itemId = itemId;
+        this.worldPoint = worldPoint;
+        this.ownerName = ownerName;
+    }
+}
+package com.PartyPotionTracker;
+
+import javax.inject.Inject;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.party.PartyService;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+import net.runelite.client.party.WSClient;
+
+
+
+
+@Slf4j
+@PluginDescriptor(
+	name = "Party Potion Tracker",
+		description = "Tracks and highlights potions in parties and who picks them up",
+		tags = {"potion", "party", "toa", "team", "tracker"}
+)
+public class PotionTrackerPlugin extends Plugin
+{
+	private static class PendingDespawn {
+		final TrackedItem item;
+		int ageTicks = 0;
+
+		PendingDespawn(TrackedItem item) {
+			this.item = item;
+		}
+	}
+
+	@Inject
+	private WSClient wsClient;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private PartyService partyService;
+
+	@Inject private OverlayManager overlayManager;
+
+	@Inject private PotionTrackerOverlay overlay;
+
+	@Inject
+	private net.runelite.client.callback.ClientThread clientThread;
+
+	@Getter
+	private PickupManager pickupManager;
+	private DropManager dropManager;
+
+	private final Map<String, Color> partyColorMap = new HashMap<>();
+	private final Color[] colorPool = {
+			Color.CYAN, Color.MAGENTA, Color.ORANGE, Color.GREEN, Color.PINK, Color.YELLOW, Color.RED, Color.BLUE
+	};
+
+	private Boolean inToa = false;
+	private int colorIndex = 0;
+
+	private final List<PendingDespawn> pendingDespawnItem = new ArrayList<>();
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		dropManager = new DropManager(client, partyService);
+		pickupManager = new PickupManager(client, partyService, clientThread);
+		wsClient.registerMessage(TrackedItemMessage.class);
+		wsClient.registerMessage(PickedUpItemMessage.class);
+		overlayManager.add(overlay);
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		// Clean up
+		overlayManager.remove(overlay);
+		dropManager.pendingDrops.clear();
+		pendingDespawnItem.clear();
+		wsClient.unregisterMessage(PickedUpItemMessage.class);
+		wsClient.unregisterMessage(TrackedItemMessage.class);
+	}
+
+	@Subscribe
+	public void onTrackedItemMessage(TrackedItemMessage msg) {
+		TrackedItem tracked = new TrackedItem(msg.getItemId(), msg.getWorldPoint(), msg.getOwnerName());
+		pickupManager.myDroppedItems.add(tracked);
+	}
+
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event) {
+		if (inToa){
+			dropManager.menuOptionClicked(event);
+		}
+	}
+
+	@Subscribe
+	public void onPickedUpItemMessage(PickedUpItemMessage msg) {
+		if (inToa) {
+			pickupManager.onPickedUpItemMessage(msg);
+		}
+	}
+
+
+	@Subscribe
+	public void onItemDespawned(ItemDespawned event) {
+		if (inToa){
+			TileItem item = event.getItem();
+			WorldPoint location = event.getTile().getWorldLocation();
+
+			TrackedItem matched = pickupManager.myDroppedItems.stream()
+					.filter(i -> i.getItemId() == item.getId() && i.getWorldPoint().equals(location))
+					.findFirst()
+					.orElse(null);
+
+			if (matched != null)
+			{
+				pickupManager.pendingDespawnItem.add(new PickupManager.PendingDespawn(matched)); // ✅ Delay removal
+				log.info("Queued despawn of itemId {} at {} for delayed processing", item.getId(), location);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameState) {
+		if (gameState.getGameState().equals(GameState.LOADING)){
+			pickupManager.pendingDespawnItem.clear();
+			dropManager.pendingDrops.clear();
+			pickupManager.myDroppedItems.clear();
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick) {
+		LocalPoint lp = client.getLocalPlayer().getLocalLocation();
+		int regionId = lp == null ? -1 : WorldPoint.fromLocalInstance(client, lp).getRegionID();
+		ToaRegion currentRegion = ToaRegion.fromRegionID(regionId);
+        inToa = currentRegion != null;
+
+		if (inToa){
+			pickupManager.gameTick();
+		}
+	}
+
+	@Subscribe
+	public void onItemSpawned(ItemSpawned event) {
+		if (inToa){
+			dropManager.itemSpawned(event);
+		}
+	}
+
+	@Subscribe
+	public void onItemContainerChanged(ItemContainerChanged event) {
+		pickupManager.itemContainerChanged(event);
+	}
+
+	public Color getColorForPartyMember(String name)
+	{
+		if (partyColorMap.containsKey(name)) {
+			return partyColorMap.get(name);
+		}
+
+		Color assigned = colorPool[colorIndex % colorPool.length];
+		partyColorMap.put(name, assigned);
+		colorIndex++;
+		return assigned;
+	}
+}
+
+package com.PartyPotionTracker;
+
+import lombok.EqualsAndHashCode;
+import lombok.Getter;
+import net.runelite.api.coords.WorldPoint;
+
+@Getter
+@EqualsAndHashCode
+public class TrackedItem
+{
+    private final int itemId;
+    private final WorldPoint worldPoint;
+    private final String ownerName;
+
+    public TrackedItem(int itemId, WorldPoint worldPoint, String ownerName){
+        this.itemId = itemId;
+        this.worldPoint = worldPoint;
+        this.ownerName = ownerName;
+    }
+
+}
+package com.PartyPotionTracker;
+
+import lombok.RequiredArgsConstructor;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@RequiredArgsConstructor
+public enum ToaRegion
+{
+    MAIN_AREA(14160),
+    CHEST_ROOM(14672),
+    PUZZLE_MONKEY(15186),
+    PUZZLE_CRONDIS(15698),
+    PUZZLE_SCABARAS(14162),
+    PUZZLE_HET(14674),
+    BOSS_BABA(15188),
+    BOSS_ZEBAK(15700),
+    BOSS_KEPHRI(14164),
+    BOSS_AKKHA(14676),
+    BOSS_WARDEN(15184),
+    BOSS_WARDEN_FINAL(15696);
+
+
+    public final int regionID;
+    private static final Map<Integer, ToaRegion> REGION_MAP = new HashMap<>();
+
+    static {
+        for (ToaRegion e: values()) {
+            REGION_MAP.put(e.regionID, e);
+        }
+    }
+
+    public static ToaRegion fromRegionID(int regionID) {
+        return REGION_MAP.get(regionID);
+    }
+}
+package com.PartyPotionTracker;
+
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ItemSpawned;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.client.party.PartyService;
+import java.awt.*;
+import java.util.*;
+import java.util.List;
+
+@Slf4j
+@RequiredArgsConstructor
+public class DropManager {
+
+    private static class PendingDropItem {
+        int itemId;
+        WorldPoint location;
+        public PendingDropItem(int itemId, WorldPoint location) {
+            this.itemId = itemId;
+            this.location = location;
+        }
+    }
+
+    private Client client;
+    private PartyService partyService;
+
+    public DropManager(Client client, PartyService partyService) {
+        this.client = client;
+        this.partyService = partyService;
+    }
+
+
+
+    public final List<DropManager.PendingDropItem> pendingDrops = new ArrayList<>();
+
+    private final Color[] colorPool = {
+            Color.CYAN, Color.MAGENTA, Color.ORANGE, Color.GREEN, Color.PINK, Color.YELLOW, Color.RED, Color.BLUE
+    };
+
+    public void menuOptionClicked(MenuOptionClicked event){
+        if (event.getMenuOption().equalsIgnoreCase("Drop")) {
+            int itemId = event.getMenuEntry().getItemId();
+            if (!ToaPotions.isPotion(itemId)) {
+                return;
+            }
+            WorldPoint location = client.getLocalPlayer().getWorldLocation();
+            pendingDrops.add(new DropManager.PendingDropItem(itemId, location));
+        }
+    }
+
+    public void itemSpawned(ItemSpawned event) {
+        TileItem item = event.getItem();
+        int itemId = item.getId();
+        if (!ToaPotions.isPotion(itemId)) {
+            return;
+        }
+        WorldPoint spawnLocation = event.getTile().getWorldLocation();
+        DropManager.PendingDropItem matchedDrop = null;
+        Iterator<DropManager.PendingDropItem> iter = pendingDrops.iterator();
+
+        while (iter.hasNext()) {
+            DropManager.PendingDropItem drop = iter.next();
+
+            if (drop.itemId == itemId &&
+                    drop.location.distanceTo(spawnLocation) <= 2)
+            {
+                matchedDrop = drop;
+                iter.remove(); // Clean it up
+                break;
+            }
+        }
+
+        if (matchedDrop != null) {
+            // Optionally: send message to party
+            if (partyService != null) {
+                partyService.send(new TrackedItemMessage(itemId, spawnLocation, client.getLocalPlayer().getName()));
+            }
+        }
+    }
+}
+
+package com.PartyPotionTracker;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PotionTracker
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(PotionTrackerPlugin.class);
+		RuneLite.main(args);
+	}
+}
