@@ -109,7 +109,7 @@ public class LootFiltersPanel extends PluginPanel {
 
         add(root);
 
-        reflowFilterSelect(plugin.getFilterManager().loadFilters(), plugin.getSelectedFilterName());
+        reflowFilterSelect(plugin.getLoadedFilters(), plugin.getSelectedFilterName());
     }
 
     private void onCreateEmptyFilter() {
@@ -172,7 +172,7 @@ public class LootFiltersPanel extends PluginPanel {
             return;
         }
 
-        var existing = plugin.getParsedUserFilters();
+        var existing = plugin.getLoadedFilters();
         for (var filter : existing) {
             if (!filter.getName().equals(newFilter.getName())) {
                 continue;
@@ -262,7 +262,7 @@ public class LootFiltersPanel extends PluginPanel {
 
     private void onReloadFilters() {
         plugin.reloadFilters();
-        reflowFilterSelect(plugin.getParsedUserFilters(), plugin.getSelectedFilterName());
+        reflowFilterSelect(plugin.getLoadedFilters(), plugin.getSelectedFilterName());
     }
 
     private void onBrowseFolder() {
@@ -302,7 +302,6 @@ import com.lootfilters.model.DisplayConfigIndex;
 import com.lootfilters.model.IconIndex;
 import com.lootfilters.model.PluginTileItem;
 import com.lootfilters.model.SoundProvider;
-import com.lootfilters.util.AudioPlayer;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
@@ -318,6 +317,7 @@ import net.runelite.api.events.ItemDespawned;
 import net.runelite.api.events.ItemSpawned;
 import net.runelite.api.events.MenuEntryAdded;
 import net.runelite.client.Notifier;
+import net.runelite.client.audio.AudioPlayer;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -331,10 +331,12 @@ import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.ui.overlay.OverlayManager;
+import okhttp3.OkHttpClient;
 
 import javax.inject.Inject;
 import javax.inject.Named;
 import java.io.File;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Objects;
@@ -381,6 +383,8 @@ public class LootFiltersPlugin extends Plugin {
 	@Inject private ItemManager itemManager;
 	@Inject private Notifier notifier;
 	@Inject private SpriteManager spriteManager;
+	@Inject private OkHttpClient okHttpClient;
+	@Inject private AudioPlayer audioPlayer;
 
 	private LootFiltersPanel pluginPanel;
 	private NavigationButton pluginPanelNav;
@@ -392,9 +396,9 @@ public class LootFiltersPlugin extends Plugin {
 
 	private final MenuEntryComposer menuEntryComposer = new MenuEntryComposer(this);
 	private final LootFilterManager filterManager = new LootFilterManager(this);
-	private final AudioPlayer audioPlayer = new AudioPlayer(); // remove when https://github.com/runelite/runelite/pull/18745 is merged
 	private final ExecutorService audioDispatcher = Executors.newSingleThreadExecutor();
 	private final Set<SoundProvider> queuedAudio = new HashSet<>();
+	private final List<String> queuedChatMessages = new ArrayList<>();
 
 	private LootFilter activeFilter;
 	private LootFilter currentAreaFilter;
@@ -426,20 +430,25 @@ public class LootFiltersPlugin extends Plugin {
 		}
 	}
 
+	public List<LootFilter> getLoadedFilters() {
+		var filters = new ArrayList<LootFilter>();
+		filters.addAll(filterManager.getDefaultFilters());
+		filters.addAll(parsedUserFilters);
+		return filters;
+	}
+
 	public LootFilter getSelectedFilter() {
-		return parsedUserFilters.stream()
+		return getLoadedFilters().stream()
 				.filter(it -> it.getName().equals(getSelectedFilterName()))
 				.findFirst().orElse(LootFilter.Nop);
 	}
 
 	public boolean hasFilter(String name) {
-		return parsedUserFilters.stream().anyMatch(it -> it.getName().equals(name));
+		return getLoadedFilters().stream().anyMatch(it -> it.getName().equals(name));
 	}
 
 	public void addChatMessage(String msg) {
-		clientThread.invoke(() -> {
-			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", msg, "loot-filters", false);
-		});
+		queuedChatMessages.add(msg);
 	}
 
 	public String getItemName(int id) {
@@ -460,9 +469,15 @@ public class LootFiltersPlugin extends Plugin {
 				.icon(loadImageResource(this.getClass(), "/com/lootfilters/icons/panel.png"))
 				.panel(pluginPanel)
 				.build();
-		clientToolbar.addNavigation(pluginPanelNav);
+		if (config.showPluginPanel()) {
+			clientToolbar.addNavigation(pluginPanelNav);
+		}
 		keyManager.registerKeyListener(hotkeyListener);
 		mouseManager.registerMouseListener(mouseAdapter);
+
+		if (config.fetchDefaultFilters()) {
+			filterManager.fetchDefaultFilters(this::onFetchDefaultFilters);
+		}
 
 		Migrate_133_140.run(this);
 	}
@@ -496,9 +511,38 @@ public class LootFiltersPlugin extends Plugin {
 			return;
 		}
 
+		if (event.getKey().equals(LootFiltersConfig.SHOW_PLUGIN_PANEL)) {
+			if (config.showPluginPanel()) {
+				clientToolbar.addNavigation(pluginPanelNav);
+			} else {
+				clientToolbar.removeNavigation(pluginPanelNav);
+			}
+		}
+
 		if (event.getKey().equals(LootFiltersConfig.CONFIG_KEY_OVERLAY_PRIORITY)) {
 			overlay.setPriority(config.overlayPriority().getValue());
 			overlayManager.resetOverlay(overlay);
+		}
+
+		if (event.getKey().equals(LootFiltersConfig.CONFIG_KEY_FETCH_DEFAULT_FILTERS)) {
+			if (config.fetchDefaultFilters()) {
+				filterManager.fetchDefaultFilters(this::onFetchDefaultFilters);
+			} else {
+				var selected = getSelectedFilterName();
+				filterManager.getDefaultFilters().clear();
+				if (selected != null && selected.equals(DefaultFilter.FILTERSCAPE.getName())) {
+					selected = null;
+					setSelectedFilterName(null);
+				}
+				pluginPanel.reflowFilterSelect(getLoadedFilters(), selected);
+			}
+		}
+
+		if (event.getKey().equals(SELECTED_FILTER_KEY)) {
+			var selected = getSelectedFilterName();
+			if (DefaultFilter.all().stream().anyMatch(it -> it.getName().equals(selected))) {
+				addChatMessage("Loaded " + selected + ". Visit filterscape.xyz to configure it.");
+			}
 		}
 
 		loadSelectedFilter();
@@ -572,6 +616,9 @@ public class LootFiltersPlugin extends Plugin {
 		if (!queuedAudio.isEmpty()) {
 			flushAudio();
 		}
+		if (!queuedChatMessages.isEmpty()) {
+			flushChatMessages();
+		}
 	}
 
 	@Subscribe
@@ -588,6 +635,14 @@ public class LootFiltersPlugin extends Plugin {
 		queuedAudio.clear();
 	}
 
+	private void flushChatMessages() {
+		for (var msg : queuedChatMessages) {
+			var chatMsg = String.format("<col=00ffff>[Loot Filters]</col>: %s", msg);
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMsg, "loot-filters", false);
+		}
+		queuedChatMessages.clear();
+	}
+
 	private void scanAreaFilter() {
 		if (!config.autoToggleFilters()) {
 			return;
@@ -599,7 +654,7 @@ public class LootFiltersPlugin extends Plugin {
 		}
 
 		var p = WorldPoint.fromLocalInstance(client, player.getLocalLocation());
-		var match = parsedUserFilters.stream()
+		var match = getLoadedFilters().stream()
 				.filter(it -> it.isInActivationArea(p))
 				.findFirst().orElse(null);
 		if (match != null && (currentAreaFilter == null || !Objects.equals(match.getName(), currentAreaFilter.getName()))) {
@@ -636,6 +691,13 @@ public class LootFiltersPlugin extends Plugin {
 			lootbeamIndex.reset();
 			iconIndex.reset();
 		});
+	}
+
+	private void onFetchDefaultFilters() {
+		if (getSelectedFilterName() == null) {
+			setSelectedFilterName(DefaultFilter.FILTERSCAPE.getName());
+		}
+		pluginPanel.reflowFilterSelect(getLoadedFilters(), getSelectedFilterName());
 	}
 }
 
@@ -981,72 +1043,6 @@ public class FilterUtil {
     }
 }
 
-// abbreviated copy of the AudioPlayer added in https://github.com/runelite/runelite/pull/18745 until that gets merged
-package com.lootfilters.util;
-
-import lombok.extern.slf4j.Slf4j;
-
-import javax.sound.sampled.AudioInputStream;
-import javax.sound.sampled.AudioSystem;
-import javax.sound.sampled.Clip;
-import javax.sound.sampled.DataLine;
-import javax.sound.sampled.FloatControl;
-import javax.sound.sampled.Line;
-import javax.sound.sampled.LineEvent;
-import javax.sound.sampled.LineUnavailableException;
-import javax.sound.sampled.UnsupportedAudioFileException;
-import java.io.File;
-import java.io.IOException;
-
-@Slf4j
-public class AudioPlayer {
-    private Line prevLine;
-
-    public void play(File file, float gain) throws IOException, UnsupportedAudioFileException, LineUnavailableException {
-        try (AudioInputStream audio = AudioSystem.getAudioInputStream(file))
-        {
-            DataLine line = getSelfClosingLine(audio);
-            if (gain != 0) {
-                trySetGain(line, gain);
-            }
-            line.start();
-        }
-    }
-
-    private DataLine getSelfClosingLine(AudioInputStream stream) throws IOException, LineUnavailableException
-    {
-        Clip clip = AudioSystem.getClip();
-        try {
-            clip.open(stream);
-        } catch (IOException e) {
-            clip.close();
-            throw e;
-        }
-
-        clip.addLineListener(event -> {
-            if (event.getType() != LineEvent.Type.STOP) {
-                return;
-            }
-
-            synchronized (this) { // https://discordapp.com/channels/301497432909414422/419891709883973642/1341801141381632000
-                if (prevLine != null) {
-                    prevLine.close();
-                }
-                prevLine = clip;
-            }
-        });
-        return clip;
-    }
-
-    private void trySetGain(DataLine line, float gain) {
-        try {
-            FloatControl control = (FloatControl) line.getControl(FloatControl.Type.MASTER_GAIN);
-            control.setValue(gain);
-        } catch (Exception e) {
-            log.warn("Failed to set gain: {}", e.getMessage());
-        }
-    }
-}
 package com.lootfilters.serde;
 
 import com.google.gson.JsonElement;
@@ -1186,6 +1182,7 @@ public class LootFiltersOverlay extends Overlay {
     private static final int Z_STACK_OFFSET = 16;
     private static final int BOX_PAD = 2;
     private static final int CLICKBOX_SIZE = 8;
+    private static final int TIMER_RADIUS = 5;
 
     private final Client client;
     private final LootFiltersPlugin plugin;
@@ -1445,11 +1442,10 @@ public class LootFiltersOverlay extends Overlay {
             var timer = new ProgressPieComponent();
             var total = item.getDespawnTime() - item.getSpawnTime();
             var remaining = item.getDespawnTime() - plugin.getClient().getTickCount();
-            var radius = textHeight / 2;
-            timer.setPosition(new net.runelite.api.Point(textPoint.getX() - radius - BOX_PAD - 2 - leftOffset,
-                    textPoint.getY() - yOffset - radius));
+            timer.setPosition(new net.runelite.api.Point(textPoint.getX() - TIMER_RADIUS - BOX_PAD - 2 - leftOffset,
+                    textPoint.getY() - yOffset - TIMER_RADIUS));
             timer.setProgress(remaining / (double) total);
-            timer.setDiameter(textHeight);
+            timer.setDiameter(TIMER_RADIUS * 2);
             timer.setFill(getDespawnTextColor(item));
             timer.setBorderColor(getDespawnTextColor(item));
             timer.render(g);
@@ -2321,7 +2317,7 @@ import java.awt.Color;
 public class Token {
     public enum Type {
         WHITESPACE, NEWLINE,
-        IF, APPLY,
+        IF, APPLY, RULE,
         META,
         COLON, COMMA,
         TRUE, FALSE,
@@ -2556,6 +2552,7 @@ import static com.lootfilters.lang.Token.Type.META;
 import static com.lootfilters.lang.Token.Type.OP_AND;
 import static com.lootfilters.lang.Token.Type.OP_NOT;
 import static com.lootfilters.lang.Token.Type.OP_OR;
+import static com.lootfilters.lang.Token.Type.RULE;
 import static com.lootfilters.lang.Token.Type.STMT_END;
 import static com.lootfilters.lang.Token.Type.TRUE;
 
@@ -2575,7 +2572,7 @@ public class Parser {
             var tok = tokens.take();
             if (tok.is(META)) {
                 parseMeta();
-            } else if (tok.is(IF)) {
+            } else if (tok.is(IF) || tok.is(RULE)) {
                 parseMatcher(true);
             } else if (tok.is(APPLY)) {
                 parseMatcher(false);
@@ -3385,6 +3382,7 @@ public class Lexer {
         put("false", Token.Type.FALSE);
         put("true", Token.Type.TRUE);
         put("meta", Token.Type.META);
+        put("rule", Token.Type.RULE);
         put("if", Token.Type.IF);
         put("&&", Token.Type.OP_AND);
         put("||", Token.Type.OP_OR);
@@ -3465,6 +3463,10 @@ public class Lexer {
     }
 
     private boolean tokenizeComment() {
+        return tokenizeLineComment() || tokenizeBlockComment();
+    }
+
+    private boolean tokenizeLineComment() {
         if (!input.startsWith("//", offset)) {
             return false;
         }
@@ -3477,6 +3479,31 @@ public class Lexer {
         currentLineOffset += text.length();
         offset += text.length();
         return true;
+    }
+
+    private boolean tokenizeBlockComment() {
+        if (!input.startsWith("/*", offset)) {
+            return false;
+        }
+
+        var startLine = currentLineNumber;
+        var startOffset = currentLineOffset;
+        for (var i = offset + 2; i < input.length(); ++i) {
+            if (input.startsWith("*/", i)) {
+                currentLineOffset += 2;
+                var text = input.substring(offset, i + 2);
+                tokens.add(new Token(Token.Type.COMMENT, text, currentLocation()));
+                offset += text.length();
+                return true;
+            } else if (input.charAt(i) == '\n') {
+                ++currentLineNumber;
+                currentLineOffset = 1;
+            } else {
+                ++currentLineOffset;
+            }
+        }
+
+        throw new TokenizeException(String.format("unterminated block comment at line %d, char %d", startLine, startOffset));
     }
 
     private void tokenizeWhitespace() {
@@ -4554,7 +4581,7 @@ public class Migrate_133_140 {
             plugin.getFilterManager().saveNewFilter("migrated_filter_" + i, toMigrate.get(i));
         }
         plugin.reloadFilters();
-        plugin.getPluginPanel().reflowFilterSelect(plugin.getParsedUserFilters(), plugin.getSelectedFilterName());
+        plugin.getPluginPanel().reflowFilterSelect(plugin.getLoadedFilters(), plugin.getSelectedFilterName());
     }
 
     private List<String> getConfigUserFilters() {
@@ -4592,12 +4619,32 @@ import java.awt.Color;
 
 @ConfigGroup("loot-filters")
 public interface LootFiltersConfig extends Config {
+    @ConfigSection(name = "Plugin panel", description = "", position = -2)
+    String pluginPanel = "pluginPanel";
+    String SHOW_PLUGIN_PANEL = "showPluginPanel";
+    @ConfigItem(
+            keyName = SHOW_PLUGIN_PANEL,
+            name = "Enabled",
+            description = "Show the plugin panel in the side nav. The entire plugin, including the active loot filter, will still operate if the panel is hidden.",
+            section = pluginPanel
+    )
+    default boolean showPluginPanel() { return true; }
+
     @ConfigSection(
             name = "General",
             description = "Configure general options.",
             position = 0
     )
     String general = "general";
+    String CONFIG_KEY_FETCH_DEFAULT_FILTERS = "fetchDefaultFilters";
+    @ConfigItem(
+            keyName = CONFIG_KEY_FETCH_DEFAULT_FILTERS,
+            name = "Fetch default filters",
+            description = "Fetch the default filters and include them as options in the plugin panel.",
+            section = general,
+            position = -2
+    )
+    default boolean fetchDefaultFilters() { return true; }
     @ConfigItem(
             keyName = "autoToggleFilter",
             name = "Auto-toggle active filter",
@@ -4887,7 +4934,7 @@ public interface LootFiltersConfig extends Config {
             section = itemValueRules,
             position = 0
     )
-    default ItemValueRulesMode itemValueRulesMode() { return ItemValueRulesMode.BEFORE_FILTER; }
+    default ItemValueRulesMode itemValueRulesMode() { return ItemValueRulesMode.AFTER_FILTER; }
     @ConfigItem(
             keyName = "valueType",
             name = "Value mode",
@@ -5342,8 +5389,14 @@ class Lootbeam
 }
 package com.lootfilters;
 
-import lombok.AllArgsConstructor;
+import com.lootfilters.lang.CompileException;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.Request;
+import okhttp3.Response;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -5352,13 +5405,20 @@ import java.nio.file.Files;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 import static com.lootfilters.util.TextUtil.quote;
 
 @Slf4j
-@AllArgsConstructor
+@RequiredArgsConstructor
 public class LootFilterManager {
     private final LootFiltersPlugin plugin;
+
+    private final ExecutorService httpDispatcher = Executors.newSingleThreadExecutor();
+
+    @Getter
+    private final List<LootFilter> defaultFilters = new ArrayList<>();
 
     public List<LootFilter> loadFilters() {
         var filters = new ArrayList<LootFilter>();
@@ -5391,7 +5451,7 @@ public class LootFilterManager {
 
             filters.add(filter);
         }
-        plugin.addChatMessage(String.format("Reloaded <col=%s>%d/%d</col> loot filters.",
+        plugin.addChatMessage(String.format("Loaded <col=%s>%d/%d</col> loot filters.",
                 filters.size() == files.length ? "00FF00" : "FF0000", filters.size(), files.length));
         return filters;
     }
@@ -5419,10 +5479,58 @@ public class LootFilterManager {
         }
     }
 
+    public void fetchDefaultFilters(Runnable onComplete) {
+        httpDispatcher.execute(() -> {
+            for (var filter : DefaultFilter.all()) {
+                fetchDefaultFilter(filter);
+            }
+            onComplete.run();
+        });
+    }
+
+    public void fetchDefaultFilter(DefaultFilter filter) {
+        var req = new Request.Builder()
+                .get()
+                .url(filter.getUrl())
+                .addHeader("User-Agent", "github.com/riktenx/loot-filters")
+                .build();
+        try (var resp = plugin.getOkHttpClient().newCall(req).execute()) {
+            var src = resp.body().string();
+            var parsed = LootFilter.fromSource(src);
+            defaultFilters.add(parsed);
+        } catch (Exception e) { // there could be an issue w/ a filter, but just keep going and let other fetches complete
+            log.warn("Failed to fetch default filter {}", filter.getName(), e);
+        }
+    }
+
     private static String toFilename(String filterName) {
         return filterName.replaceAll("[^a-zA-Z0-9._-]", "_") + ".rs2f";
     }
 }
+package com.lootfilters;
+
+import lombok.Value;
+
+import java.util.List;
+
+@Value
+public class DefaultFilter {
+    String name, url;
+
+    public static final DefaultFilter FILTERSCAPE = new DefaultFilter(
+            "[default: FilterScape]",
+            "https://raw.githubusercontent.com/riktenx/filterscape/refs/heads/main/filterscape.rs2f"
+    );
+    public static final DefaultFilter JOESFILTER = new DefaultFilter(
+            "[default: Joe's filter]",
+            "https://raw.githubusercontent.com/typical-whack/loot-filters-modules/refs/heads/main/default-filter.rs2f"
+    );
+
+    public static List<DefaultFilter> all() {
+        return List.of(FILTERSCAPE, JOESFILTER);
+    }
+}
+
 package com.lootfilters;
 
 import net.runelite.client.RuneLite;
