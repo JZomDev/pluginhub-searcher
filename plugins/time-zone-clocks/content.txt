@@ -1,21 +1,422 @@
 package com.tzclocks;
 
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
+import com.google.inject.Provides;
+import com.tzclocks.tzconfig.TZClocksConfig;
+import com.tzclocks.tzdata.TZClocksDataManager;
+import com.tzclocks.tzdata.TZClocksItem;
+import com.tzclocks.tzdata.TZClocksTab;
+import com.tzclocks.tzui.TZClocksItemPanel;
+import com.tzclocks.tzui.TZClocksPluginPanel;
+import com.tzclocks.tzui.TZClocksTabItemPanel;
+import com.tzclocks.tzui.TZClocksTabPanel;
+import com.tzclocks.tzutilities.TZConstants;
+import com.tzclocks.tzutilities.TZFormatEnum;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
 
-public class TZClocksPluginTest
-{
-	public static void main(String[] args) throws Exception
-	{
-		ExternalPluginManager.loadBuiltin(TZClocksPlugin.class);
-		RuneLite.main(args);
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.image.BufferedImage;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import static com.tzclocks.tzutilities.TZConstants.PANEL_ICON_PATH;
+import static java.time.ZoneId.systemDefault;
+
+@Slf4j
+@PluginDescriptor(
+		name = "Time Zone Clocks"
+)
+public class TZClocksPlugin extends Plugin {
+	public static final String CONFIG_GROUP = "tzconfig";
+	public static final UUID LOCAL_CLOCK_UUID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+	public static final String LOCAL_ZONE_ID = String.valueOf(systemDefault());
+	public static final String LOCAL_CUSTOM_NAME = "Local";
+	public static final String LOCAL_DISPLAY_NAME = localDisplayName();
+	public static final UUID JAGEX_CLOCK_UUID = UUID.fromString("00000000-0000-0000-0000-000000000002");
+	public static final String JAGEX_ZONE_ID = "Europe/London";
+	public static final String JAGEX_CUSTOM_NAME = "Jagex";
+	public static final String JAGEX_DISPLAY_NAME = "BST";
+	public static final String FIXED_TAB_NAME = "Local/Jagex Clocks";
+
+	@Inject private Client client;
+	@Inject private ClientThread clientThread;
+	@Inject private ClientToolbar clientToolbar;
+	@Inject @Getter private TZClocksConfig config;
+	@Inject public TZClocksDataManager dataManager;
+	@Getter private TZClocksPluginPanel panel;
+	private NavigationButton navButton;
+
+	@Getter @Setter private List<TZClocksItem> timezones = new ArrayList<>();
+	@Getter @Setter private List<TZClocksTab> tabs = new ArrayList<>();
+
+	@Getter @Setter
+	private Map<TZClocksItem, TZClocksTabItemPanel> fixedSouthTabClocksMap = new HashMap<>();
+
+	@Getter private boolean fixedTabCollapsed = false;
+
+	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+	private boolean isActive;
+
+	private static String localDisplayName(){
+		ZoneId zoneId = ZoneId.systemDefault();
+		TimeZone timeZone = TimeZone.getTimeZone(zoneId);
+		return timeZone.getDisplayName(timeZone.inDaylightTime(new Date()), TimeZone.SHORT);
+	}
+
+	@Override
+	protected void startUp() throws Exception {
+		log.info("Starting Time Zone Clocks");
+		dataManager.loadData();
+
+
+		updateOrAddFixedClock(LOCAL_CLOCK_UUID, LOCAL_ZONE_ID, LOCAL_CUSTOM_NAME, LOCAL_DISPLAY_NAME);
+		updateOrAddFixedClock(JAGEX_CLOCK_UUID, JAGEX_ZONE_ID, JAGEX_CUSTOM_NAME, JAGEX_DISPLAY_NAME);
+
+		panel = injector.getInstance(TZClocksPluginPanel.class);
+		SwingUtilities.invokeLater(() -> panel.initializeSouthPanel());
+
+		final BufferedImage icon = ImageUtil.loadImageResource(TZClocksPlugin.class, PANEL_ICON_PATH);
+		navButton = NavigationButton.builder()
+				.tooltip("Timezones")
+				.icon(icon)
+				.priority(5)
+				.panel(panel)
+				.build();
+		clientToolbar.addNavigation(navButton);
+
+		SwingUtilities.invokeLater(() -> panel.updateDropdowns());
+		SwingUtilities.invokeLater(() -> panel.updatePanel());
+
+		scheduler.scheduleAtFixedRate(this::updateTimezoneData, 0, 1, TimeUnit.SECONDS);
+		isActive = true;
+	}
+	private void updateOrAddFixedClock(UUID uuid, String zoneId, String customName, String displayName) {
+		TZClocksItem existing = timezones.stream().filter(item -> item.getUuid().equals(uuid)).findFirst().orElse(null);
+		if (existing == null) {
+			timezones.add(new TZClocksItem(uuid, zoneId, "", customName, "active", displayName));
+		} else {
+
+			existing.setName(zoneId);
+			existing.setDisplayName(displayName);
+
+			if (existing.getCustomName() == null || existing.getCustomName().trim().isEmpty()) {
+				existing.setCustomName(customName);
+			}
+		}
+	}
+	@Override
+	protected void shutDown() {
+		log.info("Stopping Time Zone Clocks");
+		if (dataManager != null) { dataManager.saveData(); }
+		if (clientToolbar != null && navButton != null) { clientToolbar.removeNavigation(navButton); }
+		if (scheduler != null && !scheduler.isShutdown()) { scheduler.shutdown(); }
+		isActive = false; panel = null; fixedSouthTabClocksMap.clear(); timezones.clear(); tabs.clear();
+	}
+
+	@Provides
+	TZClocksConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(TZClocksConfig.class);
+	}
+
+	/**
+	 * Handles configuration changes.
+	 */
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event) {
+		if (!event.getGroup().equals(CONFIG_GROUP)) { return; }
+
+
+		if (event.getKey().equals("showFixedGameTimesTab")) {
+			log.debug("Config changed for showFixedGameTimesTab, rebuilding south panel.");
+			if (panel != null) {
+				SwingUtilities.invokeLater(() -> {
+					panel.initializeSouthPanel();
+					panel.revalidate(); panel.repaint();
+				});
+			}
+		}
+		if (event.getKey().equals("timezoneSourceMode")) {
+			log.debug("Config changed for timezoneSourceMode, updating dropdowns.");
+			if (panel != null) {
+
+				SwingUtilities.invokeLater(() -> panel.updateDropdowns());
+			}
+		}
+		if (event.getKey().equals("tzFormat")) {
+			updateTimezoneData();
+		}
+	}
+	public void addTimezoneToPanel(String zoneIdString, String displayName) {
+		if (zoneIdString.equals(LOCAL_ZONE_ID)) {
+			log.warn("Attempted to add fixed timezone {} via addTimezoneToPanel.", zoneIdString);
+			SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(panel, zoneIdString + " is already shown in the Game Times panel.", "Clock Exists", JOptionPane.INFORMATION_MESSAGE) ); return;
+		}
+		boolean alreadyExists = timezones.stream().anyMatch(item -> item.getName().equalsIgnoreCase(zoneIdString) && !item.getUuid().equals(LOCAL_CLOCK_UUID) && !item.getUuid().equals(JAGEX_CLOCK_UUID));
+		if (alreadyExists) { SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(panel, displayName + " (" + zoneIdString + ") has already been added.", "Clock Exists", JOptionPane.INFORMATION_MESSAGE) ); return; }
+
+		clientThread.invokeLater(() -> {
+			String customName = null; String showCalendar = null;
+			try {
+				ZoneId zoneId = ZoneId.of(zoneIdString); ZonedDateTime now = ZonedDateTime.now(zoneId);
+				DateTimeFormatter formatter = getFormatter(); String currentTime = now.format(formatter);
+				TZClocksItem newItem = new TZClocksItem(UUID.randomUUID(), zoneIdString, currentTime, customName, showCalendar, displayName);
+				timezones.add(newItem); dataManager.saveData(); SwingUtilities.invokeLater(() -> panel.updatePanel());
+			} catch (Exception e) { log.error("Failed to add timezone: {}", zoneIdString, e); SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(panel, "Failed to add timezone: " + zoneIdString, "Error", JOptionPane.ERROR_MESSAGE) ); }
+		});
+	}
+
+	public void removeTimezoneFromPanel(TZClocksItem item) {
+		if (item.getUuid().equals(LOCAL_CLOCK_UUID) || item.getUuid().equals(JAGEX_CLOCK_UUID)) { log.warn("Attempted to remove fixed timezone item {} via user action.", item.getName()); return; }
+		timezones.remove(item); removeClockFromUserTab(item); dataManager.saveData(); SwingUtilities.invokeLater(() -> panel.updatePanel());
+	}
+
+	public void editClockCustomName(TZClocksItem clock) {
+		String currentEditName = clock.getCustomName() != null ? clock.getCustomName() : clock.getDisplayName();
+		String newName = JOptionPane.showInputDialog(panel, "Enter a custom name for the clock (blank to reset):", currentEditName);
+		if (newName != null) {
+			if (newName.trim().isEmpty()) { clock.setCustomName(null); } else { clock.setCustomName(newName.trim()); }
+
+			if (!clock.getUuid().equals(LOCAL_CLOCK_UUID) && !clock.getUuid().equals(JAGEX_CLOCK_UUID)) { dataManager.saveData(); }
+
+			SwingUtilities.invokeLater(() -> {
+				panel.updatePanel();
+				if (fixedSouthTabClocksMap != null && (clock.getUuid().equals(LOCAL_CLOCK_UUID) || clock.getUuid().equals(JAGEX_CLOCK_UUID))) { panel.initializeSouthPanel(); }
+			});
+		}
+	}
+
+	public void toggleMonthDayVisibility(TZClocksItem item) {
+		if (item.getShowCalendar() == null) { item.setShowCalendar("active"); } else { item.setShowCalendar(null); }
+		if (!item.getUuid().equals(LOCAL_CLOCK_UUID) && !item.getUuid().equals(JAGEX_CLOCK_UUID)) { dataManager.saveData(); }
+		SwingUtilities.invokeLater(() -> {
+			panel.updatePanel();
+			if (fixedSouthTabClocksMap != null && (item.getUuid().equals(LOCAL_CLOCK_UUID) || item.getUuid().equals(JAGEX_CLOCK_UUID))) { panel.initializeSouthPanel(); }
+		});
+	}
+
+	public void addTab(String tabName) {
+		if (tabName.equalsIgnoreCase(FIXED_TAB_NAME)) { log.warn("Attempted to add user tab with reserved name '{}'.", FIXED_TAB_NAME); SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(panel, "Cannot use the reserved tab name '"+FIXED_TAB_NAME+"'.", "Reserved Name", JOptionPane.WARNING_MESSAGE) ); return; }
+		boolean nameExists = tabs.stream().anyMatch(tab -> tab.getName().equalsIgnoreCase(tabName));
+		if (nameExists) { SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(panel, "A tab with the name '" + tabName + "' already exists.", "Name Exists", JOptionPane.WARNING_MESSAGE) ); return; }
+		clientThread.invokeLater(() -> { tabs.add(new TZClocksTab(tabName, new ArrayList<>())); dataManager.saveData(); SwingUtilities.invokeLater(() -> panel.updatePanel()); });
+	}
+
+	public void editTab(TZClocksTab tab) {
+		String newName = JOptionPane.showInputDialog(panel, "Enter the name for this tab (30 chars max).", tab.getName());
+		if (newName == null || newName.trim().isEmpty()) { return; }
+		newName = newName.trim(); if (newName.length() > 30) { newName = newName.substring(0, 30); }
+		if (newName.equalsIgnoreCase(FIXED_TAB_NAME)) { SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(panel, "Cannot use the reserved tab name '"+FIXED_TAB_NAME+"'.", "Reserved Name", JOptionPane.WARNING_MESSAGE) ); return; }
+		String finalNewName = newName; boolean nameExists = tabs.stream().filter(t -> t != tab).anyMatch(t -> t.getName().equalsIgnoreCase(finalNewName));
+		if (nameExists) { SwingUtilities.invokeLater(() -> JOptionPane.showMessageDialog(panel, "Another tab with the name '" + finalNewName + "' already exists.", "Name Exists", JOptionPane.WARNING_MESSAGE) ); return; }
+		if (!tab.getName().equals(newName)) { tab.setName(newName); dataManager.saveData(); SwingUtilities.invokeLater(() -> panel.updatePanel()); }
+	}
+
+	public void removeTab(TZClocksTab tab) { tabs.remove(tab); dataManager.saveData(); SwingUtilities.invokeLater(() -> panel.updatePanel()); }
+
+	public void switchTabExpandCollapse(String tabName) {
+		if (tabName.equalsIgnoreCase(FIXED_TAB_NAME)) { fixedTabCollapsed = !fixedTabCollapsed; if (panel != null) { SwingUtilities.invokeLater(() -> panel.initializeSouthPanel()); } } else { tabs.stream().filter(t -> t.getName().equalsIgnoreCase(tabName)).findFirst().ifPresent(userTab -> { userTab.setCollapsed(!userTab.isCollapsed()); dataManager.saveData(); if (panel != null) { SwingUtilities.invokeLater(() -> panel.updatePanel()); } }); }
+	}
+
+	public void removeClockFromUserTab(TZClocksItem clock) { for (TZClocksTab tab : tabs) {
+		if (tab.getClocks() != null && tab.getClocks().contains(clock.getUuid())) {
+			tab.removeClock(clock.getUuid()); dataManager.saveData(); if (panel != null) { SwingUtilities.invokeLater(() -> panel.updatePanel()); } break; }
+	}
+	}
+
+	public void addClockToUserTab(TZClocksItem clock, TZClocksTab tab) {
+		if (tabs.contains(tab) && !clock.getUuid().equals(LOCAL_CLOCK_UUID) && !clock.getUuid().equals(JAGEX_CLOCK_UUID)) {
+			removeClockFromUserTab(clock);
+			if (tab.getClocks() != null) { tab.addClock(clock.getUuid()); } else { log.error("Target user tab '{}' has null clock list!", tab.getName()); }
+			dataManager.saveData(); if (panel != null) { SwingUtilities.invokeLater(() -> panel.updatePanel()); }
+		} else { log.warn("Attempted invalid addClockToUserTab operation. Clock: {}, Tab: {}", clock.getName(), tab.getName()); }
+	}
+
+
+	public void updateTimezoneData() {
+		DateTimeFormatter formatter = getFormatter();
+		boolean showFixedTab = config.showFixedGameTimesTab();
+
+		for (TZClocksItem item : timezones) {
+			try {
+				ZoneId zoneId = ZoneId.of(item.getName());
+				ZonedDateTime now = ZonedDateTime.now(zoneId); String currentTime = now.format(formatter); item.setCurrentTime(currentTime);
+				SwingUtilities.invokeLater(() -> {
+					boolean updated = false;
+					if (showFixedTab && !fixedTabCollapsed && (item.getUuid().equals(LOCAL_CLOCK_UUID) || item.getUuid().equals(JAGEX_CLOCK_UUID))) {
+						TZClocksTabItemPanel southItemPanel = fixedSouthTabClocksMap.get(item);
+						if (southItemPanel != null) { southItemPanel.updateTime(); updated = true; } else { log.trace("South panel item not found in map for fixed clock {}", item.getName()); }
+					}
+					if (!updated && panel != null) {
+						TZClocksItemPanel clockPanel = panel.getTimezonePanelsMap().get(item);
+						if (clockPanel != null) { clockPanel.updateTime(); updated = true; }
+					}
+					if (!updated && panel != null) {
+						for (TZClocksTab userTab : tabs) {
+							if (!userTab.isCollapsed() && userTab.getClocks() != null && userTab.getClocks().contains(item.getUuid())) {
+								TZClocksTabPanel userTabPanel = panel.getTabPanelsMap().get(userTab);
+								if (userTabPanel != null) {
+									TZClocksTabItemPanel userTabItemPanel = userTabPanel.getTabItemPanelsMap().get(item);
+									if (userTabItemPanel != null) { userTabItemPanel.updateTime(); updated = true; } else { log.trace("User tab item panel not found in map for clock {} in tab {}", item.getName(), userTab.getName()); }
+								} else { log.trace("User tab panel not found in map for tab {}", userTab.getName()); } break;
+							}
+						}
+					}
+				});
+			} catch (Exception e) { log.error("Failed to update time for timezone item: {} ({})", item.getName(), item.getUuid(), e); }
+		}
+	}
+
+	public DateTimeFormatter getFormatter() {
+		if (config != null && config.getTZFormatMode() == TZFormatEnum.TWENTY_FOUR_HOUR) {
+			return DateTimeFormatter.ofPattern("HH:mm:ss");
+		} else { return DateTimeFormatter.ofPattern("hh:mm:ss a"); }
+	}
+}
+package com.tzclocks.tzconfig;
+
+import com.tzclocks.TZClocksPlugin;
+import com.tzclocks.tzutilities.TZFormatEnum;
+import com.tzclocks.tzutilities.TZSourceMode;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+@ConfigGroup(TZClocksPlugin.CONFIG_GROUP)
+public interface TZClocksConfig extends Config {
+
+
+	@ConfigSection(
+			name = "Display",
+			description = "Clock display settings",
+			position = 0
+	)
+	String displaySection = "display";
+
+	@ConfigItem(
+			position = 1,
+			keyName = "tzFormat",
+			name = "Time Format",
+			description = "Select 12-hour or 24-hour format",
+			section = displaySection
+	)
+	default TZFormatEnum getTZFormatMode() {
+		return TZFormatEnum.TWELVE_HOUR;
+	}
+
+	@ConfigItem(
+			position = 2,
+			keyName = "showFixedGameTimesTab",
+			name = "Show Local/Jagex Tab",
+			description = "Shows/hides the fixed 'Local+Jagex' tab (UTC, Server Time) at the bottom.",
+			section = displaySection
+	)
+	default boolean showFixedGameTimesTab() {
+		return true;
+	}
+
+	@ConfigSection(
+			name = "Timezone Source",
+			description = "How timezones are selected in the panel",
+			position = 3
+	)
+	String sourceSection = "source";
+
+
+	@ConfigItem(
+			position = 4,
+			keyName = "timezoneSourceMode",
+			name = "Selection Mode",
+			description = "Choose how to select timezones: by region/city or by region/abbreviation.",
+			section = sourceSection
+	)
+	default TZSourceMode getTimezoneSourceMode() {
+		return TZSourceMode.ABBREVIATION;
 	}
 }
 package com.tzclocks.tzdata;
 
-import com.tzclocks.TZClocksPlugin;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+import java.util.List;
+import java.util.UUID;
+
+@AllArgsConstructor
+@Getter
+public class TZClocksTabData {
+    private String name;
+    private boolean isCollapsed;
+    private List<UUID> clocks;
+}
+package com.tzclocks.tzdata;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.List;
+import java.util.UUID;
+
+@AllArgsConstructor
+public class TZClocksTab {
+    @Getter
+    @Setter
+    private String name;
+
+    @Getter
+    @Setter
+    private boolean isCollapsed;
+
+    @Getter
+    private final List<UUID> clocks;
+
+    public TZClocksTab(String name, List<UUID> clocks) {
+        this.name = name;
+        this.isCollapsed = true;
+        this.clocks = clocks;
+    }
+
+    public void addClock(UUID clockId) {
+        this.clocks.add(clockId);
+    }
+
+    public void removeClock(UUID clockId) {
+        this.clocks.remove(clockId);
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (!(obj instanceof TZClocksTab)) {
+            return false;
+        }
+        final TZClocksTab tab = (TZClocksTab) obj;
+        return tab.getName().equals(this.name);
+    }
+}
+package com.tzclocks.tzdata;
+
 import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
+import com.tzclocks.TZClocksPlugin;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -23,104 +424,1078 @@ import net.runelite.client.config.ConfigManager;
 
 import javax.inject.Inject;
 import java.lang.reflect.Type;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.List;
+import java.util.UUID;
+import java.util.stream.Collectors;
 
 @Slf4j
 public class TZClocksDataManager {
     private static final String CONFIG_KEY_TIMEZONES = "timezonekey";
+    private static final String CONFIG_KEY_TABS = "tabsKey";
     private static final String CONFIG_GROUP = "timezonesgroup";
-    private static final String LOAD_TIMEZONE_ERROR = "Exception occurred while loading timezones";
+    private static final String LOAD_TIMEZONE_ERROR = "Exception occurred while loading user timezones";
+    private static final String LOAD_TABS_ERROR = "Exception occurred while loading user tabs";
     private static final String EMPTY_ARRAY = "[]";
+
     private final TZClocksPlugin plugin;
     private final Client client;
     private final ConfigManager configManager;
     private final Gson gson;
 
-    private List<String> timezoneIds = new ArrayList<>();
-    private final Type timezoneIdsType = new TypeToken<ArrayList<String>>() {}.getType(); //not sure what this does either
-    private final Type itemsType = new TypeToken<ArrayList<String>>() {}.getType(); //takes saved data from data manager for conversion
+
+    private final Type timezoneItemsType = new TypeToken<ArrayList<TZClocksItem>>() {}.getType();
+    private final Type tabsDataType = new TypeToken<ArrayList<TZClocksTabData>>() {}.getType();
+    private final Type oldTimezoneItemsType = new TypeToken<ArrayList<String>>() {}.getType();
+
     @Inject
-    public TZClocksDataManager(TZClocksPlugin plugin, Client client, ConfigManager configManager, Gson gson) { //saves time zones between client sessions
+    public TZClocksDataManager(TZClocksPlugin plugin, Client client, ConfigManager configManager, Gson gson) {
         this.plugin = plugin;
         this.client = client;
         this.configManager = configManager;
         this.gson = gson;
     }
 
-
-// was used when adding time zone but did not always save to data manager; leaving here just in case
-//    public void saveTimezoneToConfig(String timezoneId) {
-//        if (!timezoneIds.contains(timezoneId)) {
-//            timezoneIds.add(timezoneId);
-//            saveData();
-//        }
-//    }
-
-    public boolean loadData() { //loads data after starting client. works
-        if (client.getGameState().getState() < GameState.LOGIN_SCREEN.getState()) {
+    /**
+     * Loads user-specific timezone and tab configurations.
+     * Handles adding default displayName for older saved data.
+     * @return true if loading was attempted, false if skipped.
+     */
+    public boolean loadData() {
+        if (client.getGameState() == null || client.getGameState().getState() < GameState.LOGIN_SCREEN.getState()) {
+            log.debug("Skipping data load, game state is {} or null", client.getGameState());
             return false;
         }
+        log.info("Loading TZClocks user data...");
 
-        timezoneIds.clear();
-
-        String timezonesJson = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY_TIMEZONES);
-        if (timezonesJson == null || timezonesJson.equals(EMPTY_ARRAY)) {
-            plugin.setTimezones(new ArrayList<>());
-        } else {
-            try {
-                timezoneIds = gson.fromJson(timezonesJson, itemsType);
-                convertItems();
-            } catch (Exception e) {
-                log.error(LOAD_TIMEZONE_ERROR, e);
-                plugin.setTimezones(new ArrayList<>());
-            }
-        }
+        List<TZClocksItem> userTimezones = loadUserTimezones();
+        List<TZClocksTab> userTabs = loadUserTabs();
 
 
-        plugin.updateTimezoneData();
+        plugin.setTimezones(userTimezones);
+        plugin.setTabs(userTabs);
+
+        log.info("Data loading process complete. Loaded {} user timezones and {} user tabs.", userTimezones.size(), userTabs.size());
         return true;
     }
 
-    public void saveData() { //saves data to config
-        timezoneIds.clear();
+    /**
+     * Safely loads, parses, and processes user timezones from config.
+     * Adds default displayName if missing from saved data or if converting from old format.
+     */
+    private List<TZClocksItem> loadUserTimezones() {
+        String timezonesJson = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY_TIMEZONES);
+        log.debug("Raw user timezones JSON from config: {}", timezonesJson);
 
-        for (TZClocksItem item : plugin.getTimezones()) {
-            timezoneIds.add(item.getName());
+        if (timezonesJson == null || timezonesJson.equals(EMPTY_ARRAY) || timezonesJson.trim().isEmpty()) {
+            log.debug("No user timezones found in config.");
+            return new ArrayList<>();
         }
 
-        final String timezonesJson = gson.toJson(timezoneIds);
+        List<TZClocksItem> loadedItems = null;
+        boolean convertedFromOldFormat = false;
+        try {
+            String trimmedJson = timezonesJson.trim();
+            if (trimmedJson.startsWith("[") && trimmedJson.contains("\"uuid\":")) {
+
+                log.debug("Attempting to parse as new format (List<TZClocksItem>).");
+                loadedItems = gson.fromJson(trimmedJson, timezoneItemsType);
+                log.debug("Parsed {} items (before filtering/defaulting).", loadedItems == null ? 0 : loadedItems.size());
+            } else if (trimmedJson.startsWith("[")) {
+
+                log.info("Attempting conversion from old string list format.");
+                List<String> oldTimezoneIds = gson.fromJson(trimmedJson, oldTimezoneItemsType);
+                loadedItems = new ArrayList<>();
+                if (oldTimezoneIds != null) {
+                    for (String timezoneId : oldTimezoneIds) {
+                        if (timezoneId != null && !timezoneId.trim().isEmpty()) {
+
+                            loadedItems.add(new TZClocksItem(UUID.randomUUID(), timezoneId.trim(), null, null, null, null));
+                        }
+                    }
+                }
+                convertedFromOldFormat = true;
+                log.info("Converted {} items from old format.", loadedItems.size());
+            } else {
+                log.warn("Unrecognized timezone JSON format: {}", timezonesJson);
+                return new ArrayList<>();
+            }
+        } catch (JsonSyntaxException e) {
+            log.error(LOAD_TIMEZONE_ERROR + " (JSON Syntax): " + e.getMessage());
+            return new ArrayList<>();
+        } catch (Exception e) {
+            log.error(LOAD_TIMEZONE_ERROR, e);
+            return new ArrayList<>();
+        }
+
+
+        if (loadedItems != null) {
+            for (TZClocksItem item : loadedItems) {
+
+                if (item != null && (item.getDisplayName() == null || item.getDisplayName().trim().isEmpty())) {
+
+                    if (item.getName() != null && !item.getName().trim().isEmpty()) {
+                        item.setDisplayName(deriveDisplayNameFromName(item.getName()));
+                        if (convertedFromOldFormat) {
+                            log.debug("Set default displayName '{}' for converted item '{}'", item.getDisplayName(), item.getName());
+                        } else {
+                            log.debug("Set default displayName '{}' for loaded item '{}' (was missing)", item.getDisplayName(), item.getName());
+                        }
+                    } else {
+                        log.warn("Cannot set default displayName for item with missing ZoneId name (UUID: {})", item.getUuid());
+
+                        item.setDisplayName("Invalid Zone");
+                    }
+                }
+            }
+
+
+            return loadedItems.stream()
+                    .filter(item -> item != null && item.getUuid() != null && item.getName() != null && item.getDisplayName() != null &&
+                            !item.getUuid().equals(TZClocksPlugin.LOCAL_CLOCK_UUID) &&
+                            !item.getUuid().equals(TZClocksPlugin.JAGEX_CLOCK_UUID))
+                    .collect(Collectors.toList());
+        } else {
+            log.warn("Loaded timezone items list was null after parsing/conversion.");
+            return new ArrayList<>();
+        }
+    }
+
+    /**
+     * Derives a user-friendly display name from a ZoneId string.
+     * Example: "America/New_York" -> "New York", "Etc/UTC" -> "UTC"
+     * @param zoneIdName The full ZoneId string.
+     * @return A derived display name.
+     */
+    private String deriveDisplayNameFromName(String zoneIdName) {
+        if (zoneIdName == null || zoneIdName.isEmpty()) {
+            return "Unknown";
+        }
+
+        if ("Etc/UTC".equalsIgnoreCase(zoneIdName)) {
+            return "UTC";
+        }
+        if ("Europe/London".equalsIgnoreCase(zoneIdName)) {
+            return "London";
+        }
+
+        int lastSlash = zoneIdName.lastIndexOf('/');
+        if (lastSlash != -1 && lastSlash < zoneIdName.length() - 1) {
+
+            String derived = zoneIdName.substring(lastSlash + 1);
+
+            return derived.replace('_', ' ');
+        }
+
+        return zoneIdName;
+    }
+
+
+    /** Safely loads and parses user tabs from config. */
+    private List<TZClocksTab> loadUserTabs() {
+        String tabsJson = configManager.getConfiguration(CONFIG_GROUP, CONFIG_KEY_TABS);
+        log.debug("Raw user tabs JSON from config: {}", tabsJson);
+
+        if (tabsJson == null || tabsJson.equals(EMPTY_ARRAY) || tabsJson.trim().isEmpty()) {
+            log.debug("No user tabs found in config.");
+            return new ArrayList<>();
+        }
+
+        List<TZClocksTabData> loadedTabsDataList = null;
+        try {
+            loadedTabsDataList = gson.fromJson(tabsJson, tabsDataType);
+            log.debug("Parsed {} TabData objects (before filtering).", loadedTabsDataList == null ? 0 : loadedTabsDataList.size());
+
+        } catch (JsonSyntaxException e) {
+            log.error(LOAD_TABS_ERROR + " (JSON Syntax): " + e.getMessage());
+            return new ArrayList<>();
+        } catch (Exception e) {
+            log.error(LOAD_TABS_ERROR, e);
+            return new ArrayList<>();
+        }
+
+
+        if (loadedTabsDataList != null) {
+            List<TZClocksTab> userTabs = new ArrayList<>();
+            for (TZClocksTabData tabData : loadedTabsDataList) {
+                if (tabData != null && tabData.getName() != null &&
+                        !tabData.getName().equalsIgnoreCase(TZClocksPlugin.FIXED_TAB_NAME))
+                {
+                    List<UUID> userClockIds = (tabData.getClocks() == null) ? new ArrayList<>() :
+                            tabData.getClocks().stream()
+                                    .filter(id -> id != null &&
+                                            !id.equals(TZClocksPlugin.LOCAL_CLOCK_UUID) &&
+                                            !id.equals(TZClocksPlugin.JAGEX_CLOCK_UUID))
+                                    .collect(Collectors.toList());
+
+
+                    userTabs.add(new TZClocksTab(tabData.getName(), tabData.isCollapsed(), new ArrayList<>(userClockIds)));
+                } else if (tabData != null && tabData.getName() != null && tabData.getName().equalsIgnoreCase(TZClocksPlugin.FIXED_TAB_NAME)) {
+                    log.debug("Ignoring fixed tab '{}' found in saved data.", TZClocksPlugin.FIXED_TAB_NAME);
+                }
+            }
+            return userTabs;
+        } else {
+            log.warn("Loaded tabs data list was null after parsing.");
+            return new ArrayList<>();
+        }
+    }
+
+
+    /**
+     * Saves only the user-defined timezones and tabs to the configuration.
+     * The `displayName` field is now included automatically by Gson.
+     * Fixed clocks (UTC, London) and the fixed tab are excluded.
+     */
+    public void saveData() {
+        if (plugin == null || plugin.getTimezones() == null || plugin.getTabs() == null) {
+            log.error("Cannot save data - plugin references are null."); return;
+        }
+        log.debug("Saving TZClocks user data...");
+
+
+        List<TZClocksItem> itemsToSave = plugin.getTimezones().stream()
+                .filter(item -> item != null && item.getUuid() != null &&
+                        !item.getUuid().equals(TZClocksPlugin.LOCAL_CLOCK_UUID) &&
+                        !item.getUuid().equals(TZClocksPlugin.JAGEX_CLOCK_UUID))
+                .collect(Collectors.toList());
+
+
+        for (TZClocksItem item : itemsToSave) {
+            if (item.getDisplayName() == null || item.getDisplayName().trim().isEmpty()) {
+                log.warn("User timezone item '{}' missing display name before save. Setting default.", item.getName());
+                item.setDisplayName(deriveDisplayNameFromName(item.getName()));
+            }
+        }
+
+        final String timezonesJson = gson.toJson(itemsToSave);
+        if (timezonesJson == null) { log.error("Failed to serialize user timezones to JSON."); return; }
         configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_TIMEZONES, timezonesJson);
+        log.debug("Saved {} user timezones.", itemsToSave.size());
 
-    }
 
-    private void convertItems() { //converts time zones for loading
-        List<TZClocksItem> watchItems = new ArrayList<>();
+        List<TZClocksTabData> tabsDataToSave = new ArrayList<>();
+        List<TZClocksTab> userTabs = plugin.getTabs();
 
-        for (String timezoneId : timezoneIds) {
-            watchItems.add(convertIdToItem(timezoneId));
+        for (TZClocksTab tab : userTabs) {
+            if (tab == null || tab.getName() == null || tab.getName().equalsIgnoreCase(TZClocksPlugin.FIXED_TAB_NAME)) continue;
+            List<UUID> userClockIds = (tab.getClocks() == null) ? new ArrayList<>() :
+                    tab.getClocks().stream()
+                            .filter(id -> id != null && !id.equals(TZClocksPlugin.LOCAL_CLOCK_UUID) && !id.equals(TZClocksPlugin.JAGEX_CLOCK_UUID))
+                            .collect(Collectors.toList());
+            tabsDataToSave.add(new TZClocksTabData(tab.getName(), tab.isCollapsed(), userClockIds));
         }
 
-        plugin.setTimezones(watchItems);
-    }
-
-    private TZClocksItem convertIdToItem(String timezoneId) { //also converts time zones for loading
-        ZoneId zoneId = ZoneId.of(timezoneId);
-        ZonedDateTime now = ZonedDateTime.now(zoneId);
-        DateTimeFormatter formatter = plugin.getFormatter();
-        String currentTime = now.format(formatter);
-        return new TZClocksItem(timezoneId, currentTime);
+        final String tabsJson = gson.toJson(tabsDataToSave);
+        if (tabsJson == null) { log.error("Failed to serialize user tabs to JSON."); return; }
+        configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_TABS, tabsJson);
+        log.debug("Saved {} user tabs.", tabsDataToSave.size());
+        log.debug("Data saving process complete.");
     }
 }
 package com.tzclocks.tzdata;
 
 import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.UUID;
 
 @AllArgsConstructor
-public enum TZFormatEnum { //time zone formats
+public class TZClocksItem {
+    @Getter
+    private final UUID uuid;
+    @Getter
+    @Setter
+    private String name;
+    @Getter
+    @Setter
+    private String currentTime;
+    @Getter
+    @Setter
+    private String customName;
+    @Getter
+    @Setter
+    private String showCalendar;
+    @Getter
+    @Setter
+    private String displayName;
+
+}
+package com.tzclocks.tzutilities;
+
+import lombok.Getter;
+import java.time.ZoneId;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+/**
+ * Enum defining groups of common timezone abbreviations with fixed UTC offsets,
+ * organized by geographical/functional region.
+ */
+public enum TZAbbrevEnum {
+    ALL_ABBREV("Regions/Abbrev."),
+
+    AFRICA("Africa",
+            new NamedZoneId("CAT - Central Africa Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("CET - Central European Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("CVT - Cape Verde Time", ZoneId.of("UTC-01:00")),
+            new NamedZoneId("EAT - Eastern Africa Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("EEST - Eastern European Summer Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("EET - Eastern European Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("GMT - Greenwich Mean Time", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("MUT - Mauritius Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("RET - Reunion Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("SAST - South Africa Standard Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("SCT - Seychelles Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("WAST - West Africa Summer Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("WAT - West Africa Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("WEST - Western European Summer Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("WET - Western European Time", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("WST - Western Sahara Summer Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("WT - Western Sahara Standard Time", ZoneId.of("UTC+00:00"))
+    ),
+    ANTARCTICA("Antarctica",
+            new NamedZoneId("ART - Argentina Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("CAST - Casey Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("CEST - Central European Summer Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("CLST - Chile Summer Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("CLT - Chile Standard Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("DAVT - Davis Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("DDUT - Dumont-d'Urville Time", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("GMT - Greenwich Mean Time", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("MAWT - Mawson Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("NZDT - New Zealand Daylight Time", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("NZST - New Zealand Standard Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("ROTT - Rothera Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("SYOT - Syowa Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("VOST - Vostok Time", ZoneId.of("UTC+06:00"))
+    ),
+    ASIA("Asia",
+            new NamedZoneId("ADT - Arabia Daylight Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("AFT - Afghanistan Time", ZoneId.of("UTC+04:30")),
+            new NamedZoneId("ALMT - Alma-Ata Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("AMST - Armenia Summer Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("AMT - Armenia Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("ANAST - Anadyr Summer Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("ANAT - Anadyr Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("AQTT - Aqtobe Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("AST - Arabia Standard Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("AZST - Azerbaijan Summer Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("AZT - Azerbaijan Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("BNT - Brunei Darussalam Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("BST - Bangladesh Standard Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("BTT - Bhutan Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("CHOST - Choibalsan Summer Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("CHOT - Choibalsan Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("CST - China Standard Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("EEST - Eastern European Summer Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("EET - Eastern European Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("GET - Georgia Standard Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("GST - Gulf Standard Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("HKT - Hong Kong Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("HOVST - Hovd Summer Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("HOVT - Hovd Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("ICT - Indochina Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("IDT - Israel Daylight Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("IRDT - Iran Daylight Time", ZoneId.of("UTC+04:30")),
+            new NamedZoneId("IRKST - Irkutsk Summer Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("IRKT - Irkutsk Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("IRST - Iran Standard Time", ZoneId.of("UTC+03:30")),
+            new NamedZoneId("IST - Israel Standard Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("IST - India Standard Time", ZoneId.of("UTC+05:30")),
+            new NamedZoneId("JST - Japan Standard Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("KGT - Kyrgyzstan Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("KRAST - Krasnoyarsk Summer Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("KRAT - Krasnoyarsk Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("KST - Korea Standard Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("MAGST - Magadan Summer Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("MAGT - Magadan Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("MMT - Myanmar Time", ZoneId.of("UTC+06:30")),
+            new NamedZoneId("MSK - Moscow Standard Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("MVT - Maldives Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("MYT - Malaysia Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("NOVST - Novosibirsk Summer Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("NOVT - Novosibirsk Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("NPT - Nepal Time", ZoneId.of("UTC+05:45")),
+            new NamedZoneId("OMSST - Omsk Summer Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("OMST - Omsk Standard Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("ORAT - Oral Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("PETST - Kamchatka Summer Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("PETT - Kamchatka Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("PHT - Philippine Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("PKT - Pakistan Standard Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("PYT - Pyongyang Time", ZoneId.of("UTC+08:30")),
+            new NamedZoneId("QYZT - Qyzylorda Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("SAKT - Sakhalin Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("SGT - Singapore Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("SRET - Srednekolymsk Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("TJT - Tajikistan Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("TLT - East Timor Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("TMT - Turkmenistan Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("TRT - Turkey Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("ULAST - Ulaanbaatar Summer Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("ULAT - Ulaanbaatar Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("UZT - Uzbekistan Time", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("VLAST - Vladivostok Summer Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("VLAT - Vladivostok Time", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("WIB - Western Indonesian Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("WIT - Eastern Indonesian Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("WITA - Central Indonesian Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("YAKST - Yakutsk Summer Time", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("YAKT - Yakutsk Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("YEKST - Yekaterinburg Summer Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("YEKT - Yekaterinburg Time", ZoneId.of("UTC+05:00"))
+    ),
+    ATLANTIC("Atlantic",
+            new NamedZoneId("ADT - Atlantic Daylight Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("AST - Atlantic Standard Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("AT - Atlantic Time (DST)", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("AT - Atlantic Time (STD)", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("AZOST - Azores Summer Time", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("AZOT - Azores Time", ZoneId.of("UTC-01:00"))
+    ),
+    AUSTRALIA("Australia",
+            new NamedZoneId("ACDT - Australian Central Daylight Time", ZoneId.of("UTC+10:30")),
+            new NamedZoneId("ACST - Australian Central Standard Time", ZoneId.of("UTC+09:30")),
+            new NamedZoneId("ACT - Australian Central Time (STD)", ZoneId.of("UTC+09:30")),
+            new NamedZoneId("ACT - Australian Central Time (DST)", ZoneId.of("UTC+10:30")),
+            new NamedZoneId("ACWST - Australian Central Western Standard Time", ZoneId.of("UTC+08:45")),
+            new NamedZoneId("AEDT - Australian Eastern Daylight Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("AEST - Australian Eastern Standard Time", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("AET - Australian Eastern Time (STD)", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("AET - Australian Eastern Time (DST)", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("AWDT - Australian Western Daylight Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("AWST - Australian Western Standard Time", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("CXT - Christmas Island Time", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("LHDT - Lord Howe Daylight Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("LHST - Lord Howe Standard Time", ZoneId.of("UTC+10:30")),
+            new NamedZoneId("NFDT - Norfolk Daylight Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("NFT - Norfolk Time", ZoneId.of("UTC+11:00"))
+    ),
+    CARIBBEAN("Caribbean",
+            new NamedZoneId("AST - Atlantic Standard Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("CDT - Cuba Daylight Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("CIDST - Cayman Islands Daylight Saving Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("CIST - Cayman Islands Standard Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("CST - Cuba Standard Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("EDT - Eastern Daylight Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("EST - Eastern Standard Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("ET - Eastern Time (STD)", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("ET - Eastern Time (DST)", ZoneId.of("UTC-04:00"))
+    ),
+    CENTRAL_AMERICA("Central America",
+            new NamedZoneId("CST - Central Standard Time", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("EST - Eastern Standard Time", ZoneId.of("UTC-05:00"))
+    ),
+    EUROPE("Europe",
+            new NamedZoneId("BST - British Summer Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("CEST - Central European Summer Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("CET - Central European Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("EEST - Eastern European Summer Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("EET - Eastern European Time", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("FET - Further-Eastern European Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("GET - Georgia Standard Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("GMT - Greenwich Mean Time", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("IST - Irish Standard Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("KUYT - Kuybyshev Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("MSD - Moscow Daylight Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("MSK - Moscow Standard Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("SAMT - Samara Time", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("TRT - Turkey Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("WEST - Western European Summer Time", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("WET - Western European Time", ZoneId.of("UTC+00:00"))
+    ),
+    INDIAN_OCEAN("Indian Ocean",
+            new NamedZoneId("CCT - Cocos Islands Time", ZoneId.of("UTC+06:30")),
+            new NamedZoneId("EAT - East Africa Time", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("IOT - Indian Chagos Time", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("TFT - French Southern and Antarctic Time", ZoneId.of("UTC+05:00"))
+
+    ),
+    MILITARY("Military",
+            new NamedZoneId("A - Alfa Time Zone", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("B - Bravo Time Zone", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("C - Charlie Time Zone", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("D - Delta Time Zone", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("E - Echo Time Zone", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("F - Foxtrot Time Zone", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("G - Golf Time Zone", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("H - Hotel Time Zone", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("I - India Time Zone", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("K - Kilo Time Zone", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("L - Lima Time Zone", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("M - Mike Time Zone", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("N - November Time Zone", ZoneId.of("UTC-01:00")),
+            new NamedZoneId("O - Oscar Time Zone", ZoneId.of("UTC-02:00")),
+            new NamedZoneId("P - Papa Time Zone", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("Q - Quebec Time Zone", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("R - Romeo Time Zone", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("S - Sierra Time Zone", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("T - Tango Time Zone", ZoneId.of("UTC-07:00")),
+            new NamedZoneId("U - Uniform Time Zone", ZoneId.of("UTC-08:00")),
+            new NamedZoneId("V - Victor Time Zone", ZoneId.of("UTC-09:00")),
+            new NamedZoneId("W - Whiskey Time Zone", ZoneId.of("UTC-10:00")),
+            new NamedZoneId("X - X-ray Time Zone", ZoneId.of("UTC-11:00")),
+            new NamedZoneId("Y - Yankee Time Zone", ZoneId.of("UTC-12:00")),
+            new NamedZoneId("Z - Zulu Time Zone", ZoneId.of("UTC+00:00"))
+    ),
+    NORTH_AMERICA("North America",
+            new NamedZoneId("ADT - Atlantic Daylight Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("AKDT - Alaska Daylight Time", ZoneId.of("UTC-08:00")),
+            new NamedZoneId("AKST - Alaska Standard Time", ZoneId.of("UTC-09:00")),
+            new NamedZoneId("AST - Atlantic Standard Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("AT - Atlantic Time (STD)", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("AT - Atlantic Time (DST)", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("CDT - Central Daylight Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("CST - Central Standard Time", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("CT - Central Time (STD)", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("CT - Central Time (DST)", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("EDT - Eastern Daylight Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("EGST - Eastern Greenland Summer Time", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("EGT - East Greenland Time", ZoneId.of("UTC-01:00")),
+            new NamedZoneId("EST - Eastern Standard Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("ET - Eastern Time (STD)", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("ET - Eastern Time (DST)", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("GMT - Greenwich Mean Time", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("HDT - Hawaii-Aleutian Daylight Time", ZoneId.of("UTC-09:00")),
+            new NamedZoneId("HST - Hawaii Standard Time", ZoneId.of("UTC-10:00")),
+            new NamedZoneId("MDT - Mountain Daylight Time", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("MST - Mountain Standard Time", ZoneId.of("UTC-07:00")),
+            new NamedZoneId("MT - Mountain Time (STD)", ZoneId.of("UTC-07:00")),
+            new NamedZoneId("MT - Mountain Time (DST)", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("NDT - Newfoundland Daylight Time", ZoneId.of("UTC-02:30")),
+            new NamedZoneId("NST - Newfoundland Standard Time", ZoneId.of("UTC-03:30")),
+            new NamedZoneId("PDT - Pacific Daylight Time", ZoneId.of("UTC-07:00")),
+            new NamedZoneId("PMDT - Pierre & Miquelon Daylight Time", ZoneId.of("UTC-02:00")),
+            new NamedZoneId("PMST - Pierre & Miquelon Standard Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("PST - Pacific Standard Time", ZoneId.of("UTC-08:00")),
+            new NamedZoneId("PT - Pacific Time (STD)", ZoneId.of("UTC-08:00")),
+            new NamedZoneId("PT - Pacific Time (DST)", ZoneId.of("UTC-07:00")),
+            new NamedZoneId("WGST - Western Greenland Summer Time", ZoneId.of("UTC-01:00")),
+            new NamedZoneId("WGT - Western Greenland Time", ZoneId.of("UTC-02:00"))
+    ),
+    PACIFIC("Pacific",
+            new NamedZoneId("AoE - Anywhere on Earth", ZoneId.of("UTC-12:00")),
+            new NamedZoneId("BST - Bougainville Standard Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("CHADT - Chatham Island Daylight Time", ZoneId.of("UTC+13:45")),
+            new NamedZoneId("CHAST - Chatham Island Standard Time", ZoneId.of("UTC+12:45")),
+            new NamedZoneId("CHUT - Chuuk Time", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("CKT - Cook Island Time", ZoneId.of("UTC-10:00")),
+            new NamedZoneId("ChST - Chamorro Standard Time", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("EASST - Easter Island Summer Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("EAST - Easter Island Standard Time", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("FJST - Fiji Summer Time", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("FJT - Fiji Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("GALT - Galapagos Time", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("GAMT - Gambier Time", ZoneId.of("UTC-09:00")),
+            new NamedZoneId("GILT - Gilbert Island Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("HST - Hawaii Standard Time", ZoneId.of("UTC-10:00")),
+            new NamedZoneId("KOST - Kosrae Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("LINT - Line Islands Time", ZoneId.of("UTC+14:00")),
+            new NamedZoneId("MART - Marquesas Time", ZoneId.of("UTC-09:30")),
+            new NamedZoneId("MHT - Marshall Islands Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("NCT - New Caledonia Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("NRT - Nauru Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("NUT - Niue Time", ZoneId.of("UTC-11:00")),
+            new NamedZoneId("NZDT - New Zealand Daylight Time", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("NZST - New Zealand Standard Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("PGT - Papua New Guinea Time", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("PHOT - Phoenix Island Time", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("PONT - Pohnpei Standard Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("PST - Pitcairn Standard Time", ZoneId.of("UTC-08:00")),
+            new NamedZoneId("PWT - Palau Time", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("SBT - Solomon Islands Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("SST - Samoa Standard Time", ZoneId.of("UTC-11:00")),
+            new NamedZoneId("TAHT - Tahiti Time", ZoneId.of("UTC-10:00")),
+            new NamedZoneId("TKT - Tokelau Time", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("TOST - Tonga Summer Time", ZoneId.of("UTC+14:00")),
+            new NamedZoneId("TOT - Tonga Time", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("TVT - Tuvalu Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("VUT - Vanuatu Time", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("WAKT - Wake Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("WFT - Wallis and Futuna Time", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("WST - West Samoa Time", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("YAPT - Yap Time", ZoneId.of("UTC+10:00"))
+    ),
+    SOUTH_AMERICA("South America",
+            new NamedZoneId("ACT - Acre Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("AMST - Amazon Summer Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("AMT - Amazon Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("ART - Argentina Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("BOT - Bolivia Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("BRST - Brasília Summer Time", ZoneId.of("UTC-02:00")),
+            new NamedZoneId("BRT - Brasília Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("CLST - Chile Summer Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("CLT - Chile Standard Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("COT - Colombia Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("ECT - Ecuador Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("FKST - Falkland Islands Summer Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("FKT - Falkland Island Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("FNT - Fernando de Noronha Time", ZoneId.of("UTC-02:00")),
+            new NamedZoneId("GFT - French Guiana Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("GST - South Georgia Time", ZoneId.of("UTC-02:00")),
+            new NamedZoneId("GYT - Guyana Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("PET - Peru Time", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("PYST - Paraguay Summer Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("PYT - Paraguay Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("SRT - Suriname Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("UYST - Uruguay Summer Time", ZoneId.of("UTC-02:00")),
+            new NamedZoneId("UYT - Uruguay Time", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("VET - Venezuelan Standard Time", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("WARST - Western Argentine Summer Time", ZoneId.of("UTC-03:00"))
+    ),
+
+    UTC_OFFSETS("UTC Offsets",
+            new NamedZoneId("UTC-12:00", ZoneId.of("UTC-12:00")),
+            new NamedZoneId("UTC-11:00", ZoneId.of("UTC-11:00")),
+            new NamedZoneId("UTC-10:00", ZoneId.of("UTC-10:00")),
+            new NamedZoneId("UTC-09:30", ZoneId.of("UTC-09:30")),
+            new NamedZoneId("UTC-09:00", ZoneId.of("UTC-09:00")),
+            new NamedZoneId("UTC-08:00", ZoneId.of("UTC-08:00")),
+            new NamedZoneId("UTC-07:00", ZoneId.of("UTC-07:00")),
+            new NamedZoneId("UTC-06:00", ZoneId.of("UTC-06:00")),
+            new NamedZoneId("UTC-05:00", ZoneId.of("UTC-05:00")),
+            new NamedZoneId("UTC-04:30", ZoneId.of("UTC-04:30")),
+            new NamedZoneId("UTC-04:00", ZoneId.of("UTC-04:00")),
+            new NamedZoneId("UTC-03:30", ZoneId.of("UTC-03:30")),
+            new NamedZoneId("UTC-03:00", ZoneId.of("UTC-03:00")),
+            new NamedZoneId("UTC-02:30", ZoneId.of("UTC-02:30")),
+            new NamedZoneId("UTC-02:00", ZoneId.of("UTC-02:00")),
+            new NamedZoneId("UTC-01:00", ZoneId.of("UTC-01:00")),
+            new NamedZoneId("UTC+00:00", ZoneId.of("UTC+00:00")),
+            new NamedZoneId("UTC+01:00", ZoneId.of("UTC+01:00")),
+            new NamedZoneId("UTC+02:00", ZoneId.of("UTC+02:00")),
+            new NamedZoneId("UTC+03:00", ZoneId.of("UTC+03:00")),
+            new NamedZoneId("UTC+03:30", ZoneId.of("UTC+03:30")),
+            new NamedZoneId("UTC+04:00", ZoneId.of("UTC+04:00")),
+            new NamedZoneId("UTC+04:30", ZoneId.of("UTC+04:30")),
+            new NamedZoneId("UTC+05:00", ZoneId.of("UTC+05:00")),
+            new NamedZoneId("UTC+05:30", ZoneId.of("UTC+05:30")),
+            new NamedZoneId("UTC+05:45", ZoneId.of("UTC+05:45")),
+            new NamedZoneId("UTC+06:00", ZoneId.of("UTC+06:00")),
+            new NamedZoneId("UTC+06:30", ZoneId.of("UTC+06:30")),
+            new NamedZoneId("UTC+07:00", ZoneId.of("UTC+07:00")),
+            new NamedZoneId("UTC+08:00", ZoneId.of("UTC+08:00")),
+            new NamedZoneId("UTC+08:45", ZoneId.of("UTC+08:45")),
+            new NamedZoneId("UTC+09:00", ZoneId.of("UTC+09:00")),
+            new NamedZoneId("UTC+09:30", ZoneId.of("UTC+09:30")),
+            new NamedZoneId("UTC+10:00", ZoneId.of("UTC+10:00")),
+            new NamedZoneId("UTC+10:30", ZoneId.of("UTC+10:30")),
+            new NamedZoneId("UTC+11:00", ZoneId.of("UTC+11:00")),
+            new NamedZoneId("UTC+12:00", ZoneId.of("UTC+12:00")),
+            new NamedZoneId("UTC+12:45", ZoneId.of("UTC+12:45")),
+            new NamedZoneId("UTC+13:00", ZoneId.of("UTC+13:00")),
+            new NamedZoneId("UTC+14:00", ZoneId.of("UTC+14:00"))
+    );
+
+    private final String groupName;
+    @Getter
+    private final List<NamedZoneId> namedAbbreviationZoneIds;
+
+
+    TZAbbrevEnum(String groupName, NamedZoneId... zones) {
+        this.groupName = groupName;
+        List<NamedZoneId> zoneList = new ArrayList<>();
+        if (zones != null) {
+            for (NamedZoneId zone : zones) {
+                if (zone != null && zone.getZoneId() != null) {
+                    try { ZoneId.of(zone.getZoneId().getId()); zoneList.add(zone); }
+                    catch (DateTimeParseException e) { }
+                }
+            }
+        }
+        this.namedAbbreviationZoneIds = Collections.unmodifiableList(zoneList);
+    }
+
+
+    TZAbbrevEnum(String groupName) {
+        this.groupName = groupName;
+        this.namedAbbreviationZoneIds = Collections.emptyList();
+    }
+
+    @Override
+    public String toString() {
+        return groupName;
+    }
+}
+package com.tzclocks.tzutilities;
+
+import lombok.Getter;
+import java.time.ZoneId;
+import java.util.Objects;
+
+/**
+ * Helper class to store a ZoneId along with a user-friendly display name.
+ * The toString() method provides the display name for use in UI components like JComboBox.
+ */
+public class NamedZoneId implements Comparable<NamedZoneId> {
+
+    @Getter
+    private final String displayName;
+    @Getter
+    private final ZoneId zoneId;
+
+    public NamedZoneId(String displayName, ZoneId zoneId) {
+        if (displayName == null || displayName.trim().isEmpty()) {
+            this.displayName = (zoneId != null) ? zoneId.getId() : "Unknown Zone";
+        } else {
+            this.displayName = displayName;
+        }
+        this.zoneId = Objects.requireNonNull(zoneId, "ZoneId cannot be null");
+    }
+
+    /**
+     * Returns the user-friendly display name. This is used by JComboBox for rendering.
+     * @return The display name.
+     */
+    @Override
+    public String toString() {
+        return displayName;
+    }
+
+    /**
+     * Compares based on the display name for sorting purposes.
+     */
+    @Override
+    public int compareTo(NamedZoneId other) {
+        return this.displayName.compareToIgnoreCase(other.displayName);
+    }
+
+    /**
+     * Compares based on the display name for equality.
+     */
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        NamedZoneId that = (NamedZoneId) o;
+        return Objects.equals(displayName, that.displayName);
+    }
+
+    /**
+     * Hashes based on the display name.
+     */
+    @Override
+    public int hashCode() {
+        return Objects.hash(displayName);
+    }
+}
+package com.tzclocks.tzutilities;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+import java.time.ZoneId;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
+
+
+public enum TZRegionEnum {
+
+    ALL("All Regions"),
+       AFRICA("Africa",
+            new NamedZoneId("Abidjan", ZoneId.of("Africa/Abidjan")),
+            new NamedZoneId("Accra", ZoneId.of("Africa/Accra")),
+            new NamedZoneId("Algiers", ZoneId.of("Africa/Algiers")),
+            new NamedZoneId("Bissau", ZoneId.of("Africa/Bissau")),
+            new NamedZoneId("Cairo", ZoneId.of("Africa/Cairo")),
+            new NamedZoneId("Casablanca", ZoneId.of("Africa/Casablanca")),
+            new NamedZoneId("El Aaiun", ZoneId.of("Africa/El_Aaiun")),
+            new NamedZoneId("Johannesburg", ZoneId.of("Africa/Johannesburg")),
+            new NamedZoneId("Juba", ZoneId.of("Africa/Juba")),
+            new NamedZoneId("Khartoum", ZoneId.of("Africa/Khartoum")),
+            new NamedZoneId("Lagos", ZoneId.of("Africa/Lagos")),
+            new NamedZoneId("Maputo", ZoneId.of("Africa/Maputo")),
+            new NamedZoneId("Monrovia", ZoneId.of("Africa/Monrovia")),
+            new NamedZoneId("Nairobi", ZoneId.of("Africa/Nairobi")),
+            new NamedZoneId("Ndjamena", ZoneId.of("Africa/Ndjamena")),
+            new NamedZoneId("Sao Tome", ZoneId.of("Africa/Sao_Tome")),
+            new NamedZoneId("Tripoli", ZoneId.of("Africa/Tripoli")),
+            new NamedZoneId("Tunis", ZoneId.of("Africa/Tunis")),
+            new NamedZoneId("Windhoek", ZoneId.of("Africa/Windhoek"))),
+    AMERICA("America",
+            new NamedZoneId("Adak", ZoneId.of("America/Adak")),
+            new NamedZoneId("Anchorage", ZoneId.of("America/Anchorage")),
+            new NamedZoneId("Araguaina", ZoneId.of("America/Araguaina")),
+            new NamedZoneId("Buenos Aires", ZoneId.of("America/Argentina/Buenos_Aires")),
+            new NamedZoneId("Bogota", ZoneId.of("America/Bogota")),
+            new NamedZoneId("Caracas", ZoneId.of("America/Caracas")),
+            new NamedZoneId("Chicago", ZoneId.of("America/Chicago")),
+            new NamedZoneId("Denver", ZoneId.of("America/Denver")),
+            new NamedZoneId("Godthab", ZoneId.of("America/Godthab")),
+            new NamedZoneId("Los Angeles", ZoneId.of("America/Los_Angeles")),
+            new NamedZoneId("Mexico City", ZoneId.of("America/Mexico_City")),
+            new NamedZoneId("New York", ZoneId.of("America/New_York")),
+            new NamedZoneId("Noronha", ZoneId.of("America/Noronha")),
+            new NamedZoneId("Phoenix", ZoneId.of("America/Phoenix")),
+            new NamedZoneId("Santiago", ZoneId.of("America/Santiago")),
+            new NamedZoneId("Sao Paulo", ZoneId.of("America/Sao_Paulo")),
+            new NamedZoneId("St Johns", ZoneId.of("America/St_Johns")),
+            new NamedZoneId("Tijuana", ZoneId.of("America/Tijuana"))),
+
+    ANTARCTICA("Antarctica",
+            new NamedZoneId("Casey", ZoneId.of("Antarctica/Casey")),
+            new NamedZoneId("Davis", ZoneId.of("Antarctica/Davis")),
+            new NamedZoneId("DumontDUrville", ZoneId.of("Antarctica/DumontDUrville")),
+            new NamedZoneId("Macquarie", ZoneId.of("Antarctica/Macquarie")),
+            new NamedZoneId("Mawson", ZoneId.of("Antarctica/Mawson")),
+            new NamedZoneId("McMurdo", ZoneId.of("Antarctica/McMurdo")),
+            new NamedZoneId("Palmer", ZoneId.of("Antarctica/Palmer")),
+            new NamedZoneId("Rothera", ZoneId.of("Antarctica/Rothera")),
+            new NamedZoneId("Syowa", ZoneId.of("Antarctica/Syowa")),
+            new NamedZoneId("Troll", ZoneId.of("Antarctica/Troll")),
+            new NamedZoneId("Vostok", ZoneId.of("Antarctica/Vostok"))),
+    ASIA("Asia",
+            new NamedZoneId("Aden", ZoneId.of("Asia/Aden")),
+            new NamedZoneId("Almaty", ZoneId.of("Asia/Almaty")),
+            new NamedZoneId("Amman", ZoneId.of("Asia/Amman")),
+            new NamedZoneId("Anadyr", ZoneId.of("Asia/Anadyr")),
+            new NamedZoneId("Aqtau", ZoneId.of("Asia/Aqtau")),
+            new NamedZoneId("Aqtobe", ZoneId.of("Asia/Aqtobe")),
+            new NamedZoneId("Ashgabat", ZoneId.of("Asia/Ashgabat")),
+            new NamedZoneId("Atyrau", ZoneId.of("Asia/Atyrau")),
+            new NamedZoneId("Baghdad", ZoneId.of("Asia/Baghdad")),
+            new NamedZoneId("Bahrain", ZoneId.of("Asia/Bahrain")),
+            new NamedZoneId("Baku", ZoneId.of("Asia/Baku")),
+            new NamedZoneId("Bangkok", ZoneId.of("Asia/Bangkok")),
+            new NamedZoneId("Barnaul", ZoneId.of("Asia/Barnaul")),
+            new NamedZoneId("Beirut", ZoneId.of("Asia/Beirut")),
+            new NamedZoneId("Bishkek", ZoneId.of("Asia/Bishkek")),
+            new NamedZoneId("Brunei", ZoneId.of("Asia/Brunei")),
+            new NamedZoneId("Chita", ZoneId.of("Asia/Chita")),
+            new NamedZoneId("Choibalsan", ZoneId.of("Asia/Choibalsan")),
+            new NamedZoneId("Colombo", ZoneId.of("Asia/Colombo")),
+            new NamedZoneId("Damascus", ZoneId.of("Asia/Damascus")),
+            new NamedZoneId("Dhaka", ZoneId.of("Asia/Dhaka")),
+            new NamedZoneId("Dili", ZoneId.of("Asia/Dili")),
+            new NamedZoneId("Dubai", ZoneId.of("Asia/Dubai")),
+            new NamedZoneId("Dushanbe", ZoneId.of("Asia/Dushanbe")),
+            new NamedZoneId("Famagusta", ZoneId.of("Asia/Famagusta")),
+            new NamedZoneId("Gaza", ZoneId.of("Asia/Gaza")),
+            new NamedZoneId("Hebron", ZoneId.of("Asia/Hebron")),
+            new NamedZoneId("Ho Chi Minh", ZoneId.of("Asia/Ho_Chi_Minh")),
+            new NamedZoneId("Hong Kong", ZoneId.of("Asia/Hong_Kong")),
+            new NamedZoneId("Hovd", ZoneId.of("Asia/Hovd")),
+            new NamedZoneId("Irkutsk", ZoneId.of("Asia/Irkutsk")),
+            new NamedZoneId("Jakarta", ZoneId.of("Asia/Jakarta")),
+            new NamedZoneId("Jayapura", ZoneId.of("Asia/Jayapura")),
+            new NamedZoneId("Jerusalem", ZoneId.of("Asia/Jerusalem")),
+            new NamedZoneId("Kabul", ZoneId.of("Asia/Kabul")),
+            new NamedZoneId("Kamchatka", ZoneId.of("Asia/Kamchatka")),
+            new NamedZoneId("Karachi", ZoneId.of("Asia/Karachi")),
+            new NamedZoneId("Kathmandu", ZoneId.of("Asia/Kathmandu")),
+            new NamedZoneId("Khandyga", ZoneId.of("Asia/Khandyga")),
+            new NamedZoneId("Kolkata", ZoneId.of("Asia/Kolkata")),
+            new NamedZoneId("Krasnoyarsk", ZoneId.of("Asia/Krasnoyarsk")),
+            new NamedZoneId("Kuala Lumpur", ZoneId.of("Asia/Kuala_Lumpur")),
+            new NamedZoneId("Kuching", ZoneId.of("Asia/Kuching")),
+            new NamedZoneId("Kuwait", ZoneId.of("Asia/Kuwait")),
+            new NamedZoneId("Macau", ZoneId.of("Asia/Macau")),
+            new NamedZoneId("Magadan", ZoneId.of("Asia/Magadan")),
+            new NamedZoneId("Makassar", ZoneId.of("Asia/Makassar")),
+            new NamedZoneId("Manila", ZoneId.of("Asia/Manila")),
+            new NamedZoneId("Muscat", ZoneId.of("Asia/Muscat")),
+            new NamedZoneId("Nicosia", ZoneId.of("Asia/Nicosia")),
+            new NamedZoneId("Novokuznetsk", ZoneId.of("Asia/Novokuznetsk")),
+            new NamedZoneId("Novosibirsk", ZoneId.of("Asia/Novosibirsk")),
+            new NamedZoneId("Omsk", ZoneId.of("Asia/Omsk")),
+            new NamedZoneId("Oral", ZoneId.of("Asia/Oral")),
+            new NamedZoneId("Pontianak", ZoneId.of("Asia/Pontianak")),
+            new NamedZoneId("Pyongyang", ZoneId.of("Asia/Pyongyang")),
+            new NamedZoneId("Qatar", ZoneId.of("Asia/Qatar")),
+            new NamedZoneId("Qostanay", ZoneId.of("Asia/Qostanay")),
+            new NamedZoneId("Qyzylorda", ZoneId.of("Asia/Qyzylorda")),
+            new NamedZoneId("Riyadh", ZoneId.of("Asia/Riyadh")),
+            new NamedZoneId("Sakhalin", ZoneId.of("Asia/Sakhalin")),
+            new NamedZoneId("Samarkand", ZoneId.of("Asia/Samarkand")),
+            new NamedZoneId("Seoul", ZoneId.of("Asia/Seoul")),
+            new NamedZoneId("Shanghai", ZoneId.of("Asia/Shanghai")),
+            new NamedZoneId("Singapore", ZoneId.of("Asia/Singapore")),
+            new NamedZoneId("Srednekolymsk", ZoneId.of("Asia/Srednekolymsk")),
+            new NamedZoneId("Taipei", ZoneId.of("Asia/Taipei")),
+            new NamedZoneId("Tashkent", ZoneId.of("Asia/Tashkent")),
+            new NamedZoneId("Tbilisi", ZoneId.of("Asia/Tbilisi")),
+            new NamedZoneId("Tehran", ZoneId.of("Asia/Tehran")),
+            new NamedZoneId("Thimphu", ZoneId.of("Asia/Thimphu")),
+            new NamedZoneId("Tokyo", ZoneId.of("Asia/Tokyo")),
+            new NamedZoneId("Tomsk", ZoneId.of("Asia/Tomsk")),
+            new NamedZoneId("Ulaanbaatar", ZoneId.of("Asia/Ulaanbaatar")),
+            new NamedZoneId("Urumqi", ZoneId.of("Asia/Urumqi")),
+            new NamedZoneId("Ust Nera", ZoneId.of("Asia/Ust-Nera")),
+            new NamedZoneId("Vladivostok", ZoneId.of("Asia/Vladivostok")),
+            new NamedZoneId("Yakutsk", ZoneId.of("Asia/Yakutsk")),
+            new NamedZoneId("Yangon", ZoneId.of("Asia/Yangon")),
+            new NamedZoneId("Yekaterinburg", ZoneId.of("Asia/Yekaterinburg")),
+            new NamedZoneId("Yerevan", ZoneId.of("Asia/Yerevan"))),
+    ATLANTIC("Atlantic",
+            new NamedZoneId("Azores", ZoneId.of("Atlantic/Azores")),
+            new NamedZoneId("Bermuda", ZoneId.of("Atlantic/Bermuda")),
+            new NamedZoneId("Canary", ZoneId.of("Atlantic/Canary")),
+            new NamedZoneId("Cape Verde", ZoneId.of("Atlantic/Cape_Verde")),
+            new NamedZoneId("Faroe", ZoneId.of("Atlantic/Faroe")),
+            new NamedZoneId("Madeira", ZoneId.of("Atlantic/Madeira")),
+            new NamedZoneId("Reykjavik", ZoneId.of("Atlantic/Reykjavik")),
+            new NamedZoneId("South Georgia", ZoneId.of("Atlantic/South_Georgia")),
+            new NamedZoneId("Stanley", ZoneId.of("Atlantic/Stanley"))),
+    AUSTRALIA("Australia",
+            new NamedZoneId("Adelaide", ZoneId.of("Australia/Adelaide")),
+            new NamedZoneId("Brisbane", ZoneId.of("Australia/Brisbane")),
+            new NamedZoneId("Darwin", ZoneId.of("Australia/Darwin")),
+            new NamedZoneId("Eucla", ZoneId.of("Australia/Eucla")),
+            new NamedZoneId("Hobart", ZoneId.of("Australia/Hobart")),
+            new NamedZoneId("Lord Howe", ZoneId.of("Australia/Lord_Howe")),
+            new NamedZoneId("Melbourne", ZoneId.of("Australia/Melbourne")),
+            new NamedZoneId("Perth", ZoneId.of("Australia/Perth")),
+            new NamedZoneId("Sydney", ZoneId.of("Australia/Sydney"))),
+    EUROPE("Europe",
+            new NamedZoneId("Amsterdam", ZoneId.of("Europe/Amsterdam")),
+            new NamedZoneId("Andorra", ZoneId.of("Europe/Andorra")),
+            new NamedZoneId("Astrakhan", ZoneId.of("Europe/Astrakhan")),
+            new NamedZoneId("Athens", ZoneId.of("Europe/Athens")),
+            new NamedZoneId("Belgrade", ZoneId.of("Europe/Belgrade")),
+            new NamedZoneId("Berlin", ZoneId.of("Europe/Berlin")),
+            new NamedZoneId("Bratislava", ZoneId.of("Europe/Bratislava")),
+            new NamedZoneId("Brussels", ZoneId.of("Europe/Brussels")),
+            new NamedZoneId("Bucharest", ZoneId.of("Europe/Bucharest")),
+            new NamedZoneId("Budapest", ZoneId.of("Europe/Budapest")),
+            new NamedZoneId("Busingen", ZoneId.of("Europe/Busingen")),
+            new NamedZoneId("Chisinau", ZoneId.of("Europe/Chisinau")),
+            new NamedZoneId("Copenhagen", ZoneId.of("Europe/Copenhagen")),
+            new NamedZoneId("Dublin", ZoneId.of("Europe/Dublin")),
+            new NamedZoneId("Gibraltar", ZoneId.of("Europe/Gibraltar")),
+            new NamedZoneId("Guernsey", ZoneId.of("Europe/Guernsey")),
+            new NamedZoneId("Helsinki", ZoneId.of("Europe/Helsinki")),
+            new NamedZoneId("Isle of Man", ZoneId.of("Europe/Isle_of_Man")),
+            new NamedZoneId("Istanbul", ZoneId.of("Europe/Istanbul")),
+            new NamedZoneId("Jersey", ZoneId.of("Europe/Jersey")),
+            new NamedZoneId("Kaliningrad", ZoneId.of("Europe/Kaliningrad")),
+            new NamedZoneId("Kiev", ZoneId.of("Europe/Kiev")),
+            new NamedZoneId("Kirov", ZoneId.of("Europe/Kirov")),
+            new NamedZoneId("Lisbon", ZoneId.of("Europe/Lisbon")),
+            new NamedZoneId("Ljubljana", ZoneId.of("Europe/Ljubljana")),
+            new NamedZoneId("London", ZoneId.of("Europe/London")),
+            new NamedZoneId("Luxembourg", ZoneId.of("Europe/Luxembourg")),
+            new NamedZoneId("Madrid", ZoneId.of("Europe/Madrid")),
+            new NamedZoneId("Malta", ZoneId.of("Europe/Malta")),
+            new NamedZoneId("Mariehamn", ZoneId.of("Europe/Mariehamn")),
+            new NamedZoneId("Minsk", ZoneId.of("Europe/Minsk")),
+            new NamedZoneId("Monaco", ZoneId.of("Europe/Monaco")),
+            new NamedZoneId("Moscow", ZoneId.of("Europe/Moscow")),
+            new NamedZoneId("Oslo", ZoneId.of("Europe/Oslo")),
+            new NamedZoneId("Paris", ZoneId.of("Europe/Paris")),
+            new NamedZoneId("Podgorica", ZoneId.of("Europe/Podgorica")),
+            new NamedZoneId("Prague", ZoneId.of("Europe/Prague")),
+            new NamedZoneId("Riga", ZoneId.of("Europe/Riga")),
+            new NamedZoneId("Rome", ZoneId.of("Europe/Rome")),
+            new NamedZoneId("Samara", ZoneId.of("Europe/Samara")),
+            new NamedZoneId("San Marino", ZoneId.of("Europe/San_Marino")),
+            new NamedZoneId("Sarajevo", ZoneId.of("Europe/Sarajevo")),
+            new NamedZoneId("Saratov", ZoneId.of("Europe/Saratov")),
+            new NamedZoneId("Simferopol", ZoneId.of("Europe/Simferopol")),
+            new NamedZoneId("Skopje", ZoneId.of("Europe/Skopje")),
+            new NamedZoneId("Sofia", ZoneId.of("Europe/Sofia")),
+            new NamedZoneId("Stockholm", ZoneId.of("Europe/Stockholm")),
+            new NamedZoneId("Tallinn", ZoneId.of("Europe/Tallinn")),
+            new NamedZoneId("Tirane", ZoneId.of("Europe/Tirane")),
+            new NamedZoneId("Ulyanovsk", ZoneId.of("Europe/Ulyanovsk")),
+            new NamedZoneId("Uzhgorod", ZoneId.of("Europe/Uzhgorod")),
+            new NamedZoneId("Vaduz", ZoneId.of("Europe/Vaduz")),
+            new NamedZoneId("Vatican", ZoneId.of("Europe/Vatican")),
+            new NamedZoneId("Vienna", ZoneId.of("Europe/Vienna")),
+            new NamedZoneId("Vilnius", ZoneId.of("Europe/Vilnius")),
+            new NamedZoneId("Volgograd", ZoneId.of("Europe/Volgograd")),
+            new NamedZoneId("Warsaw", ZoneId.of("Europe/Warsaw")),
+            new NamedZoneId("Zagreb", ZoneId.of("Europe/Zagreb")),
+            new NamedZoneId("Zaporozhye", ZoneId.of("Europe/Zaporozhye")),
+            new NamedZoneId("Zurich", ZoneId.of("Europe/Zurich"))),
+    INDIAN("Indian",
+            new NamedZoneId("Antananarivo", ZoneId.of("Indian/Antananarivo")),
+            new NamedZoneId("Chagos", ZoneId.of("Indian/Chagos")),
+            new NamedZoneId("Christmas", ZoneId.of("Indian/Christmas")),
+            new NamedZoneId("Cocos", ZoneId.of("Indian/Cocos")),
+            new NamedZoneId("Comoro", ZoneId.of("Indian/Comoro")),
+            new NamedZoneId("Kerguelen", ZoneId.of("Indian/Kerguelen")),
+            new NamedZoneId("Mahe", ZoneId.of("Indian/Mahe")),
+            new NamedZoneId("Maldives", ZoneId.of("Indian/Maldives")),
+            new NamedZoneId("Mauritius", ZoneId.of("Indian/Mauritius")),
+            new NamedZoneId("Mayotte", ZoneId.of("Indian/Mayotte")),
+            new NamedZoneId("Reunion", ZoneId.of("Indian/Reunion"))),
+    PACIFIC("Pacific",
+            new NamedZoneId("Apia", ZoneId.of("Pacific/Apia")),
+            new NamedZoneId("Auckland", ZoneId.of("Pacific/Auckland")),
+            new NamedZoneId("Bougainville", ZoneId.of("Pacific/Bougainville")),
+            new NamedZoneId("Chatham", ZoneId.of("Pacific/Chatham")),
+            new NamedZoneId("Chuuk", ZoneId.of("Pacific/Chuuk")),
+            new NamedZoneId("Easter", ZoneId.of("Pacific/Easter")),
+            new NamedZoneId("Efate", ZoneId.of("Pacific/Efate")),
+            new NamedZoneId("Enderbury", ZoneId.of("Pacific/Enderbury")),
+            new NamedZoneId("Fakaofo", ZoneId.of("Pacific/Fakaofo")),
+            new NamedZoneId("Fiji", ZoneId.of("Pacific/Fiji")),
+            new NamedZoneId("Funafuti", ZoneId.of("Pacific/Funafuti")),
+            new NamedZoneId("Galapagos", ZoneId.of("Pacific/Galapagos")),
+            new NamedZoneId("Gambier", ZoneId.of("Pacific/Gambier")),
+            new NamedZoneId("Guadalcanal", ZoneId.of("Pacific/Guadalcanal")),
+            new NamedZoneId("Guam", ZoneId.of("Pacific/Guam")),
+            new NamedZoneId("Honolulu", ZoneId.of("Pacific/Honolulu")),
+            new NamedZoneId("Kiritimati", ZoneId.of("Pacific/Kiritimati")),
+            new NamedZoneId("Kosrae", ZoneId.of("Pacific/Kosrae")),
+            new NamedZoneId("Kwajalein", ZoneId.of("Pacific/Kwajalein")),
+            new NamedZoneId("Majuro", ZoneId.of("Pacific/Majuro")),
+            new NamedZoneId("Marquesas", ZoneId.of("Pacific/Marquesas")),
+            new NamedZoneId("Midway", ZoneId.of("Pacific/Midway")),
+            new NamedZoneId("Nauru", ZoneId.of("Pacific/Nauru")),
+            new NamedZoneId("Niue", ZoneId.of("Pacific/Niue")),
+            new NamedZoneId("Norfolk", ZoneId.of("Pacific/Norfolk")),
+            new NamedZoneId("Noumea", ZoneId.of("Pacific/Noumea")),
+            new NamedZoneId("Pago Pago", ZoneId.of("Pacific/Pago_Pago")),
+            new NamedZoneId("Palau", ZoneId.of("Pacific/Palau")),
+            new NamedZoneId("Pitcairn", ZoneId.of("Pacific/Pitcairn")),
+            new NamedZoneId("Pohnpei", ZoneId.of("Pacific/Pohnpei")),
+            new NamedZoneId("Port Moresby", ZoneId.of("Pacific/Port_Moresby")),
+            new NamedZoneId("Rarotonga", ZoneId.of("Pacific/Rarotonga")),
+            new NamedZoneId("Saipan", ZoneId.of("Pacific/Saipan")),
+            new NamedZoneId("Tahiti", ZoneId.of("Pacific/Tahiti")),
+            new NamedZoneId("Tarawa", ZoneId.of("Pacific/Tarawa")),
+            new NamedZoneId("Tongatapu", ZoneId.of("Pacific/Tongatapu")),
+            new NamedZoneId("Wake", ZoneId.of("Pacific/Wake")),
+            new NamedZoneId("Wallis", ZoneId.of("Pacific/Wallis"))),
+    ;
+
+    private final String regionName;
+    @Getter
+    private final List<NamedZoneId> namedZoneIds;
+
+
+    TZRegionEnum(String regionName, NamedZoneId... zones) {
+        this.regionName = regionName;
+        this.namedZoneIds = (zones == null || zones.length == 0) ? Collections.emptyList() : Arrays.asList(zones);
+    }
+
+
+    TZRegionEnum(String regionName) {
+        this.regionName = regionName;
+        this.namedZoneIds = Collections.emptyList();
+    }
+
+    @Override
+    public String toString() {
+        return regionName;
+    }
+
+
+}
+package com.tzclocks.tzutilities;
+
+import lombok.AllArgsConstructor;
+
+@AllArgsConstructor
+public enum TZFormatEnum {
     TWELVE_HOUR("12-Hour"),
     TWENTY_FOUR_HOUR("24-Hour");
 
@@ -134,294 +1509,510 @@ public enum TZFormatEnum { //time zone formats
 }
 
 
-package com.tzclocks.tzdata;
-
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-import lombok.Setter;
-
-@AllArgsConstructor
-public class TZClocksItem {
-    @Getter private String name; // Timezone ID
-    @Getter @Setter private String currentTime; // Current time in the timezone
-}
 package com.tzclocks.tzutilities;
 
 public final class TZConstants {
     private TZConstants()
     {
-        // restrict instantiation
-        // ^idk why this is here but market watcher had it so it must be important to include
+
     }
+    public static final String PANEL_ICON_PATH = "/tzpanelicon.png";
+    public static final String DELETE_ICON_PATH = "/tzdeleteicon.png";
+    public static final String EDIT_ICON_PATH = "/tzediticon.png";
+    public static final String COLLAPSE_ICON_PATH = "/tzcollapseicon.png";
+    public static final String EXPAND_ICON_PATH = "/tzexpandicon.png";
+    public static final String ARROW_UP_ICON_PATH = "/tzarrowupicon.png";
+    public static final String ADD_ICON_PATH = "/tzaddicon.png";
+    public static final String GLOBE_ICON_PATH = "/tzglobeicon.png";
+    public static final String CLOCK_ICON_PATH = "/tzclockicon.png";
+    public static final String CALENDAR_ICON_PATH = "/tzcalendaricon.png";
+    public static final String TOGGLE_ICON_PATH = "/tzcalbuttonicon.png";
 
-
-    public static final String PANEL_ICON_PATH = "/tzpanelicon.png"; //icon for panel
-    public static final String DELETE_ICON_PATH = "/tzdeleteicon.png"; //icon for delete
-
+    public static String truncateString(String string, int length) {
+        if (string.length() > length) {
+            return string.substring(0, length) + "...";
+        }
+        return string;
+    }
 
 
 }
-
 package com.tzclocks.tzutilities;
 
-import java.time.ZoneId;
-import java.util.List;
 import lombok.AllArgsConstructor;
+import lombok.Getter;
 
+@Getter
 @AllArgsConstructor
-public enum TZRegionEnum { //List of regions and their zoneIDs. Filtered down to only show unique UTC sections
-    ALL("All Regions"),
-    AFRICA("Africa",
-            ZoneId.of("Africa/Abidjan"), ZoneId.of("Africa/Accra"), ZoneId.of("Africa/Algiers"),
-            ZoneId.of("Africa/Bissau"), ZoneId.of("Africa/Cairo"), ZoneId.of("Africa/Casablanca"),
-            ZoneId.of("Africa/El_Aaiun"), ZoneId.of("Africa/Johannesburg"), ZoneId.of("Africa/Juba"),
-            ZoneId.of("Africa/Khartoum"), ZoneId.of("Africa/Lagos"), ZoneId.of("Africa/Maputo"),
-            ZoneId.of("Africa/Monrovia"), ZoneId.of("Africa/Nairobi"), ZoneId.of("Africa/Ndjamena"),
-            ZoneId.of("Africa/Sao_Tome"), ZoneId.of("Africa/Tripoli"), ZoneId.of("Africa/Tunis"),
-            ZoneId.of("Africa/Windhoek")),
-    AMERICA("America",
-            ZoneId.of("America/Adak"), ZoneId.of("America/Anchorage"), ZoneId.of("America/Araguaina"),
-            ZoneId.of("America/Argentina/Buenos_Aires"), ZoneId.of("America/Bogota"), ZoneId.of("America/Caracas"),
-            ZoneId.of("America/Chicago"), ZoneId.of("America/Denver"), ZoneId.of("America/Godthab"),
-            ZoneId.of("America/Los_Angeles"), ZoneId.of("America/Mexico_City"), ZoneId.of("America/New_York"),
-            ZoneId.of("America/Noronha"), ZoneId.of("America/Phoenix"), ZoneId.of("America/Santiago"),
-            ZoneId.of("America/Sao_Paulo"), ZoneId.of("America/St_Johns"), ZoneId.of("America/Tijuana")),
-
-    ANTARCTICA("Antarctica",
-            ZoneId.of("Antarctica/Casey"), ZoneId.of("Antarctica/Davis"), ZoneId.of("Antarctica/DumontDUrville"),
-            ZoneId.of("Antarctica/Macquarie"), ZoneId.of("Antarctica/Mawson"), ZoneId.of("Antarctica/McMurdo"),
-            ZoneId.of("Antarctica/Palmer"), ZoneId.of("Antarctica/Rothera"), ZoneId.of("Antarctica/Syowa"),
-            ZoneId.of("Antarctica/Troll"), ZoneId.of("Antarctica/Vostok")),
-    ASIA("Asia",
-            ZoneId.of("Asia/Aden"), ZoneId.of("Asia/Almaty"), ZoneId.of("Asia/Amman"), ZoneId.of("Asia/Anadyr"),
-            ZoneId.of("Asia/Aqtau"), ZoneId.of("Asia/Aqtobe"), ZoneId.of("Asia/Ashgabat"), ZoneId.of("Asia/Atyrau"),
-            ZoneId.of("Asia/Baghdad"), ZoneId.of("Asia/Bahrain"), ZoneId.of("Asia/Baku"), ZoneId.of("Asia/Bangkok"),
-            ZoneId.of("Asia/Barnaul"), ZoneId.of("Asia/Beirut"), ZoneId.of("Asia/Bishkek"), ZoneId.of("Asia/Brunei"),
-            ZoneId.of("Asia/Chita"), ZoneId.of("Asia/Choibalsan"), ZoneId.of("Asia/Colombo"), ZoneId.of("Asia/Damascus"),
-            ZoneId.of("Asia/Dhaka"), ZoneId.of("Asia/Dili"), ZoneId.of("Asia/Dubai"), ZoneId.of("Asia/Dushanbe"),
-            ZoneId.of("Asia/Famagusta"), ZoneId.of("Asia/Gaza"), ZoneId.of("Asia/Hebron"), ZoneId.of("Asia/Ho_Chi_Minh"),
-            ZoneId.of("Asia/Hong_Kong"), ZoneId.of("Asia/Hovd"), ZoneId.of("Asia/Irkutsk"), ZoneId.of("Asia/Jakarta"),
-            ZoneId.of("Asia/Jayapura"), ZoneId.of("Asia/Jerusalem"), ZoneId.of("Asia/Kabul"), ZoneId.of("Asia/Kamchatka"),
-            ZoneId.of("Asia/Karachi"), ZoneId.of("Asia/Kathmandu"), ZoneId.of("Asia/Khandyga"), ZoneId.of("Asia/Kolkata"),
-            ZoneId.of("Asia/Krasnoyarsk"), ZoneId.of("Asia/Kuala_Lumpur"), ZoneId.of("Asia/Kuching"), ZoneId.of("Asia/Kuwait"),
-            ZoneId.of("Asia/Macau"), ZoneId.of("Asia/Magadan"), ZoneId.of("Asia/Makassar"), ZoneId.of("Asia/Manila"),
-            ZoneId.of("Asia/Muscat"), ZoneId.of("Asia/Nicosia"), ZoneId.of("Asia/Novokuznetsk"), ZoneId.of("Asia/Novosibirsk"),
-            ZoneId.of("Asia/Omsk"), ZoneId.of("Asia/Oral"), ZoneId.of("Asia/Pontianak"), ZoneId.of("Asia/Pyongyang"),
-            ZoneId.of("Asia/Qatar"), ZoneId.of("Asia/Qostanay"), ZoneId.of("Asia/Qyzylorda"), ZoneId.of("Asia/Riyadh"),
-            ZoneId.of("Asia/Sakhalin"), ZoneId.of("Asia/Samarkand"), ZoneId.of("Asia/Seoul"), ZoneId.of("Asia/Shanghai"),
-            ZoneId.of("Asia/Singapore"), ZoneId.of("Asia/Srednekolymsk"), ZoneId.of("Asia/Taipei"), ZoneId.of("Asia/Tashkent"),
-            ZoneId.of("Asia/Tbilisi"), ZoneId.of("Asia/Tehran"), ZoneId.of("Asia/Thimphu"), ZoneId.of("Asia/Tokyo"),
-            ZoneId.of("Asia/Tomsk"), ZoneId.of("Asia/Ulaanbaatar"), ZoneId.of("Asia/Urumqi"), ZoneId.of("Asia/Ust-Nera"),
-            ZoneId.of("Asia/Vladivostok"), ZoneId.of("Asia/Yakutsk"), ZoneId.of("Asia/Yangon"), ZoneId.of("Asia/Yekaterinburg"),
-            ZoneId.of("Asia/Yerevan")),
-    ATLANTIC("Atlantic",
-            ZoneId.of("Atlantic/Azores"), ZoneId.of("Atlantic/Bermuda"), ZoneId.of("Atlantic/Canary"),
-            ZoneId.of("Atlantic/Cape_Verde"), ZoneId.of("Atlantic/Faroe"), ZoneId.of("Atlantic/Madeira"),
-            ZoneId.of("Atlantic/Reykjavik"), ZoneId.of("Atlantic/South_Georgia"), ZoneId.of("Atlantic/Stanley")),
-    AUSTRALIA("Australia",
-            ZoneId.of("Australia/Adelaide"), ZoneId.of("Australia/Brisbane"),
-            ZoneId.of("Australia/Darwin"), ZoneId.of("Australia/Eucla"), ZoneId.of("Australia/Hobart"),
-            ZoneId.of("Australia/Lord_Howe"), ZoneId.of("Australia/Melbourne"),
-            ZoneId.of("Australia/Perth"), ZoneId.of("Australia/Sydney")),
-    EUROPE("Europe",
-            ZoneId.of("Europe/Amsterdam"), ZoneId.of("Europe/Andorra"), ZoneId.of("Europe/Astrakhan"),
-            ZoneId.of("Europe/Athens"), ZoneId.of("Europe/Belgrade"), ZoneId.of("Europe/Berlin"),
-            ZoneId.of("Europe/Bratislava"), ZoneId.of("Europe/Brussels"), ZoneId.of("Europe/Bucharest"),
-            ZoneId.of("Europe/Budapest"), ZoneId.of("Europe/Busingen"), ZoneId.of("Europe/Chisinau"),
-            ZoneId.of("Europe/Copenhagen"), ZoneId.of("Europe/Dublin"), ZoneId.of("Europe/Gibraltar"),
-            ZoneId.of("Europe/Guernsey"), ZoneId.of("Europe/Helsinki"), ZoneId.of("Europe/Isle_of_Man"),
-            ZoneId.of("Europe/Istanbul"), ZoneId.of("Europe/Jersey"), ZoneId.of("Europe/Kaliningrad"),
-            ZoneId.of("Europe/Kiev"), ZoneId.of("Europe/Kirov"), ZoneId.of("Europe/Lisbon"),
-            ZoneId.of("Europe/Ljubljana"), ZoneId.of("Europe/Luxembourg"), ZoneId.of("Europe/Madrid"),
-            ZoneId.of("Europe/Malta"), ZoneId.of("Europe/Mariehamn"), ZoneId.of("Europe/Minsk"),
-            ZoneId.of("Europe/Monaco"), ZoneId.of("Europe/Moscow"), ZoneId.of("Europe/Oslo"),
-            ZoneId.of("Europe/Paris"), ZoneId.of("Europe/Podgorica"), ZoneId.of("Europe/Prague"),
-            ZoneId.of("Europe/Riga"), ZoneId.of("Europe/Rome"), ZoneId.of("Europe/Samara"),
-            ZoneId.of("Europe/San_Marino"), ZoneId.of("Europe/Sarajevo"), ZoneId.of("Europe/Saratov"),
-            ZoneId.of("Europe/Simferopol"), ZoneId.of("Europe/Skopje"), ZoneId.of("Europe/Sofia"),
-            ZoneId.of("Europe/Stockholm"), ZoneId.of("Europe/Tallinn"), ZoneId.of("Europe/Tirane"),
-            ZoneId.of("Europe/Ulyanovsk"), ZoneId.of("Europe/Uzhgorod"), ZoneId.of("Europe/Vaduz"),
-            ZoneId.of("Europe/Vatican"), ZoneId.of("Europe/Vienna"), ZoneId.of("Europe/Vilnius"),
-            ZoneId.of("Europe/Volgograd"), ZoneId.of("Europe/Warsaw"), ZoneId.of("Europe/Zagreb"),
-            ZoneId.of("Europe/Zaporozhye"), ZoneId.of("Europe/Zurich")),
-    INDIAN("Indian",
-            ZoneId.of("Indian/Antananarivo"), ZoneId.of("Indian/Chagos"), ZoneId.of("Indian/Christmas"),
-            ZoneId.of("Indian/Cocos"), ZoneId.of("Indian/Comoro"), ZoneId.of("Indian/Kerguelen"),
-            ZoneId.of("Indian/Mahe"), ZoneId.of("Indian/Maldives"), ZoneId.of("Indian/Mauritius"),
-            ZoneId.of("Indian/Mayotte"), ZoneId.of("Indian/Reunion")),
-    PACIFIC("Pacific",
-            ZoneId.of("Pacific/Apia"), ZoneId.of("Pacific/Auckland"), ZoneId.of("Pacific/Bougainville"),
-            ZoneId.of("Pacific/Chatham"), ZoneId.of("Pacific/Chuuk"), ZoneId.of("Pacific/Easter"),
-            ZoneId.of("Pacific/Efate"), ZoneId.of("Pacific/Enderbury"), ZoneId.of("Pacific/Fakaofo"),
-            ZoneId.of("Pacific/Fiji"), ZoneId.of("Pacific/Funafuti"), ZoneId.of("Pacific/Galapagos"),
-            ZoneId.of("Pacific/Gambier"), ZoneId.of("Pacific/Guadalcanal"), ZoneId.of("Pacific/Guam"),
-            ZoneId.of("Pacific/Honolulu"), ZoneId.of("Pacific/Kiritimati"), ZoneId.of("Pacific/Kosrae"),
-            ZoneId.of("Pacific/Kwajalein"), ZoneId.of("Pacific/Majuro"), ZoneId.of("Pacific/Marquesas"),
-            ZoneId.of("Pacific/Midway"), ZoneId.of("Pacific/Nauru"), ZoneId.of("Pacific/Niue"),
-            ZoneId.of("Pacific/Norfolk"), ZoneId.of("Pacific/Noumea"), ZoneId.of("Pacific/Pago_Pago"),
-            ZoneId.of("Pacific/Palau"), ZoneId.of("Pacific/Pitcairn"), ZoneId.of("Pacific/Pohnpei"),
-            ZoneId.of("Pacific/Port_Moresby"), ZoneId.of("Pacific/Rarotonga"), ZoneId.of("Pacific/Saipan"),
-            ZoneId.of("Pacific/Tahiti"), ZoneId.of("Pacific/Tarawa"), ZoneId.of("Pacific/Tongatapu"),
-            ZoneId.of("Pacific/Wake"), ZoneId.of("Pacific/Wallis")),
-
-    ;
+public enum TZSourceMode {
+    ABBREVIATION("Region/Abbreviation"),
+    REGIONAL("Region/Zone ID");
 
     private final String name;
-    private final List<ZoneId> zoneIds;
 
-    TZRegionEnum(String name, ZoneId... zoneIds) {
-        this.name = name;
-        this.zoneIds = List.of(zoneIds);
+    @Override
+    public String toString() {
+        return name;
     }
-
-    public List<ZoneId> getZoneIds() {
-        return zoneIds;
-    } //sends zoneIds to the plugin panel
 }
 package com.tzclocks.tzui;
 
 import com.tzclocks.TZClocksPlugin;
 import com.tzclocks.tzconfig.TZClocksConfig;
 import com.tzclocks.tzdata.TZClocksItem;
+import com.tzclocks.tzdata.TZClocksTab;
+import com.tzclocks.tzutilities.NamedZoneId;
+import com.tzclocks.tzutilities.TZAbbrevEnum;
 import com.tzclocks.tzutilities.TZRegionEnum;
+import com.tzclocks.tzutilities.TZSourceMode;
+import lombok.Getter;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.util.ImageUtil;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.ActionListener;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.time.ZoneId;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.stream.Collectors;
+
+import static com.tzclocks.tzutilities.TZConstants.*;
+
+
+public class TZClocksPluginPanel extends PluginPanel {
+    private final TZClocksPlugin plugin;
+
+
+    private final JComboBox<Object> groupDropdown = new JComboBox<>();
+    private final JComboBox<NamedZoneId> timezoneDropdown = new JComboBox<>();
+    private final JPanel clockListPanel = new JPanel();
+    private final Map<TZClocksItem, TZClocksItemPanel> timezonePanelsMap = new HashMap<>();
+    private final Map<TZClocksTab, TZClocksTabPanel> tabPanelsMap = new HashMap<>();
+    private final GridBagConstraints clockListConstraints = new GridBagConstraints();
+    private final Box.Filler glue;
+
+    private final JPanel topPanel;
+    private final JScrollPane scrollPane;
+    private final JPanel southPanel;
+
+
+    private static final ImageIcon COLLAPSE_ICON;
+    private static final ImageIcon COLLAPSE_HOVER_ICON;
+    private static final ImageIcon EXPAND_DOWN_ICON;
+    private static final ImageIcon EXPAND_DOWN_HOVER_ICON;
+    private static final ImageIcon EXPAND_UP_ICON;
+    private static final ImageIcon EXPAND_UP_HOVER_ICON;
+
+    static {
+        final int ICON_SIZE = 12; final float ALPHA_HOVER = 0.53f;
+        final BufferedImage collapseImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, COLLAPSE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        COLLAPSE_ICON = new ImageIcon(collapseImage); COLLAPSE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(collapseImage, ALPHA_HOVER));
+        final BufferedImage expandDownImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, EXPAND_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        EXPAND_DOWN_ICON = new ImageIcon(expandDownImage); EXPAND_DOWN_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(expandDownImage, ALPHA_HOVER));
+        final BufferedImage expandUpImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, ARROW_UP_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        EXPAND_UP_ICON = new ImageIcon(expandUpImage); EXPAND_UP_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(expandUpImage, ALPHA_HOVER));
+    }
+
+
+    @Inject
+    public TZClocksPluginPanel(TZClocksPlugin plugin, TZClocksConfig config) {
+        super(false);
+        this.plugin = plugin;
+
+
+        setLayout(new GridBagLayout());
+        setBorder(new EmptyBorder(10, 10, 10, 10));
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.fill = GridBagConstraints.HORIZONTAL; gbc.gridx = 0; gbc.weightx = 1.0;
+
+
+        topPanel = createTopPanel();
+        gbc.gridy = 0; gbc.weighty = 0.0; add(topPanel, gbc);
+
+
+        clockListPanel.setLayout(new GridBagLayout()); clockListPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        scrollPane = new JScrollPane(clockListPanel); scrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        scrollPane.setBorder(new EmptyBorder(10, 0, 10, 0)); scrollPane.getVerticalScrollBar().setPreferredSize(new Dimension(12, 0));
+        scrollPane.getVerticalScrollBar().setBorder(new EmptyBorder(0, 5, 0, 0));
+        gbc.gridy = 1; gbc.weighty = 1.0; gbc.fill = GridBagConstraints.BOTH; add(scrollPane, gbc);
+
+
+        southPanel = new JPanel(new BorderLayout()); southPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        southPanel.setBorder(new EmptyBorder(5, 0, 0, 0));
+        gbc.gridy = 2; gbc.weighty = 0.0; gbc.fill = GridBagConstraints.HORIZONTAL; add(southPanel, gbc);
+
+
+        clockListConstraints.fill = GridBagConstraints.HORIZONTAL; clockListConstraints.gridwidth = 1; clockListConstraints.weightx = 1.0;
+        clockListConstraints.weighty = 0.0; clockListConstraints.gridx = 0; clockListConstraints.gridy = 0; clockListConstraints.anchor = GridBagConstraints.NORTH;
+        glue = (Box.Filler) Box.createVerticalGlue();
+
+
+    }
+
+    /**
+     * Creates the top panel with dropdowns and add buttons.
+     */
+    private JPanel createTopPanel() {
+        JPanel panel = new JPanel(new GridLayout(4, 1, 0, 5));
+        panel.setBorder(new EmptyBorder(0, 0, 0, 0));
+        panel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+
+
+        groupDropdown.addActionListener(e -> updateSecondDropdown());
+        panel.add(groupDropdown);
+
+
+        panel.add(timezoneDropdown);
+
+
+        JButton addButton = new JButton("Add Timezone");
+        addButton.addActionListener(e -> {
+            NamedZoneId selectedNamedZone = (NamedZoneId) timezoneDropdown.getSelectedItem();
+            if (selectedNamedZone != null) {
+                String selectedZoneIdString = selectedNamedZone.getZoneId().toString();
+                String selectedDisplayName = selectedNamedZone.getDisplayName();
+
+
+                if (selectedZoneIdString.equals(TZClocksPlugin.LOCAL_ZONE_ID)) {
+                    JOptionPane.showMessageDialog(this, selectedZoneIdString + " is already shown in the Game Times panel.", "Clock Exists", JOptionPane.INFORMATION_MESSAGE); return;
+                }
+                plugin.addTimezoneToPanel(selectedZoneIdString, selectedDisplayName);
+            }
+        });
+        panel.add(addButton);
+
+
+        JButton addTabButton = new JButton("Add Tab");
+        addTabButton.addActionListener(e -> {
+            String tabName = JOptionPane.showInputDialog(this, "Enter a name for the tab:", "New Tab", JOptionPane.PLAIN_MESSAGE);
+            if (tabName != null && !tabName.trim().isEmpty()) {
+                tabName = tabName.trim();
+                if (tabName.equalsIgnoreCase(TZClocksPlugin.FIXED_TAB_NAME)) {
+                    JOptionPane.showMessageDialog(this, "Cannot use the reserved tab name '"+TZClocksPlugin.FIXED_TAB_NAME+"'.", "Reserved Name", JOptionPane.WARNING_MESSAGE); return;
+                } plugin.addTab(tabName);
+            }
+        });
+        panel.add(addTabButton);
+        return panel;
+    }
+
+    /**
+     * Main method called on startup and config change to refresh both dropdowns.
+     */
+    public void updateDropdowns() {
+        TZSourceMode currentMode = plugin.getConfig().getTimezoneSourceMode();
+        populateFirstDropdown(currentMode);
+
+
+
+        updateSecondDropdown();
+    }
+
+    /**
+     * Populates the first dropdown (groupDropdown) based on the selected source mode.
+     */
+    private void populateFirstDropdown(TZSourceMode mode) {
+
+        ActionListener[] listeners = groupDropdown.getActionListeners();
+        for (ActionListener l : listeners) { groupDropdown.removeActionListener(l); }
+
+        groupDropdown.removeAllItems();
+
+        if (mode == TZSourceMode.REGIONAL) {
+            for (TZRegionEnum region : TZRegionEnum.values()) {
+                groupDropdown.addItem(region);
+            }
+        } else {
+            for (TZAbbrevEnum abbrevGroup : TZAbbrevEnum.values()) {
+                groupDropdown.addItem(abbrevGroup);
+            }
+        }
+
+
+        for (ActionListener l : listeners) { groupDropdown.addActionListener(l); }
+
+
+        if (groupDropdown.getItemCount() > 0) {
+            groupDropdown.setSelectedIndex(0);
+        }
+    }
+
+
+    /**
+     * Updates the second dropdown (timezoneDropdown) based on the selection
+     * in the first dropdown (groupDropdown) and the current source mode.
+     * Renamed from updateTimeZoneDropdown.
+     */
+    public void updateSecondDropdown() {
+        Object selectedGroup = groupDropdown.getSelectedItem();
+        List<NamedZoneId> namedZoneIds = new ArrayList<>();
+
+
+        if (selectedGroup instanceof TZRegionEnum) {
+            namedZoneIds = getNamedZoneIdsForRegionSource((TZRegionEnum) selectedGroup);
+        } else if (selectedGroup instanceof TZAbbrevEnum) {
+            namedZoneIds = getNamedZoneIdsForAbbrevGroup((TZAbbrevEnum) selectedGroup);
+        }
+
+
+
+        Object previouslySelected = timezoneDropdown.getSelectedItem();
+
+        timezoneDropdown.removeAllItems();
+        for (NamedZoneId namedZone : namedZoneIds) {
+            timezoneDropdown.addItem(namedZone);
+        }
+
+
+        if (previouslySelected instanceof NamedZoneId) {
+            timezoneDropdown.setSelectedItem(previouslySelected);
+        } else if (!namedZoneIds.isEmpty()){
+
+        }
+    }
+
+    /**
+     * Gets NamedZoneIds for a selected REGION, filtering out fixed zones.
+     * Used when source mode is REGIONAL.
+     * @param region The selected TZRegionEnum.
+     * @return A sorted List<NamedZoneId>.
+     */
+    private List<NamedZoneId> getNamedZoneIdsForRegionSource(TZRegionEnum region) {
+        List<NamedZoneId> namedZoneIdsResult = new ArrayList<>();
+        if (region == TZRegionEnum.ALL) {
+            HashSet<NamedZoneId> uniqueZones = new HashSet<>();
+            for (TZRegionEnum reg : TZRegionEnum.values()) {
+                if (reg != TZRegionEnum.ALL && reg.getNamedZoneIds() != null) {
+                    uniqueZones.addAll(reg.getNamedZoneIds());
+                }
+            } namedZoneIdsResult.addAll(uniqueZones);
+        } else if (region != null && region.getNamedZoneIds() != null) {
+            namedZoneIdsResult.addAll(region.getNamedZoneIds());
+        }
+
+        Collections.sort(namedZoneIdsResult);
+        return namedZoneIdsResult;
+    }
+
+    /**
+     * Gets NamedZoneIds for a selected ABBREVIATION group.
+     * Used when source mode is ABBREVIATION.
+     * @param abbrevGroup The selected TZAbbrevEnum.
+     * @return A sorted List<NamedZoneId>.
+     */
+    private List<NamedZoneId> getNamedZoneIdsForAbbrevGroup(TZAbbrevEnum abbrevGroup) {
+        List<NamedZoneId> namedZoneIdsResult = new ArrayList<>();
+        if (abbrevGroup == TZAbbrevEnum.ALL_ABBREV) {
+            HashSet<NamedZoneId> uniqueZones = new HashSet<>();
+            for (TZAbbrevEnum group : TZAbbrevEnum.values()) {
+
+                if (group != TZAbbrevEnum.ALL_ABBREV && group.getNamedAbbreviationZoneIds() != null) {
+                    uniqueZones.addAll(group.getNamedAbbreviationZoneIds());
+                }
+            }
+            namedZoneIdsResult.addAll(uniqueZones);
+        } else if (abbrevGroup != null && abbrevGroup.getNamedAbbreviationZoneIds() != null) {
+
+            namedZoneIdsResult.addAll(abbrevGroup.getNamedAbbreviationZoneIds());
+        }
+
+
+
+        Collections.sort(namedZoneIdsResult);
+        return namedZoneIdsResult;
+    }
+
+
+
+    public void initializeSouthPanel() {
+        if (!SwingUtilities.isEventDispatchThread()) { SwingUtilities.invokeLater(this::initializeSouthPanel); return; }
+        southPanel.removeAll();
+        if (!plugin.getConfig().showFixedGameTimesTab()) { plugin.setFixedSouthTabClocksMap(new HashMap<>()); southPanel.setVisible(false); }
+        else {
+            southPanel.setVisible(true); boolean isCollapsed = plugin.isFixedTabCollapsed();
+            JPanel headerPanel = new JPanel(new BorderLayout()); headerPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR.darker()); headerPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+            JPanel leftActions = new JPanel(new BorderLayout(5, 0)); leftActions.setOpaque(false);
+            JLabel collapseButton = new JLabel(); collapseButton.setOpaque(false);
+            final ImageIcon currentIcon; final ImageIcon hoverIcon;
+            if (isCollapsed) { currentIcon = EXPAND_UP_ICON; hoverIcon = EXPAND_UP_HOVER_ICON; collapseButton.setToolTipText("Expand Tab"); } else { currentIcon = COLLAPSE_ICON; hoverIcon = COLLAPSE_HOVER_ICON; collapseButton.setToolTipText("Collapse Tab"); }
+            collapseButton.setIcon(currentIcon);
+            collapseButton.addMouseListener(new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent e) { plugin.switchTabExpandCollapse(TZClocksPlugin.FIXED_TAB_NAME); }
+                @Override public void mouseEntered(MouseEvent e) { collapseButton.setIcon(hoverIcon); }
+                @Override public void mouseExited(MouseEvent e) { collapseButton.setIcon(currentIcon); }
+            });
+            leftActions.add(collapseButton, BorderLayout.WEST);
+            JLabel tabNameLabel = new JLabel(TZClocksPlugin.FIXED_TAB_NAME); tabNameLabel.setForeground(Color.WHITE); tabNameLabel.setToolTipText(TZClocksPlugin.FIXED_TAB_NAME);
+            leftActions.add(tabNameLabel, BorderLayout.CENTER); headerPanel.add(leftActions, BorderLayout.WEST);
+
+            Map<TZClocksItem, TZClocksTabItemPanel> localFixedMap = new HashMap<>();
+            if (!isCollapsed) {
+                JPanel itemsPanel = new JPanel(new GridBagLayout()); itemsPanel.setBorder(new EmptyBorder(5, 5, 5, 5)); itemsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR); itemsPanel.setOpaque(true);
+                GridBagConstraints itemGBC = new GridBagConstraints(); itemGBC.fill = GridBagConstraints.HORIZONTAL; itemGBC.gridwidth = 1; itemGBC.weightx = 1.0; itemGBC.weighty = 0.0; itemGBC.gridx = 0; itemGBC.gridy = 0; itemGBC.anchor = GridBagConstraints.NORTH;
+                List<UUID> fixedClockIds = List.of(TZClocksPlugin.LOCAL_CLOCK_UUID, TZClocksPlugin.JAGEX_CLOCK_UUID); int itemIndex = 0;
+                for (UUID clockId : fixedClockIds) {
+                    Optional<TZClocksItem> clockOpt = plugin.getTimezones().stream().filter(c -> c.getUuid().equals(clockId)).findFirst();
+                    if (clockOpt.isPresent()) {
+                        TZClocksItem clock = clockOpt.get(); TZClocksTabItemPanel itemPanel = new TZClocksTabItemPanel(plugin, clock); localFixedMap.put(clock, itemPanel);
+                        JPanel wrapper = new JPanel(new BorderLayout()); wrapper.setOpaque(false);
+                        if (itemIndex > 0) { wrapper.setBorder(new EmptyBorder(5, 0, 0, 0)); } else { wrapper.setBorder(new EmptyBorder(0,0,0,0)); }
+                        wrapper.add(itemPanel, BorderLayout.NORTH); itemsPanel.add(wrapper, itemGBC); itemGBC.gridy++; itemIndex++;
+                    }
+                }
+                GridBagConstraints glueGBC = new GridBagConstraints(); glueGBC.gridx = 0; glueGBC.gridy = itemGBC.gridy; glueGBC.weighty = 1.0; glueGBC.fill = GridBagConstraints.VERTICAL; itemsPanel.add(Box.createVerticalGlue(), glueGBC);
+                southPanel.add(itemsPanel, BorderLayout.CENTER);
+            }
+            southPanel.add(headerPanel, BorderLayout.SOUTH); plugin.setFixedSouthTabClocksMap(localFixedMap);
+        }
+        southPanel.revalidate(); southPanel.repaint(); if (getParent() != null) { getParent().validate(); }
+    }
+
+
+    private void updateClockListPanel() { clockListPanel.revalidate(); clockListPanel.repaint(); }
+    public Map<TZClocksItem, TZClocksItemPanel> getTimezonePanelsMap() { return timezonePanelsMap; }
+    public Map<TZClocksTab, TZClocksTabPanel> getTabPanelsMap() { return tabPanelsMap; }
+    public void updatePanel() {
+        if (!SwingUtilities.isEventDispatchThread()) { SwingUtilities.invokeLater(this::updatePanel); return; }
+        timezonePanelsMap.clear(); tabPanelsMap.clear(); clockListPanel.removeAll();
+        clockListConstraints.gridy = 0;
+        for (TZClocksTab tab : plugin.getTabs()) { TZClocksTabPanel tabPanel = new TZClocksTabPanel(plugin, this, tab); tabPanelsMap.put(tab, tabPanel); JPanel wrapper = createMarginWrapper(tabPanel); clockListPanel.add(wrapper, clockListConstraints); clockListConstraints.gridy++; }
+        for (TZClocksItem clock : plugin.getTimezones()) { if (clock.getUuid().equals(TZClocksPlugin.LOCAL_CLOCK_UUID) || clock.getUuid().equals(TZClocksPlugin.JAGEX_CLOCK_UUID)) { continue; } boolean isInUserTab = plugin.getTabs().stream().anyMatch(t -> t.getClocks() != null && t.getClocks().contains(clock.getUuid())); if (!isInUserTab) { TZClocksItemPanel clockPanel = new TZClocksItemPanel(plugin, clock); timezonePanelsMap.put(clock, clockPanel); JPanel wrapper = createMarginWrapper(clockPanel); clockListPanel.add(wrapper, clockListConstraints); clockListConstraints.gridy++; } }
+        GridBagConstraints glueConstraints = new GridBagConstraints(); glueConstraints.gridx = 0; glueConstraints.gridy = clockListConstraints.gridy; glueConstraints.weighty = 1.0; glueConstraints.fill = GridBagConstraints.VERTICAL; clockListPanel.add(glue, glueConstraints);
+        updateClockListPanel();
+    }
+
+    public List<TZClocksItem> getAvailableClocks() {
+        List<TZClocksItem> availableClocks = plugin.getTimezones().stream().filter(clock -> !clock.getUuid().equals(TZClocksPlugin.LOCAL_CLOCK_UUID) && !clock.getUuid().equals(TZClocksPlugin.JAGEX_CLOCK_UUID)).collect(Collectors.toList());
+        for (TZClocksTab userTab : plugin.getTabs()) { if (userTab.getClocks() != null) { userTab.getClocks().forEach(id -> availableClocks.removeIf(c -> c.getUuid().equals(id))); } } return availableClocks;
+    }
+    public JPanel createMarginWrapper(JPanel contentPanel) {
+        JPanel marginWrapper = new JPanel(new BorderLayout()); marginWrapper.setBackground(ColorScheme.DARK_GRAY_COLOR); boolean isFirstItem = (clockListConstraints.gridy == 0);
+        marginWrapper.setBorder(isFirstItem ? new EmptyBorder(0,0,0,0) : new EmptyBorder(5,0,0,0)); marginWrapper.add(contentPanel, BorderLayout.NORTH); return marginWrapper;
+    }
+}
+package com.tzclocks.tzui;
+
+import com.tzclocks.TZClocksPlugin;
+import com.tzclocks.tzdata.TZClocksItem;
+import net.runelite.client.ui.ColorScheme;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.ActionEvent;
 import java.awt.event.ActionListener;
-import java.time.ZoneId;
-import java.time.ZonedDateTime;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
 import java.util.List;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
-public class TZClocksPluginPanel extends PluginPanel {
+import static com.tzclocks.tzutilities.TZConstants.truncateString;
 
-    private final List<TZClocksItem> timezones = new ArrayList<>();
-    private final List<TZClocksItemPanel> TZClocksItemPanels = new ArrayList<>();
-    private final JComboBox<TZRegionEnum> regionDropdown;
-    private final Map<TZClocksItem, TZClocksItemPanel> timezonePanelsMap = new HashMap<>();
-    private final TZClocksPlugin plugin;
-    private final TZClocksConfig config;
-    private final JComboBox<String> timezoneDropdown;
-    private JPanel clockPanel;
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
 
-    public void activatePanel() {
-        scheduler.scheduleAtFixedRate(this::refreshTimeDisplays, 0, 1, TimeUnit.SECONDS);
-    } //makes clock(s) in panel update every second
-    public TZClocksPluginPanel(TZClocksPlugin plugin, TZClocksConfig config) { //panel for the plugin. dropdowns and button
-        List<String> zoneIds = new ArrayList<>(ZoneId.getAvailableZoneIds());
-        Collections.sort(zoneIds);
-        this.plugin = plugin;
-        this.config = config;
-        setBorder(new EmptyBorder(10, 10, 10, 10));
-        setBackground(ColorScheme.DARK_GRAY_COLOR);
-        setLayout(new GridBagLayout());
-        GridBagConstraints c = new GridBagConstraints();
-        c.fill = GridBagConstraints.HORIZONTAL;
-        c.weightx = 1.0;
-        c.gridx = 0;
-        c.gridy = 0;
-        regionDropdown = new JComboBox<>(); //dropdown for selecting the region
-        for (TZRegionEnum region : TZRegionEnum.values()) {
-            regionDropdown.addItem(region);
-        }
-        regionDropdown.addActionListener(e -> updateTimeZoneDropdown());
-        add(regionDropdown, c);
-        c.gridy++;
-        timezoneDropdown = new JComboBox<>(); //dropdown for selecting the time zone
-        add(timezoneDropdown, c);
-        c.gridy++;
-        JButton addButton = new JButton("Add Timezone");
-        addButton.addActionListener(new ActionListener() {
+public class TZClocksSelectionPanel {
+    private final JList<TZClocksItem> clockList;
+    private ActionListener okEvent;
+    private final JDialog dialog;
+    private final TZClocksPluginPanel pluginPanel;
+
+    private static final String OK = "Ok";
+    private static final String CANCEL = "Cancel";
+    private static final String TITLE = "Select Clocks";
+    private static final String MESSAGE = "Select clocks to add to this tab";
+    private static final String SUBMESSAGE = "Ctrl+Click to select multiple clocks";
+
+    public TZClocksSelectionPanel(Component parent, TZClocksPluginPanel pluginPanel, List<TZClocksItem> clocks) {
+        this.pluginPanel = pluginPanel;
+        this.clockList = new JList<>(clocks.toArray(new TZClocksItem[0]));
+        this.clockList.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+
+        JPanel topPanel = new JPanel(new BorderLayout());
+
+        JLabel message = new JLabel(MESSAGE);
+        message.setHorizontalAlignment(SwingConstants.CENTER);
+        JLabel subMessage = new JLabel(SUBMESSAGE);
+        subMessage.setHorizontalAlignment(SwingConstants.CENTER);
+
+        topPanel.add(message, BorderLayout.NORTH);
+        topPanel.add(subMessage, BorderLayout.CENTER);
+
+
+        JPanel centerPanel = new JPanel(new BorderLayout(5, 5));
+        centerPanel.setPreferredSize(new Dimension(250, 300));
+
+
+        clockList.setCellRenderer(new DefaultListCellRenderer() {
             @Override
-            public void actionPerformed(ActionEvent e) {
-                String selectedZoneId = (String) timezoneDropdown.getSelectedItem();
-                if (selectedZoneId != null) {
-                    plugin.addTimezoneToPanel(selectedZoneId);
+            public Component getListCellRendererComponent(JList<?> list, Object value, int index, boolean isSelected, boolean cellHasFocus) {
+                Component component = super.getListCellRendererComponent(list, value, index, isSelected, cellHasFocus);
+                if (value instanceof TZClocksItem) {
+                    TZClocksItem clock = (TZClocksItem) value;
+                    setText(clock.getCustomName() != null ? clock.getCustomName() : truncateString(clock.getDisplayName(),37));
                 }
+                return component;
             }
         });
-        add(addButton, c);
-        c.gridy++;
-        clockPanel = new JPanel(new GridLayout(0, 1, 5, 5));
-        clockPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-        add(clockPanel, c);
-        scheduler.scheduleAtFixedRate(this::refreshTimeDisplays, 0, 1, TimeUnit.SECONDS);
-        updateTimeZoneDropdown();
+
+        JScrollPane scrollPane = new JScrollPane(clockList);
+        scrollPane.setBorder(new EmptyBorder(0, 5, 0, 5));
+
+        centerPanel.add(topPanel, BorderLayout.NORTH);
+        centerPanel.add(scrollPane, BorderLayout.CENTER);
+
+        JOptionPane optionPane = new JOptionPane(centerPanel);
+
+        JButton okButton = new JButton(OK);
+        okButton.addActionListener(this::onOkButtonClick);
+
+        JButton cancelButton = new JButton(CANCEL);
+        cancelButton.addActionListener(this::onCancelButtonClick);
+
+        optionPane.setOptions(new Object[]{okButton, cancelButton});
+
+        dialog = optionPane.createDialog(parent, TITLE);
+        dialog.setTitle(TITLE);
     }
 
-    private List<ZoneId> getTimeZoneIdsForRegion(TZRegionEnum region) { //self-explanatory. gets the time zone IDs from TZRegionEnum
-        if (region == TZRegionEnum.ALL) {
-            List<ZoneId> allZoneIds = new ArrayList<>();
-            for (TZRegionEnum reg : TZRegionEnum.values()) {
-                if (reg != TZRegionEnum.ALL) {
-                    allZoneIds.addAll(reg.getZoneIds());
-                }
-            }
-            return allZoneIds;
-        } else {
-            return region.getZoneIds();
+    public List<TZClocksItem> getSelectedClocks() {
+        return clockList.getSelectedValuesList();
+    }
+
+    public void setOnOk(ActionListener event) {
+        this.okEvent = event;
+    }
+
+    private void onOkButtonClick(ActionEvent e) {
+        if (okEvent != null) {
+            okEvent.actionPerformed(e);
         }
+
+
+        SwingUtilities.invokeLater(() -> pluginPanel.updatePanel());
+
+        dialog.setVisible(false);
     }
 
-    private void updateTimeZoneDropdown() { //self-explanatory. updates the time zone dropdown to match region
-        TZRegionEnum selectedRegion = (TZRegionEnum) regionDropdown.getSelectedItem();
-        List<ZoneId> zoneIds = getTimeZoneIdsForRegion(selectedRegion);
-
-        timezoneDropdown.removeAllItems();
-
-        for (ZoneId zoneId : zoneIds) {
-            timezoneDropdown.addItem(zoneId.toString());
-        }
+    private void onCancelButtonClick(ActionEvent e) {
+        dialog.setVisible(false);
     }
 
-    public void addTimezonePanel(TZClocksItem item) { //adds the time zone panel
-        TZClocksItemPanel TZClocksItemPanel = new TZClocksItemPanel(plugin, item);
-        TZClocksItemPanels.add(TZClocksItemPanel);
-        timezonePanelsMap.put(item, TZClocksItemPanel);
-        clockPanel.add(TZClocksItemPanel);
-        revalidate();
-        repaint();
+    public void show() {
+        dialog.setVisible(true);
     }
-
-    public void removeTimezonePanel(TZClocksItem item) { //removes time zone from panel
-        TZClocksItemPanel timezonePanelToRemove = timezonePanelsMap.remove(item);
-        if (timezonePanelToRemove != null) {
-            clockPanel.remove(timezonePanelToRemove);
-            TZClocksItemPanels.remove(timezonePanelToRemove);
-            revalidate();
-            repaint();
-        }
-    }
-
-    public void refreshTimeDisplays( ) { //refreshes panel when adding new time zone
-        DateTimeFormatter formatter = plugin.getFormatter();
-        for (TZClocksItem item : timezones) {
-            ZoneId zoneId = ZoneId.of(item.getName());
-            ZonedDateTime now = ZonedDateTime.now(zoneId);
-            item.setCurrentTime(now.format(formatter));
-        }
-        for (TZClocksItemPanel panel : TZClocksItemPanels) {
-            panel.updateTime();
-        }
-    }
-
-    public void removeAllClocks() { //removes clocks to prevent re-adding previously selected clocks. there might be an alternative
-        clockPanel.removeAll();
-        TZClocksItemPanels.clear();
-        timezonePanelsMap.clear();
-        revalidate();
-        repaint();
-    }
-
 }
 package com.tzclocks.tzui;
 
@@ -435,255 +2026,843 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.event.MouseListener;
 import java.awt.image.BufferedImage;
-
-import static com.tzclocks.tzutilities.TZConstants.*;
-
-public class TZClocksItemPanel extends JPanel {
-    private static final String DELETE_TITLE = "Warning";
-    private static final String DELETE_MESSAGE = "Are you sure you want to delete this item?";
-    private static final ImageIcon DELETE_ICON;
-    private static final ImageIcon DELETE_HOVER_ICON;;
-
-    private final TZClocksItem item;
-    private final JLabel currentTimeLabel;
-
-    static {
-        final BufferedImage deleteImage = ImageUtil.loadImageResource(TZClocksItemPanel.class, DELETE_ICON_PATH);
-        DELETE_ICON = new ImageIcon(deleteImage);
-        DELETE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(deleteImage, 0.53f));
-
-
-    }
-
-    TZClocksItemPanel(TZClocksPlugin plugin, TZClocksItem item) { //format and buttons for added time zones
-        this.item = item;
-        setLayout(new BorderLayout(5, 0));
-        setBorder(new EmptyBorder(5, 5, 5, 0));
-
-        int itemIndex = plugin.getTimezones().indexOf(item); //need to check if actually used or not
-        int itemsSize = plugin.getTimezones().size(); //same as above
-
-        JPanel timezoneDetailsPanel = new JPanel(new GridLayout(2, 1));
-        timezoneDetailsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-
-        JLabel timezoneName = new JLabel();
-        timezoneName.setForeground(Color.WHITE);
-        timezoneName.setText(item.getName());
-        timezoneDetailsPanel.add(timezoneName);
-
-        currentTimeLabel = new JLabel();
-        currentTimeLabel.setForeground(Color.WHITE);
-        currentTimeLabel.setText(item.getCurrentTime());
-        timezoneDetailsPanel.add(currentTimeLabel);
-        JPanel actionPanel = new JPanel(new BorderLayout());
-        actionPanel.setBackground(new Color(0, 0, 0, 0));
-        actionPanel.setOpaque(false);
-        JLabel deleteItem = new JLabel(DELETE_ICON);
-        deleteItem.setBorder(new EmptyBorder(0, 0, 0, 3));
-        deleteItem.addMouseListener(new MouseAdapter() {
-            @Override
-            public void mouseReleased(MouseEvent e) {
-                if (deleteConfirm()) {
-                    plugin.removeTimezoneFromPanel(item);
-                }
-            }
-
-            @Override
-            public void mouseEntered(MouseEvent e) {
-                deleteItem.setIcon(DELETE_HOVER_ICON);
-            }
-
-            @Override
-            public void mouseExited(MouseEvent e) {
-                deleteItem.setIcon(DELETE_ICON);
-            }
-        });
-        actionPanel.add(deleteItem, BorderLayout.NORTH);
-
-        add(timezoneDetailsPanel, BorderLayout.WEST);
-        add(actionPanel, BorderLayout.EAST);
-    }
-
-    private boolean deleteConfirm() { //self-explanatory
-        int confirm = JOptionPane.showConfirmDialog(this,
-                DELETE_MESSAGE, DELETE_TITLE, JOptionPane.YES_NO_OPTION);
-        return confirm == JOptionPane.YES_NO_OPTION;
-    }
-
-    @Override
-    protected void paintComponent(Graphics g) {
-        g.setColor(ColorScheme.DARKER_GRAY_COLOR);
-        g.fillRect(0, 0, this.getWidth(), this.getHeight());
-    }
-
-    public void updateTime() {
-        currentTimeLabel.setText(item.getCurrentTime());
-    } //updates panel with new time zones
-}
-package com.tzclocks.tzconfig;
-
-import java.util.List;
-
-import com.tzclocks.TZClocksPlugin;
-import com.tzclocks.tzdata.TZFormatEnum;
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-
-
-@ConfigGroup(TZClocksPlugin.CONFIG_GROUP)
-public interface TZClocksConfig extends Config {
-		//format dropdown
-		@ConfigItem(
-			position = 1,
-			keyName = "tzFormat",
-			name = "Time Format",
-			description = "Select 12-hour or 24-hour format"
-	)
-	default TZFormatEnum getTZFormatMode() {
-		return TZFormatEnum.TWELVE_HOUR;
-	} //default format
-
-	void setTimeFormat(TZFormatEnum tzFormat); //says no usages but is important
-	void setTimezones(List<String> timezones); //also says no usages but also important
-}
-package com.tzclocks;
-
-import com.tzclocks.tzconfig.TZClocksConfig;
-import com.tzclocks.tzdata.TZClocksDataManager;
-import com.tzclocks.tzdata.TZClocksItem;
-import com.tzclocks.tzdata.TZFormatEnum;
-
-import com.tzclocks.tzui.TZClocksPluginPanel;
-import com.google.inject.Provides;
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.ui.ClientToolbar;
-import net.runelite.client.ui.NavigationButton;
-import net.runelite.client.util.ImageUtil;
-
-import javax.inject.Inject;
-import javax.swing.*;
-import java.awt.image.BufferedImage;
+import java.time.LocalDate;
 import java.time.ZoneId;
 import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
+
+import static com.tzclocks.tzutilities.TZConstants.*;
+import static javax.swing.BorderFactory.createEmptyBorder;
+import static javax.swing.BorderFactory.createRaisedBevelBorder;
+
+public class TZClocksTabItemPanel extends JPanel {
+    private static final String DELETE_TITLE = "Remove Clock";
+    private static final String DELETE_MESSAGE = "Are you sure you want to remove this clock from the tab?";
+    private static final ImageIcon DELETE_ICON;
+    private static final ImageIcon DELETE_HOVER_ICON;
+    private static final ImageIcon EDIT_ICON;
+    private static final ImageIcon EDIT_HOVER_ICON;
+    private static final ImageIcon GLOBE_ICON;
+    private static final ImageIcon CLOCK_ICON;
+    private static final ImageIcon CALENDAR_ICON;
+    private static final ImageIcon TOGGLE_ICON;
+    private static final ImageIcon TOGGLE_HOVER_ICON;
+
+    private final TZClocksItem item;
+    private final JLabel currentTimeLabel;
+    private final JLabel timezoneNameLabel;
+    private final JLabel customNameLabel;
+    private final JLabel dayMonthLabel;
+    private final JPanel calendarPanel;
+    private final JPanel timePanel;
+    private final TZClocksPlugin plugin;
+
+    private final JLabel toggleIconLabel;
+    private final JLabel editButton;
+    private final JLabel deleteButton;
+
+    private final JLabel editPlaceholder;
+    private final JLabel deletePlaceholder;
+
+
+    static {
+
+        final int ICON_SIZE = 10;
+        final float ALPHA_HOVER = 0.53f;
+
+        final BufferedImage deleteImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksTabItemPanel.class, DELETE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        DELETE_ICON = new ImageIcon(deleteImage);
+        DELETE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(deleteImage, ALPHA_HOVER));
+
+        final BufferedImage editImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksTabItemPanel.class, EDIT_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        EDIT_ICON = new ImageIcon(editImage);
+        EDIT_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(editImage, ALPHA_HOVER));
+
+        final BufferedImage toggleImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, TOGGLE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        TOGGLE_ICON = new ImageIcon(toggleImage);
+        TOGGLE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(toggleImage, ALPHA_HOVER));
+
+        final BufferedImage globeImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, GLOBE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        GLOBE_ICON = new ImageIcon(globeImage);
+
+        final BufferedImage clockImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, CLOCK_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        CLOCK_ICON = new ImageIcon(clockImage);
+
+        final BufferedImage calendarImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, CALENDAR_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        CALENDAR_ICON = new ImageIcon(calendarImage);
+    }
+
+    public TZClocksTabItemPanel(TZClocksPlugin plugin, TZClocksItem item) {
+        this.plugin = plugin;
+        this.item = item;
+
+        setLayout(new BorderLayout(5, 0));
+        setBorder(BorderFactory.createCompoundBorder(createRaisedBevelBorder(), createEmptyBorder(3,5,5,5)));
+        setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        setOpaque(true);
+
+
+        JPanel detailsPanel = new JPanel(new GridBagLayout());
+        detailsPanel.setOpaque(false);
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.gridx = 0; gbc.gridy = 0; gbc.weightx = 1.0; gbc.anchor = GridBagConstraints.WEST;
+
+
+        customNameLabel = new JLabel();
+        customNameLabel.setForeground(Color.WHITE);
+
+        timezoneNameLabel = new JLabel(truncateString(item.getDisplayName(),17));
+        timezoneNameLabel.setForeground(Color.WHITE);
+        timezoneNameLabel.setToolTipText(item.getDisplayName());
+        JPanel namePanel = new JPanel(new BorderLayout(5, 0));
+        namePanel.setOpaque(false);
+        namePanel.add(new JLabel(GLOBE_ICON), BorderLayout.WEST);
+        namePanel.add(timezoneNameLabel, BorderLayout.CENTER);
+
+
+        currentTimeLabel = new JLabel(item.getCurrentTime());
+        currentTimeLabel.setForeground(Color.WHITE);
+
+        dayMonthLabel = new JLabel();
+        dayMonthLabel.setForeground(Color.WHITE);
+        calendarPanel = new JPanel(new BorderLayout(0, 0));
+        calendarPanel.setOpaque(false);
+        calendarPanel.add(new JLabel(CALENDAR_ICON), BorderLayout.WEST);
+        calendarPanel.add(dayMonthLabel, BorderLayout.CENTER);
+
+
+        timePanel = new JPanel(new BorderLayout(5, 0));
+        timePanel.setOpaque(false);
+        JPanel clockIconAndTimePanel = new JPanel(new BorderLayout(5,0));
+        clockIconAndTimePanel.setOpaque(false);
+        clockIconAndTimePanel.add(new JLabel(CLOCK_ICON), BorderLayout.WEST);
+        clockIconAndTimePanel.add(currentTimeLabel, BorderLayout.CENTER);
+        timePanel.add(clockIconAndTimePanel, BorderLayout.CENTER);
+
+
+
+
+        JPanel actionPanel = new JPanel(new GridLayout(1, 3, 3, 0));
+        actionPanel.setOpaque(false);
+        actionPanel.setBorder(new EmptyBorder(0, 0, 0, 3));
+
+
+        toggleIconLabel = new JLabel(TOGGLE_ICON, SwingConstants.CENTER);
+
+
+        editButton = new JLabel(EDIT_ICON, SwingConstants.CENTER);
+
+
+        deleteButton = new JLabel(DELETE_ICON, SwingConstants.CENTER);
+
+
+
+        Dimension placeholderSize = new Dimension(EDIT_ICON.getIconWidth(), EDIT_ICON.getIconHeight());
+        editPlaceholder = new JLabel();
+        editPlaceholder.setPreferredSize(placeholderSize);
+        editPlaceholder.setMinimumSize(placeholderSize);
+        deletePlaceholder = new JLabel();
+        deletePlaceholder.setPreferredSize(placeholderSize);
+        deletePlaceholder.setMinimumSize(placeholderSize);
+
+
+
+        if (!isFixedClock()) {
+
+            toggleIconLabel.setToolTipText("Toggle Calendar");
+            toggleIconLabel.addMouseListener(new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent e) { plugin.toggleMonthDayVisibility(item); }
+                @Override public void mouseEntered(MouseEvent e) { toggleIconLabel.setIcon(TOGGLE_HOVER_ICON); }
+                @Override public void mouseExited(MouseEvent e) { toggleIconLabel.setIcon(TOGGLE_ICON); }
+            });
+
+
+
+            editButton.setToolTipText("Edit custom name");
+            editButton.addMouseListener(new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent e) { plugin.editClockCustomName(item); }
+                @Override public void mouseEntered(MouseEvent e) { editButton.setIcon(EDIT_HOVER_ICON); }
+                @Override public void mouseExited(MouseEvent e) { editButton.setIcon(EDIT_ICON); }
+            });
+
+
+            deleteButton.setToolTipText("Remove from tab");
+            deleteButton.addMouseListener(new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent e) { if (deleteConfirm()) plugin.removeClockFromUserTab(item); }
+                @Override public void mouseEntered(MouseEvent e) { deleteButton.setIcon(DELETE_HOVER_ICON); }
+                @Override public void mouseExited(MouseEvent e) { deleteButton.setIcon(DELETE_ICON); }
+            });
+
+
+            actionPanel.add(toggleIconLabel);
+            actionPanel.add(editButton);
+            actionPanel.add(deleteButton);
+        } else {
+
+
+            toggleIconLabel.setToolTipText("Toggle Calendar");
+            toggleIconLabel.addMouseListener(new MouseAdapter() {
+                @Override public void mousePressed(MouseEvent e) { plugin.toggleMonthDayVisibility(item); }
+                @Override public void mouseEntered(MouseEvent e) { toggleIconLabel.setIcon(TOGGLE_HOVER_ICON); }
+                @Override public void mouseExited(MouseEvent e) { toggleIconLabel.setIcon(TOGGLE_ICON); }
+            });
+
+
+            editButton.setToolTipText(null);
+            deleteButton.setToolTipText(null);
+
+            for(MouseListener ml : editButton.getMouseListeners()){ editButton.removeMouseListener(ml); }
+            for(MouseListener ml : deleteButton.getMouseListeners()){ deleteButton.removeMouseListener(ml); }
+
+
+            actionPanel.add(editPlaceholder);
+            actionPanel.add(deletePlaceholder);
+            actionPanel.add(toggleIconLabel);
+        }
+
+
+        JPanel eastWrapperPanel = new JPanel(new BorderLayout());
+        eastWrapperPanel.setOpaque(false);
+        eastWrapperPanel.setBorder(new EmptyBorder(0, 0, 0, 3));
+        eastWrapperPanel.add(actionPanel, BorderLayout.NORTH);
+
+
+        add(detailsPanel, BorderLayout.CENTER);
+        add(eastWrapperPanel, BorderLayout.EAST);
+
+
+        updateCustomName(detailsPanel, gbc, namePanel);
+        toggleMonthDayVisibility();
+    }
+
+
+    private boolean isFixedClock() {
+        return item.getUuid().equals(TZClocksPlugin.LOCAL_CLOCK_UUID) ||
+                item.getUuid().equals(TZClocksPlugin.JAGEX_CLOCK_UUID);
+    }
+
+
+    private void updateCustomName(JPanel detailsPanel, GridBagConstraints gbc, JPanel namePanel) {
+        detailsPanel.removeAll();
+        if (item.getCustomName() != null && !item.getCustomName().isEmpty()) {
+            customNameLabel.setText(item.getCustomName());
+            gbc.gridy = 0; detailsPanel.add(customNameLabel, gbc);
+            gbc.gridy = 1; detailsPanel.add(namePanel, gbc);
+            timezoneNameLabel.setBorder(new EmptyBorder(5, 0, 0, 0));
+            gbc.gridy = 2; detailsPanel.add(timePanel, gbc);
+        } else {
+            gbc.gridy = 0; detailsPanel.add(namePanel, gbc);
+            timezoneNameLabel.setBorder(new EmptyBorder(0, 0, 0, 0));
+            gbc.gridy = 1; detailsPanel.add(timePanel, gbc);
+        }
+        detailsPanel.revalidate();
+        detailsPanel.repaint();
+    }
+
+
+    private void toggleMonthDayVisibility() {
+        boolean calendarVisible = false;
+        for (Component comp : timePanel.getComponents()) {
+            if (comp == calendarPanel) {
+                calendarVisible = true;
+                break;
+            }
+        }
+        if (calendarVisible) { timePanel.remove(calendarPanel); }
+        if (item.getShowCalendar() != null) {
+            try {
+                ZoneId zoneId = ZoneId.of(item.getName());
+                ZonedDateTime zonedDateTime = ZonedDateTime.now(zoneId);
+                LocalDate currentDate = zonedDateTime.toLocalDate();
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM dd");
+                dayMonthLabel.setText(currentDate.format(formatter));
+            } catch (Exception e) { dayMonthLabel.setText("?? ??"); }
+
+            timePanel.add(calendarPanel, BorderLayout.EAST);
+        }
+        timePanel.revalidate();
+        timePanel.repaint();
+    }
+
+
+    private boolean deleteConfirm() {
+        int confirm = JOptionPane.showConfirmDialog(this,
+                DELETE_MESSAGE, DELETE_TITLE, JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        return confirm == JOptionPane.YES_OPTION;
+    }
+
+
+    public void updateTime() {
+        currentTimeLabel.setText(item.getCurrentTime());
+        if (item.getShowCalendar() != null) {
+            try {
+                ZoneId zoneId = ZoneId.of(item.getName());
+                ZonedDateTime zonedDateTime = ZonedDateTime.now(zoneId);
+                LocalDate currentDate = zonedDateTime.toLocalDate();
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM dd");
+                String currentFormattedDate = currentDate.format(formatter);
+                if (!dayMonthLabel.getText().equals(currentFormattedDate)) {
+                    dayMonthLabel.setText(currentFormattedDate);
+                }
+            } catch (Exception e) {
+                if (!dayMonthLabel.getText().equals("?? ??")) {
+                    dayMonthLabel.setText("?? ??");
+                }
+            }
+        }
+    }
+
+}
+package com.tzclocks.tzui;
+
+import com.tzclocks.TZClocksPlugin;
+import com.tzclocks.tzdata.TZClocksItem;
+import com.tzclocks.tzdata.TZClocksTab;
+import lombok.Getter;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.ImageUtil;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.border.EtchedBorder;
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
 import java.util.List;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.*;
 
-import static com.tzclocks.tzutilities.TZConstants.PANEL_ICON_PATH;
+import static com.tzclocks.tzutilities.TZConstants.*;
+import static javax.swing.BorderFactory.createEmptyBorder;
+import static javax.swing.BorderFactory.createEtchedBorder;
 
-@Slf4j
-@PluginDescriptor(
-		name = "Time Zone clocks"
-)
-public class TZClocksPlugin extends Plugin {
+public class TZClocksTabPanel extends JPanel {
+    private static final String DELETE_TITLE = "Delete Tab";
+    private static final String DELETE_MESSAGE = "Are you sure you want to delete this tab? This will not delete the clocks.";
 
-	public static final String CONFIG_GROUP = "tzconfig";
-	@Inject
-	private Client client;
+    private static final ImageIcon ADD_ICON;
+    private static final ImageIcon ADD_HOVER_ICON;
+    private static final ImageIcon EDIT_ICON;
+    private static final ImageIcon EDIT_HOVER_ICON;
+    private static final ImageIcon DELETE_TAB_ICON;
+    private static final ImageIcon DELETE_TAB_HOVER_ICON;
 
-	@Inject
-	private ClientToolbar clientToolbar;
-
-	@Inject
-	@Setter
-	private TZClocksConfig config;
-
-	@Inject
-	private TZClocksDataManager dataManager;
-
-	private TZClocksPluginPanel panel;
-	private NavigationButton navButton;
-
-	@Getter
-	@Setter
-	private List<TZClocksItem> timezones = new ArrayList<>();
+    private static final ImageIcon COLLAPSE_ICON;
+    private static final ImageIcon COLLAPSE_HOVER_ICON;
+    private static final ImageIcon EXPAND_DOWN_ICON;
+    private static final ImageIcon EXPAND_DOWN_HOVER_ICON;
 
 
+    private final TZClocksPlugin plugin;
+    @Getter
+    private final TZClocksTab tab;
+    private final TZClocksPluginPanel pluginPanel;
+    private final JPanel itemsPanel;
+    private final GridBagConstraints constraints = new GridBagConstraints();
+    @Getter
+    private final Map<TZClocksItem, TZClocksTabItemPanel> tabItemPanelsMap = new HashMap<>();
 
-	private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(); //updates the clocks as scheduled. Might be a better alternative
+    static {
 
-	@Override
-	protected void startUp() throws Exception { //starts plugin when loading client
-		panel = new TZClocksPluginPanel(this, config);
-		final BufferedImage icon = ImageUtil.loadImageResource(TZClocksPlugin.class, PANEL_ICON_PATH);
-		navButton = NavigationButton.builder()
-				.tooltip("Timezones")
-				.icon(icon)
-				.priority(5)
-				.panel(panel)
-				.build();
-		clientToolbar.addNavigation(navButton);
-		dataManager.loadData();
-		refreshTimezonePanels();
-		panel.activatePanel();
+        final int ICON_SIZE = 12;
+        final float ALPHA_NORMAL = 0.7f;
+        final float ALPHA_HOVER = 0.53f;
 
-		scheduler.scheduleAtFixedRate(this::updateTimezoneData, 0, 1, TimeUnit.SECONDS);
-	}
+        final BufferedImage addImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, ADD_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        ADD_ICON = new ImageIcon(ImageUtil.alphaOffset(addImage, ALPHA_NORMAL));
+        ADD_HOVER_ICON = new ImageIcon(addImage);
 
-	@Override
-	protected void shutDown() throws Exception { //shuts down plugin
-		clientToolbar.removeNavigation(navButton); //removes from navigation bar, same as other plugins
-		dataManager.saveData(); //saves data one last time before closing
-		scheduler.shutdown(); //shuts down scheduler. might be better alternative
-	}
+        final BufferedImage editImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, EDIT_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        EDIT_ICON = new ImageIcon(ImageUtil.alphaOffset(editImage, ALPHA_NORMAL));
+        EDIT_HOVER_ICON = new ImageIcon(editImage);
 
-	@Provides
-	TZClocksConfig provideConfig(ConfigManager configManager) {
-		return configManager.getConfig(TZClocksConfig.class);
-	} //supposedly saves to the RL config manager. Not actually sure but other plugins use the same thing. Need to actually spend time learning how it works
+        final BufferedImage deleteTabImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, DELETE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        DELETE_TAB_ICON = new ImageIcon(ImageUtil.alphaOffset(deleteTabImage, ALPHA_NORMAL));
+        DELETE_TAB_HOVER_ICON = new ImageIcon(deleteTabImage);
 
-	public void addTimezoneToPanel(String timezoneId) { //adds clock to the panel and saves data to data manager
-		ZoneId zoneId = ZoneId.of(timezoneId);
-		ZonedDateTime now = ZonedDateTime.now(zoneId);
-		DateTimeFormatter formatter = getFormatter();
-		String currentTime = now.format(formatter);
-		TZClocksItem newItem = new TZClocksItem(timezoneId, currentTime);
-		timezones.add(newItem);
-		panel.addTimezonePanel(newItem);
-		dataManager.saveData();
-	}
 
-	public void removeTimezoneFromPanel(TZClocksItem item) { //removes clock from the panel and updates data in the data manager
-		timezones.remove(item);
-		dataManager.saveData();
-		SwingUtilities.invokeLater(() -> panel.removeTimezonePanel(item));
-	}
 
-	public void refreshTimezonePanels() { //refreshes panel on start up
-		SwingUtilities.invokeLater(() -> {
-			panel.removeAllClocks();
-			for (TZClocksItem item : timezones) {
-				panel.addTimezonePanel(item);
-			}
-		});
-	}
+        final BufferedImage collapseImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, COLLAPSE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        COLLAPSE_ICON = new ImageIcon(collapseImage);
+        COLLAPSE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(collapseImage, ALPHA_HOVER));
 
-	public void updateTimezoneData() { //updates time based on scheduler
-		DateTimeFormatter formatter = getFormatter();
-		for (TZClocksItem item : timezones) {
-			ZoneId zoneId = ZoneId.of(item.getName());
-			ZonedDateTime now = ZonedDateTime.now(zoneId);
-			String currentTime = now.format(formatter);
-			item.setCurrentTime(currentTime);
-		}
-		SwingUtilities.invokeLater(() -> panel.refreshTimeDisplays());
-	}
-	public DateTimeFormatter getFormatter() { //formats based on selected option from config
-		if (config.getTZFormatMode() == TZFormatEnum.TWENTY_FOUR_HOUR) {
-			return DateTimeFormatter.ofPattern("HH:mm:ss");
-		} else {
-			return DateTimeFormatter.ofPattern("hh:mm:ss a");
-		}
+
+        final BufferedImage expandDownImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksPlugin.class, EXPAND_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        EXPAND_DOWN_ICON = new ImageIcon(expandDownImage);
+        EXPAND_DOWN_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(expandDownImage, ALPHA_HOVER));
+    }
+
+
+    public TZClocksTabPanel(TZClocksPlugin plugin, TZClocksPluginPanel panel, TZClocksTab tab) {
+        this.plugin = plugin;
+        this.pluginPanel = panel;
+        this.tab = tab;
+
+
+        setLayout(new BorderLayout(0, 0));
+        setBorder(BorderFactory.createCompoundBorder(createEtchedBorder(EtchedBorder.RAISED), createEmptyBorder(0,0,0,0)));
+        setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        setOpaque(true);
+
+
+        boolean isCollapsed = tab.isCollapsed();
+
+
+        JPanel headerPanel = new JPanel(new BorderLayout());
+        headerPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        headerPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+
+
+        JPanel leftActions = new JPanel(new BorderLayout(5, 0));
+        leftActions.setOpaque(false);
+
+        JLabel collapseButton = new JLabel();
+        collapseButton.setOpaque(false);
+
+
+        final ImageIcon currentIcon;
+        final ImageIcon hoverIcon;
+        if (isCollapsed) {
+            currentIcon = EXPAND_DOWN_ICON;
+            hoverIcon = EXPAND_DOWN_HOVER_ICON;
+            collapseButton.setToolTipText("Expand Tab");
+        } else {
+            currentIcon = COLLAPSE_ICON;
+            hoverIcon = COLLAPSE_HOVER_ICON;
+            collapseButton.setToolTipText("Collapse Tab");
+        }
+        collapseButton.setIcon(currentIcon);
+        collapseButton.addMouseListener(new MouseAdapter() {
+
+            @Override public void mousePressed(MouseEvent e) { plugin.switchTabExpandCollapse(tab.getName()); }
+            @Override public void mouseEntered(MouseEvent e) { collapseButton.setIcon(hoverIcon); }
+            @Override public void mouseExited(MouseEvent e) { collapseButton.setIcon(currentIcon); }
+        });
+        leftActions.add(collapseButton, BorderLayout.WEST);
+
+        JLabel tabNameLabel = new JLabel(tab.getName());
+        tabNameLabel.setForeground(Color.WHITE);
+        tabNameLabel.setToolTipText(tab.getName());
+        leftActions.add(tabNameLabel, BorderLayout.CENTER);
+
+        headerPanel.add(leftActions, BorderLayout.WEST);
+
+
+        JPanel rightActions = new JPanel();
+        rightActions.setLayout(new BoxLayout(rightActions, BoxLayout.X_AXIS));
+        rightActions.setOpaque(false);
+
+        JLabel addClockButton = new JLabel(ADD_ICON);
+        addClockButton.setToolTipText("Add clock(s) to this tab");
+        addClockButton.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) { showAddClocksDialog(); }
+            @Override public void mouseEntered(MouseEvent e) { addClockButton.setIcon(ADD_HOVER_ICON); }
+            @Override public void mouseExited(MouseEvent e) { addClockButton.setIcon(ADD_ICON); }
+        });
+
+
+        JLabel editTabButton = new JLabel(EDIT_ICON);
+        editTabButton.setToolTipText("Edit tab name");
+        editTabButton.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) { plugin.editTab(tab); }
+            @Override public void mouseEntered(MouseEvent e) { editTabButton.setIcon(EDIT_HOVER_ICON); }
+            @Override public void mouseExited(MouseEvent e) { editTabButton.setIcon(EDIT_ICON); }
+        });
+
+
+        JLabel deleteTabButton = new JLabel(DELETE_TAB_ICON);
+        deleteTabButton.setToolTipText("Delete this tab");
+        deleteTabButton.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) { if (deleteConfirm()) plugin.removeTab(tab); }
+            @Override public void mouseEntered(MouseEvent e) { deleteTabButton.setIcon(DELETE_TAB_HOVER_ICON); }
+            @Override public void mouseExited(MouseEvent e) { deleteTabButton.setIcon(DELETE_TAB_ICON); }
+        });
+
+
+
+        rightActions.add(addClockButton);
+        rightActions.add(Box.createHorizontalStrut(5));
+        rightActions.add(editTabButton);
+        rightActions.add(Box.createHorizontalStrut(5));
+        rightActions.add(deleteTabButton);
+
+
+        headerPanel.add(rightActions, BorderLayout.EAST);
+
+
+        add(headerPanel, BorderLayout.NORTH);
+
+
+
+        itemsPanel = new JPanel(new GridBagLayout());
+        itemsPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+        itemsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        itemsPanel.setOpaque(true);
+
+
+        constraints.fill = GridBagConstraints.HORIZONTAL;
+        constraints.gridwidth = 1; constraints.weightx = 1.0; constraints.weighty = 0.0;
+        constraints.gridx = 0; constraints.gridy = 0; constraints.anchor = GridBagConstraints.NORTH;
+
+
+        if (!isCollapsed) {
+            int itemIndex = 0;
+            List<UUID> clockIds = tab.getClocks() != null ? tab.getClocks() : new ArrayList<>();
+
+            for (UUID clockId : clockIds) {
+                Optional<TZClocksItem> clockOpt = plugin.getTimezones().stream()
+                        .filter(c -> c.getUuid().equals(clockId))
+                        .findFirst();
+
+                if (clockOpt.isPresent()) {
+                    TZClocksItem clock = clockOpt.get();
+
+                    TZClocksTabItemPanel itemPanel = new TZClocksTabItemPanel(plugin, clock);
+                    tabItemPanelsMap.put(clock, itemPanel);
+
+
+                    JPanel wrapper = new JPanel(new BorderLayout());
+                    wrapper.setOpaque(false);
+                    if (itemIndex > 0) { wrapper.setBorder(new EmptyBorder(5, 0, 0, 0)); }
+                    else { wrapper.setBorder(new EmptyBorder(0,0,0,0)); }
+                    wrapper.add(itemPanel, BorderLayout.NORTH);
+                    itemsPanel.add(wrapper, constraints);
+
+                    constraints.gridy++;
+                    itemIndex++;
+                }
+            }
+
+            GridBagConstraints tabGlueConstraints = new GridBagConstraints();
+            tabGlueConstraints.gridx = 0; tabGlueConstraints.gridy = constraints.gridy;
+            tabGlueConstraints.weighty = 1.0; tabGlueConstraints.fill = GridBagConstraints.VERTICAL;
+            itemsPanel.add(Box.createVerticalGlue(), tabGlueConstraints);
+
+
+            add(itemsPanel, BorderLayout.CENTER);
+        }
+    }
+
+    /**
+     * Shows the dialog for selecting clocks to add to this user tab.
+     */
+    private void showAddClocksDialog() {
+        List<TZClocksItem> clocks = pluginPanel.getAvailableClocks();
+        if (clocks.isEmpty()) {
+            JOptionPane.showMessageDialog(this, "All available clocks are already in tabs.", "No Available Clocks", JOptionPane.INFORMATION_MESSAGE);
+            return;
+        }
+
+        TZClocksSelectionPanel selectionPanel = new TZClocksSelectionPanel(this, pluginPanel, clocks);
+        selectionPanel.setOnOk(e -> {
+            List<TZClocksItem> selectedClocks = selectionPanel.getSelectedClocks();
+            for (TZClocksItem clock : selectedClocks) {
+
+                plugin.addClockToUserTab(clock, tab);
+            }
+        });
+        selectionPanel.show();
+    }
+
+    /**
+     * Shows confirmation dialog before deleting a user tab.
+     */
+    private boolean deleteConfirm() {
+        int confirm = JOptionPane.showConfirmDialog(this, DELETE_MESSAGE, DELETE_TITLE, JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        return confirm == JOptionPane.YES_OPTION;
+    }
+
+}
+package com.tzclocks.tzui;
+
+import com.tzclocks.TZClocksPlugin;
+import com.tzclocks.tzdata.TZClocksItem;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.ImageUtil;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.time.LocalDate;
+import java.time.ZoneId;
+import java.time.ZonedDateTime;
+import java.time.format.DateTimeFormatter;
+
+import static com.tzclocks.tzutilities.TZConstants.*;
+import static javax.swing.BorderFactory.createEmptyBorder;
+import static javax.swing.BorderFactory.createRaisedBevelBorder;
+
+public class TZClocksItemPanel extends JPanel {
+
+    private static final String DELETE_TITLE = "Warning";
+
+    private static final String DELETE_MESSAGE = "Are you sure you want to permanently delete this clock?";
+    private static final ImageIcon DELETE_ICON;
+    private static final ImageIcon DELETE_HOVER_ICON;
+    private static final ImageIcon EDIT_ICON;
+    private static final ImageIcon EDIT_HOVER_ICON;
+    private static final ImageIcon GLOBE_ICON;
+    private static final ImageIcon CLOCK_ICON;
+    private static final ImageIcon CALENDAR_ICON;
+    private static final ImageIcon TOGGLE_ICON;
+    private static final ImageIcon TOGGLE_HOVER_ICON;
+
+    private final TZClocksItem item;
+    private final JLabel currentTimeLabel;
+    private final JLabel timezoneNameLabel;
+    private final JLabel customNameLabel;
+    private final JLabel dayMonthLabel;
+    private final JPanel calendarPanel;
+    private final JPanel timePanel;
+    private final TZClocksPlugin plugin;
+
+
+    private final JLabel toggleButton;
+    private final JLabel editButton;
+    private final JLabel deleteButton;
+
+
+    static {
+
+        final int ICON_SIZE = 10;
+        final float ALPHA_HOVER = 0.53f;
+
+        final BufferedImage deleteImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, DELETE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        DELETE_ICON = new ImageIcon(deleteImage);
+        DELETE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(deleteImage, ALPHA_HOVER));
+
+        final BufferedImage editImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, EDIT_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        EDIT_ICON = new ImageIcon(editImage);
+        EDIT_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(editImage, ALPHA_HOVER));
+
+        final BufferedImage toggleImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, TOGGLE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        TOGGLE_ICON = new ImageIcon(toggleImage);
+        TOGGLE_HOVER_ICON = new ImageIcon(ImageUtil.alphaOffset(toggleImage, ALPHA_HOVER));
+
+        final BufferedImage globeImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, GLOBE_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        GLOBE_ICON = new ImageIcon(globeImage);
+
+        final BufferedImage clockImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, CLOCK_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        CLOCK_ICON = new ImageIcon(clockImage);
+
+        final BufferedImage calendarImage = ImageUtil.resizeImage(ImageUtil.loadImageResource(TZClocksItemPanel.class, CALENDAR_ICON_PATH), ICON_SIZE, ICON_SIZE);
+        CALENDAR_ICON = new ImageIcon(calendarImage);
+    }
+
+    TZClocksItemPanel(TZClocksPlugin plugin, TZClocksItem item) {
+        this.plugin = plugin;
+        this.item = item;
+        setLayout(new BorderLayout(5, 0));
+        setBorder(BorderFactory.createCompoundBorder(createRaisedBevelBorder(), createEmptyBorder(3,5,5,5)));
+        setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        setOpaque(true);
+
+
+
+        JPanel detailsPanel = new JPanel(new GridBagLayout());
+        detailsPanel.setOpaque(false);
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.gridx = 0; gbc.gridy = 0; gbc.weightx = 1.0; gbc.anchor = GridBagConstraints.WEST;
+
+        customNameLabel = new JLabel();
+        customNameLabel.setForeground(Color.WHITE);
+
+        timezoneNameLabel = new JLabel(truncateString(item.getDisplayName(),20));
+        timezoneNameLabel.setForeground(Color.WHITE);
+        timezoneNameLabel.setToolTipText(item.getDisplayName());
+        JPanel namePanel = new JPanel(new BorderLayout(5, 0));
+        namePanel.setOpaque(false);
+        namePanel.add(new JLabel(GLOBE_ICON), BorderLayout.WEST);
+        namePanel.add(timezoneNameLabel, BorderLayout.CENTER);
+
+
+        currentTimeLabel = new JLabel(item.getCurrentTime());
+        currentTimeLabel.setForeground(Color.WHITE);
+
+        dayMonthLabel = new JLabel();
+        dayMonthLabel.setForeground(Color.WHITE);
+        calendarPanel = new JPanel(new BorderLayout(0, 0));
+        calendarPanel.setOpaque(false);
+        calendarPanel.add(new JLabel(CALENDAR_ICON), BorderLayout.WEST);
+        calendarPanel.add(dayMonthLabel, BorderLayout.CENTER);
+
+        timePanel = new JPanel(new BorderLayout(5, 0));
+        timePanel.setOpaque(false);
+        JPanel clockIconAndTimePanel = new JPanel(new BorderLayout(5,0));
+        clockIconAndTimePanel.setOpaque(false);
+        clockIconAndTimePanel.add(new JLabel(CLOCK_ICON), BorderLayout.WEST);
+        clockIconAndTimePanel.add(currentTimeLabel, BorderLayout.CENTER);
+        timePanel.add(clockIconAndTimePanel, BorderLayout.CENTER);
+
+
+
+
+        JPanel gridActionPanel = new JPanel(new GridLayout(1, 3, 3, 0));
+        gridActionPanel.setOpaque(false);
+
+
+        toggleButton = new JLabel(TOGGLE_ICON, SwingConstants.CENTER);
+        toggleButton.setToolTipText("Toggle Calendar");
+        toggleButton.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) { plugin.toggleMonthDayVisibility(item); }
+            @Override public void mouseEntered(MouseEvent e) { toggleButton.setIcon(TOGGLE_HOVER_ICON); }
+            @Override public void mouseExited(MouseEvent e) { toggleButton.setIcon(TOGGLE_ICON); }
+        });
+        gridActionPanel.add(toggleButton);
+
+
+        editButton = new JLabel(EDIT_ICON, SwingConstants.CENTER);
+        editButton.setToolTipText("Edit custom name");
+        editButton.addMouseListener(new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) { plugin.editClockCustomName(item); }
+            @Override public void mouseEntered(MouseEvent e) { editButton.setIcon(EDIT_HOVER_ICON); }
+            @Override public void mouseExited(MouseEvent e) { editButton.setIcon(EDIT_ICON); }
+        });
+        gridActionPanel.add(editButton);
+
+
+        deleteButton = new JLabel(DELETE_ICON, SwingConstants.CENTER);
+        deleteButton.setToolTipText("Delete this clock permanently");
+        deleteButton.addMouseListener(new MouseAdapter() {
+
+            @Override public void mousePressed(MouseEvent e) { if (deleteConfirm()) plugin.removeTimezoneFromPanel(item); }
+            @Override public void mouseEntered(MouseEvent e) { deleteButton.setIcon(DELETE_HOVER_ICON); }
+            @Override public void mouseExited(MouseEvent e) { deleteButton.setIcon(DELETE_ICON); }
+        });
+        gridActionPanel.add(deleteButton);
+
+
+
+        JPanel eastWrapperPanel = new JPanel(new BorderLayout());
+        eastWrapperPanel.setOpaque(false);
+
+        eastWrapperPanel.setBorder(new EmptyBorder(0, 0, 0, 3));
+        eastWrapperPanel.add(gridActionPanel, BorderLayout.NORTH);
+
+
+
+        add(detailsPanel, BorderLayout.CENTER);
+        add(eastWrapperPanel, BorderLayout.EAST);
+
+
+        updateCustomName(detailsPanel, gbc, namePanel);
+        toggleMonthDayVisibility();
+    }
+
+    /**
+     * Updates layout based on custom name presence. Adds name rows and the timePanel.
+     */
+    private void updateCustomName(JPanel detailsPanel, GridBagConstraints gbc, JPanel namePanel) {
+        detailsPanel.removeAll();
+        if (item.getCustomName() != null && !item.getCustomName().isEmpty()) {
+            customNameLabel.setText(item.getCustomName());
+            gbc.gridy = 0; detailsPanel.add(customNameLabel, gbc);
+            gbc.gridy = 1; detailsPanel.add(namePanel, gbc);
+            timezoneNameLabel.setBorder(new EmptyBorder(5, 0, 0, 0));
+            gbc.gridy = 2; detailsPanel.add(timePanel, gbc);
+        } else {
+            gbc.gridy = 0; detailsPanel.add(namePanel, gbc);
+            timezoneNameLabel.setBorder(new EmptyBorder(0, 0, 0, 0));
+            gbc.gridy = 1; detailsPanel.add(timePanel, gbc);
+        }
+        detailsPanel.revalidate();
+        detailsPanel.repaint();
+    }
+
+
+    /**
+     * Adds or removes the calendar panel within the timePanel (in EAST position).
+     */
+    private void toggleMonthDayVisibility() {
+        boolean calendarVisible = false;
+
+        for (Component comp : timePanel.getComponents()) {
+            if (comp == calendarPanel) {
+                calendarVisible = true;
+                break;
+            }
+        }
+
+
+        if (item.getShowCalendar() != null && !calendarVisible) {
+
+            try {
+                ZoneId zoneId = ZoneId.of(item.getName());
+                ZonedDateTime zonedDateTime = ZonedDateTime.now(zoneId);
+                LocalDate currentDate = zonedDateTime.toLocalDate();
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM dd");
+                dayMonthLabel.setText(currentDate.format(formatter));
+            } catch (Exception e) {
+                dayMonthLabel.setText("?? ??");
+            }
+
+            timePanel.add(calendarPanel, BorderLayout.EAST);
+            timePanel.revalidate();
+            timePanel.repaint();
+        } else if (item.getShowCalendar() == null && calendarVisible) {
+
+            timePanel.remove(calendarPanel);
+            timePanel.revalidate();
+            timePanel.repaint();
+        }
+
+    }
+
+
+    /**
+     * Shows confirmation dialog for deleting the clock permanently.
+     */
+    private boolean deleteConfirm() {
+        int confirm = JOptionPane.showConfirmDialog(this,
+                DELETE_MESSAGE,
+                DELETE_TITLE, JOptionPane.YES_NO_OPTION, JOptionPane.WARNING_MESSAGE);
+        return confirm == JOptionPane.YES_OPTION;
+    }
+
+    /**
+     * Updates the displayed time and potentially the date. Called by the plugin scheduler.
+     */
+    public void updateTime() {
+
+        currentTimeLabel.setText(item.getCurrentTime());
+
+
+        if (item.getShowCalendar() != null) {
+            try {
+                ZoneId zoneId = ZoneId.of(item.getName());
+                ZonedDateTime zonedDateTime = ZonedDateTime.now(zoneId);
+                LocalDate currentDate = zonedDateTime.toLocalDate();
+                DateTimeFormatter formatter = DateTimeFormatter.ofPattern("MMM dd");
+                String currentFormattedDate = currentDate.format(formatter);
+                if (!dayMonthLabel.getText().equals(currentFormattedDate)) {
+                    dayMonthLabel.setText(currentFormattedDate);
+                }
+            } catch (Exception e) {
+                if (!dayMonthLabel.getText().equals("?? ??")) {
+                    dayMonthLabel.setText("?? ??");
+                }
+            }
+        }
+    }
+}
+package com.tzclocks;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class TZClocksPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(TZClocksPlugin.class);
+		RuneLite.main(args);
 	}
 }
