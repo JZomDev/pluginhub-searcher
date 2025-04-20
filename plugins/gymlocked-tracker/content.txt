@@ -1,0 +1,510 @@
+package tf.fox.gymlocked;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import java.util.Arrays;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.StatChanged;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ImageUtil;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Gymlocked Tracker",
+	description = "Tracks XP gained and be able to manually set available XP for special XP locked accounts.",
+	tags = {"xp", "tracker", "gymlocked", "snowflake"}
+)
+public class GymlockedPlugin extends Plugin
+{
+	@Getter @Setter private int availableXp;
+	@Getter @Setter private int xpUnlockedTotal;
+	@Getter @Setter private int lastTotalXp;
+
+	@Inject private Client client;
+	@Inject private GymlockedConfig config;
+	@Inject private ConfigManager configManager;
+	@Inject private GymlockedOverlay greyOverlay;
+	@Inject private GymlockedInfoOverlay infoOverlay;
+	@Inject private OverlayManager overlayManager;
+	@Inject private ClientToolbar clientToolbar;
+
+	private GymlockedPanel panel;
+	private NavigationButton navigationButton;
+	private boolean fetchXp = false;
+
+	@Provides
+	GymlockedConfig provideConfig(ConfigManager cm)
+	{
+		return cm.getConfig(GymlockedConfig.class);
+	}
+
+	@Override
+	protected void startUp() {
+		availableXp     = config.availableXp();
+		xpUnlockedTotal = config.xpUnlocked();
+		lastTotalXp     = config.lastTotalXp();
+
+
+		panel = injector.getInstance(GymlockedPanel.class);
+		panel.init(this);
+
+		navigationButton = NavigationButton
+				.builder()
+				.tooltip("Gymlocked")
+				.icon(ImageUtil.loadImageResource(getClass(), "/gym_icon.png"))
+				.panel(panel)
+				.build();
+
+		clientToolbar.addNavigation(navigationButton);
+		overlayManager.add(greyOverlay);
+		overlayManager.add(infoOverlay);
+	}
+
+	private int calculateTotalXp()
+	{
+		return Arrays.stream(Skill.values()).mapToInt(client::getSkillExperience).sum();
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		clientToolbar.removeNavigation(navigationButton);
+		overlayManager.remove(greyOverlay);
+		overlayManager.remove(infoOverlay);
+		persist();
+	}
+
+	void persist()
+	{
+		configManager.setConfiguration("gymlocked", "availableXp", availableXp);
+		configManager.setConfiguration("gymlocked", "xpUnlocked", xpUnlockedTotal);
+		configManager.setConfiguration("gymlocked", "lastTotalXp", lastTotalXp);
+	}
+
+	public void addUnlockedXp(int delta)
+	{
+		xpUnlockedTotal += delta;
+		availableXp     += delta;
+		persist();
+		panel.refresh();
+	}
+
+	public void resetCounters()
+	{
+		availableXp = 0;
+		xpUnlockedTotal = 0;
+		lastTotalXp = calculateTotalXp();
+		persist();
+		panel.refresh();
+	}
+
+    public boolean shouldGrey()
+	{
+		return availableXp < 0;
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		if (gameStateChanged.getGameState() == GameState.LOGGED_IN)
+		{
+			// xp is not available until after login is finished, so fetch it on the next gametick
+			fetchXp = true;
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick gameTick) {
+        if (!fetchXp) {
+            return;
+        }
+
+        int currentTotal = calculateTotalXp();
+
+        if (lastTotalXp == 0) {
+            lastTotalXp = currentTotal;
+            persist();
+        } else {
+            int offlineGain = currentTotal - lastTotalXp;
+            if (offlineGain > 0) {
+                availableXp -= offlineGain;
+            }
+            lastTotalXp = currentTotal;
+            persist();
+        }
+
+        fetchXp = false;
+    }
+
+	@Subscribe
+	public void onStatChanged(StatChanged statChanged)
+	{
+		if(fetchXp) return;
+
+		int currentTotal = calculateTotalXp();
+		int gained = currentTotal - lastTotalXp;
+		if (gained > 0)
+		{
+			availableXp -= gained;
+			lastTotalXp  = currentTotal;
+			persist();
+			panel.refresh();
+		}
+		else if (gained < 0) // should never happen but handle de‑leveling, etc.
+		{
+			lastTotalXp = currentTotal;
+			persist();
+		}
+	}
+}
+
+package tf.fox.gymlocked;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.FlatTextField;
+import net.runelite.client.util.SwingUtil;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+
+@Slf4j
+@Singleton
+public class GymlockedPanel extends PluginPanel
+{
+    private static final Dimension BTN_SIZE   = new Dimension(80, 26);
+    private static final String    TITLE_TEXT = "Gymlocked";
+
+    private final JLabel availableXpValue  = new JLabel("0");
+    private final JLabel totalUnlockedValue = new JLabel("0");
+    private final FlatTextField xpInputField = new FlatTextField();
+
+    private static final int[] QUICK_AMOUNTS = {1_000, 10_000};
+
+    private GymlockedPlugin plugin;
+
+    public void init(GymlockedPlugin plugin) {
+        this.plugin = plugin;
+        setLayout(new BorderLayout());
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        add(buildHeader(), BorderLayout.NORTH);
+        add(wrapScrollable(buildBody()), BorderLayout.CENTER);
+        refresh();
+    }
+
+    private JComponent buildHeader()
+    {
+        JPanel header = new JPanel(new BorderLayout());
+        header.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        header.setBorder(new EmptyBorder(8, 10, 6, 10));
+
+        JLabel title = new JLabel(TITLE_TEXT);
+        title.setFont(FontManager.getRunescapeBoldFont());
+        title.setForeground(Color.WHITE);
+
+        header.add(title, BorderLayout.WEST);
+        header.add(new JSeparator(SwingConstants.HORIZONTAL), BorderLayout.SOUTH);
+        return header;
+    }
+
+    private JPanel buildBody()
+    {
+        JPanel body = new JPanel();
+        body.setLayout(new BoxLayout(body, BoxLayout.Y_AXIS));
+        body.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        body.setBorder(new EmptyBorder(8, 10, 10, 10));
+
+        body.add(statsRow("Available XP:",  availableXpValue));
+        body.add(Box.createVerticalStrut(4));
+        body.add(statsRow("Total Unlocked:", totalUnlockedValue));
+        body.add(Box.createVerticalStrut(12));
+
+        body.add(quickAddBar());
+        body.add(Box.createVerticalStrut(8));
+
+        xpInputField.setBorder(new EmptyBorder(5, 7, 5, 7));
+        xpInputField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        xpInputField.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        body.add(xpInputField);
+
+        body.add(Box.createVerticalStrut(8));
+        body.add(buttonBar());
+
+        body.add(Box.createVerticalGlue());
+        return body;
+    }
+
+    private JPanel statsRow(String key, JLabel valueLabel)
+    {
+        JPanel row = new JPanel(new BorderLayout());
+        row.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        JLabel keyLabel = new JLabel(key);
+        keyLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+        keyLabel.setFont(FontManager.getRunescapeFont());
+
+        valueLabel.setForeground(Color.WHITE);
+        valueLabel.setFont(FontManager.getRunescapeSmallFont());
+
+        row.add(keyLabel, BorderLayout.WEST);
+        row.add(valueLabel, BorderLayout.EAST);
+        return row;
+    }
+
+    private JPanel quickAddBar()
+    {
+        JPanel bar = new JPanel(new GridLayout(1, 0, 6, 0));
+        bar.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        for (int amt : QUICK_AMOUNTS)
+        {
+            JButton btn = new JButton("+" + (amt / 1_000) + "k");
+            styleButton(btn);
+            btn.setPreferredSize(new Dimension(60, 24));
+            btn.setFont(FontManager.getRunescapeSmallFont());
+            btn.addActionListener(e -> plugin.addUnlockedXp(amt));
+            bar.add(btn);
+        }
+        return bar;
+    }
+
+    private JPanel buttonBar()
+    {
+        JPanel bar = new JPanel(new GridLayout(1, 0, 6, 0));
+        bar.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        JButton add = new JButton("Add XP");
+        styleButton(add);
+        add.addActionListener(e -> addXp());
+
+        JButton reset = new JButton("Reset");
+        styleButton(reset);
+        reset.addActionListener(e -> resetCounters());
+
+        bar.add(add);
+        bar.add(reset);
+        return bar;
+    }
+
+    private void styleButton(JButton btn)
+    {
+        SwingUtil.removeButtonDecorations(btn);
+        btn.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        btn.setForeground(Color.WHITE);
+        btn.setPreferredSize(BTN_SIZE);
+    }
+
+    private JScrollPane wrapScrollable(JComponent c)
+    {
+        JScrollPane sp = new JScrollPane(c,
+                ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED,
+                ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+        sp.setBorder(null);
+        sp.setViewportBorder(null);
+        return sp;
+    }
+
+    private void addXp()
+    {
+        String input = xpInputField.getText().replace(",", "").trim();
+        if (input.isEmpty())
+        {
+            return;
+        }
+
+        try
+        {
+            int xp = Integer.parseInt(input);
+            plugin.addUnlockedXp(xp);
+            xpInputField.setText("");
+        }
+        catch (NumberFormatException ignored) { }
+    }
+
+    private void resetCounters()
+    {
+        int result = JOptionPane.showConfirmDialog(
+                this,
+                "Are you sure you want to reset all counters?",
+                "Reset confirmation",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE);
+
+        if (result == JOptionPane.YES_OPTION)
+        {
+            plugin.resetCounters();
+        }
+    }
+
+    public void refresh()
+    {
+        availableXpValue.setText(format(plugin.getAvailableXp()));
+        totalUnlockedValue.setText(format(plugin.getXpUnlockedTotal()));
+
+        availableXpValue.setForeground(plugin.getAvailableXp() < 0
+                ? ColorScheme.PROGRESS_ERROR_COLOR
+                : Color.WHITE);
+    }
+
+    private static String format(int xp)
+    {
+        return String.format("%,d", xp);
+    }
+}
+
+package tf.fox.gymlocked;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("gymlocked")
+public interface GymlockedConfig extends Config
+{
+	@ConfigItem(
+			keyName = "availableXp",
+			name = "Available XP",
+			description = "Current available XP left."
+	)
+	default int availableXp() { return 0; }
+
+	@ConfigItem(
+			keyName = "xpUnlocked",
+			name = "XP Unlocked Total",
+			description = "Sum of all XP ever unlocked via the plugin."
+	)
+	default int xpUnlocked() { return 0; }
+
+	@ConfigItem(
+			keyName = "lastTotalXp",
+			name = "Last Total XP",
+			description = "Total account XP recorded on last client shutdown."
+	)
+	default int lastTotalXp() { return 0; }
+}
+
+package tf.fox.gymlocked;
+
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import javax.inject.Inject;
+import net.runelite.client.ui.overlay.*;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+public class GymlockedInfoOverlay extends OverlayPanel
+{
+    @Inject private GymlockedPlugin plugin;
+
+    private final static String AVAILABLE_XP = "Available XP:";
+    private final static String XP_UNLOCKED = "XP Unlocked:";
+
+    public GymlockedInfoOverlay()
+    {
+        setPosition(OverlayPosition.TOP_LEFT);
+    }
+
+    @Override
+    public Dimension render(Graphics2D g)
+    {
+        String availableXp = String.format("%,d", plugin.getAvailableXp());
+        String xpUnlocked = String.format("%,d", plugin.getXpUnlockedTotal());
+
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left(AVAILABLE_XP)
+                .leftColor(Color.WHITE)
+                .right(availableXp)
+                .rightColor(plugin.getAvailableXp() < 0 ? Color.RED : Color.WHITE)
+                .build());
+
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left(XP_UNLOCKED)
+                .leftColor(Color.WHITE)
+                .right(xpUnlocked)
+                .rightColor(plugin.getXpUnlockedTotal() < 0 ? Color.RED : Color.WHITE)
+                .build());
+
+        panelComponent.setPreferredSize(new Dimension(getLongestStringWidth(new String[] { AVAILABLE_XP + " " + availableXp, XP_UNLOCKED + " " + xpUnlocked }, g) + 25, 0));
+
+        return super.render(g);
+    }
+
+    private int getLongestStringWidth(String[] strings, Graphics2D graphics) {
+        int longest = 0;
+        for(String i: strings) {
+            int currentItemWidth = graphics.getFontMetrics().stringWidth(i);
+            if(currentItemWidth > longest) {
+                longest = currentItemWidth;
+            }
+        }
+        return longest;
+    }
+}
+package tf.fox.gymlocked;
+
+import java.awt.AlphaComposite;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import javax.inject.Inject;
+import net.runelite.api.Client;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+public class GymlockedOverlay extends Overlay
+{
+    @Inject private GymlockedPlugin plugin;
+    @Inject private Client client;
+
+    public GymlockedOverlay()
+    {
+        setPosition(OverlayPosition.DYNAMIC);
+    }
+
+    @Override
+    public Dimension render(Graphics2D g)
+    {
+        if (!plugin.shouldGrey())
+        {
+            return null;
+        }
+
+        int width  = client.getCanvasWidth();
+        int height = client.getCanvasHeight();
+        g.setComposite(AlphaComposite.SrcOver.derive(0.75f));
+        g.setColor(Color.GRAY);
+        g.fillRect(0, 0, width, height);
+        return null;
+    }
+}
+package tf.fox.gymlocked;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class GymlockedTrackerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(GymlockedPlugin.class);
+		RuneLite.main(args);
+	}
+}
