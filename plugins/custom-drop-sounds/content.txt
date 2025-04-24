@@ -1,5 +1,87 @@
 package org.CustomSounds;
 
+import lombok.extern.slf4j.Slf4j;
+
+import javax.sound.sampled.*;
+import java.io.File;
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+@Slf4j
+public class SoundManager {
+    private final ExecutorService audioExecutor = Executors.newSingleThreadExecutor();
+    private final Map<File, Clip> clipCache = new HashMap<>();
+    private final CustomSoundsConfig config;
+
+    public SoundManager(CustomSoundsConfig config) {
+        this.config = config;
+    }
+
+    public void playSound(File soundFile) {
+        if (!soundFile.exists()) {
+            log.warn("Sound file does not exist: {}", soundFile.getPath());
+            return;
+        }
+
+        audioExecutor.submit(() -> {
+            try {
+                Clip audioClip = getClip(soundFile);
+                if (audioClip.isRunning()) {
+                    audioClip.stop();
+                }
+                audioClip.setFramePosition(0);
+                setVolume(audioClip, config.masterVolume());
+                audioClip.start();
+            } catch (Exception e) {
+                log.warn("Error playing sound {}: {}", soundFile.getName(), e.getMessage());
+            }
+        });
+    }
+
+    private Clip getClip(File soundFile) throws IOException, UnsupportedAudioFileException, LineUnavailableException {
+        // Check if we have a cached clip
+        if (clipCache.containsKey(soundFile)) {
+            return clipCache.get(soundFile);
+        }
+
+        // Create a new clip
+        try (AudioInputStream audioInputStream = AudioSystem.getAudioInputStream(soundFile)) {
+            AudioFormat format = audioInputStream.getFormat();
+            DataLine.Info info = new DataLine.Info(Clip.class, format);
+            Clip clip = (Clip) AudioSystem.getLine(info);
+            clip.open(audioInputStream);
+
+            // Cache the clip for future use
+            clipCache.put(soundFile, clip);
+
+            return clip;
+        }
+    }
+
+    private void setVolume(Clip clip, int volume) {
+        float vol = volume / 100.0f;
+        if (clip.isControlSupported(FloatControl.Type.MASTER_GAIN)) {
+            FloatControl gainControl = (FloatControl) clip.getControl(FloatControl.Type.MASTER_GAIN);
+            gainControl.setValue(20.0f * (float) Math.log10(vol));
+        }
+    }
+
+    public void shutdown() {
+        audioExecutor.shutdown();
+        // Clean up all cached clips
+        for (Clip clip : clipCache.values()) {
+            if (clip.isOpen()) {
+                clip.close();
+            }
+        }
+        clipCache.clear();
+    }
+}
+package org.CustomSounds;
+
 import net.runelite.client.config.*;
 
 @ConfigGroup("CustomDropSounds")
@@ -41,7 +123,7 @@ public interface CustomSoundsConfig extends Config
 	)
 	default boolean highlightSound()
 	{
-		return true;
+		return false;
 	}
 
 	@ConfigItem(
@@ -61,7 +143,7 @@ public interface CustomSoundsConfig extends Config
 			section = "hitsplatToggleSection",
 			position = 3
 	)
-	default boolean maxHitBoolean() {return true;}
+	default boolean maxHitBoolean() {return false;}
 
 	@ConfigItem(
 			keyName = "announceDeath",
@@ -332,22 +414,17 @@ public interface CustomSoundsConfig extends Config
 package org.CustomSounds;
 import com.google.common.collect.ImmutableList;
 import com.google.inject.Provides;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
+
+import java.io.*;
 import java.util.List;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.regex.Pattern;
 import javax.inject.Inject;
-import javax.sound.sampled.AudioFormat;
-import javax.sound.sampled.AudioInputStream;
-import javax.sound.sampled.AudioSystem;
 import javax.sound.sampled.Clip;
-import javax.sound.sampled.DataLine;
 import javax.sound.sampled.FloatControl;
 import javax.sound.sampled.LineUnavailableException;
 import javax.sound.sampled.UnsupportedAudioFileException;
+
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.events.ActorDeath;
@@ -367,6 +444,8 @@ import net.runelite.client.plugins.grounditems.GroundItemsPlugin;
 import net.runelite.client.plugins.loottracker.LootReceived;
 import net.runelite.client.util.Text;
 
+import net.runelite.client.audio.AudioPlayer;
+
 @Slf4j
 @PluginDescriptor(
 		name = "Custom Sounds",
@@ -378,6 +457,9 @@ public class CustomSoundsPlugin extends Plugin
 {
 	@Inject
 	private CustomSoundsConfig config;
+
+	@Inject
+	private AudioPlayer audioPlayer;
 
 	@Provides
 	CustomSoundsConfig provideConfig(ConfigManager configManager)
@@ -394,7 +476,9 @@ public class CustomSoundsPlugin extends Plugin
 	@Inject
 	private ItemManager itemManager;
 
-	private static final String COLLOG = "New item added to your collection log";
+
+	private static final Pattern COLLECTION_LOG_ITEM_REGEX = Pattern.compile("New item added to your collection log:.*");
+
 
 	private static final ImmutableList<String> PET_MESSAGES = ImmutableList.of("You have a funny feeling like you're being followed",
 			"You feel something weird sneaking into your backpack",
@@ -443,7 +527,8 @@ public class CustomSoundsPlugin extends Plugin
 	private List<String> highlightedItemsList = new CopyOnWriteArrayList<>();
 	private static final long CLIP_TIME_UNLOADED = -2;
 
-	private long lastClipTime = CLIP_TIME_UNLOADED;
+
+	private SoundManager soundManager;
 	private Clip clip = null;
 
 	@Override
@@ -456,8 +541,6 @@ public class CustomSoundsPlugin extends Plugin
 	@Override
 	protected void shutDown()
 	{
-		clip.close();
-		clip = null;
 		highlightedItemsList = null;
 	}
 
@@ -556,28 +639,33 @@ public class CustomSoundsPlugin extends Plugin
 
 	private void playSound(File f)
 	{
-		long currentTime = System.currentTimeMillis();
-		if (clip == null || !clip.isOpen() || currentTime != lastClipTime) {
-			lastClipTime = currentTime;
-			try
-			{
-				// making sure last clip closes so we don't get multiple instances
-				if (clip != null && clip.isOpen()) clip.close();
-
-				AudioInputStream is = AudioSystem.getAudioInputStream(f);
-				AudioFormat format = is.getFormat();
-				DataLine.Info info = new DataLine.Info(Clip.class, format);
-				clip = (Clip) AudioSystem.getLine(info);
-				clip.open(is);
-				setVolume(config.masterVolume());
-				clip.start();
-			}
-			catch (LineUnavailableException | UnsupportedAudioFileException | IOException e)
-			{
-				log.warn("Sound file error", e);
-				lastClipTime = CLIP_TIME_UNLOADED;
-			}
+		if (!f.exists()) {
+			log.warn("Sound file does not exist: {}", f.getPath());
+			return;
 		}
+		try {
+			// Convert percentage (0-100) to gain in dB
+			float gainInDecibels = convertToDecibels(config.masterVolume());
+
+			// Call the instance method
+			audioPlayer.play(f, gainInDecibels);
+		} catch (IOException | UnsupportedAudioFileException | LineUnavailableException e) {
+			log.warn("Error playing sound {}: {}", f.getName(), e.getMessage());
+		}
+
+	}
+
+	private float convertToDecibels(int volumePercentage) {
+		// Avoid log(0)
+		if (volumePercentage <= 0) {
+			return -80.0f; // Very quiet
+		}
+
+		// Convert percentage to a ratio (0.0 to 1.0)
+		float ratio = volumePercentage / 100.0f;
+
+		// Convert ratio to decibels
+		return 20f * (float) Math.log10(ratio);
 	}
 
 	// sets volume using dB to linear conversion
@@ -662,7 +750,7 @@ public class CustomSoundsPlugin extends Plugin
 		{
 			return;
 		}
-		if (config.announceCollectionLog() && COLLOG.contains(chatMessage)){
+		if (config.announceCollectionLog() && COLLECTION_LOG_ITEM_REGEX.matcher(event.getMessage()).matches()){
 			playSound(COLLECTIONLOG_SOUND_FILE);
 		}
 		else if (config.petSound() && PET_MESSAGES.stream().anyMatch(chatMessage::contains))
