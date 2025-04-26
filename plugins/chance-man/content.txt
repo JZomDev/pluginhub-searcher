@@ -155,43 +155,76 @@ package com.chanceman;
 
 import com.chanceman.account.AccountManager;
 import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 
 import javax.inject.Inject;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
+import javax.inject.Singleton;
+import java.io.BufferedWriter;
 import java.io.IOException;
-import java.lang.reflect.Type;
-import java.nio.file.Path;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
-import java.util.Set;
+import java.io.Reader;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 
 import static net.runelite.client.RuneLite.RUNELITE_DIR;
 
 /**
- * Manages the set of rolled items.
- * This class persists the rolled item IDs to a JSON file so that rolled items remain tracked across sessions.
+ * Manages the set of rolled items with atomic persistence.
+ * Provides thread-safe operations for marking items as rolled,
+ * loading from and saving to disk with backups and atomic moves.
  */
 @Slf4j
+@Singleton
 public class RolledItemsManager
 {
+    private static final int MAX_BACKUPS = 10;
     private final Set<Integer> rolledItems = Collections.synchronizedSet(new LinkedHashSet<>());
+
     @Inject private AccountManager accountManager;
     @Inject private Gson gson;
     @Setter private ExecutorService executor;
 
-    private File getFile()
+    /**
+     * Atomically moves source→target, but if ATOMIC_MOVE fails retries a normal move with REPLACE_EXISTING.
+     */
+    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
     {
-        return Path.of(RUNELITE_DIR.getPath(), "chanceman", accountManager.getPlayerName(), "chanceman_rolled.json").toFile();
+        try
+        {
+            Files.move(source, target, opts);
+        }
+        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
+        {
+            // remove ATOMIC_MOVE, add REPLACE_EXISTING
+            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
+            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
+            fallback.add(StandardCopyOption.REPLACE_EXISTING);
+            Files.move(source, target, fallback.toArray(new CopyOption[0]));
+        }
     }
 
-	/**
+    /**
+     * Builds the file path for the current account's rolled-items JSON file.
+     *
+     * @return path to the rolled items JSON file
+     */
+    private Path getFilePath() throws IOException
+    {
+        String name = accountManager.getPlayerName();
+        if (name == null)
+        {
+            throw new IOException("Player name is null");
+        }
+        Path dir = RUNELITE_DIR.toPath()
+                .resolve("chanceman")
+                .resolve(name);
+        Files.createDirectories(dir);
+        return dir.resolve("chanceman_rolled.json");
+    }
+
+      /**
      * Checks if an item has been rolled.
      *
      * @param itemId The item ID.
@@ -203,56 +236,110 @@ public class RolledItemsManager
     }
 
     /**
-     * Marks an item as rolled and saves the state.
+     * Marks an item as rolled and triggers an asynchronous save.
      *
      * @param itemId The item ID to mark as rolled.
      */
     public void markRolled(int itemId)
     {
-        rolledItems.add(itemId);
-        saveRolledItems();
+        if (rolledItems.add(itemId))
+        {
+            saveRolledItems();
+        }
     }
 
     /**
-     * Loads the set of rolled items from the JSON file.
+     * Loads the set of rolled items from disk into memory.
+     * If the file does not exist or is empty, initializes an empty set.
      */
     public void loadRolledItems()
     {
+        if (accountManager.getPlayerName() == null)
+        {
+            return;
+        }
+
         rolledItems.clear();
-        executor.submit(() -> {
-            File file = getFile();
-            if (!file.exists())
+        Path file;
+        try
+        {
+            file = getFilePath();
+        }
+        catch (IOException ioe)
+        {
+            return;
+        }
+
+        if (!Files.exists(file))
+        {
+            // first run: write an empty file
+            saveRolledItems();
+            return;
+        }
+
+        try (Reader r = Files.newBufferedReader(file))
+        {
+            Set<Integer> loaded = gson.fromJson(r,
+                    new com.google.gson.reflect.TypeToken<Set<Integer>>() {}.getType());
+            if (loaded != null)
             {
-                file.getParentFile().mkdirs();
-                return;
+                rolledItems.addAll(loaded);
             }
-            try (FileReader reader = new FileReader(file))
-            {
-                Type setType = new TypeToken<Set<Integer>>() {}.getType();
-                Set<Integer> loaded = gson.fromJson(reader, setType);
-                if (loaded != null)
-                {
-                    rolledItems.addAll(loaded);
-                }
-            }
-            catch (IOException e)
-            {
-                log.error("Error loading rolled items", e);
-            }
-        });
+        }
+        catch (IOException e)
+        {
+            log.error("Error loading rolled items", e);
+        }
     }
 
     /**
-     * Saves the current set of rolled items to the JSON file.
+     * Saves the current set of rolled items to disk.
+     * Uses a temporary file and backups for atomicity and data safety.
      */
-    public synchronized void saveRolledItems()
+    public void saveRolledItems()
     {
-        executor.submit(() -> {
-            File file = getFile();
-            file.getParentFile().mkdirs();
-            try (FileWriter writer = new FileWriter(file))
+        executor.submit(() ->
+        {
+            Path file;
+            try
             {
-                gson.toJson(rolledItems, writer);
+                file = getFilePath();
+            }
+            catch (IOException ioe)
+            {
+                log.error("Could not resolve rolled‑items path", ioe);
+                return;
+            }
+
+            try
+            {
+                // 1) backup current .json
+                if (Files.exists(file))
+                {
+                    Path backups = file.getParent().resolve("backups");
+                    Files.createDirectories(backups);
+                    String ts = new SimpleDateFormat("yyyyMMddHHmmss").format(new Date());
+                    Path bak = backups.resolve(file.getFileName() + "." + ts + ".bak");
+                    safeMove(file, bak,
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                    // prune old backups…
+                    Files.list(backups)
+                            .filter(p -> p.getFileName().toString().startsWith(file.getFileName() + "."))
+                            .sorted(Comparator.comparing(Path::getFileName).reversed())
+                            .skip(MAX_BACKUPS)
+                            .forEach(p -> p.toFile().delete());
+                }
+
+                // 2) write new JSON to .tmp
+                Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+                try (BufferedWriter w = Files.newBufferedWriter(tmp))
+                {
+                    gson.toJson(rolledItems, w);
+                }
+
+                // 3) atomically replace .json
+                safeMove(tmp, file, StandardCopyOption.ATOMIC_MOVE);
             }
             catch (IOException e)
             {
@@ -271,7 +358,6 @@ public class RolledItemsManager
         return Collections.unmodifiableSet(rolledItems);
     }
 }
-
 package com.chanceman;
 
 
@@ -387,7 +473,6 @@ public class ChanceManPlugin extends Plugin
                                     .panel(chanceManPanel)
                                     .build();
         clientToolbar.addNavigation(navButton);
-        overlayManager.add(chanceManOverlay);
 
         accountManager.init();
     }
@@ -1470,111 +1555,172 @@ public class ChanceManPanel extends PluginPanel
 package com.chanceman;
 
 import com.chanceman.account.AccountManager;
-import com.chanceman.filters.PoisonWeapons;
 import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
-import java.io.File;
-import java.io.FileReader;
-import java.io.FileWriter;
+import java.io.BufferedWriter;
 import java.io.IOException;
-import java.lang.reflect.Type;
-import java.nio.file.Path;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.LinkedHashSet;
-import java.util.Set;
+import java.io.Reader;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
+import java.util.*;
 import java.util.concurrent.ExecutorService;
 
 import static net.runelite.client.RuneLite.RUNELITE_DIR;
 
 /**
- * Manages the set of unlocked items.
- * This class persists the unlocked item IDs to a JSON file so that items remain unlocked across sessions.
- * It uses an asynchronous executor for saving the data.
+ * Manages the set of unlocked items with robust, atomic persistence and 10‑file backup rotation.
  */
 @Slf4j
 @Singleton
 public class UnlockedItemsManager
 {
+    private static final int MAX_BACKUPS = 10;
+
     private final Set<Integer> unlockedItems = Collections.synchronizedSet(new LinkedHashSet<>());
+
     @Inject private AccountManager accountManager;
     @Inject private Gson gson;
     @Setter private ExecutorService executor;
 
-    public boolean ready() { return accountManager.getPlayerName() != null; }
-
-    private File getFile()
+    public boolean ready()
     {
-        return Path.of(RUNELITE_DIR.getPath(), "chanceman", accountManager.getPlayerName(), "chanceman_unlocked.json").toFile();
+        return accountManager.getPlayerName() != null;
     }
 
-	/**
-     * Checks if an item is unlocked.
-     *
-     * @param itemId The item ID.
-     * @return true if the item is unlocked, false otherwise.
+    /**
+     * Atomically moves source→target, but if ATOMIC_MOVE fails retries a normal move with REPLACE_EXISTING.
      */
+    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
+    {
+        try
+        {
+            Files.move(source, target, opts);
+        }
+        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
+        {
+            // retry without ATOMIC_MOVE but with REPLACE_EXISTING
+            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
+            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
+            fallback.add(StandardCopyOption.REPLACE_EXISTING);
+            Files.move(source, target, fallback.toArray(new CopyOption[0]));
+        }
+    }
+
+    private Path getFilePath() throws IOException
+    {
+        String name = accountManager.getPlayerName();
+        if (name == null)
+        {
+            throw new IOException("Player name is null");
+        }
+        Path dir = RUNELITE_DIR.toPath()
+                .resolve("chanceman")
+                .resolve(name);
+        Files.createDirectories(dir);
+        return dir.resolve("chanceman_unlocked.json");
+    }
+
     public boolean isUnlocked(int itemId)
     {
         return unlockedItems.contains(itemId);
     }
 
-    /**
-     * Unlocks an item and saves the state.
-     *
-     * @param itemId The item ID to unlock.
-     */
     public void unlockItem(int itemId)
     {
-        unlockedItems.add(itemId);
-        saveUnlockedItems();
+        if (unlockedItems.add(itemId))
+        {
+            saveUnlockedItems();
+        }
     }
 
-    /**
-     * Loads the set of unlocked items from the JSON file.
-     */
     public void loadUnlockedItems()
     {
+        if (!ready())
+        {
+            return;
+        }
+
         unlockedItems.clear();
-        executor.submit(() -> {
-            File file = getFile();
-            if (!file.exists())
+        Path file;
+        try
+        {
+            file = getFilePath();
+        }
+        catch (IOException ioe)
+        {
+            return;
+        }
+
+        if (!Files.exists(file))
+        {
+            // first‑run: empty set → write an empty JSON file
+            saveUnlockedItems();
+            return;
+        }
+
+        try (Reader r = Files.newBufferedReader(file))
+        {
+            Set<Integer> loaded = gson.fromJson(r,
+                    new com.google.gson.reflect.TypeToken<Set<Integer>>() {}.getType());
+            if (loaded != null)
             {
-                file.getParentFile().mkdirs();
-                return;
+                unlockedItems.addAll(loaded);
             }
-            try (FileReader reader = new FileReader(file))
-            {
-                Type setType = new TypeToken<Set<Integer>>() {}.getType();
-                Set<Integer> loaded = gson.fromJson(reader, setType);
-                if (loaded != null)
-                {
-                    unlockedItems.addAll(loaded);
-                }
-            }
-            catch (IOException e)
-            {
-                log.error("Error loading unlocked items", e);
-            }
-        });
+        }
+        catch (IOException e)
+        {
+            log.error("Error loading unlocked items", e);
+        }
     }
 
-    /**
-     * Saves the current set of unlocked items asynchronously to the JSON file.
-     */
-    public synchronized void saveUnlockedItems()
+    public void saveUnlockedItems()
     {
-        executor.submit(() -> {
-            File file = getFile();
-            file.getParentFile().mkdirs();
-            try (FileWriter writer = new FileWriter(file))
+        executor.submit(() ->
+        {
+            Path file;
+            try
             {
-                gson.toJson(unlockedItems, writer);
+                file = getFilePath();
+            }
+            catch (IOException ioe)
+            {
+                log.error("Could not resolve file path", ioe);
+                return;
+            }
+
+            try
+            {
+                // 1) rotate .json → .bak
+                if (Files.exists(file))
+                {
+                    Path backups = file.getParent().resolve("backups");
+                    Files.createDirectories(backups);
+                    String ts = new SimpleDateFormat("yyyyMMddHHmmss").format(new Date());
+                    Path bak = backups.resolve(file.getFileName() + "." + ts + ".bak");
+                    safeMove(file, bak,
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                    // prune older backups…
+                    Files.list(backups)
+                            .filter(p -> p.getFileName().toString().startsWith(file.getFileName() + "."))
+                            .sorted(Comparator.comparing(Path::getFileName).reversed())
+                            .skip(MAX_BACKUPS)
+                            .forEach(p -> p.toFile().delete());
+                }
+
+                // 2) write new JSON to .tmp
+                Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+                try (BufferedWriter w = Files.newBufferedWriter(tmp))
+                {
+                    gson.toJson(unlockedItems, w);
+                }
+
+                // 3) atomically replace .json with .tmp
+                safeMove(tmp, file, StandardCopyOption.ATOMIC_MOVE);
             }
             catch (IOException e)
             {
@@ -1582,6 +1728,7 @@ public class UnlockedItemsManager
             }
         });
     }
+
 
     /**
      * Retrieves an unmodifiable set of unlocked item IDs.
@@ -3030,11 +3177,11 @@ public class ActionHandler {
 		// Always allow "Drop"
 		if (option.equalsIgnoreCase("drop"))
 			return true;
-		if (option.equalsIgnoreCase("clean")) {
+		if (option.equalsIgnoreCase("clean") || option.equalsIgnoreCase("rub"))
+		{
+			if (!plugin.isInPlay(id)) { return true; }
 			return unlockedItemsManager.isUnlocked(id);
 		}
-		if (option.equalsIgnoreCase("Rub"))
-			return unlockedItemsManager.isUnlocked(id);
 		if (SkillOp.isSkillOp(option))
 			return restrictions.isSkillOpEnabled(option);
 		else if (Spell.isSpell(target))
@@ -3042,7 +3189,8 @@ public class ActionHandler {
 
 		boolean enabled;
 		if (enabledUiOpen()) {
-			enabled = option.startsWith("Deposit") || option.startsWith("Examine") || option.startsWith("Withdraw");
+			enabled = option.startsWith("Deposit") || option.startsWith("Examine") || option.startsWith("Withdraw")
+					|| option.startsWith("Release");
 		} else {
 			enabled = !disabledActions.contains(action);
 		}
