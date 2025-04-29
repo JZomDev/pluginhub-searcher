@@ -5,18 +5,22 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.CompletableFuture;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Actor;
-import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.Hitsplat;
 import net.runelite.api.NPC;
-import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.NpcSpawned;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.HitsplatApplied;
+import net.runelite.api.events.CommandExecuted;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -35,7 +39,7 @@ import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
 public class NpcMaxHitPlugin extends Plugin
 {
 	private Actor player;
-	private long lastHitsplatTime = 0;
+	private long lastDisplayTime = 0;
 	private ExecutorService executor;
 
 	@Inject
@@ -131,6 +135,93 @@ public class NpcMaxHitPlugin extends Plugin
 		}
 	}
 
+	@Subscribe
+	public void onNpcSpawned(NpcSpawned event)
+	{
+		NPC npc = event.getNpc();
+
+		if (!config.showInMenu() || event.getActor().getCombatLevel() <= 0 || shouldFilterNpc(npc) || !npc.getComposition().isInteractible())
+		{
+			return;
+		}
+		fetchMaxHitData(npc.getId());
+	}
+
+	@Subscribe
+	public void onMenuEntryAdded(MenuEntryAdded event)
+	{
+		if (!config.showInMenu() && !config.displayMaxHitOnExamine())
+		{
+			return;
+		}
+
+		MenuEntry menuEntry = event.getMenuEntry();
+		NPC npc = menuEntry.getNpc();
+		if (npc == null || npc.getCombatLevel() <= 0 || shouldFilterNpc(npc))
+		{
+			return;
+		}
+
+		boolean isAttackOption = event.getType() == MenuAction.NPC_SECOND_OPTION.getId() && event.getOption().equals("Attack");
+		boolean isExamineOption = event.getType() == MenuAction.EXAMINE_NPC.getId();
+
+		// on examine click action
+		if (isExamineOption && config.displayMaxHitOnExamine())
+		{
+			List<NpcMaxHitData> npcMaxHitData = wikiService.getMaxHitData(npc.getId());
+			if (!npcMaxHitData.isEmpty())
+			{
+				menuEntry.onClick(me -> {
+					lastDisplayTime = System.currentTimeMillis();
+					displayMaxHitData(npcMaxHitData);
+				});
+			}
+		}
+
+		// add max hit to enabled menu options
+		if (config.showInMenu() &&
+			((isAttackOption && config.showOnAttackOption()) ||
+				(isExamineOption && config.showOnExamineOption())))
+		{
+			List<NpcMaxHitData> npcMaxHitData = wikiService.getMaxHitData(npc.getId());
+			if (!npcMaxHitData.isEmpty())
+			{
+				int maxHit = npcMaxHitData.get(0).getHighestMaxHit();
+				// skip if max hit is not computed i.e. -1
+				if (maxHit < 0)
+				{
+					return;
+				}
+				String maxHitText = config.menuDisplayStyle() == NpcMaxHitConfig.MenuDisplayStyle.NUMBER_ONLY ?
+					String.format(" (%d)", maxHit) :
+					String.format(" (Max Hit: %d)", maxHit);
+
+				String target = event.getTarget();
+				String colorTag = "<col=" + Integer.toHexString(config.menuMaxHitColor().getRGB() & 0xFFFFFF) + ">";
+				String newTarget = target + colorTag + maxHitText + "</col>";
+				menuEntry.setTarget(newTarget);
+			}
+		}
+	}
+
+	private void displayMaxHitData(List<NpcMaxHitData> dataList)
+	{
+		if (dataList.isEmpty())
+		{
+			return;
+		}
+
+		clientThread.invoke(() -> {
+			overlay.updateNpcDataList(dataList);
+			updateInfoBox(dataList);
+		});
+	}
+
+	private CompletableFuture<List<NpcMaxHitData>> fetchMaxHitData(int npcId)
+	{
+		return CompletableFuture.supplyAsync(() -> wikiService.getMaxHitData(npcId), executor);
+	}
+
 	private boolean shouldFilterNpc(NPC npc)
 	{
 		int threshold = config.combatLevelThreshold();
@@ -182,7 +273,7 @@ public class NpcMaxHitPlugin extends Plugin
 		}
 
 		// Update last hitsplat time
-		lastHitsplatTime = System.currentTimeMillis();
+		lastDisplayTime = System.currentTimeMillis();
 
 		// dont attempt to re-fetch data if the same npc is being attacked and overlay includes the npc
 		if (player.getInteracting() == npc && overlay.getCurrentNpcList().stream().anyMatch(data -> data.getNpcId() == npc.getId()))
@@ -190,22 +281,7 @@ public class NpcMaxHitPlugin extends Plugin
 			return;
 		}
 
-		fetchAndDisplayMaxHitData(npc.getId());
-	}
-
-	public void fetchAndDisplayMaxHitData(int npcId)
-	{
-		executor.submit(() -> {
-			List<NpcMaxHitData> dataList = wikiService.getMaxHitData(npcId);
-
-			if (!dataList.isEmpty())
-			{
-				clientThread.invoke(() -> {
-					overlay.updateNpcDataList(dataList);
-					updateInfoBox(dataList);
-				});
-			}
-		});
+		fetchMaxHitData(npc.getId()).thenAccept(this::displayMaxHitData);
 	}
 
 	@Subscribe
@@ -213,7 +289,7 @@ public class NpcMaxHitPlugin extends Plugin
 	{
 		long currentTime = System.currentTimeMillis();
 		int timeoutMs = config.timeout() * 1000;
-		if (currentTime - lastHitsplatTime >= timeoutMs)
+		if (currentTime - lastDisplayTime >= timeoutMs)
 		{
 			if (!overlay.getCurrentNpcList().isEmpty())
 			{
@@ -225,20 +301,35 @@ public class NpcMaxHitPlugin extends Plugin
 		}
 	}
 
-//	@Subscribe
-//	public void onCommandExecuted(CommandExecuted event)
-//	{
-//		String command = event.getCommand().toLowerCase();
-//		if (!command.equals("maxhit"))
-//		{
-//			return;
-//		}
-//
-//		String[] arg = event.getArguments();
-//		int npcId = Integer.parseInt(arg[0]);
-//
-//		fetchAndDisplayMaxHitData(npcId);
-//	}
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted event)
+	{
+		String command = event.getCommand().toLowerCase();
+		// ::npcmaxhit 3029
+		if (!command.equals("npcmaxhit"))
+		{
+			return;
+		}
+
+		String[] args = event.getArguments();
+		if (args.length == 0)
+		{
+			return;
+		}
+
+		try
+		{
+			int npcId = Integer.parseInt(args[0]);
+
+			lastDisplayTime = System.currentTimeMillis();
+
+			fetchMaxHitData(npcId).thenAccept(this::displayMaxHitData);
+		}
+		catch (NumberFormatException e)
+		{
+			log.warn("Invalid command arguments", e);
+		}
+	}
 
 	@Provides
 	NpcMaxHitConfig provideConfig(ConfigManager configManager)
@@ -317,7 +408,7 @@ public class NpcMaxHitOverlay extends OverlayPanel
 			{
 				panelComponent.getChildren().add(LineComponent.builder()
 					.left("Max Hit")
-					.right(Integer.toString(data.getHighestMaxHit()))
+					.right(data.getHighestMaxHit() >= 0 ? String.valueOf(data.getHighestMaxHit()) : "?")
 					.leftColor(config.overlayTextColor())
 					.rightColor(config.overlayValueColor())
 					.build());
@@ -338,6 +429,7 @@ public class NpcMaxHitOverlay extends OverlayPanel
 		return super.render(graphics);
 	}
 }
+
 
 package com.npcmaxhit;
 
@@ -526,6 +618,14 @@ public interface NpcMaxHitConfig extends Config
 	)
 	String infoboxSection = "infobox";
 
+	@ConfigSection(
+		name = "Menu Options",
+		description = "Menu entry appearance settings",
+		position = 3,
+		closedByDefault = true
+	)
+	String menuSection = "menu";
+
 	@ConfigItem(
 		keyName = "showOverlay",
 		name = "Show Overlay",
@@ -551,11 +651,35 @@ public interface NpcMaxHitConfig extends Config
 	}
 
 	@ConfigItem(
+		keyName = "showInMenu",
+		name = "Show in NPC Right-click Menus",
+		description = "Show the highest max hit value next to NPC menu options (e.g. Attack, Examine) <br>Can be configured in the Menu Options section.",
+		section = generalSection,
+		position = 2
+	)
+	default boolean showInMenu()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "displayMaxHitOnExamine",
+		name = "Lookup on Examine",
+		description = "Display max hit information when examining NPCs",
+		section = generalSection,
+		position = 3
+	)
+	default boolean displayMaxHitOnExamine()
+	{
+		return true;
+	}
+
+	@ConfigItem(
 		keyName = "timeout",
 		name = "Display Timeout",
 		description = "Time in seconds before the displays are hidden after the player stops attacking",
 		section = generalSection,
-		position = 2
+		position = 4
 	)
 	default int timeout()
 	{
@@ -567,7 +691,7 @@ public interface NpcMaxHitConfig extends Config
 		name = "Level Threshold",
 		description = "Will not display max hits for NPCs below this combat level (0 to disable)",
 		section = generalSection,
-		position = 3
+		position = 5
 	)
 	default int combatLevelThreshold()
 	{
@@ -579,7 +703,7 @@ public interface NpcMaxHitConfig extends Config
 		name = "Filtered NPC IDs",
 		description = "Will not display max hits for these NPCs (comma-separated list of IDs, e.g. 3029,12191,2042)",
 		section = generalSection,
-		position = 4
+		position = 6
 	)
 	default String filteredNpcIds()
 	{
@@ -756,7 +880,7 @@ public interface NpcMaxHitConfig extends Config
 	@ConfigItem(
 		keyName = "infoboxTooltipTextColor",
 		name = "Tooltip Text Color",
-		description = "Color of the text in the infobox tooltip (NPC name, attack style/type)",
+		description = "Color of the text in the infobox tooltip (attack style/type)",
 		section = infoboxSection,
 		position = 98
 	)
@@ -777,6 +901,73 @@ public interface NpcMaxHitConfig extends Config
 		return Color.YELLOW;
 	}
 
+	@ConfigItem(
+		keyName = "showOnAttackOption",
+		name = "Show on Attack Option",
+		description = "Show max hit on the Attack menu option",
+		section = menuSection,
+		position = 0
+	)
+	default boolean showOnAttackOption()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "showOnExamineOption",
+		name = "Show on Examine Option",
+		description = "Show max hit on the Examine menu option",
+		section = menuSection,
+		position = 1
+	)
+	default boolean showOnExamineOption()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "menuDisplayStyle",
+		name = "Display Style",
+		description = "How to display the max hit in menu entries",
+		section = menuSection,
+		position = 2
+	)
+	default MenuDisplayStyle menuDisplayStyle()
+	{
+		return MenuDisplayStyle.WITH_LABEL;
+	}
+
+	@ConfigItem(
+		keyName = "menuMaxHitColor",
+		name = "Menu Max Hit Color",
+		description = "Color of the max hit value shown in menu entries",
+		section = menuSection,
+		position = 3
+	)
+	default Color menuMaxHitColor()
+	{
+		return Color.YELLOW;
+	}
+
+	@Getter
+	enum MenuDisplayStyle
+	{
+		NUMBER_ONLY("Number Only"),
+		WITH_LABEL("With Label");
+
+		private final String name;
+
+		MenuDisplayStyle(String name)
+		{
+			this.name = name;
+		}
+
+		@Override
+		public String toString()
+		{
+			return name;
+		}
+	}
 }
 
 package com.npcmaxhit;
@@ -827,10 +1018,12 @@ public class NpcMaxHitInfoBox extends InfoBox
 		g.drawImage(baseImage, 0, 0, null);
 
 		final FontMetrics metrics = g.getFontMetrics();
-		String text = String.valueOf(dataList.stream()
+		int maxHit = dataList.stream()
 			.mapToInt(NpcMaxHitData::getHighestMaxHit)
 			.max()
-			.orElse(0));
+			.orElse(-1);
+
+		String text = maxHit >= 0 ? String.valueOf(maxHit) : "?";
 
 		int x = image.getWidth() / 2 - metrics.stringWidth(text) / 2;
 		int y = image.getHeight() / 2 - metrics.getHeight() / 2 + metrics.getAscent() + 2;
@@ -888,6 +1081,7 @@ public class NpcMaxHitInfoBox extends InfoBox
 		return config.showInfobox();
 	}
 }
+
 package com.npcmaxhit;
 
 import java.util.Arrays;
@@ -899,10 +1093,17 @@ import lombok.Value;
 @Value
 public class NpcMaxHitData
 {
+	private static final int MAX_HIT_LENGTH = 25;
+
 	String npcName;
 	String version;
 	int npcId;
 	Map<String, String> maxHits;
+
+	private String truncateHitValue(String value)
+	{
+		return value.length() > MAX_HIT_LENGTH ? value.substring(0, MAX_HIT_LENGTH) + "..." : value;
+	}
 
 	public NpcMaxHitData(String fullName, int npcId, Map<String, String> maxHits)
 	{
@@ -911,7 +1112,7 @@ public class NpcMaxHitData
 		this.version = parts.length > 1 ? parts[1].split(",")[0] : null;
 		this.npcId = npcId;
 		this.maxHits = new TreeMap<>((a, b) -> toTitleCase(a).compareTo(toTitleCase(b)));
-		maxHits.forEach((style, value) -> this.maxHits.put(toTitleCase(style), value));
+		maxHits.forEach((style, value) -> this.maxHits.put(toTitleCase(style), truncateHitValue(value)));
 	}
 
 	private String toTitleCase(String input)
@@ -949,12 +1150,20 @@ public class NpcMaxHitData
 			.mapToInt(s -> {
 				try
 				{
-					if (s.contains("+")) // e.g. NpcID.FRAGMENT_OF_SEREN
+					s = s.replaceAll("\\s+", ""); // remove any whitespace
+					if (s.contains("+")) // 12+3 -> 15
 					{
-						// Split on + and sum all numbers
 						return Arrays.stream(s.split("\\+"))
 							.mapToInt(num -> Integer.parseInt(num.trim()))
 							.sum();
+					}
+					else if (s.contains("x")) // 12x3 -> 36
+					{
+						String[] parts = s.split("x");
+						if (parts.length == 2)
+						{
+							return Integer.parseInt(parts[0].trim()) * Integer.parseInt(parts[1].trim());
+						}
 					}
 					return Integer.parseInt(s.trim());
 				}
@@ -964,7 +1173,7 @@ public class NpcMaxHitData
 				}
 			})
 			.max()
-			.orElse(0);
+			.orElse(-1);
 	}
 }
 
