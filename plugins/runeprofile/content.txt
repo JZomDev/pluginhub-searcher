@@ -1,30 +1,285 @@
+/*
+ * Copyright (c) 2018, John Pettenger
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 package com.runeprofile.utils;
 
-import java.text.ParseException;
-import java.text.SimpleDateFormat;
+import com.google.common.collect.EvictingQueue;
 
-public class DateHeader {
+import java.awt.event.KeyEvent;
+import java.awt.event.KeyListener;
+import java.util.Arrays;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.regex.Pattern;
+import javax.inject.Singleton;
+import javax.swing.SwingUtilities;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.Document;
+import javax.swing.text.JTextComponent;
 
-	private static SimpleDateFormat headerFormat;
-	private static SimpleDateFormat stringFormat;
+import com.google.inject.Inject;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Friend;
+import net.runelite.api.FriendsChatManager;
+import net.runelite.api.Nameable;
+import net.runelite.api.NameableContainer;
+import net.runelite.api.Player;
+import net.runelite.api.WorldView;
+import net.runelite.api.clan.ClanID;
+import net.runelite.api.clan.ClanMember;
+import net.runelite.api.clan.ClanSettings;
 
-	public static String getDateString(String dateString) {
-		if (headerFormat == null) {
-			headerFormat = new SimpleDateFormat("EEE, dd MMM yyyy HH:mm:ss zzz");
-		}
+@Slf4j
+@Singleton
+public class UsernameAutocompleter implements KeyListener {
+    /**
+     * Non-breaking space character.
+     */
+    private static final String NBSP = Character.toString((char) 160);
 
-		if (stringFormat == null) {
-			stringFormat = new SimpleDateFormat("MM/dd/yyyy HH:mm:ss");
-		}
+    /**
+     * Character class for characters that cannot be in an RSN.
+     */
+    private static final Pattern INVALID_CHARS = Pattern.compile("[^a-zA-Z0-9_ -]");
 
-		try {
-			return stringFormat.format(headerFormat.parse(dateString));
-		} catch (ParseException e) {
-			return "Failed to parse";
-		}
-	}
+    private static final int MAX_SEARCH_HISTORY = 25;
+
+    private final Client client;
+
+    private final EvictingQueue<String> searchHistory = EvictingQueue.create(MAX_SEARCH_HISTORY);
+
+    /**
+     * The name currently being autocompleted.
+     */
+    private String autocompleteName;
+
+    /**
+     * Pattern for the name currently being autocompleted.
+     */
+    private Pattern autocompleteNamePattern;
+
+    @Inject
+    private UsernameAutocompleter(Client client) {
+        this.client = client;
+    }
+
+    @Override
+    public void keyPressed(KeyEvent e) {
+
+    }
+
+    @Override
+    public void keyReleased(KeyEvent e) {
+
+    }
+
+    @Override
+    public void keyTyped(KeyEvent e) {
+        final JTextComponent input = (JTextComponent) e.getSource();
+        final String inputText = input.getText();
+
+        // Only autocomplete if the selection end is at the end of the text.
+        if (input.getSelectionEnd() != inputText.length()) {
+            return;
+        }
+
+        // Character to be inserted at the selection start.
+        final String charToInsert = Character.toString(e.getKeyChar());
+
+        // Don't attempt to autocomplete if the name is invalid.
+        // This condition is also true when the user presses a key like backspace.
+        if (INVALID_CHARS.matcher(charToInsert).find()
+                || INVALID_CHARS.matcher(inputText).find()) {
+            return;
+        }
+
+        // Check if we are already autocompleting.
+        if (autocompleteName != null && autocompleteNamePattern.matcher(inputText).matches()) {
+            if (isExpectedNext(input, charToInsert)) {
+                try {
+                    // Insert the character and move the selection.
+                    final int insertIndex = input.getSelectionStart();
+                    Document doc = input.getDocument();
+                    doc.remove(insertIndex, 1);
+                    doc.insertString(insertIndex, charToInsert, null);
+                    input.select(insertIndex + 1, input.getSelectionEnd());
+                } catch (BadLocationException ex) {
+                    log.warn("Could not insert character.", ex);
+                }
+
+                // Prevent default behavior.
+                e.consume();
+            } else // Character to insert does not match current autocompletion. Look for another name.
+            {
+                newAutocomplete(e);
+            }
+        } else // Search for a name to autocomplete
+        {
+            newAutocomplete(e);
+        }
+    }
+
+    private void newAutocomplete(KeyEvent e) {
+        final JTextComponent input = (JTextComponent) e.getSource();
+        final String inputText = input.getText();
+        final String nameStart = inputText.substring(0, input.getSelectionStart()) + e.getKeyChar();
+
+        if (findAutocompleteName(nameStart)) {
+            // Assert this.autocompleteName != null
+            final String name = this.autocompleteName;
+            SwingUtilities.invokeLater(() ->
+            {
+                try {
+                    input.getDocument().insertString(
+                            nameStart.length(),
+                            name.substring(nameStart.length()),
+                            null);
+                    input.select(nameStart.length(), name.length());
+                } catch (BadLocationException ex) {
+                    log.warn("Could not autocomplete name.", ex);
+                }
+            });
+        }
+    }
+
+    private boolean findAutocompleteName(String nameStart) {
+        final Pattern pattern;
+        Optional<String> autocompleteName;
+
+        // Pattern to match names that start with nameStart.
+        // Allows spaces to be represented as common whitespaces, underscores,
+        // hyphens, or non-breaking spaces.
+        // Matching non-breaking spaces is necessary because the API
+        // returns non-breaking spaces when a name has whitespace.
+        pattern = Pattern.compile(
+                "(?i)^" + nameStart.replaceAll("[ _-]", "[ _" + NBSP + "-]") + ".+?");
+
+        // Search all previous successful queries
+        autocompleteName = searchHistory.stream()
+                .filter(n -> pattern.matcher(n).matches())
+                .findFirst();
+
+        // Search friends if previous searches weren't matched
+        if (!autocompleteName.isPresent()) {
+            NameableContainer<Friend> friendContainer = client.getFriendContainer();
+            if (friendContainer != null) {
+                autocompleteName = Arrays.stream(friendContainer.getMembers())
+                        .map(Nameable::getName)
+                        .filter(n -> pattern.matcher(n).matches())
+                        .findFirst();
+            }
+        }
+
+        // Search friends chat if a friend wasn't found
+        if (!autocompleteName.isPresent()) {
+            final FriendsChatManager friendsChatManager = client.getFriendsChatManager();
+            if (friendsChatManager != null) {
+                autocompleteName = Arrays.stream(friendsChatManager.getMembers())
+                        .map(Nameable::getName)
+                        .filter(n -> pattern.matcher(n).matches())
+                        .findFirst();
+            }
+        }
+
+        // Search clans
+        if (!autocompleteName.isPresent()) {
+            final ClanSettings[] clanSettings = {
+                    client.getClanSettings(ClanID.CLAN),
+                    client.getClanSettings(ClanID.GROUP_IRONMAN),
+                    client.getGuestClanSettings()
+            };
+            autocompleteName = Arrays.stream(clanSettings)
+                    .filter(Objects::nonNull)
+                    .flatMap(cs -> cs.getMembers().stream())
+                    .map(ClanMember::getName)
+                    .filter(n -> pattern.matcher(n).matches())
+                    .findFirst();
+        }
+
+        // Search cached players if a friend wasn't found
+        if (!autocompleteName.isPresent()) {
+            WorldView wv = client.getTopLevelWorldView();
+            autocompleteName = wv.players().stream()
+                    .filter(Objects::nonNull)
+                    .map(Player::getName)
+                    .filter(Objects::nonNull)
+                    .filter(n -> pattern.matcher(n).matches())
+                    .findFirst();
+        }
+
+        if (autocompleteName.isPresent()) {
+            this.autocompleteName = autocompleteName.get().replace(NBSP, " ");
+            this.autocompleteNamePattern = Pattern.compile(
+                    "(?i)^" + this.autocompleteName.replaceAll("[ _-]", "[ _-]") + "$");
+        } else {
+            this.autocompleteName = null;
+            this.autocompleteNamePattern = null;
+        }
+
+        return autocompleteName.isPresent();
+    }
+
+    void addToSearchHistory(@NonNull String name) {
+        if (!searchHistory.contains(name)) {
+            searchHistory.offer(name);
+        }
+    }
+
+    private boolean isExpectedNext(JTextComponent input, String nextChar) {
+        String expected;
+        if (input.getSelectionStart() < input.getSelectionEnd()) {
+            try {
+                expected = input.getText(input.getSelectionStart(), 1);
+            } catch (BadLocationException ex) {
+                log.warn("Could not get first character from input selection.", ex);
+                return false;
+            }
+        } else {
+            expected = "";
+        }
+        return nextChar.equalsIgnoreCase(expected);
+    }
+}
+package com.runeprofile.utils;
+
+@FunctionalInterface
+public interface SupplierWithException<T, E extends Exception> {
+    T get() throws E;
 }
 
+package com.runeprofile.utils;
+
+import lombok.Getter;
+
+@Getter
+public class RuneProfileApiException extends RuntimeException {
+    public RuneProfileApiException(String message) {
+        super(message);
+    }
+}
 package com.runeprofile.utils;
 
 import net.runelite.api.Client;
@@ -61,80 +316,75 @@ public class AccountHash {
 package com.runeprofile;
 
 import com.runeprofile.panels.InvalidPanel;
-import com.runeprofile.panels.MainPanel;
-import com.runeprofile.panels.misc.HeaderPanel;
-import lombok.Getter;
+import com.runeprofile.panels.LayoutPluginPanel;
+import com.runeprofile.panels.HeaderPanel;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.ui.PluginPanel;
 
+import javax.inject.Inject;
 import javax.swing.*;
 import java.awt.*;
 
 @Slf4j
-public class RuneProfilePanel extends PluginPanel {
-	private final RuneProfilePlugin runeProfilePlugin;
+public class RuneProfilePanel extends net.runelite.client.ui.PluginPanel {
+    private final LayoutPluginPanel layoutPluginPanel;
+    private InvalidPanel invalidPanel;
 
-	@Getter
-	private MainPanel mainPanel;
-	private InvalidPanel invalidPanel;
+    @Inject
+    public RuneProfilePanel(HeaderPanel headerPanel, LayoutPluginPanel layoutPluginPanel) {
+        super(false);
+        setLayout(new BorderLayout());
 
-	public RuneProfilePanel(RuneProfilePlugin runeProfilePlugin) {
-		super(false);
-		setLayout(new BorderLayout());
+        this.layoutPluginPanel = layoutPluginPanel;
 
-		this.runeProfilePlugin = runeProfilePlugin;
+        add(headerPanel, BorderLayout.NORTH);
+        loadInvalidState();
+    }
 
-		add(new HeaderPanel(), BorderLayout.NORTH);
-		loadInvalidState();
-	}
+    public void loadValidState() {
+        SwingUtilities.invokeLater(() -> {
+            if (invalidPanel != null) {
+                remove(invalidPanel);
+            }
 
-	public void loadValidState() {
-		SwingUtilities.invokeLater(() -> {
-			if (invalidPanel != null) {
-				remove(invalidPanel);
-			}
+            add(layoutPluginPanel, BorderLayout.CENTER);
+            revalidate();
+            repaint();
+        });
+    }
 
-			mainPanel = new MainPanel(runeProfilePlugin);
+    public void loadInvalidState() {
+        SwingUtilities.invokeLater(() -> {
+            if (layoutPluginPanel != null) {
+                remove(layoutPluginPanel);
+            }
 
-			add(mainPanel, BorderLayout.CENTER);
-			revalidate();
-			repaint();
-		});
-	}
+            if (invalidPanel == null) {
+                invalidPanel = new InvalidPanel();
+            }
 
-	public void loadInvalidState() {
-		SwingUtilities.invokeLater(() -> {
-			if (mainPanel != null) {
-				remove(mainPanel);
-			}
+            invalidPanel.setHintText("Login to use this plugin.");
+            add(invalidPanel, BorderLayout.CENTER);
+            revalidate();
+            repaint();
+        });
+    }
 
-			if (invalidPanel == null) {
-				invalidPanel = new InvalidPanel();
-			}
+    public void loadInvalidRequestState() {
+        SwingUtilities.invokeLater(() -> {
+            if (layoutPluginPanel != null) {
+                remove(layoutPluginPanel);
+            }
 
-			invalidPanel.setHintText("Login to use this plugin.");
-			add(invalidPanel, BorderLayout.CENTER);
-			revalidate();
-			repaint();
-		});
-	}
+            if (invalidPanel == null) {
+                invalidPanel = new InvalidPanel();
+            }
 
-	public void loadInvalidRequestState() {
-		SwingUtilities.invokeLater(() -> {
-			if (mainPanel != null) {
-				remove(mainPanel);
-			}
-
-			if (invalidPanel == null) {
-				invalidPanel = new InvalidPanel();
-			}
-
-			invalidPanel.setHintText("Invalid world/mode.");
-			add(invalidPanel, BorderLayout.CENTER);
-			revalidate();
-			repaint();
-		});
-	}
+            invalidPanel.setHintText("Invalid world/mode.");
+            add(invalidPanel, BorderLayout.CENTER);
+            revalidate();
+            repaint();
+        });
+    }
 }
 
 package com.runeprofile.data;
@@ -211,11 +461,15 @@ package com.runeprofile.data;
 import lombok.Getter;
 import lombok.RequiredArgsConstructor;
 
+import javax.annotation.Nullable;
+
 @RequiredArgsConstructor
 @Getter
 public class PlayerModelData {
-	private final String accountHash;
-	private final byte[] model;
+    private final String accountHash;
+    private final byte[] model;
+    @Nullable
+    private final byte[] petModel;
 }
 
 package com.runeprofile.data;
@@ -279,120 +533,17 @@ public class CollectionLogItem {
     private final int id;
     private final int quantity;
 }
-package com.runeprofile.panels.home;
+package com.runeprofile.data;
 
-import com.runeprofile.RuneProfileConfig;
-import com.runeprofile.RuneProfilePlugin;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.ui.FontManager;
-import net.runelite.client.util.LinkBrowser;
-
-import javax.swing.*;
-import javax.swing.border.Border;
-import javax.swing.border.EmptyBorder;
-import java.awt.*;
-import java.io.IOException;
-import java.util.Arrays;
-import java.util.concurrent.CompletableFuture;
-
-@Slf4j
-public class HomePanel extends JPanel {
-
-    private final Border buttonBorder;
-
-    public HomePanel(RuneProfilePlugin plugin) {
-        buttonBorder = new EmptyBorder(8, 16, 8, 16);
-
-        setLayout(new BorderLayout());
-        JPanel wrapper = new JPanel(new GridLayout(0, 1, 0, 6));
-
-        // Update Model
-        JLabel updatedModelLabel = createUpdateLabel(RuneProfileConfig.MODEL_UPDATE_DATE);
-        JButton updateModelButton = createUpdateButton(
-                "Update Model",
-                updatedModelLabel,
-                plugin::updateModelAsync
-        );
-
-        wrapper.add(updatedModelLabel);
-        wrapper.add(updateModelButton);
+import lombok.Data;
 
 
-        // Open Profile
-        JButton openProfileButton = new JButton("Open Profile");
-        openProfileButton.setBorder(buttonBorder);
-        openProfileButton.addActionListener(e -> {
-            String username = RuneProfilePlugin.getClient().getLocalPlayer().getName();
-            LinkBrowser.browse("https://runeprofile.com/" + username);
-        });
-
-        wrapper.add(openProfileButton);
-
-        if (plugin.isDeveloperMode()) {
-            // DEV ONLY - generate hiscores icons
-            JButton generateHiscoreIcons = new JButton("DEV: Hiscores Icons");
-            generateHiscoreIcons.setBorder(buttonBorder);
-            generateHiscoreIcons.addActionListener(e -> {
-                plugin.DEV_generateHiscoreIconsJson();
-            });
-            wrapper.add(generateHiscoreIcons);
-        }
-
-        add(wrapper, BorderLayout.NORTH);
-    }
-
-    private JLabel createUpdateLabel(String configKey) {
-        String lastUpdatedDate = RuneProfilePlugin.getConfigManager().getRSProfileConfiguration(RuneProfileConfig.CONFIG_GROUP, configKey);
-        JLabel label = new JLabel((lastUpdatedDate != null) ? "Last update: " + lastUpdatedDate : "Last update: Never");
-        label.setFont(FontManager.getRunescapeSmallFont());
-        return label;
-    }
-
-    private JButton createUpdateButton(String buttonText, JLabel statusLabel, SupplierWithException<CompletableFuture<String>, Exception> updateAction) {
-        JButton button = new JButton(buttonText);
-        button.setBorder(buttonBorder);
-        button.addActionListener((event) -> {
-            button.setEnabled(false);
-            statusLabel.setText("Last update: Updating...");
-            new SwingWorker<String, Void>() {
-                @Override
-                protected String doInBackground() throws Exception {
-                    try {
-                        return updateAction.get().get();
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        return "Update interrupted";
-                    } catch (IOException e) {
-                        log.debug(Arrays.toString(e.getStackTrace()));
-                        log.error("Failed to update: {}", e.toString());
-                        return "Failed to update";
-                    }
-                }
-
-                @Override
-                protected void done() {
-                    try {
-                        String lastUpdated = get();
-                        statusLabel.setText("Last update: " + lastUpdated);
-                    } catch (Exception e) {
-                        log.debug(Arrays.toString(e.getStackTrace()));
-                        log.error("Failed to update: {}", e.toString());
-                        statusLabel.setText("Last update: Failed");
-                    } finally {
-                        button.setEnabled(true);
-                    }
-                }
-            }.execute();
-        });
-        return button;
-    }
+@Data
+public class ProfileSearchResult {
+    private final String username;
 }
 
-@FunctionalInterface
-interface SupplierWithException<T, E extends Exception> {
-    T get() throws E;
-}
-package com.runeprofile.panels.misc;
+package com.runeprofile.panels;
 
 import com.runeprofile.Icon;
 import net.runelite.client.ui.ColorScheme;
@@ -400,6 +551,7 @@ import net.runelite.client.ui.FontManager;
 import net.runelite.client.util.LinkBrowser;
 import net.runelite.client.util.SwingUtil;
 
+import javax.inject.Inject;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import javax.swing.plaf.basic.BasicButtonUI;
@@ -411,6 +563,7 @@ public class HeaderPanel extends JPanel {
     private static final int iconSize = 16;
     private final JPanel buttonsContainer;
 
+    @Inject
     public HeaderPanel() {
         setLayout(new BorderLayout());
         setBorder(new EmptyBorder(10, 10, 10, 10));
@@ -459,30 +612,235 @@ public class HeaderPanel extends JPanel {
 package com.runeprofile.panels;
 
 import com.runeprofile.RuneProfilePlugin;
-import com.runeprofile.panels.home.HomePanel;
-import net.runelite.client.ui.ColorScheme;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.client.callback.ClientThread;
 
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.*;
+
+
+@Slf4j
+public class MainButtonsPanel extends JPanel {
+    @Inject
+    public MainButtonsPanel(RuneProfilePlugin plugin, Client client, ClientThread clientThread) {
+        setLayout(new BorderLayout());
+        JPanel wrapper = new JPanel(new GridLayout(0, 1, 0, 6));
+
+        // Update Model
+        JButton updateModelButton = createButton("Update Player Model");
+        updateModelButton.addActionListener((e) -> {
+            clientThread.invokeLater(() -> {
+                client.addChatMessage(ChatMessageType.CONSOLE, "RuneProfile", "Updating player model...", "RuneProfile");
+            });
+            plugin.updateModelAsync();
+        });
+        wrapper.add(updateModelButton);
+
+        // Open Profile
+        JButton openProfileButton = createButton("Open Profile");
+        openProfileButton.addActionListener(e -> {
+            String username = RuneProfilePlugin.getClient().getLocalPlayer().getName();
+            if (username == null) return;
+            plugin.openProfileInBrowser(username);
+        });
+
+        wrapper.add(openProfileButton);
+
+        if (plugin.isDeveloperMode()) {
+            // DEV ONLY - generate hiscores icons
+            JButton generateHiscoreIcons = new JButton("DEV: Hiscores Icons");
+            generateHiscoreIcons.addActionListener(e -> {
+                plugin.DEV_generateHiscoreIconsJson();
+            });
+            wrapper.add(generateHiscoreIcons);
+        }
+
+        add(wrapper, BorderLayout.NORTH);
+    }
+
+    private JButton createButton(String text) {
+        JButton button = new JButton(text);
+        button.setPreferredSize(new Dimension(button.getPreferredSize().width, 30));
+        return button;
+    }
+}
+
+
+package com.runeprofile.panels;
+
+import javax.inject.Inject;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 
-public class MainPanel extends JPanel {
-
-    public MainPanel(RuneProfilePlugin runeProfilePlugin) {
+public class LayoutPluginPanel extends JPanel {
+    @Inject
+    public LayoutPluginPanel(MainButtonsPanel mainButtonsPanel, SearchPanel searchPanel) {
         setLayout(new BorderLayout());
-        setBackground(ColorScheme.DARK_GRAY_COLOR);
 
-        HomePanel homePanel = new HomePanel(runeProfilePlugin);
-        homePanel.setBorder(new EmptyBorder(10, 10, 10, 10));
-        add(homePanel, BorderLayout.NORTH);
+        // Main content panel with vertical (flex-column-like) layout
+        JPanel contentPanel = new JPanel();
+        contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
+        contentPanel.setBorder(new EmptyBorder(10, 10, 10, 10)); // padding around entire content
 
-        JPanel display = new JPanel();
-        display.setLayout(new BoxLayout(display, BoxLayout.Y_AXIS));
-        display.setBorder(new EmptyBorder(10, 10, 8, 10));
+        // Create and add components
+        mainButtonsPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        contentPanel.add(mainButtonsPanel);
+        mainButtonsPanel.setMaximumSize(new Dimension(Short.MAX_VALUE, mainButtonsPanel.getPreferredSize().height)); // Limit vertical growth
 
-        add(display, BorderLayout.CENTER);
+        contentPanel.add(Box.createVerticalStrut(32)); // spacing between components
+
+        searchPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        contentPanel.add(searchPanel);
+        searchPanel.setMaximumSize(new Dimension(Short.MAX_VALUE, searchPanel.getPreferredSize().height)); // Limit initial vertical growth
+
+        contentPanel.add(Box.createVerticalGlue());
+
+        JScrollPane scrollPane = new JScrollPane(contentPanel);
+        scrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
+        scrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+
+        add(scrollPane, BorderLayout.CENTER);
     }
 }
+package com.runeprofile.panels;
+
+import com.runeprofile.RuneProfileApiClient;
+import com.runeprofile.RuneProfilePlugin;
+import com.runeprofile.data.ProfileSearchResult;
+import com.runeprofile.utils.RuneProfileApiException;
+import com.runeprofile.utils.UsernameAutocompleter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.IconTextField;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.*;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+import java.util.Arrays;
+import java.util.List;
+
+@Slf4j
+public class SearchPanel extends JPanel {
+    private final RuneProfilePlugin plugin;
+
+    private final JPanel resultsPanel;
+    private final IconTextField searchField;
+
+    @Inject
+    public SearchPanel(RuneProfilePlugin plugin, RuneProfileApiClient runeProfileApiClient, UsernameAutocompleter usernameAutocompleter) {
+        this.plugin = plugin;
+
+        setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+
+        JLabel title = new JLabel("Search profiles");
+        title.setAlignmentX(Component.LEFT_ALIGNMENT);
+        add(title);
+
+        searchField = new IconTextField();
+        searchField.setIcon(IconTextField.Icon.SEARCH);
+        searchField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        searchField.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        searchField.setPreferredSize(new Dimension(PluginPanel.PANEL_WIDTH - 20, 30));
+        searchField.setMinimumSize(new Dimension(0, 30));
+        searchField.setAlignmentX(Component.LEFT_ALIGNMENT);
+        searchField.setAlignmentY(Component.TOP_ALIGNMENT);
+
+        add(Box.createVerticalStrut(5));
+        add(searchField);
+        add(Box.createVerticalStrut(5));
+
+        resultsPanel = new JPanel();
+        resultsPanel.setLayout(new BoxLayout(resultsPanel, BoxLayout.Y_AXIS));
+        resultsPanel.setAlignmentY(Component.TOP_ALIGNMENT);
+        resultsPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        searchField.addKeyListener(usernameAutocompleter);
+        searchField.addKeyListener(new KeyAdapter() {
+            @Override
+            public void keyTyped(KeyEvent e) {
+                String query = Text.sanitize(searchField.getText());
+                if (query.isEmpty()) resultsPanel.removeAll();
+            }
+        });
+        searchField.addClearListener(resultsPanel::removeAll);
+        searchField.addActionListener(
+                (e) -> {
+                    String query = Text.sanitize(searchField.getText());
+                    if (query.isEmpty()) resultsPanel.removeAll();
+
+                    if (!query.isEmpty()) {
+                        runeProfileApiClient.searchProfiles(query).whenComplete((results, ex) -> {
+                            if (ex != null) {
+                                log.error("Error searching profiles: ", ex);
+
+                                if (ex instanceof RuneProfileApiException) {
+                                    updateErrors("Error: " + ex.getMessage());
+                                } else {
+                                    updateErrors("An unexpected error occurred.");
+                                }
+
+                                return;
+                            }
+                            updateResults(Arrays.asList(results));
+                        });
+                    }
+                }
+        );
+
+        add(resultsPanel);
+    }
+
+    private void updateErrors(String errorMessage) {
+        resultsPanel.removeAll();
+        JLabel errorLabel = new JLabel(errorMessage);
+        errorLabel.setForeground(Color.RED);
+        resultsPanel.add(errorLabel);
+        resultsPanel.revalidate();
+        resultsPanel.repaint();
+    }
+
+    private void updateResults(List<ProfileSearchResult> results) {
+        resultsPanel.removeAll();
+
+        if (results.isEmpty()) {
+            JLabel noResults = new JLabel("No results found.");
+            noResults.setForeground(Color.LIGHT_GRAY);
+            resultsPanel.add(noResults);
+        } else {
+            for (int i = 0; i < results.size(); i++) {
+                JButton resultButton = getResultButton(results, i);
+                resultsPanel.add(resultButton);
+            }
+        }
+
+        resultsPanel.revalidate();
+        resultsPanel.repaint();
+    }
+
+    private JButton getResultButton(List<ProfileSearchResult> results, int i) {
+        ProfileSearchResult result = results.get(i);
+
+        JButton resultButton = new JButton(result.getUsername());
+        int buttonHeight = 30;
+        resultButton.setMaximumSize(new Dimension(Integer.MAX_VALUE, buttonHeight));
+        resultButton.setPreferredSize(new Dimension(resultsPanel.getWidth(), buttonHeight));
+        resultButton.setMinimumSize(new Dimension(0, buttonHeight));
+        resultButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+        resultButton.setToolTipText("Open in browser");
+
+        resultButton.addActionListener((e) -> plugin.openProfileInBrowser(result.getUsername()));
+        return resultButton;
+    }
+}
+
 package com.runeprofile.panels;
 
 import net.runelite.client.ui.FontManager;
@@ -610,6 +968,8 @@ import net.runelite.api.annotations.Component;
 import net.runelite.api.events.ScriptPostFired;
 import net.runelite.api.widgets.*;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneLiteConfig;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 
@@ -645,23 +1005,26 @@ public class SyncButtonManager {
     private static final int FONT_COLOUR_INACTIVE = 0xd6d6d6;
     private static final int FONT_COLOUR_ACTIVE = 0xffffff;
     private static final int CLOSE_BUTTON_OFFSET = 28;
-    private static final int BUTTON_WIDTH = 95;
+    private static final int BUTTON_WIDTH = 80;
     private static final int BUTTON_OFFSET = CLOSE_BUTTON_OFFSET + 5;
     private int lastAttemptedUpdate = -1;
 
     private final Client client;
     private final ClientThread clientThread;
     private final EventBus eventBus;
+    private final ConfigManager configManager;
 
     @Inject
     private SyncButtonManager(
             Client client,
             ClientThread clientThread,
-            EventBus eventBus
+            EventBus eventBus,
+            ConfigManager configManager
     ) {
         this.client = client;
         this.clientThread = clientThread;
         this.eventBus = eventBus;
+        this.configManager = configManager;
     }
 
     public void startUp() {
@@ -699,10 +1062,8 @@ public class SyncButtonManager {
     @Subscribe
     public void onScriptPostFired(ScriptPostFired scriptPostFired) {
         if (scriptPostFired.getScriptId() == COLLECTION_LOG_SETUP) {
-            clientThread.invokeLater(() -> {
-                removeButton();
-                addButton(Screen.COLLECTION_LOG, this::onButtonClick);
-            });
+            removeButton();
+            addButton(Screen.COLLECTION_LOG, this::onButtonClick);
         }
     }
 
@@ -736,7 +1097,7 @@ public class SyncButtonManager {
         final int y = searchButton.getOriginalY();
         final int cornerDim = 9;
 
-        final Widget[] spriteWidgets = new Widget[10];
+        final Widget[] spriteWidgets = new Widget[9];
 
         spriteWidgets[0] = parent.createChild(-1, WidgetType.GRAPHIC)
                 .setSpriteId(SPRITE_IDS_INACTIVE[0])
@@ -780,7 +1141,7 @@ public class SyncButtonManager {
                 .setPos(x, y + cornerDim);
 
         // Top and bottom edges
-        int topWidth = 77;
+        int topWidth = BUTTON_WIDTH - 2 * cornerDim;
         int topHeight = 9;
         spriteWidgets[6] = parent.createChild(-1, WidgetType.GRAPHIC)
                 .setSpriteId(SPRITE_IDS_INACTIVE[6])
@@ -792,16 +1153,7 @@ public class SyncButtonManager {
                 .setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
                 .setSize(topWidth, topHeight)
                 .setPos(x + cornerDim, y + h - topHeight);
-        // Refresh icon
-        spriteWidgets[9] = parent.createChild(-1, WidgetType.GRAPHIC)
-                .setSpriteId(SpriteID.CHATBOX_TRANSPARENT_SCROLLBAR_ARROW_UP)
-                .setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-                .setSize(13, 16)
-                .setOpacity(80)
-                .setPos(x + 10, y + 3);
-
-
-        for (int i = 0; i < 10; i++) {
+        for (int i = 0; i < 9; i++) {
             spriteWidgets[i].revalidate();
         }
 
@@ -811,9 +1163,9 @@ public class SyncButtonManager {
                 .setFontId(FontID.PLAIN_11)
                 .setTextShadowed(true)
                 .setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-                .setXTextAlignment(WidgetTextAlignment.LEFT)
+                .setXTextAlignment(WidgetTextAlignment.CENTER)
                 .setYTextAlignment(WidgetTextAlignment.CENTER)
-                .setPos(x - 10, y + 1)
+                .setPos(x, y)
                 .setSize(w, h)
                 .setYPositionMode(searchButton.getYPositionMode());
         text.revalidate();
@@ -839,9 +1191,12 @@ public class SyncButtonManager {
         text.setAction(0, "Update your RuneProfile");
         text.setOnOpListener((JavaScriptCallback) ev -> onClick.run());
 
-
-        // Shrink the top bar to avoid overlapping the new button
-        draggableTopbar.setOriginalWidth(draggableTopbar.getOriginalWidth() - (w + (x - CLOSE_BUTTON_OFFSET)));
+        boolean isWikiSyncPluginEnabled = Boolean.parseBoolean(configManager.getConfiguration(RuneLiteConfig.GROUP_NAME, "wikisyncplugin"));
+        log.info("WikiSync plugin enabled: {}", isWikiSyncPluginEnabled);
+        if (!isWikiSyncPluginEnabled) {
+            // Shrink the top bar to avoid overlapping the new button
+            draggableTopbar.setOriginalWidth(draggableTopbar.getOriginalWidth() - (w + (x - CLOSE_BUTTON_OFFSET)));
+        }
         draggableTopbar.revalidate();
 
         // recompute locations / sizes on parent
@@ -864,38 +1219,47 @@ import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 
-@ConfigGroup("runeprofile")
+@ConfigGroup(RuneProfilePlugin.CONFIG_GROUP)
 public interface RuneProfileConfig extends Config {
-    String CONFIG_GROUP = "runeprofile";
-
-    String MODEL_UPDATE_DATE = "model_update_date"; // The last time the model was updated.
-
     @ConfigItem(keyName = "update_on_logout", name = "Update on logout", description = "Automatically update your RuneProfile on logout. (Excluding model and Collection Log)")
     default boolean updateOnLogout() {
         return true;
+    }
+
+    @ConfigItem(
+            keyName = "menuLookupOption",
+            name = "Menu option",
+            description = "Add RuneProfile option to menus"
+    )
+    default boolean menuLookupOption() {
+        return false;
     }
 }
 
 package com.runeprofile;
 
+import com.google.common.collect.ImmutableList;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 
-import java.io.ByteArrayOutputStream;
-import java.io.File;
-import java.io.FileWriter;
+import java.io.*;
+import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ScheduledExecutorService;
 
 import com.runeprofile.data.*;
-import com.runeprofile.modelexporter.PlayerModelExporter;
+import com.runeprofile.modelexporter.ModelExporter;
 import com.runeprofile.ui.SyncButtonManager;
 import com.runeprofile.utils.AccountHash;
+import com.runeprofile.utils.RuneProfileApiException;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.events.*;
+import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.VarbitID;
+import net.runelite.api.widgets.WidgetUtil;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.config.RuneScapeProfileType;
@@ -909,13 +1273,13 @@ import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
 import net.runelite.client.util.ImageUtil;
 import net.runelite.client.chat.ChatCommandManager;
+import net.runelite.client.util.LinkBrowser;
 import net.runelite.client.util.Text;
 
 import javax.imageio.ImageIO;
 import javax.inject.Inject;
 import javax.inject.Named;
 import java.awt.image.BufferedImage;
-import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -928,6 +1292,7 @@ import java.util.stream.Collectors;
         tags = {"runeprofile", "rune", "profile", "collection"}
 )
 public class RuneProfilePlugin extends Plugin {
+    public static final String CONFIG_GROUP = "runeprofile";
     private static RuneProfilePlugin instance;
 
     @Inject
@@ -974,6 +1339,10 @@ public class RuneProfilePlugin extends Plugin {
     @Inject
     private SyncButtonManager syncButtonManager;
 
+    // menu option
+    private static final String KICK_OPTION = "Kick";
+    private static final ImmutableList<String> AFTER_OPTIONS = ImmutableList.of("Message", "Add ignore", "Remove friend", "Delete", KICK_OPTION);
+
     // collection log
     private final Map<Integer, Integer> playerItems = new HashMap<>();
     private int tickCollectionLogScriptFired = -1;
@@ -985,10 +1354,6 @@ public class RuneProfilePlugin extends Plugin {
         return instance.client;
     }
 
-    public static ConfigManager getConfigManager() {
-        return instance.configManager;
-    }
-
     @Provides
     RuneProfileConfig provideConfig(ConfigManager configManager) {
         return configManager.getConfig(RuneProfileConfig.class);
@@ -998,31 +1363,34 @@ public class RuneProfilePlugin extends Plugin {
     protected void startUp() {
         instance = this;
 
-        this.runeProfilePanel = new RuneProfilePanel(this);
+        this.runeProfilePanel = injector.getInstance(RuneProfilePanel.class);
         final BufferedImage toolbarIcon = Icon.LOGO.getImage();
 
         navigationButton = NavigationButton.builder()
                 .tooltip("RuneProfile")
                 .icon(toolbarIcon)
                 .panel(runeProfilePanel)
-                .priority(3)
+                .priority(4)
                 .build();
 
         clientToolbar.addNavigation(navigationButton);
 
-        syncButtonManager.startUp();
         chatCommandManager.registerCommand(COLLECTION_LOG_COMMAND, this::executeLogCommand);
 
         GameState state = client.getGameState();
         updatePanelState(state);
+
+        syncButtonManager.startUp();
     }
 
     @Override
     protected void shutDown() {
         clientToolbar.removeNavigation(navigationButton);
-        syncButtonManager.shutDown();
         chatCommandManager.unregisterCommand(COLLECTION_LOG_COMMAND);
+
+        syncButtonManager.shutDown();
     }
+
 
     @Subscribe
     private void onGameStateChanged(GameStateChanged gameStateChanged) {
@@ -1088,6 +1456,46 @@ public class RuneProfilePlugin extends Plugin {
         }
     }
 
+    @Subscribe
+    public void onMenuEntryAdded(MenuEntryAdded event) {
+        if (!config.menuLookupOption()) return;
+
+        int groupId = WidgetUtil.componentToInterface(event.getActionParam1());
+        String option = event.getOption();
+
+        if (!AFTER_OPTIONS.contains(option)
+                // prevent duplicate menu options in friends list
+                || (option.equals("Delete") && groupId != InterfaceID.IGNORE)) {
+            return;
+        }
+
+        boolean addMenuLookup = (groupId == InterfaceID.FRIENDS
+                || groupId == InterfaceID.CHATCHANNEL_CURRENT
+                || groupId == InterfaceID.CLANS_SIDEPANEL
+                || groupId == InterfaceID.CLANS_GUEST_SIDEPANEL
+                // prevent from adding for Kick option (interferes with the raiding party one)
+                || groupId == InterfaceID.CHATBOX && !KICK_OPTION.equals(option)
+                || groupId == InterfaceID.RAIDS_SIDEPANEL
+                || groupId == InterfaceID.PM_CHAT
+                || groupId == InterfaceID.IGNORE);
+
+        if (addMenuLookup) {
+            String username = Text.toJagexName(Text.removeTags(event.getTarget()));
+
+            client.getMenu().createMenuEntry(-2)
+                    .setTarget(event.getTarget())
+                    .setOption("RuneProfile")
+                    .setType(MenuAction.RUNELITE)
+                    .setIdentifier(event.getIdentifier())
+                    .onClick(e -> openProfileInBrowser(username));
+        }
+    }
+
+    public void openProfileInBrowser(String username) {
+        String url = "https://www.runeprofile.com/" + username.replace(" ", "%20");
+        LinkBrowser.browse(url);
+    }
+
     private void executeLogCommand(ChatMessage chatMessage, String message) {
         log.debug("Executing log command: {}", message);
         Matcher commandMatcher = COLLECTION_LOG_COMMAND_PATTERN.matcher(message);
@@ -1106,10 +1514,12 @@ public class RuneProfilePlugin extends Plugin {
                 ? client.getLocalPlayer().getName()
                 : Text.sanitize(chatMessage.getName());
 
-        runeProfileApiClient.getCollectionLogPage(senderName, pageName).thenAccept((page) -> {
+        runeProfileApiClient.getCollectionLogPage(senderName, pageName).whenComplete((page, ex) -> {
             clientThread.invokeLater(() -> {
-                if (page == null) {
-                    updateChatMessage(chatMessage, "Failed to load collection log page");
+                if (ex != null) {
+                    log.info("Instance of RuneProfileApiException: {}", ex.getClass());
+                    final String errorMessage = getApiErrorMessage(ex, "Failed to load collection log page.");
+                    updateChatMessage(chatMessage, errorMessage);
                     return;
                 }
 
@@ -1131,7 +1541,7 @@ public class RuneProfilePlugin extends Plugin {
                 int obtainedItemsCount = (int) items.stream().filter(item -> item.getQuantity() > 0).count();
                 int totalItemsCount = items.size();
 
-                final String replacementMessage = page.getName() + " " + "(" + obtainedItemsCount + "/" + totalItemsCount + ")" + " : " + itemBuilder.toString();
+                final String replacementMessage = page.getName() + " " + "(" + obtainedItemsCount + "/" + totalItemsCount + ")" + " : " + itemBuilder;
                 updateChatMessage(chatMessage, replacementMessage);
             });
         });
@@ -1144,25 +1554,26 @@ public class RuneProfilePlugin extends Plugin {
         isValidRequest();
 
         getPlayerDataAsync().thenCompose((data) -> runeProfileApiClient.updateProfileAsync(data))
-                .handle((dateString, ex) -> {
+                .whenComplete((result, ex) -> {
                     if (ex != null) {
                         log.error("Error updating profile", ex);
+
+                        final String errorMessage = getApiErrorMessage(ex, "Failed to update your profile.");
+
                         clientThread.invokeLater(() -> {
-                            client.addChatMessage(ChatMessageType.CONSOLE, "RuneProfile", "Failed to update your profile.", "RuneProfile");
+                            client.addChatMessage(ChatMessageType.CONSOLE, "RuneProfile", errorMessage, "RuneProfile");
                         });
 
-                        throw new RuntimeException(ex);
+                        throw new RuneProfileApiException(errorMessage);
                     }
 
                     clientThread.invokeLater(() -> {
                         client.addChatMessage(ChatMessageType.CONSOLE, "RuneProfile", "Your profile has been updated!", "RuneProfile");
                     });
-
-                    return dateString;
                 });
     }
 
-    public CompletableFuture<String> updateModelAsync() throws IllegalStateException {
+    public void updateModelAsync() {
         isValidRequest();
 
         CompletableFuture<PlayerModelData> dataFuture = new CompletableFuture<>();
@@ -1175,28 +1586,43 @@ public class RuneProfilePlugin extends Plugin {
 
             byte[] modelBytes = null;
             try {
-                modelBytes = PlayerModelExporter.export(model);
+                modelBytes = ModelExporter.toBytes(model);
             } catch (IOException e) {
                 dataFuture.completeExceptionally(e);
             }
 
-            dataFuture.complete(new PlayerModelData(accountHash, modelBytes));
+            NPC pet = client.getFollower();
+            Model petModel = pet != null ? pet.getModel() : null;
+
+            byte[] petModelBytes = null;
+            if (petModel != null) {
+                try {
+                    petModelBytes = ModelExporter.toBytes(petModel);
+                } catch (IOException e) {
+                    dataFuture.completeExceptionally(e);
+                }
+            }
+
+            dataFuture.complete(new PlayerModelData(accountHash, modelBytes, petModelBytes));
         });
 
-        return dataFuture.thenCompose((data) -> runeProfileApiClient.updateModelAsync(data)
-                .handle((dateString, ex) -> {
+        dataFuture.thenCompose((data) -> runeProfileApiClient.updateModelAsync(data)
+                .whenComplete((result, ex) -> {
                     if (ex != null) {
                         log.error("Error updating model", ex);
-                        throw new RuntimeException(ex);
+
+                        final String errorMessage = getApiErrorMessage(ex, "Failed to update your player model.");
+
+                        clientThread.invokeLater(() -> {
+                            client.addChatMessage(ChatMessageType.CONSOLE, "RuneProfile", errorMessage, "RuneProfile");
+                        });
+
+                        throw new RuneProfileApiException(errorMessage);
                     }
 
-                    configManager.setRSProfileConfiguration(
-                            RuneProfileConfig.CONFIG_GROUP,
-                            RuneProfileConfig.MODEL_UPDATE_DATE,
-                            dateString
-                    );
-
-                    return dateString;
+                    clientThread.invokeLater(() -> {
+                        client.addChatMessage(ChatMessageType.CONSOLE, "RuneProfile", "Your player model has been updated!", "RuneProfile");
+                    });
                 }));
     }
 
@@ -1315,6 +1741,18 @@ public class RuneProfilePlugin extends Plugin {
         }
 
         client.setModIcons(newModIcons);
+    }
+
+    public static String getApiErrorMessage(Throwable ex, String defaultMessage) {
+        String result = defaultMessage;
+
+        if (ex instanceof RuneProfileApiException) {
+            result = ex.getMessage();
+        } else if (ex.getCause() instanceof RuneProfileApiException) {
+            result = ex.getCause().getMessage();
+        }
+
+        return result;
     }
 
     public void DEV_generateHiscoreIconsJson() {
@@ -1636,144 +2074,132 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
 
-public class PlayerModelExporter
-{
-	private final static int[] colorPalette = JagexColor.createPalette(JagexColor.BRIGHTNESS_MIN);
+public class ModelExporter {
+    private final static int[] colorPalette = JagexColor.createPalette(JagexColor.BRIGHTNESS_MIN);
 
-	public static byte[] export(Model m) throws IOException
-	{
-		List<Vertex> vertices = new ArrayList<>();
-		for (int fi=0; fi < m.getFaceCount(); fi++)
-		{
-			// determine vertex colors (textured or colored?)
-			Color vc1;
-			Color vc2;
-			Color vc3;
-			int textureId = -1;
-			if (m.getFaceTextures() != null)
-				textureId = m.getFaceTextures()[fi];
-			if (textureId != -1)
-			{
-				// get average color of texture
-				vc1 = TextureColor.getColor(textureId);
-				vc2 = vc1;
-				vc3 = vc1;
-			}
-			else
-			{
-				if (m.getFaceColors3()[fi] == -1)
-				{
-					// face should be shaded flat
-					int colorIndex = m.getFaceColors1()[fi];
-					int rgbColor = colorPalette[colorIndex];
-					vc1 = vc2 = vc3 = new Color(rgbColor);
-				} else {
-					// get color for each vertex
-					vc1 = new Color(JagexColor.HSLtoRGB((short) m.getFaceColors1()[fi], JagexColor.BRIGHTNESS_MIN));
-					vc2 = new Color(JagexColor.HSLtoRGB((short) m.getFaceColors2()[fi], JagexColor.BRIGHTNESS_MIN));
-					vc3 = new Color(JagexColor.HSLtoRGB((short) m.getFaceColors3()[fi], JagexColor.BRIGHTNESS_MIN));
-				}
-			}
+    public static byte[] toBytes(Model m) throws IOException {
+        List<Vertex> vertices = new ArrayList<>();
+        for (int fi = 0; fi < m.getFaceCount(); fi++) {
+            // determine vertex colors (textured or colored?)
+            Color vc1;
+            Color vc2;
+            Color vc3;
+            int textureId = -1;
+            if (m.getFaceTextures() != null)
+                textureId = m.getFaceTextures()[fi];
+            if (textureId != -1) {
+                // get average color of texture
+                vc1 = TextureColor.getColor(textureId);
+                vc2 = vc1;
+                vc3 = vc1;
+            } else {
+                if (m.getFaceColors3()[fi] == -1) {
+                    // face should be shaded flat
+                    int colorIndex = m.getFaceColors1()[fi];
+                    int rgbColor = colorPalette[colorIndex];
+                    vc1 = vc2 = vc3 = new Color(rgbColor);
+                } else {
+                    // get color for each vertex
+                    vc1 = new Color(JagexColor.HSLtoRGB((short) m.getFaceColors1()[fi], JagexColor.BRIGHTNESS_MIN));
+                    vc2 = new Color(JagexColor.HSLtoRGB((short) m.getFaceColors2()[fi], JagexColor.BRIGHTNESS_MIN));
+                    vc3 = new Color(JagexColor.HSLtoRGB((short) m.getFaceColors3()[fi], JagexColor.BRIGHTNESS_MIN));
+                }
+            }
 
-			int vi1 = m.getFaceIndices1()[fi];
-			int vi2 = m.getFaceIndices2()[fi];
-			int vi3 = m.getFaceIndices3()[fi];
+            int vi1 = m.getFaceIndices1()[fi];
+            int vi2 = m.getFaceIndices2()[fi];
+            int vi3 = m.getFaceIndices3()[fi];
 
-			int vx1 = (int) m.getVerticesX()[vi1];
-			int vx2 = (int) m.getVerticesX()[vi2];
-			int vx3 = (int) m.getVerticesX()[vi3];
-			int vy1 = (int) -m.getVerticesY()[vi1];
-			int vy2 = (int) -m.getVerticesY()[vi2];
-			int vy3 = (int) -m.getVerticesY()[vi3];
-			int vz1 = (int) m.getVerticesZ()[vi1];
-			int vz2 = (int) m.getVerticesZ()[vi2];
-			int vz3 = (int) m.getVerticesZ()[vi3];
+            int vx1 = (int) m.getVerticesX()[vi1];
+            int vx2 = (int) m.getVerticesX()[vi2];
+            int vx3 = (int) m.getVerticesX()[vi3];
+            int vy1 = (int) -m.getVerticesY()[vi1];
+            int vy2 = (int) -m.getVerticesY()[vi2];
+            int vy3 = (int) -m.getVerticesY()[vi3];
+            int vz1 = (int) m.getVerticesZ()[vi1];
+            int vz2 = (int) m.getVerticesZ()[vi2];
+            int vz3 = (int) m.getVerticesZ()[vi3];
 
-			vertices.add(new Vertex(vx1, vy1, vz1, vc1.getRed(), vc1.getGreen(), vc1.getBlue()));
-			vertices.add(new Vertex(vx2, vy2, vz2, vc2.getRed(), vc2.getGreen(), vc2.getBlue()));
-			vertices.add(new Vertex(vx3, vy3, vz3, vc3.getRed(), vc3.getGreen(), vc3.getBlue()));
-		}
+            vertices.add(new Vertex(vx1, vy1, vz1, vc1.getRed(), vc1.getGreen(), vc1.getBlue()));
+            vertices.add(new Vertex(vx2, vy2, vz2, vc2.getRed(), vc2.getGreen(), vc2.getBlue()));
+            vertices.add(new Vertex(vx3, vy3, vz3, vc3.getRed(), vc3.getGreen(), vc3.getBlue()));
+        }
 
-		ByteArrayOutputStream ply = new ByteArrayOutputStream();
-		PrintWriter plyHeader = new PrintWriter(ply);
-		plyHeader.println("ply");
-		plyHeader.println("format binary_little_endian 1.0");
-		plyHeader.println("element vertex " + vertices.size());
-		plyHeader.println("property int16 x");
-		plyHeader.println("property int16 y");
-		plyHeader.println("property int16 z");
-		plyHeader.println("property uint8 red");
-		plyHeader.println("property uint8 green");
-		plyHeader.println("property uint8 blue");
-		plyHeader.println("element face " + m.getFaceCount());
-		plyHeader.println("property list uint8 int16 vertex_indices");
-		plyHeader.println("end_header");
-		plyHeader.flush();
+        ByteArrayOutputStream ply = new ByteArrayOutputStream();
+        PrintWriter plyHeader = new PrintWriter(ply);
+        plyHeader.println("ply");
+        plyHeader.println("format binary_little_endian 1.0");
+        plyHeader.println("element vertex " + vertices.size());
+        plyHeader.println("property int16 x");
+        plyHeader.println("property int16 y");
+        plyHeader.println("property int16 z");
+        plyHeader.println("property uint8 red");
+        plyHeader.println("property uint8 green");
+        plyHeader.println("property uint8 blue");
+        plyHeader.println("element face " + m.getFaceCount());
+        plyHeader.println("property list uint8 int16 vertex_indices");
+        plyHeader.println("end_header");
+        plyHeader.flush();
 
-		ByteArrayOutputStream w = new ByteArrayOutputStream();
+        ByteArrayOutputStream w = new ByteArrayOutputStream();
 
-		for (Vertex v: vertices)
-		{
-			// Y and Z axes are flipped
-			w.write(le(v.x));
-			w.write(le(v.z));
-			w.write(le(v.y));
-			w.write((byte) v.r);
-			w.write((byte) v.g);
-			w.write((byte) v.b);
-		}
+        for (Vertex v : vertices) {
+            // Y and Z axes are flipped
+            w.write(le(v.x));
+            w.write(le(v.z));
+            w.write(le(v.y));
+            w.write((byte) v.r);
+            w.write((byte) v.g);
+            w.write((byte) v.b);
+        }
 
-		for (int i=0; i < m.getFaceCount(); ++i)
-		{
-			int vi = i*3;
-			w.write((byte) 3);
-			w.write(le(vi));
-			w.write(le(vi+1));
-			w.write(le(vi+2));
-		}
+        for (int i = 0; i < m.getFaceCount(); ++i) {
+            int vi = i * 3;
+            w.write((byte) 3);
+            w.write(le(vi));
+            w.write(le(vi + 1));
+            w.write(le(vi + 2));
+        }
 
-		w.flush();
-		ply.write(w.toByteArray());
-		return ply.toByteArray();
-	}
+        w.flush();
+        ply.write(w.toByteArray());
+        return ply.toByteArray();
+    }
 
-	// int to little endian byte array
-	private static byte[] le(int n)
-	{
-		byte[] b = new byte[2];
-		b[0] = (byte) n;
-		b[1] = (byte) (n >> 8);
-		return b;
-	}
+    // int to little endian byte array
+    private static byte[] le(int n) {
+        byte[] b = new byte[2];
+        b[0] = (byte) n;
+        b[1] = (byte) (n >> 8);
+        return b;
+    }
 
-	private static class Vertex
-	{
-		public int x, y, z;
-		public int r, g, b;
+    private static class Vertex {
+        public int x, y, z;
+        public int r, g, b;
 
-		public Vertex(int x, int y, int z, int r, int g, int b)
-		{
-			this.x = x;
-			this.y = y;
-			this.z = z;
-			this.r = r;
-			this.g = g;
-			this.b = b;
-		}
+        public Vertex(int x, int y, int z, int r, int g, int b) {
+            this.x = x;
+            this.y = y;
+            this.z = z;
+            this.r = r;
+            this.g = g;
+            this.b = b;
+        }
 
-		@Override
-		public boolean equals(Object o) {
-			if (this == o) return true;
-			if (o == null || getClass() != o.getClass()) return false;
-			Vertex vertex = (Vertex) o;
-			return x == vertex.x && y == vertex.y && z == vertex.z && r == vertex.r && g == vertex.g && b == vertex.b;
-		}
+        @Override
+        public boolean equals(Object o) {
+            if (this == o) return true;
+            if (o == null || getClass() != o.getClass()) return false;
+            Vertex vertex = (Vertex) o;
+            return x == vertex.x && y == vertex.y && z == vertex.z && r == vertex.r && g == vertex.g && b == vertex.b;
+        }
 
-		@Override
-		public int hashCode() {
-			return Objects.hash(x, y, z, r, g, b);
-		}
-	}
+        @Override
+        public int hashCode() {
+            return Objects.hash(x, y, z, r, g, b);
+        }
+    }
 
 }
 package com.runeprofile;
@@ -1783,13 +2209,15 @@ import com.google.gson.JsonObject;
 import com.runeprofile.data.CollectionLogPage;
 import com.runeprofile.data.PlayerData;
 import com.runeprofile.data.PlayerModelData;
-import com.runeprofile.utils.DateHeader;
+import com.runeprofile.data.ProfileSearchResult;
+import com.runeprofile.utils.RuneProfileApiException;
 import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLiteProperties;
 import okhttp3.*;
 
+import javax.annotation.Nullable;
 import javax.inject.Inject;
 import java.io.IOException;
 import java.util.Objects;
@@ -1865,83 +2293,98 @@ public class RuneProfileApiClient {
         return future;
     }
 
-    public CompletableFuture<Response> postHttpRequestAsync(HttpUrl url, String data) {
+    private CompletableFuture<Response> postHttpRequestAsync(HttpUrl url, String data) {
         RequestBody body = RequestBody.create(JSON_MEDIA_TYPE, data);
         Request request = buildApiRequest(url, builder -> builder.post(body)).build();
         log.debug("Sending json request to = {}, data = {}", url.toString(), data);
         return executeHttpRequestAsync(okHttpClient, request);
     }
 
-    public CompletableFuture<Response> postHttpRequestAsync(HttpUrl url, MultipartBody data) {
+    private CompletableFuture<Response> postHttpRequestAsync(HttpUrl url, MultipartBody data) {
         Request request = buildApiRequest(url, builder -> builder.post(data)).build();
         log.debug("Sending form data request to = {}, data = {}", url.toString(), data);
         return executeHttpRequestAsync(okHttpClient, request);
     }
 
-    public CompletableFuture<Response> getHttpRequestAsync(HttpUrl url) {
+    private CompletableFuture<Response> getHttpRequestAsync(HttpUrl url) {
         Request request = buildApiRequest(url, Request.Builder::get)
                 .build();
         return executeHttpRequestAsync(okHttpClient, request);
     }
 
-    public CompletableFuture<Response> deleteHttpRequestAsync(HttpUrl url) {
+    private CompletableFuture<Response> deleteHttpRequestAsync(HttpUrl url) {
         Request request = buildApiRequest(url, Request.Builder::delete)
                 .build();
         return executeHttpRequestAsync(okHttpClient, request);
     }
 
-    public CompletableFuture<String> updateProfileAsync(PlayerData data) {
-        HttpUrl url = buildApiUrl("profiles");
-        return postHttpRequestAsync(url, gson.toJson(data)).thenApplyAsync(this::getResponseDateString);
+    private <T> T handleResponse(Response response, @Nullable Class<T> clazz) {
+        try (Response res = response) {
+            ResponseBody body = res.body();
+
+            if (body == null) {
+                throw new RuneProfileApiException("Response body is null");
+            }
+
+            String bodyString = body.string();
+
+            if (!response.isSuccessful()) {
+                JsonObject json = gson.fromJson(bodyString, JsonObject.class);
+                throw new RuneProfileApiException(json.get("message").getAsString());
+            }
+
+            if (clazz == null) {
+                return null;
+            }
+
+            return gson.fromJson(bodyString, clazz);
+        } catch (IOException e) {
+            throw new RuneProfileApiException("Error reading response body");
+        }
     }
 
-    public CompletableFuture<String> updateModelAsync(PlayerModelData data) {
+    public CompletableFuture<Void> updateProfileAsync(PlayerData data) {
+        HttpUrl url = buildApiUrl("profiles");
+        return postHttpRequestAsync(url, gson.toJson(data))
+                .thenApply((response) -> handleResponse(response, null));
+    }
+
+    public CompletableFuture<Void> updateModelAsync(PlayerModelData data) {
         HttpUrl url = buildApiUrl("profiles", "models");
 
-        RequestBody file = RequestBody.create(MediaType.parse("model/ply"), data.getModel());
-        MultipartBody body = new MultipartBody.Builder()
+        RequestBody modelFile = RequestBody.create(MediaType.parse("model/ply"), data.getModel());
+
+        MultipartBody.Builder bodyBuilder = new MultipartBody.Builder()
                 .setType(MultipartBody.FORM)
                 .addFormDataPart("accountId", data.getAccountHash())
-                .addFormDataPart("model", "model.ply", file)
-                .build();
+                .addFormDataPart("model", "model.ply", modelFile);
 
-        return postHttpRequestAsync(url, body).thenApplyAsync(this::getResponseDateString);
+        @Nullable
+        byte[] petModel = data.getPetModel();
+        if (petModel != null) {
+            RequestBody petFile = RequestBody.create(MediaType.parse("model/ply"), petModel);
+            bodyBuilder.addFormDataPart("petModel", "pet.ply", petFile);
+        }
+
+        MultipartBody body = bodyBuilder.build();
+
+        return postHttpRequestAsync(url, body)
+                .thenApplyAsync((response -> handleResponse(response, null)));
     }
 
     public CompletableFuture<CollectionLogPage> getCollectionLogPage(String username, String page) {
         HttpUrl url = buildApiUrl("profiles", username, "collection-log", page);
-
-        return getHttpRequestAsync(url).thenApplyAsync((response -> {
-            if (response.isSuccessful()) {
-                try (Response res = response) {
-                    ResponseBody body = res.body();
-                    if (body == null) {
-                        log.warn("Async API request failed with code: {}", response.code());
-                        return null;
-                    }
-                    return gson.fromJson(body.string(), CollectionLogPage.class);
-                } catch (IOException e) {
-                    log.warn("Async API request failed with code: {}", response.code());
-                    log.error("Error reading response body", e);
-                    return null;
-                }
-            } else {
-                log.warn("Async API request failed with code: {}", response.code());
-                return null;
-            }
-        }));
+        return getHttpRequestAsync(url)
+                .thenApplyAsync((response -> handleResponse(response, CollectionLogPage.class)));
     }
 
-    public String getResponseDateString(Response response) {
-        try (Response res = response) {
-            if (response.isSuccessful()) {
-                String date = res.header("Date");
-                return DateHeader.getDateString(date);
-            } else {
-                log.warn("Async API request failed with code: {}", response.code());
-                return "Failed";
-            }
-        }
+    public CompletableFuture<ProfileSearchResult[]> searchProfiles(String query) {
+        HttpUrl url = buildApiUrl("profiles")
+                .newBuilder()
+                .addQueryParameter("q", query)
+                .build();
+        return getHttpRequestAsync(url)
+                .thenApplyAsync((response -> handleResponse(response, ProfileSearchResult[].class)));
     }
 }
 
