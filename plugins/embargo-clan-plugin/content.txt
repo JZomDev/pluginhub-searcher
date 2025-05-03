@@ -158,10 +158,12 @@ import net.runelite.client.util.Text;
 import net.runelite.http.api.loottracker.LootRecordType;
 
 import javax.inject.Inject;
+import javax.swing.*;
 import java.awt.image.BufferedImage;
 import java.time.temporal.ChronoUnit;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiConsumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -227,6 +229,8 @@ public class EmbargoPlugin extends Plugin {
 
 	private final Map<String, Integer> skillLevelCache = new HashMap<>();
 
+	AtomicBoolean isUsernameRegistered = new AtomicBoolean(false);
+
 	@Provides
 	EmbargoConfig getConfig(ConfigManager configManager) {
 		return configManager.getConfig(EmbargoConfig.class);
@@ -235,6 +239,10 @@ public class EmbargoPlugin extends Plugin {
 	@Override
 	protected void startUp() {
 		log.info("Embargo Clan plugin started!");
+
+		if (dataManager.stopTryingForAccount.get()) {
+			return;
+		}
 
 		initializePanel();
 		initializeManagers();
@@ -248,9 +256,11 @@ public class EmbargoPlugin extends Plugin {
 
 		if (client != null) {
 			if (client.getGameState() == GameState.LOGGED_IN) {
-				if (dataManager.checkRegistered(client.getLocalPlayer().getName())) {
-					embargoPanel.updateLoggedIn(false);
-				}
+				dataManager.isUserRegisteredAsync(client.getLocalPlayer().getName(), isRegistered -> {
+					if (isRegistered) {
+						embargoPanel.updateLoggedIn(false);
+					}
+				});
 			}
 		}
 	}
@@ -330,21 +340,27 @@ public class EmbargoPlugin extends Plugin {
 	
 	private void handleLoggedIn() {
 		clientThread.invokeLater(() -> {
-			if (client == null) {
+			if (client == null || dataManager.stopTryingForAccount.get()) {
 				return false;
+			}
+
+			if (isUsernameRegistered.get()) {
+				embargoPanel.updateLoggedIn(true);
+				return true;
 			}
 
 			Player localPlayer = client.getLocalPlayer();
 			if (localPlayer != null) {
 				String username = localPlayer.getName();
-				if (dataManager.checkRegistered(username)) {
-					embargoPanel.updateLoggedIn(true);
-					return true;
 
-					
-				}
+				dataManager.isUserRegisteredAsync(username, isRegistered -> {
+					if (isRegistered) {
+						embargoPanel.updateLoggedIn(true);
+						isUsernameRegistered.set(true);
+					}
+				});
 			}
-			return false;
+			return isUsernameRegistered.get();
 		});
 	}
 	
@@ -353,7 +369,7 @@ public class EmbargoPlugin extends Plugin {
     
 		// Clear both panel references
 		if (embargoPanel != null) {
-			embargoPanel.logOut();
+			SwingUtilities.invokeLater(() -> embargoPanel.logOut());
 		} else {
 			log.debug("embargoPanel is null!!!");
 		}
@@ -405,13 +421,18 @@ public class EmbargoPlugin extends Plugin {
 	}
 	
 	private void updatePlayerRegistrationStatus() {
+		if (dataManager.stopTryingForAccount.get()) {
+			return;
+		}
 		Player localPlayer = client.getLocalPlayer();
 		if (localPlayer != null) {
 			String username = localPlayer.getName();
-			if (dataManager.checkRegistered(username)) {
-				log.debug("updateProfileAfterLoggedIn Member registered");
-				embargoPanel.updateLoggedIn(true);
-			}
+			dataManager.isUserRegisteredAsync(username, isRegistered -> {
+				if (isRegistered) {
+					log.debug("updateProfileAfterLoggedIn Member registered");
+					embargoPanel.updateLoggedIn(true);
+				}
+			});
 		}
 	}
 
@@ -1720,13 +1741,13 @@ public class UntrackableItemManager {
                 okHttpClient.newCall(request).enqueue(new Callback() {
                     @Override
                     public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                        log.error("Something went wrong inside of untrackable items");
+                        log.error("Something went wrong inside of getUntrackableItems: {}", e.getLocalizedMessage());
                     }
 
                     @Override
                     public void onResponse(@NonNull Call call, @NonNull Response response) {
                         if (response.isSuccessful()) {
-                            log.debug("Successfully submitted untrackable items");
+                            log.debug("Successfully submitted getUntrackableItems");
                         }
                         response.close();
                     }
@@ -1795,10 +1816,9 @@ package gg.embargo;
 
 import com.google.common.collect.HashMultimap;
 import com.google.gson.*;
-import gg.embargo.collections.CollectionLogManager;
 import gg.embargo.manifest.ManifestManager;
 import gg.embargo.ui.EmbargoPanel;
-import gg.embargo.manifest.Manifest;
+import gg.embargo.untrackables.UntrackableItemManager;
 import lombok.Getter;
 import lombok.NonNull;
 import lombok.Setter;
@@ -1818,9 +1838,14 @@ import okio.BufferedSource;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.io.IOException;
+import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.Consumer;
 
 @Slf4j
 @Singleton
@@ -1852,14 +1877,14 @@ public class DataManager {
     private HashSet<Integer> varbitsToCheck;
 
     @Inject
-    private Manifest manifest;
-
-    @Inject
     private ManifestManager manifestManager;
 
     @Getter
     @Setter
     private int lastManifestVersion = -1;
+
+    AtomicBoolean isUsernameRegistered = new AtomicBoolean(false);
+    public AtomicBoolean stopTryingForAccount = new AtomicBoolean(false);
 
     private int[] oldVarps;
 
@@ -1871,29 +1896,31 @@ public class DataManager {
 
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
 
-     enum APIRoutes {
-         MANIFEST("runelite/manifest"),
-         UNTRACKABLES("untrackables"),
-         CHECKREGISTRATION("checkregistration"),
-         GET_PROFILE("getgear"),
-         SUBMIT_LOOT("loot"),
-         GET_RAID_MONSTERS_TO_TRACK_LOOT("lootBosses"),
-         PREPARE_RAID("raid"),
-         UPLOAD_CLOG("collectionlog"),
-         MINIGAME_COMPLETE("minigame");
+    enum APIRoutes {
+        MANIFEST("runelite/manifest"),
+        UNTRACKABLES("untrackables"),
+        CHECKREGISTRATION("checkregistration"),
+        GET_PROFILE("getgear"),
+        SUBMIT_LOOT("loot"),
+        GET_RAID_MONSTERS_TO_TRACK_LOOT("lootBosses"),
+        PREPARE_RAID("raid"),
+        UPLOAD_CLOG("collectionlog"),
+        MINIGAME_COMPLETE("minigame");
 
-         APIRoutes(String route) {
-             this.route = route;
-         }
+        APIRoutes(String route) {
+            this.route = route;
+        }
 
-         private final String route;
+        private final String route;
 
-         @Override
-         public String toString() {
-             return route;
-         }
-     }
+        @Override
+        public String toString() {
+            return route;
+        }
+    }
 
+    // private static final String MOCK_API_URI =
+    // "https://a278d141-927f-433b-8e4b-6d994067900d.mock.pstmn.io/api/";
     private static final String API_URI = "https://embargo.gg/api/";
     private static final String MANIFEST_ENDPOINT = API_URI + APIRoutes.MANIFEST;
     private static final String UNTRACKABLE_POST_ENDPOINT = API_URI + APIRoutes.UNTRACKABLES;
@@ -1913,14 +1940,15 @@ public class DataManager {
         }
     }
 
-    public void resetVarbsAndVarpsToCheck(){
+    public void resetVarbsAndVarpsToCheck() {
         varbitsToCheck = null;
         varpsToCheck = null;
     }
 
     public List<Player> getSurroundingPlayers() {
         List<Player> pl = new ArrayList<>();
-        if (client == null || client.getTopLevelWorldView() == null || client.getTopLevelWorldView().players() == null) {
+        if (client == null || client.getTopLevelWorldView() == null
+                || client.getTopLevelWorldView().players() == null) {
             return pl;
         }
 
@@ -1955,9 +1983,9 @@ public class DataManager {
 
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-                //Update what we want to track on the fly
+                // Update what we want to track on the fly
                 if (response.isSuccessful()) {
-                    //convert response.body().string() to ArrayList<String>
+                    // convert response.body().string() to ArrayList<String>
                     BufferedSource source = response.body().source();
                     String json = source.readUtf8();
                     response.close();
@@ -1972,29 +2000,29 @@ public class DataManager {
         return null;
     }
 
-    public void uploadCollectionLogUnlock(String item, String player)
-    {
+    public void uploadCollectionLogUnlock(String item, String player) {
         JsonObject payload = getClogUploadPayload(item, player);
-        //log.debug(String.valueOf(payload));
+        // log.debug(String.valueOf(payload));
 
-        okHttpClient.newCall(new Request.Builder().url(CLOG_UNLOCK_ENDPOINT).post(RequestBody.create(JSON, payload.toString())).build()).enqueue(new Callback() {
-            @Override
-            public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                log.debug("Failed to upload new clog slot to Embargo", e);
-            }
+        okHttpClient.newCall(new Request.Builder().url(CLOG_UNLOCK_ENDPOINT)
+                .post(RequestBody.create(JSON, payload.toString())).build()).enqueue(new Callback() {
+                    @Override
+                    public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                        log.debug("Failed to upload new clog slot to Embargo", e);
+                    }
 
-            @Override
-            public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-                //Update what we want to track on the fly
-                if (response.isSuccessful()) {
-                    log.debug("Successfully uploaded new collection log slot");
-                    response.close();
-                    return;
-                }
+                    @Override
+                    public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                        // Update what we want to track on the fly
+                        if (response.isSuccessful()) {
+                            log.debug("Successfully uploaded new collection log slot");
+                            response.close();
+                            return;
+                        }
 
-                response.close();
-            }
-        });
+                        response.close();
+                    }
+                });
     }
 
     public void uploadRaidCompletion(String raid, String message) {
@@ -2003,21 +2031,22 @@ public class DataManager {
         }
 
         JsonObject payload = getRaidCompletionPayload(raid, message);
-        okHttpClient.newCall(new Request.Builder().url(PREPARE_RAID_ENDPOINT).post(RequestBody.create(JSON, payload.toString())).build()).enqueue(new Callback() {
-            @Override
-            public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                log.debug("Failed to upload upload raid completion", e);
-            }
+        okHttpClient.newCall(new Request.Builder().url(PREPARE_RAID_ENDPOINT)
+                .post(RequestBody.create(JSON, payload.toString())).build()).enqueue(new Callback() {
+                    @Override
+                    public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                        log.debug("Failed to upload upload raid completion", e);
+                    }
 
-            @Override
-            public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-                if (response.isSuccessful()) {
-                    log.debug("Successfully uploaded raid preparation");
-                }
+                    @Override
+                    public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                        if (response.isSuccessful()) {
+                            log.debug("Successfully uploaded raid preparation");
+                        }
 
-                response.close();
-            }
-        });
+                        response.close();
+                    }
+                });
     }
 
     public void uploadMinigameCompletion(String minigameName, String message) {
@@ -2026,25 +2055,25 @@ public class DataManager {
         }
 
         JsonObject payload = getMinigamePayload(minigameName, message);
-        okHttpClient.newCall(new Request.Builder().url(MINIGAME_COMPLETION_ENDPOINT).post(RequestBody.create(JSON, payload.toString())).build()).enqueue(new Callback() {
-            @Override
-            public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                log.debug("Failed to upload upload minigame completion", e);
-            }
+        okHttpClient.newCall(new Request.Builder().url(MINIGAME_COMPLETION_ENDPOINT)
+                .post(RequestBody.create(JSON, payload.toString())).build()).enqueue(new Callback() {
+                    @Override
+                    public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                        log.debug("Failed to upload upload minigame completion", e);
+                    }
 
-            @Override
-            public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-                if (response.isSuccessful()) {
-                    log.debug("Successfully uploaded minigame preparation");
-                }
+                    @Override
+                    public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                        if (response.isSuccessful()) {
+                            log.debug("Successfully uploaded minigame preparation");
+                        }
 
-                response.close();
-            }
-        });
+                        response.close();
+                    }
+                });
     }
 
-    private JsonObject getClogUploadPayload(String itemName, String username)
-    {
+    private JsonObject getClogUploadPayload(String itemName, String username) {
 
         JsonObject payload = new JsonObject();
         payload.addProperty("playerName", username);
@@ -2059,7 +2088,7 @@ public class DataManager {
         var world = client.getWorld();
         List<Player> players = getSurroundingPlayers();
 
-        //convert List<Player> to JSON
+        // convert List<Player> to JSON
         JsonArray playersJson = new JsonArray();
         for (Player player : players) {
             JsonObject playerJson = new JsonObject();
@@ -2081,7 +2110,7 @@ public class DataManager {
         var user = client.getLocalPlayer().getName();
         List<Player> players = getSurroundingPlayers();
 
-        //convert List<Player> to JSON
+        // convert List<Player> to JSON
         JsonArray playersJson = new JsonArray();
         for (Player player : players) {
             JsonObject playerJson = new JsonObject();
@@ -2097,58 +2126,145 @@ public class DataManager {
         return payload;
     }
 
-    public JsonObject getProfile(String username) {
+    public CompletableFuture<JsonObject> getProfileAsync(String username) {
+        CompletableFuture<JsonObject> future = new CompletableFuture<>();
+
         Request request = new Request.Builder()
                 .url(GET_PROFILE_ENDPOINT + '/' + username)
                 .get()
                 .build();
 
-        OkHttpClient shortTimeoutClient = okHttpClient.newBuilder()
-                .callTimeout(5, TimeUnit.SECONDS)
-                .build();
-
-        try (Response response = shortTimeoutClient.newCall(request).execute()) {
-            if (response.isSuccessful()) {
-                BufferedSource source = response.body().source();
-                String json = source.readUtf8();
-
-                response.close();
-                return gson.fromJson(json, JsonObject.class);
+        okHttpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                future.complete(new JsonObject()); // Complete with empty object on failure
             }
 
-            response.close();
-            return new JsonObject();
-        } catch (IOException ioException) {
-            log.error("Failed to check if user is registered.");
-        }
-        return new JsonObject();
-    }
-
-    public boolean checkRegistered(String username) {
-        Request request = new Request.Builder()
-                .url(CHECK_REGISTRATION_ENDPOINT + '/' + username)
-                .get()
-                .build();
-
-        OkHttpClient shortTimeoutClient = okHttpClient.newBuilder()
-                .callTimeout(5, TimeUnit.SECONDS)
-                .build();
-
-        try (Response response = shortTimeoutClient.newCall(request).execute()) {
-            if (response.isSuccessful()) {
-                response.close();
-                return true;
-
-            } else {
-                log.error("Failed to check if user is registered.");
-                response.close();
+            @Override
+            public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                if (response.isSuccessful()) {
+                    BufferedSource source = response.body().source();
+                    String json = source.readUtf8();
+                    response.close();
+                    future.complete(gson.fromJson(json, JsonObject.class));
+                } else {
+                    response.close();
+                    future.complete(new JsonObject()); // Complete with empty object on unsuccessful response
+                }
             }
-        } catch (IOException ioException) {
-            log.error("Failed to check if user is registered.");
+        });
+
+        return future;
+    }
+
+    private final AtomicBoolean apiFailureMode = new AtomicBoolean(false);
+    private final AtomicLong lastApiFailure = new AtomicLong(0);
+    private static final long API_RETRY_DELAY_MINUTES = 1;
+
+    /**
+     * Checks if a user is registered with Embargo asynchronously
+     * @param username The username to check
+     * @param callback Callback to handle the result
+     */
+    public void isUserRegisteredAsync(String username, Consumer<Boolean> callback) {
+        if (username == null) {
+            callback.accept(false);
+            return;
         }
 
-        return false;
+        if (stopTryingForAccount.get()) {
+            callback.accept(false);
+            return;
+        }
+
+        if (isUsernameRegistered.get()) {
+            callback.accept(true);
+            return;
+        }
+
+        log.debug("Checking if {} is registered with Embargo", username);
+
+        // If we're in API failure mode, only retry after the delay period
+        long currentTime = Instant.now().getEpochSecond();
+        long failureTime = lastApiFailure.get();
+        long elapsedMinutes = TimeUnit.SECONDS.toMinutes(currentTime - failureTime);
+
+        if (apiFailureMode.get() && elapsedMinutes < API_RETRY_DELAY_MINUTES) {
+            log.debug("apiFailureMode is true, skipping execution for {} minute(s)", API_RETRY_DELAY_MINUTES);
+            callback.accept(false);
+            return;
+        }
+
+        apiFailureMode.set(false);
+
+        try {
+            Request request = new Request.Builder()
+                    .url(CHECK_REGISTRATION_ENDPOINT + "/" + username)
+                    .get()
+                    .build();
+
+            // Create a client with shorter timeout for this specific check
+            OkHttpClient shortTimeoutClient = okHttpClient.newBuilder()
+                    .callTimeout(5, TimeUnit.SECONDS)
+                    .build();
+
+            shortTimeoutClient.newCall(request).enqueue(new Callback() {
+                @Override
+                public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                    log.error("Failed to check if {} is registered with Embargo's database", username);
+                    apiFailureMode.set(true);
+                    lastApiFailure.set(Instant.now().getEpochSecond());
+                    callback.accept(false);
+                }
+
+                @Override
+                public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                    try (response) {
+                        if (response.isSuccessful()) {
+                            String responseBody = response.body().string();
+                            JsonObject jsonResponse = gson.fromJson(responseBody, JsonObject.class);
+                            if (jsonResponse != null && jsonResponse.has("message") && "registered".equals(jsonResponse.get("message").getAsString())) {
+                                log.debug("{} is registered, return true", username);
+                                isUsernameRegistered.set(true);
+                                callback.accept(true);
+                            } else {
+                                log.debug("{} is NOT registered, return false", username);
+                                stopTryingForAccount.set(true);
+                                callback.accept(false);
+                            }
+                            apiFailureMode.set(false);
+
+                        } else {
+                            String responseBody = response.body().string();
+                            JsonObject jsonResponse = gson.fromJson(responseBody, JsonObject.class);
+                            if (jsonResponse != null && jsonResponse.has("message") && "not registered".equals(jsonResponse.get("message").getAsString())) {
+                                stopTryingForAccount.set(true);
+                                callback.accept(false);
+                                return;
+                            }
+                            log.error("Failed to check if {} is registered with Embargo's database. Status: {}",
+                                    username, response.code());
+                            apiFailureMode.set(true);
+                            lastApiFailure.set(Instant.now().getEpochSecond());
+                            callback.accept(false);
+                            isUsernameRegistered.set(false);
+                        }
+                    }
+                }
+            });
+        } catch (Exception e) {
+            // Log once and enter failure mode
+            if (!apiFailureMode.get()) {
+                log.error("Failed to check if user is registered. API may be down. Will retry in {} minutes.",
+                        API_RETRY_DELAY_MINUTES, e);
+                apiFailureMode.set(true);
+                lastApiFailure.set(Instant.now().getEpochSecond());
+                isUsernameRegistered.set(false);
+            }
+            callback.accept(false);
+        }
     }
+
 
     public void uploadLoot(LootReceived event) {
         JsonObject payload = getJsonObject(event);
@@ -2185,7 +2301,7 @@ public class DataManager {
         var user = client.getLocalPlayer().getName();
         List<Player> players = getSurroundingPlayers();
 
-        //convert List<Player> to JSON
+        // convert List<Player> to JSON
         JsonArray playersJson = new JsonArray();
         for (Player player : players) {
             JsonObject playerJson = new JsonObject();
@@ -2193,7 +2309,7 @@ public class DataManager {
             playersJson.add(playerJson);
         }
 
-        //convert itemStacks to JSON using gson
+        // convert itemStacks to JSON using gson
         JsonArray itemStacksJson = new JsonArray();
         for (ItemStack itemStack : itemStacks) {
             JsonObject itemStackJson = new JsonObject();
@@ -2205,10 +2321,10 @@ public class DataManager {
             itemStacksJson.add(itemStackJson);
         }
 
-        //convert json array to String
+        // convert json array to String
         String itemStacksJsonString = itemStacksJson.toString();
 
-        //build payload with bossName and itemStacks
+        // build payload with bossName and itemStacks
         JsonObject payload = new JsonObject();
         payload.addProperty("bossName", event.getName());
         payload.addProperty("user", user);
@@ -2277,7 +2393,8 @@ public class DataManager {
     private JsonObject convertToJson() {
         JsonObject j = new JsonObject();
         JsonObject parent = new JsonObject();
-        // We need to synchronize this to handle the case where the RuneScapeProfileType changes
+        // We need to synchronize this to handle the case where the RuneScapeProfileType
+        // changes
         synchronized (this) {
             RuneScapeProfileType r = RuneScapeProfileType.getCurrent(client);
             HashMap<Integer, Integer> tempVarbData = clearChanges(varbData);
@@ -2318,44 +2435,52 @@ public class DataManager {
         }
     }
 
-
     protected void submitToAPI() {
-        if (!hasDataToPush() || client.getLocalPlayer() == null || client.getLocalPlayer().getName() == null)
+        if (!hasDataToPush() || client.getLocalPlayer() == null || client.getLocalPlayer().getName() == null || stopTryingForAccount.get())
             return;
 
-        if (RuneScapeProfileType.getCurrent(client) == RuneScapeProfileType.BETA)
+        if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD)
             return;
 
-        if (!checkRegistered(client.getLocalPlayer().getName())) {
-            return;
-        }
+        isUserRegisteredAsync(client.getLocalPlayer().getName(), isRegistered -> {
+            if (!isRegistered) {
+                return;
+            }
 
         if (client.getGameState() == GameState.LOGIN_SCREEN || client.getGameState() == GameState.HOPPING) {
             return;
         }
 
-        //log.debug("Submitting changed data to endpoint...");
-        JsonObject postRequestBody = convertToJson();
-        Request request = new Request.Builder()
-                .url(UNTRACKABLE_POST_ENDPOINT)
-                .post(RequestBody.create(JSON, postRequestBody.toString()))
-                .build();
+        try {
+            JsonObject payload = convertToJson();
 
-        OkHttpClient shortTimeoutClient = okHttpClient.newBuilder()
-                .callTimeout(5, TimeUnit.SECONDS)
-                .build();
-        try (Response response = shortTimeoutClient.newCall(request).execute()) {
-            if (!response.isSuccessful()) {
-                // If we failed to submit, read the data to the data lists (unless there are newer ones)
-                //log.error("[submitToAPI !response.isSuccessful(): 496] Failed to submit data, attempting to reload dropped data");
-                this.restoreData(postRequestBody);
-            }
+            okHttpClient.newCall(new Request.Builder().url(UNTRACKABLE_POST_ENDPOINT)
+                    .post(RequestBody.create(JSON, payload.toString())).build()).enqueue(new Callback() {
+                        @Override
+                        public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                            log.error(e.getLocalizedMessage());
+                            restoreData(payload);
+                            log.error("Failed to submit player in submitToAPI, restoring data. Cause of failure:", e);
+                        }
 
-        } catch (IOException ioException) {
+                        @Override
+                        public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
+                            if (response.isSuccessful()) {
+                                log.debug("Successfully uploaded untrackable items");
+                                response.close();
+                                return;
+                            } else {
+                                response.close();
+                                log.error("submitToAPI onResponse returned, but without success");
+                            }
 
-            //log.error("[submitToAPI IOException: 496] Failed to submit data, attempting to reload dropped data");
-            this.restoreData(postRequestBody);
+                            response.close();
+                        }
+                    });
+        } catch (Exception e) {
+            log.error("Error preparing data for API submission", e);
         }
+    });
     }
 
     private HashSet<Integer> parseSet(JsonArray j) {
@@ -2366,28 +2491,24 @@ public class DataManager {
         return h;
     }
 
-    public void loadInitialData()
-    {
+    public void loadInitialData() {
         manifestManager.getLatestManifest();
 
-        for (int varbIndex : varbitsToCheck)
-        {
+        for (int varbIndex : varbitsToCheck) {
             storeVarbitChanged(varbIndex, client.getVarbitValue(varbIndex));
         }
 
-        for (int varpIndex : varpsToCheck)
-        {
+        for (int varpIndex : varpsToCheck) {
             storeVarpChanged(varpIndex, client.getVarpValue(varpIndex));
         }
-        for (Skill s : Skill.values())
-        {
+        for (Skill s : Skill.values()) {
             storeSkillChanged(s.getName(), client.getRealSkillLevel(s));
         }
     }
 
-    //NEEDS TO BE MODIFIED TO USE NEW MANIFEST OBJECT STUFF
+    // NEEDS TO BE MODIFIED TO USE NEW MANIFEST OBJECT STUFF
     protected void getManifest() {
-        //log.debug("Getting manifest file...");
+        // log.debug("Getting manifest file...");
         try {
             Request r = new Request.Builder()
                     .url(MANIFEST_ENDPOINT)
@@ -2402,7 +2523,8 @@ public class DataManager {
                 public void onResponse(@NonNull Call call, @NonNull Response response) {
                     if (response.isSuccessful()) {
                         try {
-                            // We want to be able to change the varbs and varps we get on the fly. To do so, we tell
+                            // We want to be able to change the varbs and varps we get on the fly. To do so,
+                            // we tell
                             // the client what to send the server on startup via the manifest.
                             if (response.body() == null) {
                                 log.error("Manifest request succeeded but returned empty body");
@@ -2450,9 +2572,9 @@ public class DataManager {
         }
     }
 
-    //NEEDS TO BE MODIFIED TO USE NEW MANIFEST OBJECT STUFF
+    // NEEDS TO BE MODIFIED TO USE NEW MANIFEST OBJECT STUFF
     protected int getVersion() {
-        //log.debug("Attempting to get manifest version...");
+        // log.debug("Attempting to get manifest version...");
         Request request = new Request.Builder()
                 .url(MANIFEST_ENDPOINT)
                 .build();
@@ -2468,7 +2590,8 @@ public class DataManager {
                 public void onResponse(@NonNull Call call, Response response) throws IOException {
                     if (response.isSuccessful()) {
                         try {
-                            // We want to be able to change the varbs and varps we get on the fly. To do so, we tell
+                            // We want to be able to change the varbs and varps we get on the fly. To do so,
+                            // we tell
                             // the client what to send the server on startup via the manifest.
                             if (response.body() == null) {
                                 log.error("Manifest request succeeded but returned empty body");
@@ -2481,7 +2604,7 @@ public class DataManager {
                                 try {
                                     int manifestVersion = j.get("version").getAsInt();
                                     if (manifestManager.getLatestManifest().getVersion() != manifestVersion) {
-                                        //update to use new manifest stuff
+                                        // update to use new manifest stuff
                                         clientThread.invoke(() -> loadInitialData());
                                     }
                                 } catch (UnsupportedOperationException | NullPointerException exception) {
@@ -2513,20 +2636,17 @@ public class DataManager {
     }
 
     @Subscribe
-    public void onVarbitChanged(VarbitChanged varbitChanged)
-    {
+    public void onVarbitChanged(VarbitChanged varbitChanged) {
         if (client == null || varbitsToCheck == null || varpsToCheck == null)
             return;
         if (oldVarps == null)
             setupVarpTracking();
 
         int varpIndexChanged = varbitChanged.getVarpId();
-        if (varpsToCheck.contains(varpIndexChanged))
-        {
+        if (varpsToCheck.contains(varpIndexChanged)) {
             storeVarpChanged(varpIndexChanged, client.getVarpValue(varpIndexChanged));
         }
-        for (Integer i : varpToVarbitMapping.get(varpIndexChanged))
-        {
+        for (Integer i : varpToVarbitMapping.get(varpIndexChanged)) {
             if (!varbitsToCheck.contains(i))
                 continue;
             // For each varbit index, see if it changed.
@@ -2543,33 +2663,29 @@ public class DataManager {
     // Get varp, if varp in hashset, queue it.
     // Get each varb index in varp. If varb changed and varb in hashset, queue it.
     // Checking if varb has changed requires us to keep track of old varps
-    private void setupVarpTracking()
-    {
+    private void setupVarpTracking() {
         final int VARBITS_ARCHIVE_ID = 14;
         // Init stuff to keep track of varb changes
         varpToVarbitMapping.clear();
 
-        if (oldVarps == null)
-        {
+        if (oldVarps == null) {
             oldVarps = new int[client.getVarps().length];
         }
 
         // Set oldVarps to be the current varps
         System.arraycopy(client.getVarps(), 0, oldVarps, 0, oldVarps.length);
 
-        // For all varbits, add their ids to the multimap with the varp index as their key
+        // For all varbits, add their ids to the multimap with the varp index as their
+        // key
         clientThread.invoke(() -> {
-            if (client.getIndexConfig() == null)
-            {
+            if (client.getIndexConfig() == null) {
                 return false;
             }
             IndexDataBase indexVarbits = client.getIndexConfig();
             final int[] varbitIds = indexVarbits.getFileIds(VARBITS_ARCHIVE_ID);
-            for (int id : varbitIds)
-            {
+            for (int id : varbitIds) {
                 VarbitComposition varbit = client.getVarbit(id);
-                if (varbit != null)
-                {
+                if (varbit != null) {
                     varpToVarbitMapping.put(varbit.getIndex(), id);
                 }
             }
@@ -2577,38 +2693,37 @@ public class DataManager {
         });
     }
 
-    @Schedule(
-            period = 5*60,
-            unit = ChronoUnit.SECONDS,
-            asynchronous = true
-    )
-    public void resyncManifest()
-    {
-        //log.debug("Attempting to resync manifest");
-        if (manifestManager.getManifest().getVersion() != getLastManifestVersion())
-        {
+    @Schedule(period = 5 * 60, unit = ChronoUnit.SECONDS, asynchronous = true)
+    public void resyncManifest() {
+        // log.debug("Attempting to resync manifest");
+        if (manifestManager.getManifest().getVersion() != getLastManifestVersion()) {
             getManifest();
         }
     }
 
-    @Schedule(
-            period = 10,
-            unit = ChronoUnit.SECONDS,
-            asynchronous = true
-    )
-    public void scheduledSubmit()
-    {
-        if (client != null && (client.getGameState() != GameState.HOPPING && client.getGameState() != GameState.LOGIN_SCREEN)) {
+    @Schedule(period = 10, unit = ChronoUnit.SECONDS, asynchronous = true)
+    public void scheduledSubmit() {
+        if (stopTryingForAccount.get()) {
+            return;
+        }
+        if (client != null
+                && (client.getGameState() != GameState.HOPPING && client.getGameState() != GameState.LOGIN_SCREEN)) {
             submitToAPI();
             if (client.getLocalPlayer() != null) {
                 String username = client.getLocalPlayer().getName();
-                if (checkRegistered(username)) {
-                    //log.debug("updateProfileAfterLoggedIn Member registered");
-                    embargoPanel.updateLoggedIn(true);
-                }
+
+                isUserRegisteredAsync(username, isRegistered -> {
+                    if (isRegistered) {
+                        embargoPanel.updateLoggedIn(true);
+                    } else {
+                        embargoPanel.isLoggedIn = false;
+                        embargoPanel.updateLoggedIn(false);
+                        embargoPanel.logOut();
+                    }
+                });
             }
         } else {
-            //log.debug("User is hopping or logged out, do not send data");
+            // log.debug("User is hopping or logged out, do not send data");
             embargoPanel.isLoggedIn = false;
             embargoPanel.updateLoggedIn(false);
             embargoPanel.logOut();
@@ -2907,9 +3022,12 @@ public class SyncButtonManager {
 }
 package gg.embargo.ui;
 
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ItemComposition;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
@@ -2929,6 +3047,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Stream;
+import java.util.stream.StreamSupport;
 
 @Slf4j
 public class MissingRequirementsPanel extends PluginPanel {
@@ -2938,11 +3058,11 @@ public class MissingRequirementsPanel extends PluginPanel {
     private static final int TOOLTIP_PADDING = 3;
     private static final Color HOVER_COLOR = ColorScheme.DARKER_GRAY_HOVER_COLOR;
     private static final Color NORMAL_COLOR = ColorScheme.DARKER_GRAY_COLOR;
-    
+
     // Cache for item icons to avoid recreating them
     private final Map<Integer, BufferedImage> iconCache = new ConcurrentHashMap<>();
     private final Map<String, BufferedImage> letterIconCache = new ConcurrentHashMap<>();
-    
+
     private final ItemManager itemManager;
     private final JPanel itemsContainer;
     private final List<MissingItem> missingItems = new ArrayList<>();
@@ -2985,7 +3105,7 @@ public class MissingRequirementsPanel extends PluginPanel {
         subtitle.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
         subtitle.setFont(new Font("SansSerif", Font.ITALIC, 10));
         titlePanel.add(subtitle, BorderLayout.SOUTH);
-        
+
         return titlePanel;
     }
 
@@ -2993,29 +3113,52 @@ public class MissingRequirementsPanel extends PluginPanel {
      * Adds a missing item to the panel if it doesn't already exist
      * 
      * @param itemName The name of the item
-     * @param itemId The item ID in RuneScape
+     * 
+     * @param itemId   The item ID in RuneScape
      */
     public void addMissingItem(String itemName, int itemId) {
+        if (itemName.isEmpty() && itemId != -1) {
+            // get item name by id
+            ItemComposition ic = itemManager.getItemComposition(itemId);
+
+            // generate icon
+            BufferedImage itemIcon = getItemIcon(itemId, ic.getName());
+
+            log.debug("updating icons (empty + itemId != -1) untrackable with {} ", ic.getName());
+            // add to missing items panel
+            missingItems.add(new MissingItem(ic.getName(), itemId, itemIcon));
+            updatePanel();
+            return;
+        }
+
         String cleanedName = itemName.replace("\"", "");
-        
+        cleanedName = cleanedName.replace(" (uncharged)", "");
         // Check if item already exists
+        String finalCleanedName = cleanedName;
         boolean itemExists = missingItems.stream()
-                .anyMatch(item -> item.getItemName().contains(cleanedName));
-      
+                .anyMatch(item -> item.getItemName().contains(finalCleanedName));
+
+        // Technically trackable, but untradable. Special case
+        if (finalCleanedName.toLowerCase().contains("quiver")) {
+            itemId = 28947;
+        }
+
+        if (finalCleanedName.toLowerCase().contains("infernal cape")) {
+            itemId = 21295;
+        }
+        
         // Only add if it doesn't exist
         if (!itemExists) {
             BufferedImage itemIcon;
             int finalItemId;
-            
             if (itemName.contains("Combat Achievement")) {
                 finalItemId = getHiltIdFromName(itemName);
                 itemIcon = getHiltImageFromName(itemName.split(" ")[0]);
             } else {
                 finalItemId = itemId;
-                itemIcon = getItemIcon(itemId, cleanedName);
+                itemIcon = getItemIcon(itemId, finalCleanedName);
             }
-            
-            missingItems.add(new MissingItem(cleanedName, finalItemId, itemIcon));
+            missingItems.add(new MissingItem(finalCleanedName, finalItemId, itemIcon));
             updatePanel();
         }
     }
@@ -3038,8 +3181,15 @@ public class MissingRequirementsPanel extends PluginPanel {
 
     public BufferedImage getHiltImageFromName(String name) {
         String lowercaseName = name.toLowerCase();
-        
+        // Strip out extra "'s
+        lowercaseName = lowercaseName.replace("\"", "");
+
         for (AchievementHilts hilt : AchievementHilts.values()) {
+            // Shortcut to bypass conflicting name with "Master" being in "Grandmaster"
+            if (lowercaseName.contains("grand")) {
+                return getItemIcon(AchievementHilts.GRANDMASTER.getItemId(), "Ghommal's_avernic_defender_6");
+            }
+
             if (lowercaseName.contains(hilt.name().toLowerCase())) {
                 return getItemIcon(hilt.getItemId(), "Ghommal's_avernic_defender_" + (hilt.ordinal() + 1));
             }
@@ -3054,14 +3204,14 @@ public class MissingRequirementsPanel extends PluginPanel {
         if (lowercaseName.contains("grand")) {
             return AchievementHilts.GRANDMASTER.getItemId();
         }
-        
+
         // Check for other hilt types
         for (AchievementHilts hilt : AchievementHilts.values()) {
             if (lowercaseName.contains(hilt.name().toLowerCase())) {
                 return hilt.getItemId();
             }
         }
-        
+
         return 882;
     }
 
@@ -3078,12 +3228,10 @@ public class MissingRequirementsPanel extends PluginPanel {
      */
     private void updatePanel() {
         itemsContainer.removeAll();
-        
         for (MissingItem item : missingItems) {
             JPanel itemPanel = createItemPanel(item);
             itemsContainer.add(itemPanel);
         }
-        
         revalidate();
         repaint();
     }
@@ -3098,19 +3246,19 @@ public class MissingRequirementsPanel extends PluginPanel {
         panel.setPreferredSize(new Dimension(CELL_SIZE, CELL_SIZE));
         panel.setMinimumSize(new Dimension(CELL_SIZE, CELL_SIZE));
         panel.setMaximumSize(new Dimension(CELL_SIZE, CELL_SIZE));
-    
+
         // Get the item icon
         JLabel iconLabel = new JLabel(new ImageIcon(item.getIcon()));
         iconLabel.setHorizontalAlignment(SwingConstants.CENTER);
         panel.add(iconLabel, BorderLayout.CENTER);
         panel.setToolTipText(buildTooltipText(item));
-    
+
         // Add hover effect and click handler to the panel
         panel.addMouseListener(itemMouseAdapter);
-    
+
         return panel;
     }
-    
+
     private MouseAdapter createMouseAdapter() {
         return new MouseAdapter() {
             @Override
@@ -3119,29 +3267,32 @@ public class MissingRequirementsPanel extends PluginPanel {
                 panel.setBackground(HOVER_COLOR);
                 panel.setCursor(new Cursor(Cursor.HAND_CURSOR));
             }
-        
+
             @Override
             public void mouseExited(MouseEvent e) {
                 JPanel panel = (JPanel) e.getSource();
                 panel.setBackground(NORMAL_COLOR);
                 panel.setCursor(new Cursor(Cursor.DEFAULT_CURSOR));
             }
-        
+
             @Override
             public void mouseClicked(MouseEvent e) {
                 JPanel panel = (JPanel) e.getSource();
                 Component[] components = itemsContainer.getComponents();
                 int index = -1;
-                
+
                 for (int i = 0; i < components.length; i++) {
                     if (components[i] == panel) {
                         index = i;
                         break;
                     }
                 }
-                
+
                 if (index >= 0 && index < missingItems.size()) {
                     MissingItem item = missingItems.get(index);
+                    if (item.getItemId() == -1) {
+                        return;
+                    }
                     String wikiUrl = OSRS_WIKI_BASE_URL + item.getItemName().replace(" ", "_");
                     LinkBrowser.browse(wikiUrl);
                 }
@@ -3159,7 +3310,7 @@ public class MissingRequirementsPanel extends PluginPanel {
             if (cachedIcon != null) {
                 return cachedIcon;
             }
-            
+
             BufferedImage icon = itemManager.getImage(itemId);
             BufferedImage resizedIcon = ImageUtil.resizeImage(icon, CELL_SIZE, CELL_SIZE);
             iconCache.put(itemId, resizedIcon);
@@ -3168,18 +3319,18 @@ public class MissingRequirementsPanel extends PluginPanel {
             // For letter-based icons, create a cache key
             String letter = getLetterForItem(itemName);
             String cacheKey = letter + "_" + CELL_SIZE;
-            
+
             BufferedImage cachedIcon = letterIconCache.get(cacheKey);
             if (cachedIcon != null) {
                 return cachedIcon;
             }
-            
+
             BufferedImage icon = createLetterIcon(letter);
             letterIconCache.put(cacheKey, icon);
             return icon;
         }
     }
-    
+
     private String getLetterForItem(String itemName) {
         if (itemName.contains("community")) {
             return "CP";
@@ -3192,7 +3343,7 @@ public class MissingRequirementsPanel extends PluginPanel {
         }
         return itemName.substring(0, 1).toUpperCase();
     }
-    
+
     private BufferedImage createLetterIcon(String letter) {
         BufferedImage icon = new BufferedImage(CELL_SIZE, CELL_SIZE, BufferedImage.TYPE_INT_ARGB);
         Graphics2D g2d = icon.createGraphics();
@@ -3201,16 +3352,16 @@ public class MissingRequirementsPanel extends PluginPanel {
         g2d.setColor(ColorScheme.MEDIUM_GRAY_COLOR);
         g2d.fillRect(0, 0, CELL_SIZE, CELL_SIZE);
         g2d.setColor(Color.WHITE);
-        
+
         // Calculate appropriate font size based on text length
         int fontSize = 16; // Default font size
         if (letter.length() > 1) {
             // Reduce font size for longer text
             fontSize = Math.max(8, 16 - (letter.length() - 1) * 2);
         }
-        
+
         g2d.setFont(new Font("SansSerif", Font.BOLD, fontSize));
-        
+
         // Ensure text fits within the cell
         FontMetrics fm = g2d.getFontMetrics();
         while (fm.stringWidth(letter) > CELL_SIZE - 2 && fontSize > 8) {
@@ -3218,12 +3369,12 @@ public class MissingRequirementsPanel extends PluginPanel {
             g2d.setFont(new Font("SansSerif", Font.BOLD, fontSize));
             fm = g2d.getFontMetrics();
         }
-        
+
         int x = (CELL_SIZE - fm.stringWidth(letter)) / 2;
         int y = ((CELL_SIZE - fm.getHeight()) / 2) + fm.getAscent();
         g2d.drawString(letter, x, y);
         g2d.dispose();
-        
+
         return icon;
     }
 
@@ -3233,23 +3384,23 @@ public class MissingRequirementsPanel extends PluginPanel {
     private String buildTooltipText(MissingItem item) {
         StringBuilder sb = new StringBuilder("<html><body style='padding: ");
         sb.append(TOOLTIP_PADDING).append("px;");
-        
+
         if (item.getItemId() == -1) {
             sb.append(" text-align: center;");
         }
-        
+
         sb.append("'><div style='font-weight: bold;");
-        
+
         if (item.getItemId() != -1) {
             sb.append(" margin-bottom: 3px;");
         }
-        
+
         sb.append("'>").append(item.getItemName()).append("</div>");
-        
+
         if (item.getItemId() != -1) {
             sb.append("<div style='color: #99FFFF; font-style: italic;'>Click to open wiki</div>");
         }
-        
+
         sb.append("</body></html>");
         return sb.toString();
     }
@@ -3292,6 +3443,7 @@ import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import gg.embargo.DataManager;
+import gg.embargo.EmbargoPlugin;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
@@ -3312,6 +3464,7 @@ import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.util.ArrayList;
 
 @Slf4j
 public class EmbargoPanel extends PluginPanel {
@@ -3333,13 +3486,14 @@ public class EmbargoPanel extends PluginPanel {
     @Setter
     public boolean isLoggedIn = false;
 
-
     // Keep track of all boxes
-    //private final ArrayList<ItemID> items = new ArrayList<>();
+    // private final ArrayList<ItemID> items = new ArrayList<>();
     JPanel versionPanel = new JPanel();
     JPanel missingRequirementsPanel = new JPanel();
-    private static final ImageIcon ARROW_RIGHT_ICON = new ImageIcon(ImageUtil.loadImageResource(EmbargoPanel.class, "/util/arrow_right.png"));
-    private static final ImageIcon DISCORD_ICON = new ImageIcon(ImageUtil.loadImageResource(EmbargoPanel.class, "/discord_icon.png"));
+    private static final ImageIcon ARROW_RIGHT_ICON = new ImageIcon(
+            ImageUtil.loadImageResource(EmbargoPanel.class, "/util/arrow_right.png"));
+    private static final ImageIcon DISCORD_ICON = new ImageIcon(
+            ImageUtil.loadImageResource(EmbargoPanel.class, "/discord_icon.png"));
     static ImageIcon GITHUB_ICON = new ImageIcon(ImageUtil.loadImageResource(EmbargoPanel.class, "/github_icon.png"));
     static ImageIcon WEBSITE_ICON = new ImageIcon(ImageUtil.loadImageResource(EmbargoPanel.class, "/website_icon.png"));
     private final JRichTextPane emailLabel = new JRichTextPane();
@@ -3350,35 +3504,35 @@ public class EmbargoPanel extends PluginPanel {
     private final JLabel currentRankLabel = new JLabel(htmlLabel("Current Rank:", " N/A"));
     private final JLabel isRegisteredWithClanLabel = new JLabel(htmlLabel("Account registered:", " No"));
     private final JLabel currentCALabel = new JLabel(htmlLabel("Current TA Tier:", " N/A"));
-    final JLabel missingRequiredItemsLabel = new JLabel(htmlLabel("Sign in to see what requirements", " you are missing for rank up"));
+    final JLabel missingRequiredItemsLabel = new JLabel(
+            htmlLabel("Sign in to see what requirements", " you are missing for rank up"));
     private final Font smallFont = FontManager.getRunescapeSmallFont();
     final JPanel missingRequirementsContainer = new JPanel(new BorderLayout(5, 0));
 
-    //final JLabel playerNameLabel = new JLabel("Missing Requirements For Next Rank", JLabel.LEFT);
     @Inject
     private EmbargoPanel() {
     }
 
-    private String htmlLabel(String key, String value)
-    {
-        return "<html><body style = 'color:#a5a5a5'>" + key + "<span style = 'color:white'>" + value + "</span></body></html>";
+    private String htmlLabel(String key, String value) {
+        return "<html><body style = 'color:#a5a5a5'>" + key + "<span style = 'color:white'>" + value
+                + "</span></body></html>";
     }
 
     void setupVersionPanel() {
-        //Set up Embargo Clan Version at top of Version panel
-        JLabel version = new JLabel(htmlLabel("Embargo Clan Version: ", "1.4.0"));
+        // Set up Embargo Clan Version at top of Version panel
+        JLabel version = new JLabel(htmlLabel("Embargo Clan Version: ", "1.4.2"));
         version.setFont(smallFont);
 
-        //Set version's font
+        // Set version's font
         JLabel revision = new JLabel();
         revision.setFont(smallFont);
 
-        //Set up versionPanel
+        // Set up versionPanel
         versionPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
         versionPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
         versionPanel.setLayout(new GridLayout(0, 1));
 
-        //Set up custom embargo labels
+        // Set up custom embargo labels
         isRegisteredWithClanLabel.setFont(smallFont);
         isRegisteredWithClanLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
 
@@ -3419,38 +3573,47 @@ public class EmbargoPanel extends PluginPanel {
         actionsContainer.setBorder(new EmptyBorder(10, 0, 0, 0));
         actionsContainer.setLayout(new GridLayout(0, 1, 0, 10));
 
-        actionsContainer.add(buildLinkPanel(DISCORD_ICON, "Join us on our", "Discord", "https://embargo.gg/discord"));
+        actionsContainer.add(buildLinkPanel(DISCORD_ICON, "Join us on our", "Discord", "https://discord.gg/embargo"));
         actionsContainer.add(buildLinkPanel(WEBSITE_ICON, "Go to our", "clan website", "https://embargo.gg/"));
-        actionsContainer.add(buildLinkPanel(GITHUB_ICON, "Report a bug or", "inspect the plugin code", "https://github.com/Sharpienero/Embargo-Plugin"));
+        actionsContainer.add(buildLinkPanel(GITHUB_ICON, "Report a bug or", "inspect the plugin code",
+                "https://github.com/Sharpienero/Embargo-Plugin"));
 
         return actionsContainer;
     }
 
     void setupMissingItemsPanel() {
-        if (client == null || client.getGameState() == GameState.LOADING || client.getGameState() == GameState.LOGIN_SCREEN) {
-            missingRequirementsContainer.removeAll();
-            this.remove(missingRequirementsContainer);
-            this.revalidate();
-        }
-        this.add(missingRequirementsContainer);
-        this.revalidate();
+        // Clear any existing content
+        missingRequirementsContainer.removeAll();
+        missingRequirementsPanel.removeAll();
+
+        // Set up container styling
         missingRequirementsContainer.setBorder(new EmptyBorder(7, 7, 7, 7));
         missingRequirementsContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-
         missingRequirementsContainer.setFont(FontManager.getRunescapeSmallFont());
         missingRequirementsContainer.setForeground(Color.WHITE);
-        missingRequirementsContainer.add(missingRequirementsPanel);
 
+        // Set up panel styling
         missingRequirementsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
         missingRequirementsPanel.setBorder(new EmptyBorder(10, 0, 10, 0));
         missingRequirementsPanel.setLayout(new GridLayout(1, 1));
 
-        //Push text to top of component
+        // Always add the default message initially
+        missingRequiredItemsLabel
+                .setText(htmlLabel("Sign in to see what requirements", " you are missing for rank up"));
+        missingRequiredItemsLabel.setFont(smallFont);
+        missingRequiredItemsLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+        missingRequirementsPanel.add(missingRequiredItemsLabel);
+
+        // Add panel to container
+        missingRequirementsContainer.add(missingRequirementsPanel, BorderLayout.CENTER);
+
+        // Add container to main panel
         this.add(missingRequirementsContainer, BorderLayout.NORTH);
+        this.revalidate();
     }
 
     void addSidePanel() {
-        //Add the panels to the side plugin
+        // Add the panels to the side plugin
         this.add(versionPanel, BorderLayout.NORTH);
         setupMissingItemsPanel();
         this.add(this.setUpQuickLinks(), BorderLayout.SOUTH);
@@ -3461,98 +3624,136 @@ public class EmbargoPanel extends PluginPanel {
         this.setUpQuickLinks();
         this.addSidePanel();
 
-        //Update version panel with Embargo plugin information
+        // Update version panel with Embargo plugin information
         updateLoggedIn(false);
     }
 
-    public void init()
-    {
+    public void init() {
         this.setupSidePanel();
+        logOut();
     }
 
     public void updateLoggedIn(boolean scheduled) {
+        if (dataManager.stopTryingForAccount.get()) {
+            emailLabel.setText("Account not registered with Embargo");
+            missingRequirementsPanelX.removeAll();
+            missingRequirementsContainer.removeAll();
+            missingRequirementsPanel.removeAll();
+            missingRequiredItemsLabel.removeAll();
+            missingRequirementsContainer.removeAll();
+            missingRequirementsContainer.revalidate();
+            missingRequirementsContainer.repaint();
+            return;
+        }
         if (!isLoggedIn || scheduled) {
             if (client != null && client.getLocalPlayer() != null) {
                 this.isLoggedIn = true;
                 var username = client.getLocalPlayer().getName();
                 loggedLabel.setText(htmlLabel("Signed in as ", " " + username));
 
-                boolean isRegisteredWithClan = dataManager.checkRegistered(username);
 
-                if (isRegisteredWithClan) {
-                    //remove "Sign in to send..."
-                    versionPanel.remove(emailLabel);
-
-                    //re-register labels with panel
-                    versionPanel.add(isRegisteredWithClanLabel);
-                    versionPanel.add(embargoScoreLabel);
-                    versionPanel.add(accountScoreLabel);
-                    versionPanel.add(communityScoreLabel);
-                    versionPanel.add(currentRankLabel);
-                    versionPanel.add(currentCALabel);
-
-                    isRegisteredWithClanLabel.setText(htmlLabel("Account registered:", " Yes"));
-
-                    //get gear
-                    var embargoProfileData = dataManager.getProfile(username);
-
-                    JsonElement currentAccountPoints = embargoProfileData.get("accountPoints");
-
-                    JsonElement currentCommunityPoints = embargoProfileData.getAsJsonPrimitive("communityPoints");
-                    embargoScoreLabel.setText((htmlLabel("Embargo Score:", " " + (Integer.parseInt(String.valueOf(currentAccountPoints)) + Integer.parseInt(String.valueOf(currentCommunityPoints))))));
-                    //JsonObject currentHighestCombatAchievementTier = embargoProfileData.getAsJsonObject("currentHighestCombatAchievementTier");
-                    JsonElement getCurrentCAName = embargoProfileData.get("currentHighestCAName");
-                    accountScoreLabel.setText(htmlLabel("Account Score: ", String.valueOf(Integer.parseInt(String.valueOf(currentAccountPoints)))));
-                    communityScoreLabel.setText(htmlLabel("Community Score: ", String.valueOf(Integer.parseInt(String.valueOf(currentCommunityPoints)))));
-                    //JsonArray currentGearReqs = embargoProfileData.getAsJsonArray("currentGearRequirements");
-                    JsonArray missingGearReqs = embargoProfileData.getAsJsonArray("missingGearRequirements");
-
-                    //JsonObject nextRank = embargoProfileData.getAsJsonObject("nextRank");
-                    JsonObject currentRank = embargoProfileData.getAsJsonObject("currentRank");
-                    JsonElement currentRankName = currentRank.get("name");
-
-                    var currentRankDisplay = String.valueOf(currentRankName).replace("\"", "");
-                    currentRankLabel.setText(htmlLabel("Current Rank:", " " + currentRankDisplay));
-
-                    var displayCAName = String.valueOf(getCurrentCAName).replace("\"", "");
-                    displayCAName = displayCAName.replace(" Combat Achievement", "");
-
-                    currentCALabel.setText(htmlLabel("Current CA Tier:", " " + displayCAName));
-
-
-                    //Build out the missing requirements panel
-                    if (missingGearReqs.size() > 0) {
-                        for (JsonElement mi : missingGearReqs) {
-                            clientThread.invokeLater(() ->
-                                    missingRequirementsPanelX.addMissingItem(String.valueOf(mi), missingRequirementsPanelX.findItemIdByName(String.valueOf(mi))));
-                        }
-
-                        // Clear the panel first
-                        missingRequirementsPanel.removeAll();
-                        
-                        // Add only the missingRequirementsPanelX (not the label)
-                        missingRequirementsPanel.add(missingRequirementsPanelX);
-                        
-                        // Refresh the panel
-                        missingRequirementsPanel.revalidate();
-                        missingRequirementsPanel.repaint();
-                    } else {
-                        missingRequiredItemsLabel.setText(htmlLabel("Missing Requirements: ", "None"));
+                dataManager.isUserRegisteredAsync(username, isRegistered -> {
+                    if (!isRegistered) {
+                        emailLabel.setText("Account not registered with Embargo");
+                        return;
                     }
-                } else {
-                    emailLabel.setText("Account not registered with Embargo");
-                }
+                });
+
+                // remove "Sign in to send..."
+                versionPanel.remove(emailLabel);
+
+                // re-register labels with panel
+                versionPanel.add(isRegisteredWithClanLabel);
+                versionPanel.add(embargoScoreLabel);
+                versionPanel.add(accountScoreLabel);
+                versionPanel.add(communityScoreLabel);
+                versionPanel.add(currentRankLabel);
+                versionPanel.add(currentCALabel);
+
+                isRegisteredWithClanLabel.setText(htmlLabel("Account registered:", " Yes"));
+
+                // get gear asynchronously
+                dataManager.getProfileAsync(username).thenAccept(embargoProfileData -> {
+                    // This code runs when the profile data is received
+                    // We need to run UI updates on the client thread
+                    clientThread.invokeLater(() -> {
+                        JsonElement currentAccountPoints = embargoProfileData.get("accountPoints");
+                        JsonElement currentCommunityPoints = embargoProfileData
+                                .getAsJsonPrimitive("communityPoints");
+
+                        embargoScoreLabel.setText((htmlLabel("Embargo Score:", " " +
+                                (Integer.parseInt(String.valueOf(currentAccountPoints)) +
+                                        Integer.parseInt(String.valueOf(currentCommunityPoints))))));
+
+                        JsonElement getCurrentCAName = embargoProfileData.get("currentHighestCAName");
+                        accountScoreLabel.setText(htmlLabel("Account Score: ",
+                                String.valueOf(Integer.parseInt(String.valueOf(currentAccountPoints)))));
+
+                        communityScoreLabel.setText(htmlLabel("Community Score: ",
+                                String.valueOf(Integer.parseInt(String.valueOf(currentCommunityPoints)))));
+
+                        JsonArray missingGearReqs = embargoProfileData.getAsJsonArray("missingGearRequirements");
+                        JsonArray missingUntradableItemIdReqs = embargoProfileData
+                                .getAsJsonArray("missingUntradableItemIds");
+
+                        JsonObject currentRank = embargoProfileData.getAsJsonObject("currentRank");
+                        JsonElement currentRankName = currentRank.get("name");
+
+                        var currentRankDisplay = String.valueOf(currentRankName).replace("\"", "");
+                        currentRankLabel.setText(htmlLabel("Current Rank:", " " + currentRankDisplay));
+
+                        var displayCAName = String.valueOf(getCurrentCAName).replace("\"", "");
+                        displayCAName = displayCAName.replace(" Combat Achievement", "");
+
+                        currentCALabel.setText(htmlLabel("Current CA Tier:", " " + displayCAName));
+
+                        ArrayList<String> alreadyProcessed = new ArrayList<>();
+
+                        // Build out the missing requirements panel
+                        if (missingGearReqs.size() > 0 || missingUntradableItemIdReqs.size() > 0) {
+                            for (JsonElement mi : missingGearReqs) {
+                                alreadyProcessed.add(mi.getAsString());
+                                log.debug("Processing {} in missingGearReqs", mi.getAsString());
+                                clientThread.invokeLater(
+                                        () -> missingRequirementsPanelX.addMissingItem(String.valueOf(mi),
+                                                missingRequirementsPanelX.findItemIdByName(String.valueOf(mi))));
+                            }
+
+                            for (JsonElement mu : missingUntradableItemIdReqs) {
+                                if (alreadyProcessed.contains(mu.getAsString())) {
+                                    log.debug("{} already added, skipping missingUntradableItemIdReqs",
+                                            mu.getAsString());
+                                    continue;
+                                }
+                                missingRequirementsPanelX.addMissingItem("", mu.getAsInt());
+                            }
+
+                            // Clear the panel first
+                            missingRequirementsPanel.removeAll();
+
+                            // Add only the missingRequirementsPanelX (not the label)
+                            missingRequirementsPanel.add(missingRequirementsPanelX);
+
+                            // Refresh the panel
+                            missingRequirementsPanel.revalidate();
+                            missingRequirementsPanel.repaint();
+                        } else {
+                            missingRequiredItemsLabel.setText(htmlLabel("Missing Requirements: ", "None"));
+                        }
+                    });
+                }).exceptionally(ex -> {
+                    log.error("Error fetching profile data", ex);
+                    return null;
+                });
+
                 this.isLoggedIn = true;
-            } else {
-                this.logOut();
+
             }
-        } else {
-            this.logOut();
         }
     }
 
     public void logOut() {
-       //log.debug("inside of logOut()");
+        // log.debug("inside of logOut()");
         this.isLoggedIn = false;
 
         // Update labels
@@ -3561,7 +3762,8 @@ public class EmbargoPanel extends PluginPanel {
         loggedLabel.setText("Not signed in");
 
         // Reset missing gear requirements
-        missingRequiredItemsLabel.setText(htmlLabel("Sign in to see what requirements", " you are missing for rank up"));
+        missingRequiredItemsLabel
+                .setText(htmlLabel("Sign in to see what requirements", " you are missing for rank up"));
         missingRequiredItemsLabel.setFont(smallFont);
         missingRequiredItemsLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
         missingRequirementsPanelX.clearItems();
@@ -3615,8 +3817,7 @@ public class EmbargoPanel extends PluginPanel {
         return false;
     }
 
-    public void reset()
-    {
+    public void reset() {
         eventBus.unregister(this);
         this.updateLoggedIn(false);
     }
@@ -3624,8 +3825,7 @@ public class EmbargoPanel extends PluginPanel {
     /**
      * Builds a link panel with a given icon, text and url to redirect to.
      */
-    private static JPanel buildLinkPanel(ImageIcon icon, String topText, String bottomText, String url)
-    {
+    private static JPanel buildLinkPanel(ImageIcon icon, String topText, String bottomText, String url) {
         return buildLinkPanel(icon, topText, bottomText, () -> LinkBrowser.browse(url));
     }
 
@@ -4508,7 +4708,7 @@ public class ManifestManager {
     // 3 minutes in milliseconds
     private static final long CHECK_INTERVAL = 3 * 60 * 1000;
 
-    private static final String MOCK_API_URI = "https://a278d141-927f-433b-8e4b-6d994067900d.mock.pstmn.io/api/";
+    //private static final String MOCK_API_URI = "https://a278d141-927f-433b-8e4b-6d994067900d.mock.pstmn.io/api/";
     private static final String API_URI = "https://embargo.gg/api/";
     private static final String MANIFEST_ENDPOINT = API_URI + "runelite/manifest";
 
@@ -4530,6 +4730,7 @@ public class ManifestManager {
                     .header("Pragma", "no-cache")
                     .cacheControl(new CacheControl.Builder().noCache().noStore().build())
                     .build();
+
             okHttpClient.newCall(r).enqueue(new Callback() {
                 @Override
                 public void onFailure(@NonNull Call call, @NonNull IOException e) {
