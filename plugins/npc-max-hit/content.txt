@@ -19,6 +19,7 @@ import net.runelite.api.events.NpcSpawned;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.HitsplatApplied;
 import net.runelite.api.events.CommandExecuted;
+import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
 import net.runelite.client.callback.ClientThread;
@@ -83,7 +84,6 @@ public class NpcMaxHitPlugin extends Plugin
 		overlayManager.remove(overlay);
 		overlay.updateNpcDataList(List.of());
 		removeInfoBox();
-
 	}
 
 	private void shutdownExecutor()
@@ -150,7 +150,7 @@ public class NpcMaxHitPlugin extends Plugin
 	@Subscribe
 	public void onMenuEntryAdded(MenuEntryAdded event)
 	{
-		if (!config.showInMenu() && !config.displayMaxHitOnExamine())
+		if (!config.showInMenu())
 		{
 			return;
 		}
@@ -165,17 +165,10 @@ public class NpcMaxHitPlugin extends Plugin
 		boolean isAttackOption = event.getType() == MenuAction.NPC_SECOND_OPTION.getId() && event.getOption().equals("Attack");
 		boolean isExamineOption = event.getType() == MenuAction.EXAMINE_NPC.getId();
 
-		// on examine click action
-		if (isExamineOption && config.displayMaxHitOnExamine())
+		List<NpcMaxHitData> npcMaxHitData = wikiService.getCachedMaxHitData(npc.getId());
+		if (npcMaxHitData.isEmpty())
 		{
-			List<NpcMaxHitData> npcMaxHitData = wikiService.getMaxHitData(npc.getId());
-			if (!npcMaxHitData.isEmpty())
-			{
-				menuEntry.onClick(me -> {
-					lastDisplayTime = System.currentTimeMillis();
-					displayMaxHitData(npcMaxHitData);
-				});
-			}
+			return;
 		}
 
 		// add max hit to enabled menu options
@@ -183,24 +176,47 @@ public class NpcMaxHitPlugin extends Plugin
 			((isAttackOption && config.showOnAttackOption()) ||
 				(isExamineOption && config.showOnExamineOption())))
 		{
-			List<NpcMaxHitData> npcMaxHitData = wikiService.getMaxHitData(npc.getId());
-			if (!npcMaxHitData.isEmpty())
+			int maxHit = npcMaxHitData.get(0).getHighestMaxHit();
+			// skip if max hit is not computed i.e. -1
+			if (maxHit < 0)
 			{
-				int maxHit = npcMaxHitData.get(0).getHighestMaxHit();
-				// skip if max hit is not computed i.e. -1
-				if (maxHit < 0)
-				{
-					return;
-				}
-				String maxHitText = config.menuDisplayStyle() == NpcMaxHitConfig.MenuDisplayStyle.NUMBER_ONLY ?
-					String.format(" (%d)", maxHit) :
-					String.format(" (Max Hit: %d)", maxHit);
-
-				String target = event.getTarget();
-				String colorTag = "<col=" + Integer.toHexString(config.menuMaxHitColor().getRGB() & 0xFFFFFF) + ">";
-				String newTarget = target + colorTag + maxHitText + "</col>";
-				menuEntry.setTarget(newTarget);
+				return;
 			}
+			String maxHitText = config.menuDisplayStyle() == NpcMaxHitConfig.MenuDisplayStyle.NUMBER_ONLY ?
+				String.format(" (%d)", maxHit) :
+				String.format(" (Max Hit: %d)", maxHit);
+
+			String target = event.getTarget();
+			String colorTag = "<col=" + Integer.toHexString(config.menuMaxHitColor().getRGB() & 0xFFFFFF) + ">";
+			String newTarget = target + colorTag + maxHitText + "</col>";
+			menuEntry.setTarget(newTarget);
+		}
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		if (!config.displayMaxHitOnExamine())
+		{
+			return;
+		}
+
+		if (event.getMenuAction() != MenuAction.EXAMINE_NPC)
+		{
+			return;
+		}
+
+		NPC npc = event.getMenuEntry().getNpc();
+		if (npc == null || npc.getCombatLevel() <= 0 || shouldFilterNpc(npc))
+		{
+			return;
+		}
+
+		List<NpcMaxHitData> npcMaxHitData = wikiService.getCachedMaxHitData(npc.getId());
+		if (!npcMaxHitData.isEmpty())
+		{
+			lastDisplayTime = System.currentTimeMillis();
+			displayMaxHitData(npcMaxHitData);
 		}
 	}
 
@@ -219,7 +235,7 @@ public class NpcMaxHitPlugin extends Plugin
 
 	private CompletableFuture<List<NpcMaxHitData>> fetchMaxHitData(int npcId)
 	{
-		return CompletableFuture.supplyAsync(() -> wikiService.getMaxHitData(npcId), executor);
+		return wikiService.getMaxHitData(npcId);
 	}
 
 	private boolean shouldFilterNpc(NPC npc)
@@ -314,6 +330,12 @@ public class NpcMaxHitPlugin extends Plugin
 		String[] args = event.getArguments();
 		if (args.length == 0)
 		{
+			return;
+		}
+
+		if (args[0].equals("clear"))
+		{
+			wikiService.clearCache();
 			return;
 		}
 
@@ -446,6 +468,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.util.regex.Matcher;
@@ -457,7 +481,8 @@ public class WikiService
 {
 	private static final String WIKI_API_URL = "https://oldschool.runescape.wiki/api.php?action=ask&format=json&query=[[NPC ID::%d]]|?Max hit";
 	private static final Pattern MAX_HIT_VALUE_PATTERN = Pattern.compile("(.+?)\\s*\\(([^)]+)\\)");
-	private final Map<Integer, List<NpcMaxHitData>> maxHitCache = new HashMap<>();
+	private final Map<Integer, List<NpcMaxHitData>> maxHitCache = new ConcurrentHashMap<>();
+	private final Map<Integer, CompletableFuture<List<NpcMaxHitData>>> inFlightRequests = new ConcurrentHashMap<>();
 
 	@Inject
 	private OkHttpClient httpClient;
@@ -465,88 +490,105 @@ public class WikiService
 	@Inject
 	private Gson gson;
 
-	public List<NpcMaxHitData> getMaxHitData(int npcId)
+	public CompletableFuture<List<NpcMaxHitData>> getMaxHitData(int npcId)
 	{
 		// Check cache first
 		if (maxHitCache.containsKey(npcId))
 		{
-			return maxHitCache.get(npcId);
+			return CompletableFuture.completedFuture(maxHitCache.get(npcId));
 		}
 
-		try
-		{
-			String url = String.format(WIKI_API_URL, npcId);
+		// check for exinst inflight request for NPC ID
+		return inFlightRequests.computeIfAbsent(npcId, id -> {
+			CompletableFuture<List<NpcMaxHitData>> future = new CompletableFuture<>();
 
-			Request request = new Request.Builder()
-				.url(url)
-				.header("User-Agent", "RuneLite npc-max-hit plugin")
-				.build();
-
-			try (Response response = httpClient.newCall(request).execute())
-			{
-				if (!response.isSuccessful() || response.body() == null)
+			CompletableFuture.runAsync(() -> {
+				try
 				{
-					return Collections.emptyList();
-				}
+					String url = String.format(WIKI_API_URL, id);
+					Request request = new Request.Builder()
+						.url(url)
+						.header("User-Agent", "RuneLite npc-max-hit plugin")
+						.build();
 
-				String responseBody = response.body().string();
-				JsonObject jsonResponse = gson.fromJson(responseBody, JsonObject.class);
-
-				if (!jsonResponse.has("query") || !jsonResponse.getAsJsonObject("query").has("results"))
-				{
-					return Collections.emptyList();
-				}
-
-				List<NpcMaxHitData> results = new ArrayList<>();
-				JsonObject resultsObj = jsonResponse.getAsJsonObject("query").getAsJsonObject("results");
-
-				for (Map.Entry<String, JsonElement> entry : resultsObj.entrySet())
-				{
-					String fullName = entry.getKey();
-					JsonObject result = entry.getValue().getAsJsonObject();
-					JsonObject printouts = result.getAsJsonObject("printouts");
-
-					if (printouts.has("Max hit") && printouts.getAsJsonArray("Max hit").size() > 0)
+					try (Response response = httpClient.newCall(request).execute())
 					{
-						Map<String, String> maxHits = new HashMap<>();
-						var maxHitArray = printouts.getAsJsonArray("Max hit");
+						List<NpcMaxHitData> results = Collections.emptyList();
 
-						if (maxHitArray.size() > 1)
+						if (response.isSuccessful() && response.body() != null)
 						{
-							// Process each element in the array directly
-							for (JsonElement maxHitElement : maxHitArray)
+							results = parseWikiResponse(response.body().string(), id);
+							if (!results.isEmpty())
 							{
-								String maxHitString = maxHitElement.getAsString().trim();
-								parseMaxHitValues(maxHitString, maxHits);
+								maxHitCache.put(id, results);
 							}
 						}
-						else
-						{
-							// Single element - might contain multiple hits
-							String maxHitString = maxHitArray.get(0).getAsString();
-							parseMaxHitValues(maxHitString, maxHits);
-						}
 
-						if (!maxHits.isEmpty())
-						{
-							results.add(new NpcMaxHitData(fullName, npcId, maxHits));
-						}
+						future.complete(results);
 					}
 				}
-
-				if (!results.isEmpty())
+				catch (Exception e)
 				{
-					maxHitCache.put(npcId, results);
-					return results;
+					log.warn("Error fetching wiki data for (ID: {}): {}", id, e.getMessage());
+					future.complete(Collections.emptyList());
+				}
+				finally
+				{
+					inFlightRequests.remove(id);
+				}
+			});
+
+			return future;
+		});
+	}
+
+	private List<NpcMaxHitData> parseWikiResponse(String responseBody, int npcId)
+	{
+		JsonObject jsonResponse = gson.fromJson(responseBody, JsonObject.class);
+
+		if (!jsonResponse.has("query") || !jsonResponse.getAsJsonObject("query").has("results"))
+		{
+			return Collections.emptyList();
+		}
+
+		List<NpcMaxHitData> results = new ArrayList<>();
+		JsonObject resultsObj = jsonResponse.getAsJsonObject("query").getAsJsonObject("results");
+
+		for (Map.Entry<String, JsonElement> entry : resultsObj.entrySet())
+		{
+			String fullName = entry.getKey();
+			JsonObject result = entry.getValue().getAsJsonObject();
+			JsonObject printouts = result.getAsJsonObject("printouts");
+
+			if (printouts.has("Max hit") && printouts.getAsJsonArray("Max hit").size() > 0)
+			{
+				Map<String, String> maxHits = new HashMap<>();
+				var maxHitArray = printouts.getAsJsonArray("Max hit");
+
+				if (maxHitArray.size() > 1)
+				{
+					// Process each element in the array directly
+					for (JsonElement maxHitElement : maxHitArray)
+					{
+						String maxHitString = maxHitElement.getAsString().trim();
+						parseMaxHitValues(maxHitString, maxHits);
+					}
+				}
+				else
+				{
+					// Single element - might contain multiple hits
+					String maxHitString = maxHitArray.get(0).getAsString();
+					parseMaxHitValues(maxHitString, maxHits);
+				}
+
+				if (!maxHits.isEmpty())
+				{
+					results.add(new NpcMaxHitData(fullName, npcId, maxHits));
 				}
 			}
 		}
-		catch (Exception e)
-		{
-			log.warn("Error fetching wiki data for (ID: {}): {}", npcId, e.getMessage());
-		}
 
-		return Collections.emptyList();
+		return results;
 	}
 
 	private void parseMaxHitValues(String maxHitString, Map<String, String> maxHits)
@@ -578,6 +620,16 @@ public class WikiService
 				}
 			}
 		}
+	}
+
+	public List<NpcMaxHitData> getCachedMaxHitData(int npcId)
+	{
+		return maxHitCache.getOrDefault(npcId, Collections.emptyList());
+	}
+
+	public void clearCache()
+	{
+		maxHitCache.clear();
 	}
 }
 
