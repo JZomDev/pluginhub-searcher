@@ -123,7 +123,11 @@ public class SkillDataExporter extends Plugin
 
 			// Ensure output directory exists. If it does not, the config value for output directory
 			// is reset to  the default, RUNELITE_DIR/skill_data_exporter/
-			File outputFile = new File(config.outputDirectory());
+			String outputPath = config.outputDirectory().trim();
+			if (outputPath.endsWith(File.separator)) {
+				outputPath = outputPath.substring(0, outputPath.length() - 1);
+			}
+			File outputFile = new File(outputPath);
 			String defaultDirectory = Paths.get(RuneLite.RUNELITE_DIR.getAbsolutePath(), "skill_data_exporter").toString();
 
 			if(!outputFile.exists() || !outputFile.isDirectory()) {
