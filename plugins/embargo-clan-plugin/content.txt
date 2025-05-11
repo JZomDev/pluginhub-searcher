@@ -3022,8 +3022,6 @@ public class SyncButtonManager {
 }
 package gg.embargo.ui;
 
-import com.google.gson.JsonArray;
-import com.google.gson.JsonElement;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.extern.slf4j.Slf4j;
@@ -3034,6 +3032,8 @@ import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.util.ImageUtil;
 import net.runelite.client.util.LinkBrowser;
 import net.runelite.http.api.item.ItemPrice;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import javax.swing.*;
@@ -3043,13 +3043,9 @@ import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
-import java.util.ArrayList;
+import java.util.*;
 import java.util.List;
-import java.util.Map;
-import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.stream.Stream;
-import java.util.stream.StreamSupport;
 
 @Slf4j
 public class MissingRequirementsPanel extends PluginPanel {
@@ -3068,6 +3064,22 @@ public class MissingRequirementsPanel extends PluginPanel {
     private final JPanel itemsContainer;
     private final List<MissingItem> missingItems = new ArrayList<>();
     private final MouseAdapter itemMouseAdapter = createMouseAdapter();
+    private final Object lock = new Object();
+
+    @Getter
+    private enum DynamicItems {
+        ACCOUNT_POINTS("account points"),
+        EHB("EHB"),
+        COMMUNITY_POINTS("community points"),
+        TOTAL_LEVEL("total level");
+
+        private final String label;
+
+        DynamicItems(String label) {
+            this.label = label;
+        }
+
+    }
 
     @Inject
     public MissingRequirementsPanel(ItemManager itemManager) {
@@ -3117,55 +3129,113 @@ public class MissingRequirementsPanel extends PluginPanel {
      * @param itemId   The item ID in RuneScape
      */
     public void addMissingItem(String itemName, int itemId) {
-        // Clean up the item name
-        String cleanedName = itemName.replace("\"", "").replace(" (uncharged)", "");
+        synchronized (lock) {
+            // Clean up the item name
+            String cleanedName = itemName.replace("\"", "").replace(" (uncharged)", "");
 
-        // Handle case where itemName is empty but we have an itemId
-        if (itemName.isEmpty() && itemId != -1) {
-            ItemComposition ic = itemManager.getItemComposition(itemId);
-            String itemNameFromId = ic.getName();
+            // Handle case where itemName is empty but we have an itemId
+            if (itemName.isEmpty() && itemId != -1) {
+                ItemComposition ic = itemManager.getItemComposition(itemId);
+                String itemNameFromId = ic.getName();
 
-            // Check if this item already exists in our list
-            if (missingItems.stream().anyMatch(item -> Objects.equals(item.getItemName(), itemNameFromId))) {
-                log.debug("Item {} already exists, skipping", itemNameFromId);
+                // Check if this item already exists in our list
+                if (missingItems.stream().anyMatch(item -> Objects.equals(item.getItemName(), itemNameFromId))) {
+                    log.debug("Item {} already exists, skipping", itemNameFromId);
+                    return;
+                }
+
+                // Add the item with name from ItemComposition
+                BufferedImage itemIcon = getItemIcon(itemId, itemNameFromId);
+                log.debug("Adding untrackable item: {}", itemNameFromId);
+                missingItems.add(new MissingItem(itemNameFromId, itemId, itemIcon));
+                updatePanel();
                 return;
             }
 
-            // Add the item with name from ItemComposition
-            BufferedImage itemIcon = getItemIcon(itemId, itemNameFromId);
-            log.debug("Adding untrackable item: {}", itemNameFromId);
-            missingItems.add(new MissingItem(itemNameFromId, itemId, itemIcon));
+            // Check if this is a dynamic item that already exists by type, not exact name
+            boolean isDynamicItem = false;
+            EnumSet<DynamicItems> dynamicItemsSet = EnumSet.of(
+                    DynamicItems.ACCOUNT_POINTS,
+                    DynamicItems.EHB,
+                    DynamicItems.TOTAL_LEVEL,
+                    DynamicItems.COMMUNITY_POINTS);
+
+            for (DynamicItems dynamicItem : dynamicItemsSet) {
+                if (cleanedName.contains(dynamicItem.getLabel())) {
+                    isDynamicItem = true;
+                    boolean didRefreshItem = refreshDynamicItems(itemName, dynamicItemsSet);
+                    if (didRefreshItem) {
+                        return; // Successfully refreshed the dynamic item
+                    }
+                    break;
+                }
+            }
+
+            // If not a dynamic item, check for exact match as before
+            if (!isDynamicItem && !cleanedName.isEmpty() && missingItems.stream()
+                    .anyMatch(item -> Objects.equals(item.getItemName(), cleanedName))) {
+                log.debug("Item {} already exists, returning", cleanedName);
+                return;
+            }
+
+            // Handle special cases for specific items
+            int finalItemId = itemId;
+            if (cleanedName.toLowerCase().contains("quiver")) {
+                finalItemId = 28947;
+            } else if (cleanedName.toLowerCase().contains("infernal cape")) {
+                finalItemId = 21295;
+            }
+
+            // Process the item and add it to the panel
+            BufferedImage itemIcon;
+            if (itemName.contains("Combat Achievement")) {
+                finalItemId = getHiltIdFromName(itemName);
+                itemIcon = getHiltImageFromName(itemName.split(" ")[0]);
+            } else {
+                itemIcon = getItemIcon(finalItemId, cleanedName);
+            }
+            missingItems.add(new MissingItem(cleanedName, finalItemId, itemIcon));
+            log.debug("Added new item to panel: {}", cleanedName);
             updatePanel();
-            return;
         }
+    }
 
-        // Handle case where we have an itemName
-        // Check if item already exists
-        if (!cleanedName.isEmpty() && missingItems.stream()
-                .anyMatch(item -> Objects.equals(item.getItemName(), cleanedName))) {
-            log.debug("Item {} already exists, returning", cleanedName);
-            return;
+    public boolean refreshDynamicItems(String itemName, EnumSet<DynamicItems> dynamicItemsEnumSet) {
+        synchronized (lock) {
+            String cleanedItemName = itemName.replaceAll("^\"|\"$", "");
+            boolean itemRemoved = false;
+
+            // First, remove any existing items that match the dynamic type
+            Iterator<MissingItem> iterator = missingItems.iterator();
+            while (iterator.hasNext()) {
+                MissingItem item = iterator.next();
+
+                // Check if this existing item matches any of our dynamic types
+                for (DynamicItems dynamicItem : dynamicItemsEnumSet) {
+                    if (item.itemName.contains(dynamicItem.getLabel()) &&
+                            cleanedItemName.contains(dynamicItem.getLabel())) {
+                        // Found a match - remove the old item
+                        iterator.remove();
+                        itemRemoved = true;
+                        log.debug("Removed dynamic item {} to be replaced with {}",
+                                item.itemName, cleanedItemName);
+                        break;
+                    }
+                }
+            }
+
+            // Now add the new item if we removed an old one
+            if (itemRemoved) {
+                // Add the new item with updated value
+                missingItems.add(new MissingItem(cleanedItemName, -1,
+                        getItemIcon(-1, cleanedItemName)));
+                log.debug("Added new dynamic item: {}", cleanedItemName);
+                updatePanel(); // Make sure to update the panel to reflect changes
+                return true;
+            } else {
+                return false;
+            }
         }
-
-        // Handle special cases for specific items
-        int finalItemId = itemId;
-        if (cleanedName.toLowerCase().contains("quiver")) {
-            finalItemId = 28947;
-        } else if (cleanedName.toLowerCase().contains("infernal cape")) {
-            finalItemId = 21295;
-        }
-
-        // Process the item and add it to the panel
-        BufferedImage itemIcon;
-        if (itemName.contains("Combat Achievement")) {
-            finalItemId = getHiltIdFromName(itemName);
-            itemIcon = getHiltImageFromName(itemName.split(" ")[0]);
-        } else {
-            itemIcon = getItemIcon(finalItemId, cleanedName);
-        }
-
-        missingItems.add(new MissingItem(cleanedName, finalItemId, itemIcon));
-        updatePanel();
     }
 
     @Getter
@@ -3224,21 +3294,25 @@ public class MissingRequirementsPanel extends PluginPanel {
      * Clears all missing items from the panel
      */
     public void clearItems() {
-        missingItems.clear();
-        updatePanel();
+        synchronized (lock) {
+            missingItems.clear();
+            updatePanel();
+        }
     }
 
     /**
      * Updates the panel with the current list of missing items
      */
     private void updatePanel() {
-        itemsContainer.removeAll();
-        for (MissingItem item : missingItems) {
-            JPanel itemPanel = createItemPanel(item);
-            itemsContainer.add(itemPanel);
+        synchronized (lock) {
+            itemsContainer.removeAll();
+            for (MissingItem item : missingItems) {
+                JPanel itemPanel = createItemPanel(item);
+                itemsContainer.add(itemPanel);
+            }
+            revalidate();
+            repaint();
         }
-        revalidate();
-        repaint();
     }
 
     /**
@@ -3525,7 +3599,7 @@ public class EmbargoPanel extends PluginPanel {
 
     void setupVersionPanel() {
         // Set up Embargo Clan Version at top of Version panel
-        JLabel version = new JLabel(htmlLabel("Embargo Clan Version: ", "1.4.3"));
+        JLabel version = new JLabel(htmlLabel("Embargo Clan Version: ", "1.4.4"));
         version.setFont(smallFont);
 
         // Set version's font
@@ -3654,6 +3728,7 @@ public class EmbargoPanel extends PluginPanel {
             if (client != null && client.getLocalPlayer() != null) {
                 this.isLoggedIn = true;
                 var username = client.getLocalPlayer().getName();
+
                 loggedLabel.setText(htmlLabel("Signed in as ", " " + username));
 
 
