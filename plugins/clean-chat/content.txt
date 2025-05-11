@@ -173,6 +173,44 @@ public class ColorManager
 	}
 }
 
+package com.github.ldavid432.cleanchat;
+
+import java.util.TimerTask;
+import java.util.function.Consumer;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+class FixedCountTask extends TimerTask
+{
+
+	private final Consumer<Runnable> command;
+	private final int totalExecutionCount;
+	private final Runnable onFailure;
+
+	private int executionCount = 0;
+
+	FixedCountTask(Consumer<Runnable> command, int totalExecutionCount, Runnable onFailure)
+	{
+		this.command = command;
+		this.totalExecutionCount = totalExecutionCount;
+		this.onFailure = onFailure;
+	}
+
+	@Override
+	public void run()
+	{
+		command.accept(this::cancel);
+
+		executionCount++;
+
+		if (executionCount >= totalExecutionCount)
+		{
+			onFailure.run();
+			cancel();
+		}
+	}
+}
+
 package com.github.ldavid432.cleanchat.data;
 
 import com.github.ldavid432.cleanchat.CleanChatChannelsConfig;
@@ -441,6 +479,8 @@ import java.util.Arrays;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
+import java.util.Timer;
+import java.util.TimerTask;
 import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
@@ -474,7 +514,7 @@ import org.apache.commons.lang3.tuple.Pair;
 @Slf4j
 @PluginDescriptor(
 	name = "Clean Chat",
-	description = "Hide clan name and more to keep your chat channels clean, includes GIM, friends, and clan chats",
+	description = "Hide clan name and more to clean your chat channels, includes GIM, friends, and clan chats",
 	tags = {"clean", "chat", "clan", "friends", "gim", "group", "iron", "ironman", "channel"}
 )
 public class CleanChatChannelsPlugin extends Plugin
@@ -501,6 +541,8 @@ public class CleanChatChannelsPlugin extends Plugin
 	@Inject
 	private ChatIconManager chatIconManager;
 
+	private Timer chatCommandTimer;
+
 	@Provides
 	CleanChatChannelsConfig provideConfig(ConfigManager configManager)
 	{
@@ -520,11 +562,22 @@ public class CleanChatChannelsPlugin extends Plugin
 	@Override
 	protected void startUp() throws Exception
 	{
+		if (chatCommandTimer == null) {
+			chatCommandTimer = new Timer();
+		}
+
 		if (client.getGameState() == GameState.LOGGED_IN)
 		{
 			log.debug("Plugin enabled. Refreshing chat.");
 			processAllChatHistory();
 		}
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		chatCommandTimer.cancel();
+		chatCommandTimer = null;
 	}
 
 	@Subscribe
@@ -720,19 +773,27 @@ public class CleanChatChannelsPlugin extends Plugin
 
 			removeChatMessage(event.getType(), event.getMessageNode());
 
+			String menuName = name + CLAN_CHALLENGE_ENTRY_HIDER;
+
 			if (!sanitizeUsername(name).isBlank() && nameIsUsername)
 			{
 				name = ColorUtil.wrapWithColorTag(name, usernameColor);
-				name +=  ": ";
+				name += ": ";
 			}
 
-			client.addChatMessage(
+			MessageNode newNode = client.addChatMessage(
 				newType,
-				name + CLAN_CHALLENGE_ENTRY_HIDER,
-				name + ColorUtil.wrapWithColorTag(event.getMessage(), messageColor),
+				menuName,
+				name + ColorUtil.colorTag(messageColor) + event.getMessage(),
 				CLEAN_CHAT_SENDER,
 				false
 			);
+
+			newNode.setTimestamp(event.getMessageNode().getTimestamp());
+
+			if (event.getMessage().startsWith("!")) {
+				processChatCommand(event.getMessageNode(), newNode, name, messageColor);
+			}
 		}
 	}
 
@@ -792,6 +853,43 @@ public class CleanChatChannelsPlugin extends Plugin
 				clientThread.invoke(() -> processor.accept(event));
 			});
 	}
+
+	private void processChatCommand(final MessageNode oldNode, final MessageNode newNode, final String name, final Color messageColor)
+	{
+		final int timeout = config.chatCommandTimeout();
+
+		log.debug("Replaceable chat command found, waiting up to {}.25s for it to update.", timeout);
+
+		final String oldNodeOriginalMessage = oldNode.getValue();
+		final String oldNodeOriginalRLFormatMessage = oldNode.getRuneLiteFormatMessage();
+
+		if (chatCommandTimer == null) return;
+
+		TimerTask task = new FixedCountTask(
+			(cancel) -> {
+				if (!Objects.equals(oldNode.getRuneLiteFormatMessage(), oldNodeOriginalRLFormatMessage) && oldNode.getRuneLiteFormatMessage() != null) {
+					newNode.setRuneLiteFormatMessage(name + ColorUtil.colorTag(messageColor) + oldNode.getRuneLiteFormatMessage());
+					client.refreshChat();
+					cancel.run();
+					return;
+				}
+
+				if (!Objects.equals(oldNode.getValue(), oldNodeOriginalMessage) && oldNode.getValue() != null) {
+					newNode.setRuneLiteFormatMessage(name + ColorUtil.colorTag(messageColor) + oldNode.getValue());
+					client.refreshChat();
+					cancel.run();
+					return;
+				}
+			},
+			timeout * 2,
+			() -> log.debug("No chat command update found after waiting {}.25s", timeout)
+		);
+
+		// This is probably not needed but, just to be safe
+		chatCommandTimer.purge();
+
+		chatCommandTimer.scheduleAtFixedRate(task, 250, 500);
+	}
 }
 
 package com.github.ldavid432.cleanchat;
@@ -801,6 +899,7 @@ import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
 
 @ConfigGroup(GROUP)
 public interface CleanChatChannelsConfig extends Config
@@ -973,6 +1072,27 @@ public interface CleanChatChannelsConfig extends Config
 		return false;
 	}
 
+	@ConfigSection(
+		name = "Debug",
+		description = "Optional debug settings. You probably won't need to change these",
+		position = 4,
+		closedByDefault = true
+	)
+	String debugSection = "debugSection";
+
+	@ConfigItem(
+		keyName = "chatCommandTimeout",
+		name = "Chat command timeout",
+		description = "Time in seconds to stop waiting for a chat command to update.<br>" +
+			"If you have a slow connection and chat commands don't work you can try increasing this.",
+		section = debugSection,
+		position = 0
+	)
+	@Range(min = 2, max = 30)
+	default int chatCommandTimeout()
+	{
+		return 10;
+	}
 }
 
 package com.github.ldavid432;
