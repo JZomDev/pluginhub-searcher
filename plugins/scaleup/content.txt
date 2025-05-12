@@ -21,8 +21,8 @@ import static net.runelite.api.gameval.InventoryID.BANK;
 
 @Slf4j
 @PluginDescriptor(
-	name = "ScaleUp", description = "ScaleUp any activity",
-	tags = {"panel", "skilling"}
+	name = "ScaleUp", description = "Scale up any activity rewards",
+	tags = { "skilling","inventory","experience","panel" }
 )
 public class ScaleUpPlugin extends Plugin
 {
