@@ -63,6 +63,11 @@ public class GodbookPlugin extends Plugin
   @Subscribe
   public void onAnimationChanged(final AnimationChanged event)
   {
+    if (!(event.getActor() instanceof Player))
+    {
+      return;
+    }
+
 		if (config.theatreOnly() && !isInTheatreOfBlood())
 			return;
 
