@@ -17,12 +17,12 @@ public class NPCDataCleaner {
 
     public static List<Integer> parseNPCIDs(String input) {
         List<Integer> result = new ArrayList<>();
-        if (input.charAt(0) =='\"') {
-            input = input.split("\"", 2)[1];
-        }
         if (input == null || input.isEmpty() || input.equals("?")) {
             result.add(-1);
             return result;
+        }
+        if (input.charAt(0) =='\"') {
+            input = input.split("\"", 2)[1];
         }
         // Split the input string by commas
         String[] parts = input.split(",");
