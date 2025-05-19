@@ -1,0 +1,406 @@
+package com.locationdisplay;
+
+import com.google.common.reflect.TypeToken;
+import com.google.gson.Gson;
+
+import lombok.extern.slf4j.Slf4j;
+import javax.inject.Inject;
+import java.io.*;
+import java.lang.reflect.Type;
+import java.util.*;
+
+@Slf4j
+public class RegionMap {
+
+    @Inject
+    private Gson gson;
+
+    public Map<Region, String> regionToArea = new HashMap<>();
+
+    public void loadFromJson() throws IOException {
+        try (InputStream is = getClass().getClassLoader().getResourceAsStream("Locations.json")) {
+            if (is == null) {
+                throw new FileNotFoundException("Could not find Locations.json in resources folder.");
+            }
+
+            try (Reader reader = new InputStreamReader(is)) {
+                Type mapType = new TypeToken<Map<String, List<List<Integer>>>>() {}.getType();
+                Map<String, List<List<Integer>>> areaData = gson.fromJson(reader, mapType);
+
+                for (Map.Entry<String, List<List<Integer>>> entry : areaData.entrySet()) {
+                    String areaName = entry.getKey();
+                    for (List<Integer> coords : entry.getValue()) {
+                        if (coords.size() != 2) {
+                            log.warn("Invalid coordinates for area {}: {}", areaName, coords);
+                            continue;
+                        }
+                        Region region = new Region(coords.get(0), coords.get(1));
+                        regionToArea.put(region, areaName);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.error("Error loading Locations.json", e);
+            throw e; // Consider whether to rethrow or handle differently
+        }
+    }
+
+    public String getAreaName(Region region) {
+        return regionToArea.getOrDefault(region, "Unknown Area");
+    }
+
+    public void clear() {
+        regionToArea.clear();
+    }
+}
+package com.locationdisplay;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import java.util.Objects;
+
+@Slf4j
+@PluginDescriptor(
+		name = "Location Display",
+		description = "Shows the name of a location upon entering"
+)
+public class LocationDisplayPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private LocationDisplayConfig config;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private LocationDisplayOverlay overlay;
+
+	@Getter
+	@Setter
+	private WorldPoint playerPosition = new WorldPoint(0,0,0);
+
+	@Getter
+	@Setter
+	private String lastArea = "";
+
+	@Getter
+	@Setter
+	private Region playerRegion = new Region(-1, -1);
+
+	@Inject
+	private RegionMap regionMap;
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		overlayManager.add(overlay);
+		regionMap.loadFromJson();
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		overlayManager.remove(overlay);
+		regionMap.clear();
+	}
+
+	private void updatePlayerRegion(WorldPoint playerPosition) {
+		int currentX = playerPosition.getRegionID() >> 8;
+		int currentY = playerPosition.getRegionID() & 0xFF;
+
+		if (playerPosition.getRegionX() != currentX || playerPosition.getRegionY() != currentY) {
+			//log.debug("Player region changed: X = {}, Y = {}", currentX, currentY);
+			playerRegion.setX(currentX);
+			playerRegion.setY(currentY);
+			String currentArea = regionMap.getAreaName(playerRegion);
+
+			if (!Objects.equals(currentArea, lastArea)) {
+				lastArea = currentArea;
+			}
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick gameTick) {
+		playerPosition = client.getLocalPlayer().getWorldLocation();
+		updatePlayerRegion(playerPosition);
+
+	}
+
+	@Provides
+	LocationDisplayConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(LocationDisplayConfig.class);
+	}
+}
+
+package com.locationdisplay;
+
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.api.Client;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.TextComponent;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+public class LocationDisplayOverlay extends Overlay {
+
+    private final Client client;
+    private final LocationDisplayConfig config;
+    private final LocationDisplayPlugin plugin;
+    private final TextComponent textComponent = new TextComponent();
+    private long fadeStartTime = 0;
+    private float alpha = 0f;
+    private String lastArea = "";
+    private boolean suppressFirstLocation;
+    private enum FadeState { IDLE, FADING_IN, HOLDING, FADING_OUT }
+    private FadeState fadeState = FadeState.IDLE;
+
+    @Inject
+    private LocationDisplayOverlay(Client client, LocationDisplayPlugin plugin, LocationDisplayConfig config) {
+
+        setPosition(OverlayPosition.TOP_CENTER);
+        this.client = client;
+        this.plugin = plugin;
+        this.config = config;
+        this.suppressFirstLocation = config.suppressOnLogin();
+    }
+
+    private Font getFontFromConfig() {
+        switch (config.font()) {
+            case Regular:
+                return FontManager.getRunescapeFont().deriveFont((float) config.fontSize());
+            case Bold:
+                return FontManager.getRunescapeBoldFont().deriveFont((float) config.fontSize());
+            case Small:
+                return FontManager.getRunescapeSmallFont().deriveFont((float) config.fontSize());
+            default:
+                throw new IllegalStateException("Unexpected value: " + config.font());
+        }
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        String currentArea = plugin.getLastArea();
+
+        if (!currentArea.equals(lastArea)) {
+            lastArea = currentArea;
+            if (!lastArea.equals("Unknown Area")) {
+                fadeStartTime = System.currentTimeMillis();
+                fadeState = FadeState.FADING_IN;
+            }
+        }
+
+        // Skip everything if not fading
+        if (fadeState == FadeState.IDLE || suppressFirstLocation)
+        {
+            suppressFirstLocation = false;
+            return null;
+        }
+
+        long elapsed = System.currentTimeMillis() - fadeStartTime;
+
+        switch (fadeState)
+        {
+            case FADING_IN:
+                alpha = Math.min(1f, (float) elapsed / config.fadeDuration());
+                if (elapsed >= config.fadeDuration())
+                {
+                    fadeState = FadeState.HOLDING;
+                    fadeStartTime = System.currentTimeMillis();
+                    alpha = 1f;
+                }
+                break;
+
+            case HOLDING:
+                alpha = 1f;
+                if (elapsed >= config.holdDuration())
+                {
+                    fadeState = FadeState.FADING_OUT;
+                    fadeStartTime = System.currentTimeMillis();
+                }
+                break;
+
+            case FADING_OUT:
+                alpha = Math.max(0f, 1f - ((float) elapsed / config.fadeDuration()));
+                if (elapsed >= config.fadeDuration())
+                {
+                    fadeState = FadeState.IDLE;
+                    alpha = 0f;
+                }
+                break;
+        }
+
+        Font font = getFontFromConfig();
+        textComponent.setFont(font);
+
+        textComponent.setOutline(config.outline());
+
+        Color fadeColor = new Color(1f, 1f, 1f, alpha);
+        textComponent.setColor(fadeColor);
+
+        if (client.isResized()) {
+            textComponent.setPosition(new Point(0, config.textHeight()));
+        }
+        else {
+            //if not resized, top center offset is directly in middle so have to adjust by string width
+            int stringWidth = graphics.getFontMetrics(font).stringWidth(lastArea) / 2;
+            textComponent.setPosition(new Point(-stringWidth, config.textHeight()));
+        }
+
+        textComponent.setText(currentArea);
+
+        // Included because runelite doesn't render 0 alpha completely, 0 alpha will still leave text
+        Composite originalComposite = graphics.getComposite();
+        graphics.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+        textComponent.render(graphics);
+        graphics.setComposite(originalComposite);
+
+        return null;
+    }
+}
+
+package com.locationdisplay;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("Location Text Configuration")
+public interface LocationDisplayConfig extends Config
+{
+	@ConfigItem(
+			position = 1,
+			keyName = "textHeight",
+			name = "Text Height",
+			description = "Set the height of text overlay, higher number = lower on screen"
+	)
+	default int textHeight() { return 60;}
+
+	@ConfigItem(
+			position = 2,
+			keyName = "fadeDuration",
+			name = "Fade Duration (ms)",
+			description = "Sets the duration of fading in/fading out in milliseconds"
+	)
+	default int fadeDuration() { return 1000; }
+
+	@ConfigItem(
+			position = 3,
+			keyName = "holdDuration",
+			name = "Hold Duration (ms)",
+			description = "Sets the duration of holding after fading in in milliseconds"
+	)
+	default int holdDuration() { return 2000; }
+
+	@ConfigItem(
+			position = 4,
+			keyName = "fontSize",
+			name = "Font Size",
+			description = "Sets the font size"
+	)
+	default int fontSize() { return 32; }
+
+	@ConfigItem(
+			position = 5,
+			keyName = "outline",
+			name = "Outline",
+			description = "Outlines the text"
+	)
+	default boolean outline() { return false; }
+
+	enum FontEnum {
+		Small,
+		Regular,
+		Bold
+	}
+
+	@ConfigItem(
+			position = 6,
+			keyName = "Font",
+			name = "Font Style",
+			description = "Select font style"
+	)
+	default FontEnum font() { return FontEnum.Bold; }
+
+	@ConfigItem(
+			position = 7,
+			keyName = "suppressOnLogin",
+			name = "Suppress on login",
+			description = "Prevents location name from showing immediately after login"
+	)
+	default boolean suppressOnLogin() { return false; }
+}
+
+package com.locationdisplay;
+
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.Objects;
+
+public class Region {
+    @Getter
+    @Setter
+    private int x;
+
+    @Getter
+    @Setter
+    private int y;
+
+    public Region(int x, int y) {
+        this.x = x;
+        this.y = y;
+    }
+
+    @Override
+    public String toString() {
+        return "(" + x + ", " + y + ")";
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (this == obj) return true;
+        if (obj == null || getClass() != obj.getClass()) return false;
+        Region region = (Region) obj;
+        return x == region.x && y == region.y;
+    }
+
+    //needed this to perform equality check
+    @Override
+    public int hashCode() {
+        return Objects.hash(x, y);
+    }
+}
+
+package com.locationdisplay;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class LocationDisplayPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(LocationDisplayPlugin.class);
+		RuneLite.main(args);
+	}
+}
