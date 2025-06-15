@@ -3779,6 +3779,92 @@ public class Utils {
 
 package dinkplugin.util;
 
+import dinkplugin.domain.SeasonalPolicy;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.WorldType;
+
+import javax.inject.Singleton;
+import java.util.Set;
+
+@Slf4j
+@Singleton
+public class WorldTypeTracker extends BooleanStateTracker {
+
+    @Override
+    protected void populateState() {
+        Set<WorldType> world = client.getWorldType();
+        if (config.seasonalPolicy() == SeasonalPolicy.REJECT && world.contains(WorldType.SEASONAL)) {
+            this.state = false;
+        } else if (WorldUtils.isIgnoredWorld(world)) {
+            this.state = false;
+        } else {
+            this.state = true;
+        }
+        log.debug("Initialized world tracker for {}: {}", world, state);
+    }
+
+    public void onWorldChange() {
+        this.refresh();
+    }
+
+    public void onConfig(String configKey) {
+        if ("seasonalPolicy".equals(configKey)) {
+            this.refresh();
+        }
+    }
+
+}
+
+package dinkplugin.util;
+
+import dinkplugin.domain.AccountType;
+import dinkplugin.domain.FilterMode;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Player;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.api.gameval.VarbitID;
+
+import javax.inject.Singleton;
+
+@Slf4j
+@Singleton
+public class AccountTypeTracker extends BooleanStateTracker {
+
+    @Override
+    protected void populateState() {
+        Player player = client.getLocalPlayer();
+        var accountType = AccountType.get(client.getVarbitValue(VarbitID.IRONMAN));
+        if (player == null || player.getName() == null || accountType == null) {
+            this.state = null;
+            return;
+        } else if (config.nameFilterMode() != FilterMode.ALLOW && config.deniedAccountTypes().contains(accountType)) {
+            this.state = false;
+        } else {
+            this.state = settingsManager.isNamePermitted(player.getName());
+        }
+        log.debug("Initialized account tracker for {} {}: {}", accountType, player.getName(), this.state);
+    }
+
+    public void onVarbit(VarbitChanged event) {
+        if (event.getVarbitId() == VarbitID.IRONMAN) {
+            this.refresh();
+        }
+    }
+
+    public void onAccountChange() {
+        this.refresh();
+    }
+
+    public void onConfig(String configKey) {
+        if ("nameFilterMode".equals(configKey) || "deniedAccountTypes".equals(configKey) || "ignoredNames".equals(configKey)) {
+            this.refresh();
+        }
+    }
+
+}
+
+package dinkplugin.util;
+
 import lombok.Value;
 import net.runelite.client.game.ItemStack;
 import net.runelite.http.api.loottracker.LootRecordType;
@@ -4221,6 +4307,66 @@ public class ConfigUtil {
         // LOOT_DROP_NOTIFICATIONS and UNTRADEABLE_LOOT_DROPS must both be set to 1 for reliable pet name parsing
         return varbitValue < 1;
     }
+}
+
+package dinkplugin.util;
+
+import dinkplugin.DinkPluginConfig;
+import dinkplugin.SettingsManager;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.client.callback.ClientThread;
+
+import javax.inject.Inject;
+
+@Slf4j
+public abstract class BooleanStateTracker {
+
+    @Inject
+    protected DinkPluginConfig config;
+
+    @Inject
+    protected SettingsManager settingsManager;
+
+    @Inject
+    protected Client client;
+
+    @Inject
+    protected ClientThread clientThread;
+
+    protected volatile Boolean state;
+
+    public void init() {
+        clientThread.invoke(() -> {
+            if (client.getGameState() == GameState.LOGGED_IN && !settingsManager.justLoggedIn()) {
+                this.populateState();
+            }
+        });
+    }
+
+    public void clear() {
+        this.state = null;
+    }
+
+    public boolean hasValidState() {
+        Boolean valid = this.state;
+        return valid != null && valid;
+    }
+
+    public void onTick() {
+        if (this.state == null && !settingsManager.justLoggedIn()) {
+            populateState();
+        }
+    }
+
+    protected void refresh() {
+        this.clear();
+        this.init();
+    }
+
+    protected abstract void populateState();
+
 }
 
 package dinkplugin.util;
@@ -4824,6 +4970,10 @@ public class SettingsManager {
         importDynamicConfig(config.dynamicConfigUrl());
     }
 
+    public boolean justLoggedIn() {
+        return justLoggedIn.get();
+    }
+
     void onCommand(CommandExecuted event) {
         String cmd = event.getCommand();
         String[] args = event.getArguments();
@@ -5318,7 +5468,9 @@ import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.ItemID;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.grandexchange.GrandExchangePlugin;
@@ -5341,6 +5493,9 @@ public class GrandExchangeNotifier extends BaseNotifier {
     private static final String RL_GE_PLUGIN_NAME = GrandExchangePlugin.class.getSimpleName().toLowerCase();
     private final AtomicInteger initTicks = new AtomicInteger();
     private final Map<Integer, Instant> progressNotificationTimeBySlot = new HashMap<>();
+
+    @Inject
+    private ClientThread clientThread;
 
     @Inject
     private Gson gson;
@@ -5376,7 +5531,23 @@ public class GrandExchangeNotifier extends BaseNotifier {
 
     public void onOfferChange(int slot, GrandExchangeOffer offer) {
         if (shouldNotify(slot, offer)) {
-            handleNotify(slot, offer);
+            clientThread.invoke(() -> {
+                if (initTicks.get() > 0) {
+                    return false; // retry later
+                }
+
+                if (!isEnabled()) {
+                    return true; // terminate execution since notifier is disabled
+                }
+
+                var welcome = client.getWidget(InterfaceID.WelcomeScreen.CONTENT);
+                if (welcome != null && !welcome.isHidden()) {
+                    return false; // wait until user has passed welcome screen
+                }
+
+                handleNotify(slot, offer);
+                return true;
+            });
         }
     }
 
@@ -5418,7 +5589,8 @@ public class GrandExchangeNotifier extends BaseNotifier {
     private boolean shouldNotify(int slot, GrandExchangeOffer offer) {
         // During login, we only care about offers that have been completed, and that were *not* observed by the RuneLite GE plugin
         // This makes sure we don't fire any duplicate notifications for offers that were finished while we were online
-        if (initTicks.get() > 0) {
+        boolean justLogged = initTicks.get() > 0;
+        if (justLogged) {
             // check if offer is a completion
             if (offer.getState() != GrandExchangeOfferState.BOUGHT && offer.getState() != GrandExchangeOfferState.SOLD)
                 return false;
@@ -5433,7 +5605,7 @@ public class GrandExchangeNotifier extends BaseNotifier {
                 return false;
         }
 
-        if (!isEnabled())
+        if (!justLogged && !isEnabled())
             return false;
 
         boolean valuable = getTransactedValue(offer) >= config.grandExchangeMinValue();
@@ -5732,7 +5904,7 @@ public class SpeedrunNotifier extends BaseNotifier {
     @Override
     public boolean isEnabled() {
         // intentionally doesn't call super as WorldUtils.isIgnoredWorld includes speedrunning
-        return config.notifySpeedrun() && accountPassesConfig();
+        return config.notifySpeedrun() && accountTracker.hasValidState();
     }
 
     @Override
@@ -6361,10 +6533,17 @@ public class PlayerKillNotifier extends BaseNotifier {
         if (!config.notifyPk())
             return false;
 
-        // duplicated logic from super class but allow Duel Arena
-        EnumSet<WorldType> world = client.getWorldType().clone(); // fast on RegularEnumSet
-        world.remove(WorldType.PVP_ARENA);
-        return !WorldUtils.isIgnoredWorld(world) && accountPassesConfig();
+        if (!worldTracker.hasValidState()) {
+            // duplicated logic from super class but allow Duel Arena
+            EnumSet<WorldType> world = client.getWorldType().clone(); // fast on RegularEnumSet
+            world.remove(WorldType.PVP_ARENA);
+
+            if (WorldUtils.isIgnoredWorld(world)) {
+                return false;
+            }
+        }
+
+        return accountTracker.hasValidState();
     }
 
     @Override
@@ -9980,21 +10159,17 @@ public class LevelNotifier extends BaseNotifier {
 package dinkplugin.notifiers;
 
 import dinkplugin.DinkPluginConfig;
-import dinkplugin.SettingsManager;
-import dinkplugin.domain.FilterMode;
 import dinkplugin.domain.SeasonalPolicy;
 import dinkplugin.message.DiscordMessageHandler;
 import dinkplugin.message.NotificationBody;
-import dinkplugin.util.Utils;
-import dinkplugin.util.WorldUtils;
+import dinkplugin.util.AccountTypeTracker;
+import dinkplugin.util.WorldTypeTracker;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.Player;
 import net.runelite.api.WorldType;
 import org.apache.commons.lang3.StringUtils;
 
 import javax.inject.Inject;
-import java.util.Set;
 
 @Slf4j
 public abstract class BaseNotifier {
@@ -10003,7 +10178,10 @@ public abstract class BaseNotifier {
     protected DinkPluginConfig config;
 
     @Inject
-    protected SettingsManager settingsManager;
+    protected AccountTypeTracker accountTracker;
+
+    @Inject
+    protected WorldTypeTracker worldTracker;
 
     @Inject
     protected Client client;
@@ -10012,29 +10190,7 @@ public abstract class BaseNotifier {
     private DiscordMessageHandler messageHandler;
 
     public boolean isEnabled() {
-        Set<WorldType> world = client.getWorldType();
-        if (config.seasonalPolicy() == SeasonalPolicy.REJECT && world.contains(WorldType.SEASONAL)) {
-            return false;
-        }
-        if (WorldUtils.isIgnoredWorld(world)) {
-            return false;
-        }
-        return accountPassesConfig();
-    }
-
-    /**
-     * @return whether the player name passes the configured filtered RSNs and the account type is permitted
-     */
-    protected boolean accountPassesConfig() {
-        Player player = client.getLocalPlayer();
-        if (player == null) {
-            return false;
-        }
-        if (config.nameFilterMode() != FilterMode.ALLOW && config.deniedAccountTypes().contains(Utils.getAccountType(client))) {
-            log.info("Skipping notification from {} due to denied account type", getClass().getSimpleName());
-            return false;
-        }
-        return settingsManager.isNamePermitted(player.getName());
+        return worldTracker.hasValidState() && accountTracker.hasValidState();
     }
 
     protected abstract String getWebhookUrl();
@@ -10766,7 +10922,6 @@ import dinkplugin.message.NotificationType;
 import dinkplugin.message.templating.Replacements;
 import dinkplugin.message.templating.Template;
 import dinkplugin.notifiers.data.ChatNotificationData;
-import dinkplugin.util.ConfigUtil;
 import dinkplugin.util.Utils;
 import lombok.Synchronized;
 import net.runelite.api.ChatMessageType;
@@ -10878,7 +11033,9 @@ public class ChatNotifier extends BaseNotifier {
     private void loadPatterns(String configValue) {
         regexps.clear();
         regexps.addAll(
-            ConfigUtil.readDelimited(configValue)
+            configValue.lines()
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
                 .map(Utils::regexify)
                 .collect(Collectors.toList())
         );
@@ -11181,7 +11338,7 @@ public class MetaNotifier extends BaseNotifier {
     }
 
     public void onVarbit(VarbitChanged event) {
-        if (event.getVarbitId() == VarbitID.TOA_VAULT_SARCOPHAGUS && event.getValue() % 2 == 1) {
+        if (event.getVarbitId() == VarbitID.TOA_VAULT_SARCOPHAGUS && event.getValue() % 2 == 1 && isEnabled()) {
             clientThread.invokeAtTickEnd(this::notifyPurpleAmascut);
         }
     }
@@ -11436,7 +11593,7 @@ public class LeaguesNotifier extends BaseNotifier {
         return config.notifyLeagues() &&
             client.getVarbitValue(VarbitID.LEAGUE_TYPE) == CURRENT_LEAGUE_VERSION &&
             client.getWorldType().contains(WorldType.SEASONAL) &&
-            accountPassesConfig();
+            accountTracker.hasValidState();
     }
 
     @Override
@@ -12082,8 +12239,10 @@ import dinkplugin.notifiers.QuestNotifier;
 import dinkplugin.notifiers.SlayerNotifier;
 import dinkplugin.notifiers.SpeedrunNotifier;
 import dinkplugin.notifiers.TradeNotifier;
+import dinkplugin.util.AccountTypeTracker;
 import dinkplugin.util.KillCountService;
 import dinkplugin.util.Utils;
+import dinkplugin.util.WorldTypeTracker;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.GameState;
@@ -12102,6 +12261,7 @@ import net.runelite.api.events.UsernameChanged;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.api.events.WidgetClosed;
 import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.events.WorldChanged;
 import net.runelite.api.gameval.NpcID;
 import net.runelite.client.RuneLite;
 import net.runelite.client.chat.ChatMessageManager;
@@ -12139,6 +12299,8 @@ public class DinkPlugin extends Plugin {
 
     private @Inject SettingsManager settingsManager;
     private @Inject VersionManager versionManager;
+    private @Inject AccountTypeTracker accountTracker;
+    private @Inject WorldTypeTracker worldTracker;
 
     private @Inject KillCountService killCountService;
 
@@ -12184,6 +12346,8 @@ public class DinkPlugin extends Plugin {
         log.debug("Started up Dink");
         settingsManager.init();
         versionManager.onStart();
+        accountTracker.init();
+        worldTracker.init();
         lootNotifier.init();
         deathNotifier.init();
         chatNotifier.init();
@@ -12195,6 +12359,8 @@ public class DinkPlugin extends Plugin {
         log.debug("Shutting down Dink");
         this.resetNotifiers();
         gameState.lazySet(null);
+        accountTracker.clear();
+        worldTracker.clear();
     }
 
     void resetNotifiers() {
@@ -12219,6 +12385,7 @@ public class DinkPlugin extends Plugin {
 
     @Subscribe
     public void onAccountHashChanged(AccountHashChanged event) {
+        accountTracker.onAccountChange();
         grandExchangeNotifier.onAccountChange();
     }
 
@@ -12235,6 +12402,8 @@ public class DinkPlugin extends Plugin {
         }
 
         settingsManager.onConfigChanged(event);
+        accountTracker.onConfig(event.getKey());
+        worldTracker.onConfig(event.getKey());
         lootNotifier.onConfigChanged(event.getKey(), event.getNewValue());
         deathNotifier.onConfigChanged(event.getKey(), event.getNewValue());
         chatNotifier.onConfig(event.getKey(), event.getNewValue());
@@ -12282,6 +12451,8 @@ public class DinkPlugin extends Plugin {
     @Subscribe
     public void onGameTick(GameTick event) {
         settingsManager.onTick();
+        accountTracker.onTick();
+        worldTracker.onTick();
         collectionNotifier.onTick();
         petNotifier.onTick();
         clueNotifier.onTick();
@@ -12418,6 +12589,7 @@ public class DinkPlugin extends Plugin {
     @Subscribe
     public void onVarbitChanged(VarbitChanged event) {
         settingsManager.onVarbitChanged(event);
+        accountTracker.onVarbit(event);
         metaNotifier.onVarbit(event);
         collectionNotifier.onVarPlayer(event);
         diaryNotifier.onVarbitChanged(event);
@@ -12438,6 +12610,11 @@ public class DinkPlugin extends Plugin {
     public void onWidgetClosed(WidgetClosed event) {
         groupStorageNotifier.onWidgetClose(event);
         tradeNotifier.onWidgetClose(event);
+    }
+
+    @Subscribe
+    public void onWorldChanged(WorldChanged event) {
+        worldTracker.onWorldChange();
     }
 
     @Subscribe
@@ -16882,11 +17059,13 @@ import dinkplugin.domain.PlayerLookupService;
 import dinkplugin.message.DiscordMessageHandler;
 import dinkplugin.message.NotificationBody;
 import dinkplugin.message.templating.Template;
+import dinkplugin.util.AccountTypeTracker;
 import dinkplugin.util.BlockingClientThread;
 import dinkplugin.util.BlockingExecutor;
 import dinkplugin.util.IndexedArray;
 import dinkplugin.util.TestImageUtil;
 import dinkplugin.util.Utils;
+import dinkplugin.util.WorldTypeTracker;
 import lombok.SneakyThrows;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
@@ -16978,6 +17157,12 @@ abstract class MockedNotifierTest extends MockedTestBase {
     protected ConfigManager configManager = Mockito.mock(ConfigManager.class);
 
     @Bind
+    protected AccountTypeTracker accountTracker = Mockito.spy(AccountTypeTracker.class);
+
+    @Bind
+    protected WorldTypeTracker worldTracker = Mockito.spy(WorldTypeTracker.class);
+
+    @Bind
     protected SettingsManager settingsManager = Mockito.spy(new SettingsManager(gson, client, clientThread, plugin, config, configManager, httpClient));
 
     @Bind
@@ -17023,6 +17208,9 @@ abstract class MockedNotifierTest extends MockedTestBase {
         when(config.nameFilterMode()).thenReturn(FilterMode.DENY);
         when(config.embedColor()).thenReturn(Utils.PINK);
         when(config.deniedAccountTypes()).thenReturn(EnumSet.noneOf(AccountType.class));
+
+        accountTracker.init();
+        worldTracker.init();
     }
 
     protected void mockItem(int id, int price, String name) {
@@ -17937,6 +18125,7 @@ class PetNotifierTest extends MockedNotifierTest {
         // update mocks
         when(config.seasonalPolicy()).thenReturn(SeasonalPolicy.REJECT);
         when(client.getWorldType()).thenReturn(EnumSet.of(WorldType.SEASONAL));
+        worldTracker.onWorldChange();
 
         // send fake message
         notifier.onChatMessage("You feel something weird sneaking into your backpack.");
@@ -17997,6 +18186,7 @@ class PetNotifierTest extends MockedNotifierTest {
         when(config.nameFilterMode()).thenReturn(FilterMode.DENY);
         when(config.deniedAccountTypes()).thenReturn(EnumSet.of(AccountType.GROUP_IRONMAN));
         settingsManager.init();
+        accountTracker.init();
 
         // send fake message
         notifier.onChatMessage("You feel something weird sneaking into your backpack.");
@@ -18012,6 +18202,7 @@ class PetNotifierTest extends MockedNotifierTest {
         when(config.nameFilterMode()).thenReturn(FilterMode.ALLOW);
         when(config.filteredNames()).thenReturn("xqc");
         settingsManager.init();
+        accountTracker.init();
 
         // send fake message
         notifier.onChatMessage("You feel something weird sneaking into your backpack.");
@@ -18026,6 +18217,7 @@ class PetNotifierTest extends MockedNotifierTest {
         // ignore notifications for our player name
         when(config.filteredNames()).thenReturn(PLAYER_NAME);
         settingsManager.init();
+        accountTracker.init();
 
         // send fake message
         notifier.onChatMessage("You feel something weird sneaking into your backpack.");
@@ -21193,6 +21385,7 @@ class SpeedrunNotifierTest extends MockedNotifierTest {
         // configure deny list
         when(config.filteredNames()).thenReturn(PLAYER_NAME);
         settingsManager.init();
+        accountTracker.init();
 
         // mock widget
         Widget time = mock(Widget.class);
@@ -21243,6 +21436,7 @@ class SpeedrunNotifierTest extends MockedNotifierTest {
         // update config mocks
         when(config.deniedAccountTypes()).thenReturn(EnumSet.of(AccountType.GROUP_IRONMAN));
         settingsManager.init();
+        accountTracker.init();
 
         // mock widget
         String latest = "1:15.30";
