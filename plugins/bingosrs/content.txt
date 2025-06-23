@@ -1,0 +1,615 @@
+package com.bingosrs;
+
+import com.bingosrs.api.BingOSRSService;
+import com.bingosrs.api.model.RequiredDrop;
+import com.bingosrs.api.model.Team;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.events.ConfigChanged;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.*;
+
+@Slf4j
+@Singleton
+public class BingoInfoManager {
+    public static final String CONFIG_GROUP = "bingosrs";
+
+    @Inject
+    private BingOSRSConfig config;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private BingOSRSService bingOSRSService;
+
+    // prevent overlapping calls
+    private boolean shouldUpdateRequiredDrops = false;
+    private List<RequiredDrop> requiredDrops = new ArrayList<>();
+
+    void onConfigChanged(ConfigChanged event) {
+        if (client.getGameState() == GameState.LOGGED_IN) {
+            if (event.getKey().equals("bingoId") && !config.bingoId().isBlank() && !config.playerToken().isBlank()) {
+                this.updateRequiredDrops();
+            }
+        }
+    }
+
+    public void onGameStateChanged(GameStateChanged gameStateChanged) {
+        GameState newState = gameStateChanged.getGameState();
+        if (newState == GameState.LOGGED_IN) {
+            this.shouldUpdateRequiredDrops = true;
+        }
+    }
+
+    public void onGameTick(GameTick gameTick) {
+        if (this.shouldUpdateRequiredDrops) {
+            this.shouldUpdateRequiredDrops = false;
+            this.updateRequiredDrops();
+        }
+    }
+
+    public void triggerUpdateRequiredDrops() {
+        shouldUpdateRequiredDrops = true;
+    }
+
+    private void updateRequiredDrops() {
+        bingOSRSService.fetchTeamsAsync()
+                .thenAccept(teams -> {
+                    List<RequiredDrop> requiredDrops = new ArrayList<>();
+                    boolean onTeam = false;
+                    for (Team team: teams) {
+                        if (Arrays.asList(team.players).contains(client.getLocalPlayer().getName())) {
+                            onTeam = true;
+                            for (RequiredDrop[] tileDrops: team.remainingDrops) {
+                                requiredDrops.addAll(Arrays.asList(tileDrops));
+                            }
+                            break;
+                        }
+                    }
+
+                    this.requiredDrops = requiredDrops;
+                    if (!onTeam) {
+                        log.debug("No team found for player");
+                    } else {
+                        log.debug("Required drops updated");
+                    }
+                })
+                .exceptionally(throwable -> {
+                    return null;
+                });
+    }
+
+    public boolean isRequiredDrop(Integer itemId, Integer npcId) {
+        for (RequiredDrop requiredDrop: requiredDrops) {
+            if (Objects.equals(requiredDrop.item, itemId)) {
+                if (requiredDrop.bosses.length == 0 || Arrays.asList(requiredDrop.bosses).contains(npcId)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+}
+
+package com.bingosrs.api;
+
+import com.bingosrs.BingOSRSConfig;
+import com.bingosrs.api.message.AuthResponse;
+import com.bingosrs.api.model.Team;
+import com.bingosrs.api.message.AuthRequest;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.events.GameTick;
+import okhttp3.*;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.lang.reflect.Type;
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Singleton
+public class BingOSRSService {
+    public static final String HOST = "api.bingosrs.com";
+
+    @Inject
+    private OkHttpClient client;
+
+    @Inject
+    private Gson gson;
+
+    @Inject
+    private BingOSRSConfig config;
+
+
+    private boolean shouldFetchAuth = false;
+    private String accessToken;
+
+    private String request(Request request) throws Exception {
+        String json = null;
+        Call call = client.newCall(request);
+        Response response = null;
+
+        try {
+            response = call.execute();
+            if (!response.isSuccessful()) {
+                throw new IOException("Request failed with code: " + response.code() + " message: " + response.message()); // Throw an IOException with the error code and message
+            }
+            ResponseBody body = response.body();
+            if (body != null) {
+                json = body.string();
+            }
+            return json;
+
+        } catch (IOException e) {
+            throw e;
+        }
+        finally {
+            if(response != null) {
+                response.close();
+            }
+        }
+    }
+
+    public void onGameTick(GameTick gameTick) {
+        if (this.shouldFetchAuth) {
+            this.shouldFetchAuth = false;
+            this.fetchAuthTokenAsync();
+        }
+    }
+
+    public void triggerAuth() {
+        this.triggerAuth(false);
+    }
+
+    public void triggerAuth(boolean force) {
+        // Don't refetch auth token unless it's empty or forcing
+        // This prevents unnecessary retriggers, and covers use case for modifying token before bingo ID
+        if (this.accessToken == null || force) {
+            this.shouldFetchAuth = true;
+        }
+    }
+
+    private CompletableFuture<Void> fetchAuthTokenAsync() {
+        CompletableFuture<Void> future = new CompletableFuture<>();
+
+        HttpUrl url = new HttpUrl.Builder().scheme("https").host(HOST)
+                .addPathSegment("auth").addPathSegment("login").addPathSegment("player").build();
+
+        AuthRequest authRequest = new AuthRequest(config.bingoId(), config.playerToken());
+        String json = gson.toJson(authRequest);
+
+        RequestBody body = RequestBody.create(MediaType.get("application/json"), json);
+        Request request = new Request.Builder().url(url).post(body).build();
+
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                String syncResponseJSON = request(request);
+                AuthResponse authResponse = gson.fromJson(syncResponseJSON, AuthResponse.class);
+                this.accessToken = authResponse.accessToken;
+                log.debug("Successfully authenticated for bingo");
+                future.complete(null);
+            } catch (Exception e) {
+                accessToken = null;
+                log.debug("Authentication failed for bingo");
+                future.completeExceptionally(e);
+            }
+            return null;
+        });
+
+        return future;
+    }
+
+    public CompletableFuture<Team[]> fetchTeamsAsync() {
+        CompletableFuture<Team[]> future = new CompletableFuture<>();
+
+        HttpUrl url = new HttpUrl.Builder().scheme("https").host(HOST)
+                .addPathSegment("bingo").addPathSegment(config.bingoId()).addPathSegment("teams").build();
+
+        Request request = new Request.Builder().url(url).build();
+
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                String syncResponseJSON = request(request);
+
+                Type teamListType = new TypeToken<Team[]>(){}.getType();
+                Team[] teams = gson.fromJson(syncResponseJSON, teamListType);
+
+                future.complete(teams);
+            } catch (Exception e) {
+                log.debug("Error while fetching teams: {}", e.getMessage());
+                future.completeExceptionally(e);
+            }
+            return null; // supplyAsync requires a return value, but it won't be used here
+        });
+
+        return future;
+    }
+
+    public CompletableFuture<String> submitDropAsync(String bingoId, byte[] screenshotBytes, String player, Integer itemId, Integer npcId) {
+        return submitDropAttempt(bingoId, screenshotBytes, player, itemId, npcId, false); // initial attempt
+    }
+
+    private CompletableFuture<String> submitDropAttempt(String bingoId, byte[] screenshotBytes, String player, int itemId, int npcId, boolean isRetry) {
+        CompletableFuture<String> future = new CompletableFuture<>();
+
+        HttpUrl url = new HttpUrl.Builder().scheme("https").host(HOST)
+                .addPathSegment("bingo").addPathSegment(bingoId).addPathSegment("drop").build();
+
+        RequestBody requestBody = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("player", player)
+                .addFormDataPart("boss", Integer.toString(npcId))
+                .addFormDataPart("item", Integer.toString(itemId))
+                .addFormDataPart("screenshot", "screenshot.png",
+                        RequestBody.create(MediaType.parse("image/png"), screenshotBytes))
+                .build();
+
+        Request request = new Request.Builder()
+                .url(url)
+                .post(requestBody)
+                .header("Authorization", "Bearer " + accessToken)
+                .build();
+
+        CompletableFuture.supplyAsync(() -> {
+            try {
+                String responseString = request(request);
+                future.complete(responseString);
+            } catch (Exception e) {
+                if (e.getMessage().contains("401") && !isRetry) {
+                    log.debug("Auth error submitting drop to bingo: {}. Reauthenticating...", bingoId);
+                    // If auth error, force re-auth and then retry once
+                    fetchAuthTokenAsync()
+                            .thenRun(() -> {
+                                submitDropAttempt(bingoId, screenshotBytes, player, itemId, npcId, true)
+                                        .whenComplete((result, throwable) -> {
+                                            if (throwable != null) {
+                                                future.completeExceptionally(throwable);
+                                            } else {
+                                                future.complete(result);
+                                            }
+                                        });
+                            })
+                            .exceptionally(throwable -> {
+                                future.completeExceptionally(throwable);
+                                return null;
+                            });
+
+                } else {
+                    log.debug("Error submitting bingo drop: {}", e.getMessage());
+                    future.completeExceptionally(e);
+                }
+            }
+            return null;
+        });
+
+        return future;
+    }
+}
+
+package com.bingosrs.api.model;
+
+import com.google.gson.annotations.SerializedName;
+
+public class RequiredDrop {
+    @SerializedName("item")
+    public Integer item;
+
+    @SerializedName("bosses")
+    public Integer[] bosses;
+}
+
+package com.bingosrs.api.model;
+import com.google.gson.annotations.SerializedName;
+
+public class Team {
+    @SerializedName("name")
+    public String name;
+
+    @SerializedName("players")
+    public String[] players;
+
+    @SerializedName("remainingDrops")
+    public RequiredDrop[][] remainingDrops;
+
+}
+
+package com.bingosrs.api.message;
+
+import com.google.gson.annotations.SerializedName;
+
+public class AuthResponse {
+    @SerializedName("access_token")
+    public String accessToken;
+}
+
+package com.bingosrs.api.message;
+
+import com.google.gson.annotations.SerializedName;
+
+public class AuthRequest {
+    @SerializedName("bingoId")
+    String bingoId;
+    @SerializedName("token")
+    String token;
+
+    public AuthRequest(String bingoId, String token) {
+        this.bingoId = bingoId;
+        this.token = token;
+    }
+}
+
+package com.bingosrs.notifiers;
+
+import com.bingosrs.BingOSRSConfig;
+import com.bingosrs.BingoInfoManager;
+import com.bingosrs.api.BingOSRSService;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.gameval.NpcID;
+import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.events.PlayerLootReceived;
+import net.runelite.client.events.ServerNpcLoot;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.plugins.loottracker.LootReceived;
+import net.runelite.client.ui.DrawManager;
+import net.runelite.client.util.QuantityFormatter;
+import net.runelite.http.api.loottracker.LootRecordType;
+import okhttp3.MediaType;
+import okhttp3.RequestBody;
+import org.apache.commons.lang3.StringUtils;
+
+import javax.imageio.ImageIO;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Singleton
+public class LootNotifier {
+
+    public static final Set<Integer> SPECIAL_LOOT_NPC_IDS = Set.of(
+            NpcID.WHISPERER, NpcID.WHISPERER_MELEE, NpcID.WHISPERER_QUEST, NpcID.WHISPERER_MELEE_QUEST,
+            NpcID.ARAXXOR, NpcID.ARAXXOR_DEAD, NpcID.RT_FIRE_QUEEN_INACTIVE, NpcID.RT_ICE_KING_INACTIVE
+    );
+    public static final Set<String> SPECIAL_LOOT_NPC_NAMES = Set.of("The Whisperer", "Araxxor", "Branda the Fire Queen", "Eldric the Ice King");
+
+    @Inject
+    private BingOSRSConfig bingOSRSConfig;
+
+    @Inject
+    private BingoInfoManager bingoInfoManager;
+
+    @Inject
+    private BingOSRSService bingOSRSService;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private DrawManager drawManager;
+
+    public void onServerNpcLoot(ServerNpcLoot event) {
+        var comp = event.getComposition();
+        this.handleNotify(event.getItems(), comp.getName(), LootRecordType.NPC, comp.getId());
+    }
+
+    public void onNpcLootReceived(NpcLootReceived event) {
+        NPC npc = event.getNpc();
+        int id = npc.getId();
+        if (SPECIAL_LOOT_NPC_IDS.contains(id)) {
+            // LootReceived is fired for certain NPCs rather than NpcLootReceived, but return here just in case upstream changes their implementation.
+            return;
+        }
+
+        this.handleNotify(event.getItems(), npc.getName(), LootRecordType.NPC, id);
+    }
+
+    public void onLootReceived(LootReceived lootReceived) {
+        // only consider non-NPC and non-PK loot
+        if (lootReceived.getType() == LootRecordType.EVENT || lootReceived.getType() == LootRecordType.PICKPOCKET) {
+            this.handleNotify(lootReceived.getItems(), lootReceived.getName(), lootReceived.getType(), null);
+        } else if (lootReceived.getType() == LootRecordType.NPC && SPECIAL_LOOT_NPC_NAMES.contains(lootReceived.getName())) {
+            // Special case: upstream fires LootReceived for certain NPCs, but not NpcLootReceived
+            this.handleNotify(lootReceived.getItems(), lootReceived.getName(), lootReceived.getType(), null);
+        }
+    }
+
+    private void handleNotify(Collection<ItemStack> items, String dropper, LootRecordType type, Integer npcId) {
+        if (npcId == null && (type == LootRecordType.NPC || type == LootRecordType.PICKPOCKET)) {
+            npcId = client.getTopLevelWorldView().npcs().stream()
+                    .filter(npc -> dropper.equals(npc.getName()))
+                    .findAny()
+                    .map(NPC::getId)
+                    .orElse(null);
+        }
+
+        for (ItemStack item : items) {
+            Integer finalNpcId = npcId;
+
+            if (bingoInfoManager.isRequiredDrop(item.getId(), npcId)) {
+                log.debug("Submitting drop to bingo: " + item.getId());
+                drawManager.requestNextFrameListener(image ->
+                {
+                    BufferedImage bufferedImage = (BufferedImage) image;
+                    byte[] imageBytes;
+                    try
+                    {
+                        ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+                        ImageIO.write(bufferedImage, "png", byteArrayOutputStream);
+                        imageBytes = byteArrayOutputStream.toByteArray();
+                        bingOSRSService.submitDropAsync(bingOSRSConfig.bingoId(), imageBytes, client.getLocalPlayer().getName(), item.getId(), finalNpcId)
+                                .whenComplete((result, throwable) -> bingoInfoManager.triggerUpdateRequiredDrops());
+                    }
+                    catch (IOException e)
+                    {
+                        log.debug("Error submitting drop", e);
+                    }
+                });
+            }
+        }
+    }
+
+}
+
+package com.bingosrs;
+
+import com.bingosrs.api.BingOSRSService;
+import com.bingosrs.notifiers.LootNotifier;
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.GameState;
+import net.runelite.api.events.*;
+import net.runelite.api.gameval.NpcID;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.*;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.loottracker.LootReceived;
+import java.util.concurrent.atomic.AtomicReference;
+
+@Slf4j
+@PluginDescriptor(
+	name = "BingOSRS"
+)
+public class BingOSRSPlugin extends Plugin
+{
+	@Inject
+	private BingoInfoManager bingoInfoManager;
+
+	@Inject
+	private BingOSRSService bingOSRSService;
+
+	@Inject
+	private LootNotifier lootNotifier;
+
+	private final AtomicReference<GameState> gameState = new AtomicReference<>();
+
+	@Override
+	protected void startUp() {
+		log.debug("Started up BingOSRS");
+	}
+
+	@Override
+	protected void shutDown() {
+		log.debug("Shutting down BingOSRS");
+		gameState.lazySet(null);
+	}
+
+	@Provides
+	BingOSRSConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(BingOSRSConfig.class);
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event) {
+		if (!BingoInfoManager.CONFIG_GROUP.equals(event.getGroup())) {
+			return;
+		}
+
+        bingOSRSService.triggerAuth(event.getKey().equals("playerToken"));
+		bingoInfoManager.onConfigChanged(event);
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged) {
+		GameState newState = gameStateChanged.getGameState();
+		if (newState == GameState.LOGGED_IN) {
+			bingOSRSService.triggerAuth();
+			bingoInfoManager.onGameStateChanged(gameStateChanged);
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event) {
+		bingoInfoManager.onGameTick(event);
+		bingOSRSService.onGameTick(event);
+	}
+
+	@Subscribe(priority = 1) // run before the base loot tracker plugin
+	public void onServerNpcLoot(ServerNpcLoot event) {
+		// temporarily only use new event when needed
+		if (event.getComposition().getId() != NpcID.YAMA) {
+			return;
+		}
+		lootNotifier.onServerNpcLoot(event);
+	}
+
+	@Subscribe(priority = 1) // run before the base loot tracker plugin
+	public void onNpcLootReceived(NpcLootReceived npcLootReceived) {
+		if (npcLootReceived.getNpc().getId() == NpcID.YAMA) {
+			// handled by ServerNpcLoot, but return just in case
+			return;
+		}
+
+		lootNotifier.onNpcLootReceived(npcLootReceived);
+	}
+
+	@Subscribe
+	public void onLootReceived(LootReceived lootReceived) {
+		lootNotifier.onLootReceived(lootReceived);
+	}
+}
+
+package com.bingosrs;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("bingosrs")
+public interface BingOSRSConfig extends Config
+{
+	@ConfigItem(
+		keyName = "bingoId",
+		name = "Bingo ID",
+		description = "ID of the bingo "
+	)
+	default String bingoId()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+			keyName = "playerToken",
+			name = "Player Token",
+			description = "Player token for the bingo. Required to submit drops.",
+			secret = true
+	)
+	default String playerToken()
+	{
+		return "";
+	}
+}
+
+package com.bingosrs;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class BingOSRSPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(BingOSRSPlugin.class);
+		RuneLite.main(args);
+	}
+}
