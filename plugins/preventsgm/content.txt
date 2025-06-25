@@ -40,7 +40,7 @@ public class PreventSGMPlugin extends Plugin {
     private static final int SUPERGLASS_MAKE = 14286969;
     private static final int DEMONIC_OFFERING = 14287025;
     private static final int SINISTER_OFFERING = 14287026;
-    private static final int WEARABLE_TELEPORT = 25362449;
+    private static final int VARBIT_FOUNTAIN_OF_RUNE = 4145;
 
     private int amountOfSeaweed = 0;
     private int amountOfSand = 0;
@@ -83,11 +83,13 @@ public class PreventSGMPlugin extends Plugin {
         if (config.seaweedToggle()) {
             toggle(client.getWidget(SUPERGLASS_MAKE), checkSeaweedAndSand());
         }
-        if (config.demonicToggle()) {
-            toggle(client.getWidget(DEMONIC_OFFERING), demonic);
-        }
-        if (config.sinisterToggle()) {
-            toggle(client.getWidget(SINISTER_OFFERING), sinister);
+        if (client.getVarbitValue(VARBIT_FOUNTAIN_OF_RUNE) == 0) {
+            if (config.demonicToggle()) {
+                toggle(client.getWidget(DEMONIC_OFFERING), demonic);
+            }
+            if (config.sinisterToggle()) {
+                toggle(client.getWidget(SINISTER_OFFERING), sinister);
+            }
         }
     }
 
@@ -137,7 +139,10 @@ public class PreventSGMPlugin extends Plugin {
                     return;
                 }
                 Widget[] inventoryFiltered = Arrays.stream(items).filter(item -> item.getItemId() == ItemID.SULPHUROUS_ESSENCE).toArray(Widget[]::new);
-                int amountSulphurAsh = inventoryFiltered[0].getItemQuantity();
+                int amountSulphurAsh = 0;
+                if (inventoryFiltered.length == 1) {
+                    amountSulphurAsh = inventoryFiltered[0].getItemQuantity();
+                }
                 if (amountSulphurAsh >= config.sulphurAmountToggle()) {
                     //I haven't figured out a good way to detect if someone is trying to teleport, so this will have to do
                     String menu = event.getMenuOption();
@@ -152,6 +157,26 @@ public class PreventSGMPlugin extends Plugin {
                         client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "[Prevent Misclicks] Teleporting disabled since you have " + amountSulphurAsh + " sulphurous essence in your inventory!", null);
                     }
                 }
+            }
+        }
+        if (client.getVarbitValue(VARBIT_FOUNTAIN_OF_RUNE) == 0) {
+            switch (event.getParam1()) {
+                case SINISTER_OFFERING:
+                    if (config.sinisterToggle()) {
+                        if (!sinister) {
+                            event.consume();
+                            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "[Prevent Misclicks] Offering spell disabled", null);
+                        }
+                    }
+                    break;
+                case DEMONIC_OFFERING:
+                    if (config.demonicToggle()) {
+                        if (!demonic) {
+                            event.consume();
+                            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "[Prevent Misclicks] Offering spell disabled", null);
+                        }
+                    }
+                    break;
             }
         }
         switch (event.getParam1()) {
@@ -175,9 +200,14 @@ public class PreventSGMPlugin extends Plugin {
                 }
                 break;
             case DEPOSIT_ALL:
-            case SUPERGLASS_MAKE:
                 amountOfSand = 0;
                 amountOfSeaweed = 0;
+                break;
+            case SUPERGLASS_MAKE:
+                if (!checkSeaweedAndSand()) {
+                    event.consume();
+                    client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "[Prevent Misclicks] Superglass make spell disabled", null);
+                }
                 break;
             default:
         }
@@ -251,11 +281,9 @@ public class PreventSGMPlugin extends Plugin {
         }
         if (check) {
             spell.setOpacity(0);
-            spell.setAction(0, "Cast");
         }
         else {
             spell.setOpacity(128);
-            spell.setAction(0, "");
         }
     }
 
