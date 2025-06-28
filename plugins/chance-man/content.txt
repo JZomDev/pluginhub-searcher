@@ -1,5 +1,369 @@
-package com.chanceman;
+package com.chanceman.drops;
 
+import lombok.Getter;
+import lombok.Setter;
+
+@Setter
+@Getter
+public class DropItem
+{
+    private int itemId;
+    private String name;
+
+    public DropItem(int itemId, String name)
+    {
+        this.itemId = itemId;
+        this.name = name;
+    }
+}
+package com.chanceman.drops;
+
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.List;
+
+@Setter
+@Getter
+public class DropTableSection
+{
+    private List<DropItem> items;
+
+    public DropTableSection(String header, List<DropItem> items)
+    {
+        this.items = items;
+    }
+
+}
+package com.chanceman.drops;
+
+import static net.runelite.client.RuneLite.RUNELITE_DIR;
+
+import com.chanceman.account.AccountManager;
+import com.google.gson.Gson;
+import lombok.extern.slf4j.Slf4j;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+@Singleton
+public class DropCache
+{
+    private final Gson gson;
+    private final AccountManager accountManager;
+    private final DropFetcher dropFetcher;
+
+    @Inject
+    public DropCache(Gson gson, AccountManager accountManager, DropFetcher dropFetcher)
+    {
+        this.gson = gson;
+        this.accountManager = accountManager;
+        this.dropFetcher = dropFetcher;
+    }
+
+    /**
+     * Load from disk if possible; otherwise fetch from the wiki,
+     * write out the JSON, and return the data.
+     */
+    public CompletableFuture<NpcDropData> get(int npcId, String name, int level)
+    {
+        final Path file;
+        try
+        {
+            file = getCacheFile(npcId, name, level);
+        }
+        catch (IOException ex)
+        {
+            log.error("Could not resolve cache file for {} ({}, lvl {})", npcId, name, level, ex);
+            return CompletableFuture.failedFuture(ex);
+        }
+
+        return CompletableFuture.supplyAsync(() ->
+                {
+                    if (Files.exists(file))
+                    {
+                        try
+                        {
+                            String json = Files.readString(file, StandardCharsets.UTF_8);
+                            return gson.fromJson(json, NpcDropData.class);
+                        }
+                        catch (Exception e)
+                        {
+                            log.warn("Failed to read cache {}, will re-fetch", file, e);
+                            try
+                            {
+                                Files.deleteIfExists(file);
+                            }
+                            catch (IOException ignored) { }
+                        }
+                    }
+                    return null;
+                })
+                // If we had a valid cache, return it; otherwise fetch & write
+                .thenCompose(cached ->
+                {
+                    if (cached != null)
+                    {
+                        return CompletableFuture.completedFuture(cached);
+                    }
+
+                    return dropFetcher.fetch(npcId, name, level)
+                            .thenApply(data ->
+                            {
+                                try
+                                {
+                                    String json = gson.toJson(data);
+                                    Files.createDirectories(file.getParent());
+                                    Files.writeString(
+                                            file,
+                                            json,
+                                            StandardCharsets.UTF_8,
+                                            StandardOpenOption.CREATE,
+                                            StandardOpenOption.TRUNCATE_EXISTING
+                                    );
+                                }
+                                catch (Exception e)
+                                {
+                                    log.error("Failed to write cache file: {}", file, e);
+                                }
+                                return data;
+                            })
+                            .exceptionally(ex ->
+                            {
+                                log.error("Error fetching drop data for NPC {}", npcId, ex);
+                                return null;
+                            });
+                });
+    }
+
+    private Path getCacheFile(int npcId, String name, int level) throws IOException
+    {
+        String player = accountManager.getPlayerName();
+        if (player == null)
+        {
+            throw new IOException("Player name is not available");
+        }
+
+        String safeName = name.replaceAll("[^A-Za-z0-9]", "_");
+        Path dir = RUNELITE_DIR.toPath()
+                .resolve("chanceman")
+                .resolve(player)
+                .resolve("drops");
+        Files.createDirectories(dir);
+
+        String fn = npcId + "_" + safeName + "_" + level + ".json";
+        return dir.resolve(fn);
+    }
+}
+
+package com.chanceman.drops;
+
+import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ItemComposition;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.game.ItemManager;
+import net.runelite.http.api.item.ItemPrice;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.jsoup.nodes.Element;
+import org.jsoup.select.Elements;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.*;
+import java.util.concurrent.*;
+import java.util.stream.Collectors;
+
+@Slf4j
+@Singleton
+public class DropFetcher
+{
+    private final OkHttpClient httpClient;
+    private final ItemManager itemManager;
+    private final ClientThread clientThread;
+    private final ExecutorService fetchExecutor;
+
+    @Inject
+    public DropFetcher(OkHttpClient httpClient, ItemManager itemManager, ClientThread clientThread)
+    {
+        this.httpClient = httpClient;
+        this.itemManager  = itemManager;
+        this.clientThread = clientThread;
+        this.fetchExecutor = Executors.newFixedThreadPool(
+                2,
+                new ThreadFactoryBuilder().setNameFormat("dropfetch-%d").build()
+        );
+    }
+
+    /**
+     * Asynchronously fetches an NPC’s drop tables via the OldSchool RuneScape Wiki’s
+     * Special:Lookup endpoint.
+     *
+     * <p>The lookup URL is constructed as
+     * `/w/Special:Lookup?type=npc&amp;id={npcId}&amp;name={fallback}#Drops`,
+     * which forces an ID‐first redirect to the exact NPC page (infobox match), and
+     * only falls back to the provided name (or a search) if no ID match is found.
+     *
+     * @param npcId  the numeric NPC ID to look up in the wiki infobox
+     * @param name   the NPC name (used as a fallback if the ID lookup fails)
+     * @param level  the NPC’s combat level (carried through into the returned data)
+     * @return a CompletableFuture that, when complete, yields an NpcDropData
+     *         containing the raw HTML‐parsed drop sections and resolved item IDs
+     */
+    public CompletableFuture<NpcDropData> fetch(int npcId, String name, int level)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+                    String url = buildWikiUrl(npcId, name);
+                    String html = fetchHtml(url);
+                    List<DropTableSection> sections = parseSections(html);
+                    return new NpcDropData(npcId, name, level, sections);
+                }, fetchExecutor)
+
+                .thenCompose(data -> {
+                    CompletableFuture<NpcDropData> resolved = new CompletableFuture<>();
+                    clientThread.invoke(() -> {
+                        for (DropTableSection sec : data.getDropTableSections())
+                        {
+                            for (DropItem d : sec.getItems())
+                            {
+                                String itemName = d.getName();
+                                int resolvedId = itemManager.search(itemName).stream()
+                                        .map(ItemPrice::getId)
+                                        .filter(id -> {
+                                            ItemComposition comp = itemManager.getItemComposition(id);
+                                            return comp != null
+                                                    && comp.getName().equalsIgnoreCase(itemName);
+                                        })
+                                        .findFirst()
+                                        .orElse(0);
+                                d.setItemId(resolvedId);
+                            }
+                        }
+                        resolved.complete(data);
+                    });
+                    return resolved;
+                });
+    }
+
+    /**
+     * Extract drop table sections from HTML.
+     */
+    private List<DropTableSection> parseSections(String html)
+    {
+        Document doc = Jsoup.parse(html);
+        Elements tables = doc.select("table.item-drops");
+
+        List<DropTableSection> sections = new ArrayList<>();
+
+        for (Element table : tables)
+        {
+            String header = "Drops";
+            Element prev = table.previousElementSibling();
+            while (prev != null)
+            {
+                if (prev.tagName().matches("h[2-4]"))
+                {
+                    header = prev.text();
+                    break;
+                }
+                prev = prev.previousElementSibling();
+            }
+
+            List<DropItem> items = table.select("tbody tr").stream()
+                    .map(row -> row.select("td"))
+                    .filter(td -> td.size() >= 6)
+                    .map(td -> new DropItem(0, td.get(1).text().replace("(m)", "").trim()))
+                    .collect(Collectors.toList());
+
+            if (!items.isEmpty())
+            {
+                sections.add(new DropTableSection(header, items));
+            }
+        }
+        return sections;
+    }
+
+    private String buildWikiUrl(int npcId, String name)
+    {
+        String fallback = URLEncoder.encode(name.replace(' ', '_'), StandardCharsets.UTF_8);
+        return "https://oldschool.runescape.wiki/w/Special:Lookup"
+                + "?type=npc"
+                + "&id="   + npcId
+                + "&name=" + fallback
+                + "#Drops";
+    }
+
+    private String fetchHtml(String url)
+    {
+        Request req = new Request.Builder()
+                .url(url)
+                .header("User-Agent", "RuneLite-ChanceMan/2.2.0")
+                .build();
+        try (Response res = httpClient.newCall(req).execute())
+        {
+            if (!res.isSuccessful())
+                throw new IOException("HTTP " + res.code());
+            return res.body().string();
+        }
+        catch (IOException ex)
+        {
+            throw new UncheckedIOException(ex);
+        }
+    }
+
+    /**
+     *  shut down the executor
+     */
+    public void shutdown()
+    {
+        fetchExecutor.shutdownNow();
+    }
+}
+
+package com.chanceman.drops;
+
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.List;
+
+@Setter
+@Getter
+public class NpcDropData
+{
+    private int npcId;
+    private String name;
+    private int level;
+    private List<DropTableSection> dropTableSections;
+
+    public NpcDropData(int npcId, String name, int level, List<DropTableSection> dropTableSections)
+    {
+        this.npcId = npcId;
+        this.name = name;
+        this.level = level;
+        this.dropTableSections = dropTableSections;
+    }
+
+}
+
+package com.chanceman.managers;
+
+import com.chanceman.ChanceManOverlay;
+import com.chanceman.ChanceManPanel;
 import lombok.Getter;
 import lombok.Setter;
 import net.runelite.api.ChatMessageType;
@@ -154,7 +518,7 @@ public class RollAnimationManager
     }
 }
 
-package com.chanceman;
+package com.chanceman.managers;
 
 import com.chanceman.account.AccountManager;
 import com.google.gson.Gson;
@@ -361,17 +725,211 @@ public class RolledItemsManager
         return Collections.unmodifiableSet(rolledItems);
     }
 }
+package com.chanceman.managers;
+
+import com.chanceman.account.AccountManager;
+import com.google.gson.Gson;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.io.Reader;
+import java.nio.file.*;
+import java.text.SimpleDateFormat;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+
+import static net.runelite.client.RuneLite.RUNELITE_DIR;
+
+/**
+ * Manages the set of unlocked items with robust, atomic persistence and 10‑file backup rotation.
+ */
+@Slf4j
+@Singleton
+public class UnlockedItemsManager
+{
+    private static final int MAX_BACKUPS = 10;
+
+    private final Set<Integer> unlockedItems = Collections.synchronizedSet(new LinkedHashSet<>());
+
+    @Inject private AccountManager accountManager;
+    @Inject private Gson gson;
+    @Setter private ExecutorService executor;
+
+    public boolean ready()
+    {
+        return accountManager.getPlayerName() != null;
+    }
+
+    /**
+     * Atomically moves source→target, but if ATOMIC_MOVE fails retries a normal move with REPLACE_EXISTING.
+     */
+    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
+    {
+        try
+        {
+            Files.move(source, target, opts);
+        }
+        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
+        {
+            // retry without ATOMIC_MOVE but with REPLACE_EXISTING
+            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
+            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
+            fallback.add(StandardCopyOption.REPLACE_EXISTING);
+            Files.move(source, target, fallback.toArray(new CopyOption[0]));
+        }
+    }
+
+    private Path getFilePath() throws IOException
+    {
+        String name = accountManager.getPlayerName();
+        if (name == null)
+        {
+            throw new IOException("Player name is null");
+        }
+        Path dir = RUNELITE_DIR.toPath()
+                .resolve("chanceman")
+                .resolve(name);
+        Files.createDirectories(dir);
+        return dir.resolve("chanceman_unlocked.json");
+    }
+
+    public boolean isUnlocked(int itemId)
+    {
+        return unlockedItems.contains(itemId);
+    }
+
+    public void unlockItem(int itemId)
+    {
+        if (unlockedItems.add(itemId))
+        {
+            saveUnlockedItems();
+        }
+    }
+
+    public void loadUnlockedItems()
+    {
+        if (!ready())
+        {
+            return;
+        }
+
+        unlockedItems.clear();
+        Path file;
+        try
+        {
+            file = getFilePath();
+        }
+        catch (IOException ioe)
+        {
+            return;
+        }
+
+        if (!Files.exists(file))
+        {
+            // first‑run: empty set → write an empty JSON file
+            saveUnlockedItems();
+            return;
+        }
+
+        try (Reader r = Files.newBufferedReader(file))
+        {
+            Set<Integer> loaded = gson.fromJson(r,
+                    new com.google.gson.reflect.TypeToken<Set<Integer>>() {}.getType());
+            if (loaded != null)
+            {
+                unlockedItems.addAll(loaded);
+            }
+        }
+        catch (IOException e)
+        {
+            log.error("Error loading unlocked items", e);
+        }
+    }
+
+    public void saveUnlockedItems()
+    {
+        executor.submit(() ->
+        {
+            Path file;
+            try
+            {
+                file = getFilePath();
+            }
+            catch (IOException ioe)
+            {
+                log.error("Could not resolve file path", ioe);
+                return;
+            }
+
+            try
+            {
+                // 1) rotate .json → .bak
+                if (Files.exists(file))
+                {
+                    Path backups = file.getParent().resolve("backups");
+                    Files.createDirectories(backups);
+                    String ts = new SimpleDateFormat("yyyyMMddHHmmss").format(new Date());
+                    Path bak = backups.resolve(file.getFileName() + "." + ts + ".bak");
+                    safeMove(file, bak,
+                            StandardCopyOption.ATOMIC_MOVE,
+                            StandardCopyOption.REPLACE_EXISTING);
+                    // prune older backups…
+                    Files.list(backups)
+                            .filter(p -> p.getFileName().toString().startsWith(file.getFileName() + "."))
+                            .sorted(Comparator.comparing(Path::getFileName).reversed())
+                            .skip(MAX_BACKUPS)
+                            .forEach(p -> p.toFile().delete());
+                }
+
+                // 2) write new JSON to .tmp
+                Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
+                try (BufferedWriter w = Files.newBufferedWriter(tmp))
+                {
+                    gson.toJson(unlockedItems, w);
+                }
+
+                // 3) atomically replace .json with .tmp
+                safeMove(tmp, file, StandardCopyOption.ATOMIC_MOVE);
+            }
+            catch (IOException e)
+            {
+                log.error("Error saving unlocked items", e);
+            }
+        });
+    }
+
+
+    /**
+     * Retrieves an unmodifiable set of unlocked item IDs.
+     *
+     * @return An unmodifiable set of unlocked item IDs.
+     */
+    public Set<Integer> getUnlockedItems()
+    {
+        return Collections.unmodifiableSet(unlockedItems);
+    }
+}
+
 package com.chanceman;
 
 
 import com.chanceman.account.AccountChanged;
 import com.chanceman.account.AccountManager;
+import com.chanceman.drops.DropFetcher;
 import com.chanceman.filters.EnsouledHeadMapping;
 import com.chanceman.menus.ActionHandler;
 import com.chanceman.filters.ItemsFilter;
+import com.chanceman.ui.DropsTabUI;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 import lombok.Getter;
+import com.chanceman.managers.RollAnimationManager;
+import com.chanceman.managers.RolledItemsManager;
+import com.chanceman.managers.UnlockedItemsManager;
 import net.runelite.api.*;
 import net.runelite.api.events.*;
 import net.runelite.api.widgets.Widget;
@@ -433,6 +991,8 @@ public class ChanceManPlugin extends Plugin
     private EventBus eventBus;
     @Inject
     private ItemsFilter itemsFilter;
+    @Inject private DropsTabUI dropsTabUI;
+    @Inject private DropFetcher dropFetcher;
 
     private ChanceManPanel chanceManPanel;
     private NavigationButton navButton;
@@ -474,6 +1034,7 @@ public class ChanceManPlugin extends Plugin
         unlockedItemsManager.setExecutor(fileExecutor);
         rolledItemsManager.setExecutor(fileExecutor);
         rollAnimationManager.startUp();
+        dropsTabUI.startUp();
 
         chanceManPanel = new ChanceManPanel(
                 unlockedItemsManager,
@@ -503,7 +1064,7 @@ public class ChanceManPlugin extends Plugin
     {
         if (!featuresActive) return;
         featuresActive = false;
-
+        dropsTabUI.shutDown();
         eventBus.unregister(accountManager);
         getInjector().getInstance(ActionHandler.class).shutDown();
 
@@ -525,6 +1086,7 @@ public class ChanceManPlugin extends Plugin
             fileExecutor.shutdownNow();
             fileExecutor = null;
         }
+        dropFetcher.shutdown();
 
         // reset panel/tradeable state
         chanceManPanel = null;
@@ -796,10 +1358,755 @@ public interface ChanceManConfig extends Config
     default boolean enableRollSounds() { return true; }
 }
 
+package com.chanceman.ui;
+
+import com.chanceman.drops.NpcDropData;
+import com.chanceman.drops.DropItem;
+import com.chanceman.managers.RolledItemsManager;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.*;
+import java.util.stream.Collectors;
+import net.runelite.api.Client;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetType;
+import net.runelite.api.widgets.ItemQuantityMode;
+
+@Slf4j
+@Singleton
+public class MusicWidgetController
+{
+    private static final int MUSIC_GROUP = 239;
+    private final Client client;
+    private final ClientThread clientThread;
+    private final RolledItemsManager rolledItemsManager;
+    private final SpriteOverrideManager spriteOverrideManager;
+
+    private NpcDropData currentDrops = null;
+    private List<Widget> backupJukeboxStaticKids = null;
+    private List<Widget> backupJukeboxDynamicKids = null;
+    private List<Widget> backupScrollStaticKids = null;
+    private List<Widget> backupScrollDynamicKids = null;
+    private String originalTitleText = null;
+    @Getter private boolean overrideActive = false;
+
+    @Inject
+    public MusicWidgetController(
+            Client client,
+            ClientThread clientThread,
+            RolledItemsManager rolledItemsManager,
+            SpriteOverrideManager spriteOverrideManager
+    )
+    {
+        this.client = client;
+        this.clientThread = clientThread;
+        this.rolledItemsManager = rolledItemsManager;
+        this.spriteOverrideManager = spriteOverrideManager;
+    }
+
+    public boolean hasData()
+    {
+        return currentDrops != null;
+    }
+
+    public NpcDropData getCurrentData()
+    {
+        return currentDrops;
+    }
+
+    public void override(NpcDropData dropData)
+    {
+        this.currentDrops = dropData;
+        this.overrideActive = true;
+        applyOverride(dropData);
+        spriteOverrideManager.register();
+    }
+
+    public void restore()
+    {
+        if (!overrideActive) return;
+        spriteOverrideManager.unregister();
+        revertOverride();
+    }
+
+    private void applyOverride(NpcDropData dropData)
+    {
+
+        int[] toHide = {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
+        for (int childId : toHide)
+        {
+            Widget w = client.getWidget(MUSIC_GROUP, childId);
+            if (w != null) w.setHidden(true);
+        }
+
+        List<DropItem> drops = dropData.getDropTableSections().stream()
+                .flatMap(sec -> sec.getItems().stream())
+                .collect(Collectors.toList());
+        drops = WidgetUtils.dedupeAndSort(drops);
+
+        Set<Integer> rolledIds = rolledItemsManager.getRolledItems();
+        int totalDrops = drops.size();
+        int rolledCount = (int) drops.stream()
+                .filter(d -> rolledIds.contains(d.getItemId()))
+                .count();
+
+        Widget root = client.getWidget(MUSIC_GROUP, 0);
+        if (root != null)
+        {
+            Widget title = client.getWidget(MUSIC_GROUP, 8);
+            if (title != null && originalTitleText == null) originalTitleText = title.getText();
+
+            if (title != null && dropData != null)
+            {
+                title.setText(dropData.getName());
+                title.revalidate();
+            }
+
+            int fontId = title != null ? title.getFontId() : 0;
+            boolean shadowed = title != null && title.getTextShadowed();
+            root.setHidden(false);
+            root.setType(WidgetType.LAYER);
+            root.revalidate();
+
+            WidgetUtils.hideAllChildrenSafely(root);
+
+            int lvlX = Objects.requireNonNull(title).getOriginalX() + title.getOriginalWidth() + 83;
+            int lvlY = title.getOriginalY();
+
+            Widget lvl = root.createChild(-1);
+            lvl.setHidden(false);
+            lvl.setType(WidgetType.TEXT);
+            lvl.setText(String.format("Lvl %d", dropData.getLevel()));
+            lvl.setFontId(fontId);
+            lvl.setTextShadowed(shadowed);
+            lvl.setTextColor(0x00b33c);
+            lvl.setOriginalX(lvlX);
+            lvl.setOriginalY(lvlY);
+            lvl.setOriginalWidth(title.getOriginalWidth());
+            lvl.setOriginalHeight(title.getOriginalHeight());
+            lvl.revalidate();
+
+            Widget oldBar = client.getWidget(MUSIC_GROUP, 9);
+            if (oldBar == null) return;
+            int xOld = oldBar.getOriginalX();
+            int yOld = oldBar.getOriginalY();
+            int wOld = oldBar.getOriginalWidth();
+            int hOld = oldBar.getOriginalHeight();
+
+            final int BAR_HEIGHT    = 15;
+            final float WIDTH_RATIO = 0.7f;
+            int newW  = Math.round(wOld * WIDTH_RATIO);
+
+            int newY  = yOld + (hOld - BAR_HEIGHT) / 2;
+
+            Widget bg = root.createChild(-1);
+            bg.setHidden(false);
+            bg.setType(WidgetType.RECTANGLE);
+            bg.setOriginalX(xOld);
+            bg.setOriginalY(newY);
+            bg.setOriginalWidth(newW);
+            bg.setOriginalHeight(BAR_HEIGHT);
+            bg.setFilled(true);
+            bg.setTextColor(0x000000);
+            bg.revalidate();
+
+            final int BORDER = 1;
+            int innerWidth = newW - BORDER * 2;
+            int fillW = Math.round(innerWidth * (float) rolledCount / totalDrops);
+
+            Widget fill = root.createChild(-1);
+            fill.setHidden(false);
+            fill.setType(WidgetType.RECTANGLE);
+            fill.setOriginalX(xOld + BORDER);
+            fill.setOriginalY(newY + BORDER);
+            fill.setOriginalWidth(fillW);
+            fill.setOriginalHeight(BAR_HEIGHT - BORDER * 2);
+            fill.setFilled(true);
+            fill.setTextColor(0x00b33c);
+            fill.revalidate();
+
+            String txt = String.format("%d/%d", rolledCount, totalDrops);
+            Widget label = root.createChild(-1);
+            label.setHidden(false);
+            label.setType(WidgetType.TEXT);
+            label.setText(txt);
+            label.setTextColor(0xFFFFFF);
+            label.setFontId(title.getFontId());
+            label.setTextShadowed(title.getTextShadowed());
+            label.setOriginalWidth(newW);
+            label.setOriginalHeight(BAR_HEIGHT);
+            label.setOriginalX(xOld + (newW / 2) - (txt.length() * 4));
+            label.setOriginalY(newY + (BAR_HEIGHT / 2) - 6);
+            label.revalidate();
+
+            root.revalidate();
+        }
+
+        final int ICON_SIZE = 32, PADDING = 4, COLUMNS = 4, MARGIN_X = 8, MARGIN_Y = 8;
+        Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
+        Widget jukebox    = client.getWidget(MUSIC_GROUP, 6);
+        Widget overlay    = client.getWidget(MUSIC_GROUP, 5);
+        Widget scrollbar  = client.getWidget(MUSIC_GROUP, 7);
+
+        if (backupJukeboxStaticKids == null)
+        {
+            backupJukeboxStaticKids = Optional.ofNullable(Objects.requireNonNull(jukebox).getChildren())
+                    .map(Arrays::asList)
+                    .map(ArrayList::new)
+                    .orElseGet(ArrayList::new);
+        }
+        if (backupJukeboxDynamicKids == null)
+        {
+            backupJukeboxDynamicKids = Optional.ofNullable(Objects.requireNonNull(jukebox).getDynamicChildren())
+                    .map(Arrays::asList)
+                    .map(ArrayList::new)
+                    .orElseGet(ArrayList::new);
+        }
+        if (backupScrollStaticKids == null)
+        {
+            backupScrollStaticKids = Optional.ofNullable(Objects.requireNonNull(scrollable).getChildren())
+                    .map(Arrays::asList)
+                    .map(ArrayList::new)
+                    .orElseGet(ArrayList::new);
+        }
+        if (backupScrollDynamicKids == null)
+        {
+            backupScrollDynamicKids = Optional.ofNullable(Objects.requireNonNull(scrollable).getDynamicChildren())
+                    .map(Arrays::asList)
+                    .map(ArrayList::new)
+                    .orElseGet(ArrayList::new);
+        }
+
+        WidgetUtils.hideAllChildrenSafely(jukebox);
+        WidgetUtils.hideAllChildrenSafely(scrollable);
+
+        int displayIndex = 0;
+        for (DropItem d : drops)
+        {
+            int itemId = d.getItemId();
+            int col    = displayIndex % COLUMNS;
+            int row    = displayIndex / COLUMNS;
+            int x      = MARGIN_X + col * (ICON_SIZE + PADDING);
+            int y      = MARGIN_Y + row * (ICON_SIZE + PADDING);
+
+            Widget icon = Objects.requireNonNull(scrollable).createChild(-1);
+            icon.setHidden(false);
+            icon.setType(WidgetType.GRAPHIC);
+            icon.setItemId(itemId);
+            icon.setItemQuantityMode(ItemQuantityMode.NEVER);
+            icon.setOriginalX(x);
+            icon.setOriginalY(y);
+            icon.setOriginalWidth(ICON_SIZE);
+            icon.setOriginalHeight(ICON_SIZE);
+            icon.setBorderType(1);
+            icon.setOpacity(rolledIds.contains(itemId) ? 0 : 150);
+            icon.revalidate();
+
+            displayIndex++;
+        }
+
+        int rows = (displayIndex + COLUMNS - 1) / COLUMNS;
+        Objects.requireNonNull(scrollable).setScrollHeight(MARGIN_Y * 2 + rows * (ICON_SIZE + PADDING));
+        Objects.requireNonNull(scrollbar).revalidateScroll();
+    }
+
+    private void revertOverride()
+    {
+        if (!overrideActive)
+        {
+            return;
+        }
+
+        Widget root       = client.getWidget(MUSIC_GROUP, 0);
+        Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
+        Widget jukebox    = client.getWidget(MUSIC_GROUP, 6);
+
+        // 1) Hide any dynamic widgets under the root (lvl text, bar, counter)
+        if (root != null)
+        {
+            Widget[] dynRoot = root.getDynamicChildren();
+            if (dynRoot != null)
+            {
+                for (Widget w : dynRoot)
+                {
+                    w.setHidden(true);
+                    w.revalidate();
+                }
+            }
+        }
+
+        // 2) Hide injected drop icons under scrollable
+        if (scrollable != null && backupScrollStaticKids != null && backupScrollDynamicKids != null)
+        {
+
+            for (Widget w : scrollable.getChildren())
+            {
+                w.setHidden(true);
+            }
+            for (Widget w : scrollable.getDynamicChildren())
+            {
+                w.setHidden(true);
+            }
+
+            for (Widget w : backupScrollStaticKids)
+            {
+                w.setHidden(false);
+            }
+            for (Widget w : backupScrollDynamicKids)
+            {
+                w.setHidden(false);
+            }
+            scrollable.revalidate();
+        }
+
+        if (jukebox != null && backupJukeboxStaticKids != null && backupJukeboxDynamicKids != null)
+        {
+            for (Widget w : jukebox.getChildren())
+            {
+                w.setHidden(true);
+            }
+            for (Widget w : jukebox.getDynamicChildren())
+            {
+                w.setHidden(true);
+            }
+            for (Widget w : backupJukeboxStaticKids)
+            {
+                w.setHidden(false);
+            }
+            for (Widget w : backupJukeboxDynamicKids)
+            {
+                w.setHidden(false);
+            }
+            jukebox.revalidate();
+        }
+
+        Widget title     = client.getWidget(MUSIC_GROUP, 8);
+        Widget overlay   = client.getWidget(MUSIC_GROUP, 5);
+        Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
+        Widget progress  = client.getWidget(MUSIC_GROUP, 9);
+
+        if (title != null && originalTitleText != null)
+        {
+            title.setText(originalTitleText);
+            title.revalidate();
+            for (int id = 9; id <= 19; id++)
+            {
+                Widget w = client.getWidget(MUSIC_GROUP, id);
+                if (w != null)
+                {
+                    w.setHidden(false);
+                    w.revalidate();
+                }
+            }
+        }
+
+        if (overlay != null)
+        {
+            overlay.setHidden(false);
+            overlay.revalidate();
+        }
+        if (scrollbar != null)
+        {
+            scrollbar.setHidden(false);
+            scrollbar.revalidate();
+        }
+        if (progress != null)
+        {
+            progress.setHidden(false);
+            progress.revalidate();
+        }
+
+        if (root != null && root.getOnLoadListener() != null)
+        {
+            client.createScriptEvent(root.getOnLoadListener())
+                    .setSource(root)
+                    .run();
+            root.revalidate();
+        }
+        if (overlay != null && overlay.getOnLoadListener() != null)
+        {
+            client.createScriptEvent(overlay.getOnLoadListener())
+                    .setSource(overlay)
+                    .run();
+            overlay.revalidate();
+        }
+        if (scrollbar != null && scrollbar.getOnLoadListener() != null)
+        {
+            client.createScriptEvent(scrollbar.getOnLoadListener())
+                    .setSource(scrollbar)
+                    .run();
+            scrollbar.revalidate();
+        }
+        if (jukebox != null && jukebox.getOnLoadListener() != null)
+        {
+            client.createScriptEvent(jukebox.getOnLoadListener())
+                    .setSource(jukebox)
+                    .run();
+            jukebox.revalidate();
+        }
+
+        originalTitleText = null;
+        currentDrops      = null;
+        overrideActive    = false;
+    }
+}
+package com.chanceman.ui;
+
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.eventbus.EventBus;
+
+@Slf4j
+@Singleton
+public class DropsTabUI
+{
+    private final EventBus eventBus;
+    private final DropsMenuListener menuListener;
+    private final TabListener tabListener;
+
+    @Inject
+    public DropsTabUI(
+            EventBus eventBus,
+            DropsMenuListener menuListener,
+            TabListener tabListener
+    )
+    {
+        this.eventBus = eventBus;
+        this.menuListener = menuListener;
+        this.tabListener = tabListener;
+    }
+
+    public void startUp()
+    {
+        eventBus.register(menuListener);
+        eventBus.register(tabListener);
+    }
+
+    public void shutDown()
+    {
+        eventBus.unregister(menuListener);
+        eventBus.unregister(tabListener);
+    }
+}
+
+package com.chanceman.ui;
+
+import com.chanceman.drops.DropCache;
+import lombok.extern.slf4j.Slf4j;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.NPC;
+import net.runelite.api.events.MenuOpened;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.Subscribe;
+
+@Slf4j
+@Singleton
+public class DropsMenuListener
+{
+    private final Client client;
+    private final ClientThread clientThread;
+    private final DropCache dropCache;
+    private final MusicWidgetController widgetController;
+
+    @Inject
+    public DropsMenuListener(
+            Client client,
+            ClientThread clientThread,
+            DropCache dropCache,
+            MusicWidgetController widgetController
+    )
+    {
+        this.client = client;
+        this.clientThread = clientThread;
+        this.dropCache = dropCache;
+        this.widgetController = widgetController;
+    }
+
+    @Subscribe
+    public void onMenuOpened(MenuOpened event)
+    {
+        List<MenuEntry> entries = new ArrayList<>(Arrays.asList(event.getMenuEntries()));
+        NPC target = null;
+        MenuEntry attackEntry = null;
+        int attackIdx = -1;
+
+        for (int i = 0; i < entries.size(); i++)
+        {
+            MenuEntry e = entries.get(i);
+            if (e.getType() == MenuAction.NPC_SECOND_OPTION && "Attack".equals(e.getOption()))
+            {
+                try
+                {
+                    NPC possible = client.getTopLevelWorldView()
+                            .npcs()
+                            .byIndex(e.getIdentifier());
+                    if (possible != null && possible.getCombatLevel() > 0)
+                    {
+                        target = possible;
+                        attackEntry = e;
+                        attackIdx = i;
+                        break;
+                    }
+                }
+                catch (ArrayIndexOutOfBoundsException ex)
+                {
+                    // ignore invalid indices
+                }
+            }
+        }
+        if (attackEntry == null || target == null)
+        {
+            return;
+        }
+
+        int id = target.getId();
+        String name = target.getName();
+        int level = target.getCombatLevel();
+
+        MenuEntry showDrops = WidgetUtils.createShowDropsEntry(
+                client,
+                attackIdx - 1,
+                attackEntry
+        );
+        showDrops.onClick(me ->
+                dropCache.get(id, name, level)
+                        .thenAccept(dropData ->
+                                clientThread.invokeLater(() -> widgetController.override(dropData))
+                        )
+        );
+
+        entries.add(attackIdx + 1, showDrops);
+        event.setMenuEntries(entries.toArray(new MenuEntry[0]));
+    }
+}
+package com.chanceman.ui;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.SpriteID;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.game.SpriteManager;
+import net.runelite.client.game.SpriteOverride;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+/**
+ * Overrides the RuneLite music tab sprite with drops.png.
+ * Call register() when showing drops and unregister() to restore the original.
+ * Clears the widget sprite cache to force the client to pick up the new override.
+ */
+@Slf4j
+@Singleton
+public class SpriteOverrideManager implements SpriteOverride
+{
+    private static final int SPRITE_ID = SpriteID.TAB_MUSIC;
+    private static final String RESOURCE_PATH = "/com/chanceman/drops.png";
+
+    private final SpriteManager spriteManager;
+    private final Client client;
+    private final ClientThread clientThread;
+
+    @Inject
+    public SpriteOverrideManager(SpriteManager spriteManager, Client client, ClientThread clientThread)
+    {
+        this.spriteManager = spriteManager;
+        this.client = client;
+        this.clientThread = clientThread;
+    }
+
+    /**
+     * Apply the custom drops icon override.
+     */
+    public void register()
+    {
+        spriteManager.addSpriteOverrides(new SpriteOverride[]{this});
+        clientThread.invokeLater(() -> {
+            client.getWidgetSpriteCache().reset();
+        });
+    }
+
+    /**
+     * Remove the override, restoring the original music tab icon.
+     */
+    public void unregister()
+    {
+        spriteManager.removeSpriteOverrides(new SpriteOverride[]{this});
+        clientThread.invokeLater(() -> {
+            client.getWidgetSpriteCache().reset();
+        });
+    }
+
+    @Override
+    public int getSpriteId()
+    {
+        return SPRITE_ID;
+    }
+
+    @Override
+    public String getFileName()
+    {
+        // Resource path relative to the classpath
+        return RESOURCE_PATH;
+    }
+}
+
+package com.chanceman.ui;
+
+import com.chanceman.drops.DropItem;
+import net.runelite.api.Client;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.MenuAction;
+import net.runelite.api.widgets.Widget;
+
+import java.util.*;
+import java.util.stream.Collectors;
+import java.util.LinkedHashMap;
+
+public final class WidgetUtils
+{
+    /**
+     * Creates a "Show Drops" menu entry identical to the original Attack entry.
+     *
+     * @param client      The RuneLite client.
+     * @param insertIndex The index at which to insert the new entry.
+     * @param attackEntry The original "Attack" menu entry to clone.
+     * @return A configured MenuEntry that runs a custom drop display.
+     */
+    public static MenuEntry createShowDropsEntry(
+            Client client,
+            int insertIndex,
+            MenuEntry attackEntry
+    )
+    {
+        return client.getMenu()
+                .createMenuEntry(insertIndex)
+                .setOption("Show Drops")
+                .setTarget(attackEntry.getTarget())
+                .setIdentifier(attackEntry.getIdentifier())
+                .setParam0(attackEntry.getParam0())
+                .setParam1(attackEntry.getParam1())
+                .setType(MenuAction.RUNELITE);
+    }
+
+    /**
+     * Hides all static and dynamic children of the given widget, if any exist.
+     *
+     * @param widget The widget whose children should be hidden.
+     */
+    public static void hideAllChildrenSafely(Widget widget)
+    {
+        if (widget == null)
+            return;
+
+        Widget[] staticKids = widget.getChildren();
+        if (staticKids != null)
+        {
+            for (Widget child : staticKids)
+            {
+                if (child != null) child.setHidden(true);
+            }
+        }
+
+        Widget[] dynamicKids = widget.getDynamicChildren();
+        if (dynamicKids != null)
+        {
+            for (Widget child : dynamicKids)
+            {
+                if (child != null) child.setHidden(true);
+            }
+        }
+    }
+
+    /**
+     * Deduplicates a list of DropItems by item ID and sorts them ascending.
+     *
+     * @param drops The list of DropItems to process.
+     * @return A new sorted, deduplicated list.
+     */
+    public static List<DropItem> dedupeAndSort(List<DropItem> drops)
+    {
+        return drops.stream()
+                .filter(d -> d.getItemId() > 0)
+                .collect(Collectors.toMap(
+                        DropItem::getItemId,
+                        d -> d,
+                        (first, second) -> first,
+                        LinkedHashMap::new
+                ))
+                .values().stream()
+                .sorted(Comparator.comparingInt(DropItem::getItemId))
+                .collect(Collectors.toList());
+    }
+}
+
+package com.chanceman.ui;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.VarClientInt;
+import net.runelite.api.events.VarClientIntChanged;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.Subscribe;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Slf4j
+@Singleton
+public class TabListener
+{
+    private final Client client;
+    private final ClientThread clientThread;
+    private final MusicWidgetController widgetController;
+
+    @Inject
+    public TabListener(
+            Client client,
+            ClientThread clientThread,
+            MusicWidgetController widgetController
+    )
+    {
+        this.client = client;
+        this.clientThread = clientThread;
+        this.widgetController = widgetController;
+    }
+
+    @Subscribe
+    public void onVarClientIntChanged(VarClientIntChanged ev)
+    {
+        if (ev.getIndex() != VarClientInt.INVENTORY_TAB) return;
+
+        int newTab = client.getVarcIntValue(VarClientInt.INVENTORY_TAB);
+        if (widgetController.isOverrideActive() && newTab != 13)
+        {
+            clientThread.invokeLater(widgetController::restore);
+        }
+        else if (!widgetController.isOverrideActive() && newTab == 13 && widgetController.hasData())
+        {
+            clientThread.invokeLater(() ->
+                    widgetController.override(widgetController.getCurrentData())
+            );
+        }
+    }
+}
+
 package com.chanceman.account;
 
-import com.chanceman.RolledItemsManager;
-import com.chanceman.UnlockedItemsManager;
+import com.chanceman.managers.RolledItemsManager;
+import com.chanceman.managers.UnlockedItemsManager;
 import lombok.Getter;
 import lombok.Setter;
 import net.runelite.api.Client;
@@ -928,6 +2235,9 @@ public class AccountChanged
 
 package com.chanceman;
 
+import com.chanceman.managers.RollAnimationManager;
+import com.chanceman.managers.RolledItemsManager;
+import com.chanceman.managers.UnlockedItemsManager;
 import net.runelite.api.ItemComposition;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.game.ItemManager;
@@ -1547,195 +2857,6 @@ public class ChanceManPanel extends PluginPanel
             String name = (comp != null) ? comp.getName() : "Unknown";
             SwingUtilities.invokeLater(() -> callback.accept(name));
         });
-    }
-}
-
-package com.chanceman;
-
-import com.chanceman.account.AccountManager;
-import com.google.gson.Gson;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.io.BufferedWriter;
-import java.io.IOException;
-import java.io.Reader;
-import java.nio.file.*;
-import java.text.SimpleDateFormat;
-import java.util.*;
-import java.util.concurrent.ExecutorService;
-
-import static net.runelite.client.RuneLite.RUNELITE_DIR;
-
-/**
- * Manages the set of unlocked items with robust, atomic persistence and 10‑file backup rotation.
- */
-@Slf4j
-@Singleton
-public class UnlockedItemsManager
-{
-    private static final int MAX_BACKUPS = 10;
-
-    private final Set<Integer> unlockedItems = Collections.synchronizedSet(new LinkedHashSet<>());
-
-    @Inject private AccountManager accountManager;
-    @Inject private Gson gson;
-    @Setter private ExecutorService executor;
-
-    public boolean ready()
-    {
-        return accountManager.getPlayerName() != null;
-    }
-
-    /**
-     * Atomically moves source→target, but if ATOMIC_MOVE fails retries a normal move with REPLACE_EXISTING.
-     */
-    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
-    {
-        try
-        {
-            Files.move(source, target, opts);
-        }
-        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
-        {
-            // retry without ATOMIC_MOVE but with REPLACE_EXISTING
-            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
-            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
-            fallback.add(StandardCopyOption.REPLACE_EXISTING);
-            Files.move(source, target, fallback.toArray(new CopyOption[0]));
-        }
-    }
-
-    private Path getFilePath() throws IOException
-    {
-        String name = accountManager.getPlayerName();
-        if (name == null)
-        {
-            throw new IOException("Player name is null");
-        }
-        Path dir = RUNELITE_DIR.toPath()
-                .resolve("chanceman")
-                .resolve(name);
-        Files.createDirectories(dir);
-        return dir.resolve("chanceman_unlocked.json");
-    }
-
-    public boolean isUnlocked(int itemId)
-    {
-        return unlockedItems.contains(itemId);
-    }
-
-    public void unlockItem(int itemId)
-    {
-        if (unlockedItems.add(itemId))
-        {
-            saveUnlockedItems();
-        }
-    }
-
-    public void loadUnlockedItems()
-    {
-        if (!ready())
-        {
-            return;
-        }
-
-        unlockedItems.clear();
-        Path file;
-        try
-        {
-            file = getFilePath();
-        }
-        catch (IOException ioe)
-        {
-            return;
-        }
-
-        if (!Files.exists(file))
-        {
-            // first‑run: empty set → write an empty JSON file
-            saveUnlockedItems();
-            return;
-        }
-
-        try (Reader r = Files.newBufferedReader(file))
-        {
-            Set<Integer> loaded = gson.fromJson(r,
-                    new com.google.gson.reflect.TypeToken<Set<Integer>>() {}.getType());
-            if (loaded != null)
-            {
-                unlockedItems.addAll(loaded);
-            }
-        }
-        catch (IOException e)
-        {
-            log.error("Error loading unlocked items", e);
-        }
-    }
-
-    public void saveUnlockedItems()
-    {
-        executor.submit(() ->
-        {
-            Path file;
-            try
-            {
-                file = getFilePath();
-            }
-            catch (IOException ioe)
-            {
-                log.error("Could not resolve file path", ioe);
-                return;
-            }
-
-            try
-            {
-                // 1) rotate .json → .bak
-                if (Files.exists(file))
-                {
-                    Path backups = file.getParent().resolve("backups");
-                    Files.createDirectories(backups);
-                    String ts = new SimpleDateFormat("yyyyMMddHHmmss").format(new Date());
-                    Path bak = backups.resolve(file.getFileName() + "." + ts + ".bak");
-                    safeMove(file, bak,
-                            StandardCopyOption.ATOMIC_MOVE,
-                            StandardCopyOption.REPLACE_EXISTING);
-                    // prune older backups…
-                    Files.list(backups)
-                            .filter(p -> p.getFileName().toString().startsWith(file.getFileName() + "."))
-                            .sorted(Comparator.comparing(Path::getFileName).reversed())
-                            .skip(MAX_BACKUPS)
-                            .forEach(p -> p.toFile().delete());
-                }
-
-                // 2) write new JSON to .tmp
-                Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
-                try (BufferedWriter w = Files.newBufferedWriter(tmp))
-                {
-                    gson.toJson(unlockedItems, w);
-                }
-
-                // 3) atomically replace .json with .tmp
-                safeMove(tmp, file, StandardCopyOption.ATOMIC_MOVE);
-            }
-            catch (IOException e)
-            {
-                log.error("Error saving unlocked items", e);
-            }
-        });
-    }
-
-
-    /**
-     * Retrieves an unmodifiable set of unlocked item IDs.
-     *
-     * @return An unmodifiable set of unlocked item IDs.
-     */
-    public Set<Integer> getUnlockedItems()
-    {
-        return Collections.unmodifiableSet(unlockedItems);
     }
 }
 
@@ -2937,6 +4058,7 @@ public enum ItemSets {
     AncientDragonhide(ItemID.SET_DHIDE_ANCIENT),
 
     // Miscellaneous sets
+    OathplateSet(ItemID.SET_OATHPLATE_ARMOUR),
     PartyhatSet(ItemID.SET_PARTYHAT),
     HalloweenMaskSet(ItemID.SET_HALLOWEEN_MASK),
     AncestralRobes(ItemID.SET_ANCESTRAL_ROBES),
@@ -3404,7 +4526,7 @@ public enum SkillOp
 package com.chanceman.menus;
 
 import com.chanceman.ChanceManPlugin;
-import com.chanceman.UnlockedItemsManager;
+import com.chanceman.managers.UnlockedItemsManager;
 import lombok.Getter;
 import lombok.Setter;
 import net.runelite.api.Client;
@@ -3895,6 +5017,7 @@ public enum SkillItem
 	ADAMANT_AXE(1357, SkillOp.CHOP_DOWN),
 	RUNE_AXE(1359, SkillOp.CHOP_DOWN),
 	DRAGON_AXE(6739, SkillOp.CHOP_DOWN),
+	GILDED_AXE(23279, SkillOp.CHOP_DOWN),
 	THIRD_AGE_AXE(20011, SkillOp.CHOP_DOWN),
 
 	BRONZE_FELLING_AXE(28196, SkillOp.CHOP_DOWN),
@@ -3912,7 +5035,11 @@ public enum SkillItem
 	STEEL_PICKAXE(1269, SkillOp.MINE),
 	BLACK_PICKAXE(12297, SkillOp.MINE),
 	MITHRIL_PICKAXE(1273, SkillOp.MINE),
+	ADAMANT_PICKAXE(1271, SkillOp.MINE),
 	RUNE_PICKAXE(1275, SkillOp.MINE),
+	DRAGON_PICKAXE(12797,SkillOp.MINE),
+	GILDED_PICKAXE(23276, SkillOp.MINE),
+	THIRD_AGE_PICKAXE(20014, SkillOp.MINE),
 
 	SMALL_FISHING_NET(303, SkillOp.SMALL_NET),
 	BIG_FISHING_NET(305, SkillOp.BIG_NET),
@@ -4037,6 +5164,7 @@ public enum RuneProvider
 	TOME_OF_EARTH(true, 30064, EARTH_RUNE),
 
 	// Combo runes
+	AETHER_RUNE(false,30844,COSMIC_RUNE, SOUL_RUNE),
 	MIST_RUNE(false, 4695, AIR_RUNE, WATER_RUNE),
 	DUST_RUNE(false, 4696, AIR_RUNE, EARTH_RUNE),
 	MUD_RUNE(false, 4698, WATER_RUNE, EARTH_RUNE),
@@ -4110,7 +5238,7 @@ public enum RuneProvider
 package com.chanceman.menus;
 
 import com.chanceman.ChanceManPlugin;
-import com.chanceman.UnlockedItemsManager;
+import com.chanceman.managers.UnlockedItemsManager;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
