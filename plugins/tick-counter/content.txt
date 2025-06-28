@@ -135,7 +135,6 @@ public class TickCounterPlugin extends Plugin
 			case 1062: // dds spec
 			case 1067: // claw stab
 			case 1074: // msb spec
-			case 1167: // trident cast
 			case 1658: // Whip
 			case 9963: // Ursine Chainmace Spec
 			case 380: // spear slash
@@ -210,17 +209,24 @@ public class TickCounterPlugin extends Plugin
 					delta = 4;
 					break;
 				}
+			case 11430: // trident cast and wave spells w/staff
+				if (weapon == 25731 || weapon == 22323 || weapon == 22288 || weapon == 22292 || weapon == 12899 || weapon == 11907 || weapon == 11905) // tridents
+				{
+					delta = 4;
+					break;
+				}
 			case 708: // iban's blast
-			case 711: // strike/bolt/blast
+			case 710: // bind/snare/entangle
+			case 9144: // strike/bolt/blast
 			case 718: // vulnerability
 			case 724: // crumble undead
-			case 727: // wave spells
+			case 11429: // wave spells
 			case 1161: // bind/snare/entangle w/ staff
-			case 1162: // strike/bolt/blast w/ staff
+			case 11423: // strike/bolt/blast w/ staff
 			case 1165: // vulnerability w/ staff
 			case 1166: // crumble undead w/ staff
 			case 1576: // magic dart
-			case 7855: // surge spells
+			case 9145: // surge spells
 				if (weapon == 24423) // harmonised staff
 				{
 					delta = 4;
@@ -255,8 +261,8 @@ public class TickCounterPlugin extends Plugin
 			case 3852: // Zombie axe crush
 			case 1058: // wildy sceptres melee auto
 			case 1064: // dspear spec
-			case 1978: // rush and blitz spell cast
-			case 1979: // burst and barrage spell cast
+			case 10091: // rush and blitz spell cast
+			case 10092: // burst and barrage spell cast
 			case 2082: // Guthan's warspear crush
 			case 2080: // Guthan's warspear stab
 			case 2081: // Guthan's warspear slash
