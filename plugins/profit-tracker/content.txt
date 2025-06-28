@@ -7,7 +7,10 @@ import net.runelite.api.*;
 
 import net.runelite.api.events.*;
 
-import net.runelite.api.widgets.InterfaceID;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.ItemID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
@@ -18,10 +21,14 @@ import net.runelite.api.events.VarbitChanged;
 import org.apache.commons.lang3.ArrayUtils;
 
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 
 @Slf4j
 @PluginDescriptor(
-        name = "Profit Tracker"
+        name = "Profit Tracker",
+        description = "Tracks profit according to the GE value of your items.",
+        tags = {"overlay"}
 )
 public class ProfitTrackerPlugin extends Plugin
 {
@@ -30,34 +37,45 @@ public class ProfitTrackerPlugin extends Plugin
 
     // the profit will be calculated against this value
     private long prevInventoryValue;
+    private Map<String, ProfitTrackerPossessions> accountPossessions;
+    private ProfitTrackerPossessions previousPossessions;
+    private String previousAccount;
     // Collection of items that was last used to calculate value, includes inventory and equipment
-    private Item[] prevInventoryItems;
-    private Item[] prevBankItems;
     private long totalProfit;
 
     private long startTickMillis;
+    private long activeTicks;
 
     private boolean skipTickForProfitCalculation;
     private boolean inventoryValueChanged;
     private boolean bankValueChanged;
+    private boolean grandExchangeValueChanged;
     private boolean inProfitTrackSession;
     private boolean runePouchContentsChanged;
     // Remembers if the bank was open last tick, because tick perfect bank close reports changes late
     private boolean bankJustClosed;
+    // Remembers if untracked storage was open last tick, as tick perfect close reports changes late
+    private boolean storageJustClosed;
+    // State boolean for when a widget we do not fully track is currently opened, such as the leprechaun tool store
+    private boolean untrackedStorageOpened;
+    // Remembers the state of grand exchange
+    private boolean grandExchangeOpened;
     // Set when using a deposit menu option. Used to create a depositing deficit for the next time you open bank
     // This ensures using a deposit box doesn't spam coin drops, but also doesn't get out of sync when the race
-    // condition with menu options and container changes causes some anyways
+    // condition with menu options and container changes causes some anyway
     private boolean depositingItem;
-    private int depositDeficit;
-    private int[] RUNE_POUCH_VARBITS = {
-            Varbits.RUNE_POUCH_AMOUNT1,
-            Varbits.RUNE_POUCH_AMOUNT2,
-            Varbits.RUNE_POUCH_AMOUNT3,
-            Varbits.RUNE_POUCH_AMOUNT4,
-            Varbits.RUNE_POUCH_RUNE1,
-            Varbits.RUNE_POUCH_RUNE2,
-            Varbits.RUNE_POUCH_RUNE3,
-            Varbits.RUNE_POUCH_RUNE4
+    // State of a deposit box being open, used to avoid tracking profit changes when just sending to the bank
+    private boolean depositBoxOpened;
+    private long depositDeficit;
+    private final int[] RUNE_POUCH_VARBITS = {
+            VarbitID.RUNE_POUCH_QUANTITY_1,
+            VarbitID.RUNE_POUCH_QUANTITY_2,
+            VarbitID.RUNE_POUCH_QUANTITY_3,
+            VarbitID.RUNE_POUCH_QUANTITY_4,
+            VarbitID.RUNE_POUCH_TYPE_1,
+            VarbitID.RUNE_POUCH_TYPE_2,
+            VarbitID.RUNE_POUCH_TYPE_3,
+            VarbitID.RUNE_POUCH_TYPE_4
     };
 
     @Inject
@@ -81,13 +99,13 @@ public class ProfitTrackerPlugin extends Plugin
         // Add the inventory overlay
         overlayManager.add(overlay);
 
-        goldDropsObject = new ProfitTrackerGoldDrops(client, itemManager);
+        goldDropsObject = new ProfitTrackerGoldDrops(client, itemManager, config);
 
-        inventoryValueObject = new ProfitTrackerInventoryValue(client, itemManager);
+        inventoryValueObject = new ProfitTrackerInventoryValue(client, itemManager, config);
 
         initializeVariables();
 
-        // start tracking only if plugin was re-started mid game
+        // start tracking only if plugin was re-started mid-game
         if (client.getGameState() == GameState.LOGGED_IN)
         {
             startProfitTrackingSession();
@@ -97,14 +115,17 @@ public class ProfitTrackerPlugin extends Plugin
 
     private void initializeVariables()
     {
-        prevInventoryItems = null;
-        prevBankItems = null;
+        accountPossessions = new HashMap<>();
+        previousPossessions = null;
+        previousAccount = null;
+        inventoryValueObject.setOffers(null);
 
         // profit begins at 0 of course
         totalProfit = 0;
 
         // this will be filled with actual information in startProfitTrackingSession
         startTickMillis = 0;
+        activeTicks = 0;
 
         // skip profit calculation for first tick, to initialize first inventory value
         skipTickForProfitCalculation = true;
@@ -112,6 +133,8 @@ public class ProfitTrackerPlugin extends Plugin
         inventoryValueChanged = false;
 
         bankValueChanged = false;
+
+        grandExchangeValueChanged = false;
 
         inProfitTrackSession = false;
 
@@ -137,9 +160,49 @@ public class ProfitTrackerPlugin extends Plugin
 
         overlay.updateStartTimeMillies(startTickMillis);
 
+        overlay.updateActiveTicks(activeTicks);
+
         overlay.startSession();
 
         inProfitTrackSession = true;
+    }
+
+    public void resetSession(){
+        initializeVariables();
+        startProfitTrackingSession();
+        inventoryValueChanged = true;
+    }
+
+    /**
+     * Creates an entry for the current login if needed.
+     * Hooks up the possessions collection for repeat use for the current login.
+     */
+    private void checkAccount()
+    {
+        //Account for special worlds where a player with the same name might have different possessions
+        //For example, a speedrunning world has MEMBER and SPEEDRUNNING types
+        StringBuilder accountIdentifier = new StringBuilder(client.getLocalPlayer().getName());
+        WorldType[] worldTypes = client.getWorldType().toArray(new WorldType[0]);
+        for (WorldType worldType : worldTypes) {
+            accountIdentifier.append(worldType.name());
+        }
+
+        accountPossessions.putIfAbsent(accountIdentifier.toString(),new ProfitTrackerPossessions());
+        previousPossessions = accountPossessions.get(accountIdentifier.toString());
+
+        if (previousAccount == null || ! previousAccount.contentEquals(accountIdentifier)) {
+            if (client.getGameState() == GameState.LOGGED_IN && grandExchangeOpened)
+            {
+                inventoryValueObject.setOffers(client.getGrandExchangeOffers());
+                previousPossessions.grandExchangeItems = inventoryValueObject.getGrandExchangeContents();
+            } else {
+                previousPossessions.grandExchangeItems = null;
+            }
+        }
+
+        overlay.setBankStatus(previousPossessions.bankItems != null);
+
+        previousAccount = accountIdentifier.toString();
     }
 
     @Override
@@ -176,24 +239,24 @@ public class ProfitTrackerPlugin extends Plugin
             }
         }
 
-        boolean skipOnce = false;
-        if (bankJustClosed) {
+        checkAccount();
+        activeTicks += 1;
+        overlay.updateActiveTicks(activeTicks);
+
+        if (inventoryValueChanged || runePouchContentsChanged || bankValueChanged || grandExchangeValueChanged)
+        {
             // Interacting with bank
             // itemContainerChanged does not report bank change if closed on same tick
-            skipOnce = true;
-        }
-        bankJustClosed = false;
-
-        if (inventoryValueChanged || runePouchContentsChanged || bankValueChanged)
-        {
-            if (skipOnce) {
+            if (storageJustClosed || untrackedStorageOpened) {
                 skipTickForProfitCalculation = true;
             }
+
             tickProfit = calculateTickProfit();
 
             // accumulate profit
-            if (depositingItem){
+            if (depositingItem || depositBoxOpened || bankJustClosed){
                 // Track a deficit for deposits because of deposit box problems
+                // Include bank last tick close just to prevent confusing xp drops, even though they re-sync on open
                 depositDeficit += tickProfit;
                 depositingItem = false;
                 tickProfit = 0;
@@ -217,19 +280,63 @@ public class ProfitTrackerPlugin extends Plugin
             inventoryValueChanged = false;
             bankValueChanged = false;
             runePouchContentsChanged = false;
+            grandExchangeValueChanged = false;
+        }
+        bankJustClosed = false;
+        storageJustClosed = false;
+    }
+
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded event)
+    {
+        switch (event.getGroupId()) {
+            case InterfaceID.GE_COLLECT:
+            case InterfaceID.GE_OFFERS:
+                inventoryValueObject.setOffers(client.getGrandExchangeOffers());
+                if (previousPossessions.grandExchangeItems == null) {
+                    previousPossessions.grandExchangeItems = inventoryValueObject.getGrandExchangeContents();
+                }
+                grandExchangeOpened = true;
+                break;
+            case InterfaceID.BANK_DEPOSIT_IMP:
+            case InterfaceID.BANK_DEPOSITBOX:
+                depositBoxOpened = true;
+                break;
+            case InterfaceID.FARMING_TOOLS:
+                untrackedStorageOpened = true;
+                break;
         }
     }
 
     @Subscribe
     public void onWidgetClosed(WidgetClosed event)
     {
-        //Catch untracked storage closing, as tick perfect close can cause onItemContainerChanged to not see the change
-        if (event.getGroupId() == 871 || //Huntsman's kit
-            event.getGroupId() == InterfaceID.SEED_VAULT) { // Seed vault
-            bankJustClosed = true;
+        switch (event.getGroupId()) {
+            case InterfaceID.BANKMAIN:
+                bankJustClosed = true;
+                break;
+            //Catch untracked storage closing, as tick perfect close can cause onItemContainerChanged to not see the change
+            case InterfaceID.HUNTSMANS_KIT:
+            case InterfaceID.SEED_VAULT:
+            case InterfaceID.TACKLE_BOX_MAIN:
+                storageJustClosed = true;
+                break;
+            case InterfaceID.GE_COLLECT:
+            case InterfaceID.GE_OFFERS:
+                grandExchangeOpened = false;
+                break;
+            case InterfaceID.BANK_DEPOSIT_IMP:
+            case InterfaceID.BANK_DEPOSITBOX:
+                depositBoxOpened = false;
+                // Negates problems with closing box and depositing same tick
+                depositingItem = true;
+                break;
+            case InterfaceID.FARMING_TOOLS:
+                untrackedStorageOpened = false;
+                storageJustClosed = true;
+                break;
         }
     }
-
 
     private long calculateTickProfit()
     {
@@ -237,34 +344,40 @@ public class ProfitTrackerPlugin extends Plugin
         Calculate and return the profit for this tick
         if skipTickForProfitCalculation is set, meaning this tick was bank / deposit
         so return 0
-
          */
-        long newInventoryValue;
         Item[] newInventoryItems;
         Item[] newBankItems;
+        Item[] newGrandExchangeItems = null;
         long newProfit;
-        Item[] inventoryDifference;
-        Item[] bankDifference = new Item[0];
+        Item[] possessionDifference;
+        Item[] bankDifference;
+        Item[] grandExchangeDifference;
 
         // calculate current inventory value
-        //newInventoryValue = inventoryValueObject.calculateInventoryAndEquipmentValue();
         newInventoryItems = inventoryValueObject.getInventoryAndEquipmentContents();
         newBankItems = inventoryValueObject.getBankContents();
+        if (grandExchangeValueChanged) {
+            newGrandExchangeItems = inventoryValueObject.getGrandExchangeContents();
+        }
 
-        if (!skipTickForProfitCalculation && prevInventoryItems != null)
+        if (!skipTickForProfitCalculation && previousPossessions.inventoryItems != null && newInventoryItems != null)
         {
             // calculate new profit
-            // newProfit = newInventoryValue - prevInventoryValue;
-            inventoryDifference = inventoryValueObject.getItemCollectionDifference(prevInventoryItems,newInventoryItems);
-            newProfit = inventoryValueObject.calculateItemValue(inventoryDifference);
-            if (prevBankItems != null && newBankItems != null) {
-                bankDifference = inventoryValueObject.getItemCollectionDifference(prevBankItems,newBankItems);
+            possessionDifference = inventoryValueObject.getItemCollectionDifference(previousPossessions.inventoryItems,newInventoryItems);
+            newProfit = inventoryValueObject.calculateItemValue(possessionDifference);
+            if (previousPossessions.bankItems != null && newBankItems != null) {
+                bankDifference = inventoryValueObject.getItemCollectionDifference(previousPossessions.bankItems,newBankItems);
                 // Profit is recalculated on all items instead of summed just in case item values could change between calculations
-                Item[] inventoryAndBankDifference = ArrayUtils.addAll(inventoryDifference,bankDifference);
-                newProfit = inventoryValueObject.calculateItemValue(inventoryAndBankDifference);
+                possessionDifference = ArrayUtils.addAll(possessionDifference,bankDifference);
+                newProfit = inventoryValueObject.calculateItemValue(possessionDifference);
+            }
+            if (previousPossessions.grandExchangeItems != null && newGrandExchangeItems != null) {
+                grandExchangeDifference = inventoryValueObject.getItemCollectionDifference(previousPossessions.grandExchangeItems,newGrandExchangeItems);
+                possessionDifference = ArrayUtils.addAll(possessionDifference,grandExchangeDifference);
+                newProfit = inventoryValueObject.calculateItemValue(possessionDifference);
             }
 
-            log.debug("Calculated " + newProfit + " profit for " + (inventoryDifference.length + bankDifference.length) + " item changes.");
+            log.debug("Calculated " + newProfit + " profit for " + (possessionDifference.length) + " item changes.");
         }
         else
         {
@@ -279,13 +392,16 @@ public class ProfitTrackerPlugin extends Plugin
 
         // update prevInventoryValue for future calculations anyway!
         //prevInventoryValue = newInventoryValue;
-        prevInventoryItems = newInventoryItems;
+        previousPossessions.inventoryItems = newInventoryItems;
         if (newBankItems != null) {
-            if (prevBankItems == null) {
+            if (previousPossessions.bankItems == null) {
                 // If user hasn't opened bank yet, the deficit doesn't help us resync
                 depositDeficit = 0;
             }
-            prevBankItems = newBankItems;
+            previousPossessions.bankItems = newBankItems;
+        }
+        if (newGrandExchangeItems != null) {
+            previousPossessions.grandExchangeItems = newGrandExchangeItems;
         }
 
         return newProfit;
@@ -296,26 +412,42 @@ public class ProfitTrackerPlugin extends Plugin
     {
         /*
         this event tells us when inventory has changed
-        and when banking/equipment event occured this tick
+        and when banking/equipment event occurred this tick
          */
         log.debug("onItemContainerChanged container id: " + event.getContainerId());
 
         int containerId = event.getContainerId();
 
-        if( containerId == InventoryID.INVENTORY.getId() ||
-            containerId == InventoryID.EQUIPMENT.getId()) {
-            // inventory has changed - need calculate profit in onGameTick
+        if (containerId == InventoryID.INV ||
+            containerId == InventoryID.WORN) {
+            // Inventory has changed - need calculate profit in onGameTick
             inventoryValueChanged = true;
         }
 
-        if( containerId == InventoryID.BANK.getId()) {
+        if (containerId == InventoryID.BANK) {
             bankValueChanged = true;
         }
 
         // In these events, inventory WILL be changed, but we DON'T want to calculate profit!
-        if( containerId == 855 || // Huntsman's kit
-            containerId == InventoryID.SEED_VAULT.getId()) { // Seed vault
-            skipTickForProfitCalculation = true;
+        switch (containerId){
+            case InventoryID.HUNTSMANS_KIT:
+            case InventoryID.SEED_VAULT:
+            case InventoryID.TACKLE_BOX:
+                skipTickForProfitCalculation = true;
+        }
+
+        // No container event occurs for the GE collection item containers, but inventory does
+        if (grandExchangeOpened) {
+            grandExchangeValueChanged = true;
+        }
+    }
+
+    @Subscribe
+    public void onGrandExchangeOfferChanged(GrandExchangeOfferChanged event)
+    {
+        if (grandExchangeOpened){
+            inventoryValueObject.setOffers(client.getGrandExchangeOffers());
+            grandExchangeValueChanged = true;
         }
     }
 
@@ -334,9 +466,9 @@ public class ProfitTrackerPlugin extends Plugin
                   event.getId(), event.getMenuOption(), event.getMenuTarget()));
         String menuOption = event.getMenuOption();
 
-        String containerMenuOptions[] = {"Deposit-"};
-        for (int i = 0; i < containerMenuOptions.length; i++){
-            if (menuOption.startsWith(containerMenuOptions[i])){
+        String[] containerMenuOptions = {"Deposit-"};
+        for (String containerMenuOption : containerMenuOptions) {
+            if (menuOption.startsWith(containerMenuOption)) {
                 // Backup catch for various bank interfaces to deposit items
                 // Event object does not seem to provide information that would otherwise tell us it's a bank
                 // Still, it is possible to have game tick happen before a container changes to reflect menu option,
@@ -346,14 +478,27 @@ public class ProfitTrackerPlugin extends Plugin
             }
         }
 
+        String[] collectionMenuOptions = {"Collect to bank", "Bank"};
+        for (String collectionMenuOption : collectionMenuOptions) {
+            if (menuOption.startsWith(collectionMenuOption) && grandExchangeOpened) {
+                depositingItem = true;
+                break;
+            }
+        }
+
+        // Imp in a box acts like a deposit box, both via interface, and use interaction
+        if (menuOption.startsWith("Use") && event.getMenuTarget().contains("Imp-in-a-box(")){
+            depositingItem = true;
+        }
+
         // Container items
         // Ignore profit changes for items that act as storage only
         switch (event.getItemId()) {
-            case ItemID.COLOSSAL_POUCH: // Fill, empty | fill, empty | essence must be taken out to use
-            case ItemID.GIANT_POUCH:
-            case ItemID.LARGE_POUCH:
-            case ItemID.MEDIUM_POUCH:
-            case ItemID.SMALL_POUCH:
+            case ItemID.RCU_POUCH_COLOSSAL: // Fill, empty | fill, empty | essence must be taken out to use
+            case ItemID.RCU_POUCH_GIANT:
+            case ItemID.RCU_POUCH_LARGE:
+            case ItemID.RCU_POUCH_MEDIUM:
+            case ItemID.RCU_POUCH_SMALL:
 
             case ItemID.HUNTSMANS_KIT: // Fill, Empty, view(custom storage interface)
             case ItemID.TACKLE_BOX: // View, ??
@@ -372,19 +517,18 @@ public class ProfitTrackerPlugin extends Plugin
         // Half-volatile storage
         // Items that can change from pure storage to volatile storage by opening
         switch (event.getItemId()) {
-            case ItemID.FISH_SACK_BARREL:
-            case ItemID.FISH_BARREL: //Fill, open | empty
+            case ItemID.FISH_SACK_BARREL_CLOSED:
+            case ItemID.FISH_BARREL_CLOSED: //Fill, open | empty
+            case ItemID.GEM_BAG: //Fill, empty, open | empty
+            case ItemID.SLAYER_HERB_SACK: // Fill, empty, open | empty
 
-            case ItemID.GEM_BAG_12020: //Fill, empty, open | empty
-            case ItemID.HERB_SACK: // Fill, empty, open | empty
+            case ItemID.SEED_BOX: // Fill, Empty, Check, Open
 
-            case ItemID.SEED_BOX: // Open
-
-            case ItemID.SMALL_MEAT_POUCH: // Fill, Empty
-            case ItemID.LARGE_MEAT_POUCH: // Fill, Empty
-            case ItemID.SMALL_FUR_POUCH: // Fill, Empty
-            case ItemID.MEDIUM_FUR_POUCH: // Fill, Empty
-            case ItemID.LARGE_FUR_POUCH: // Fill, Empty
+            case ItemID.HG_MEATPOUCH_SMALL: // Fill, Empty
+            case ItemID.HG_MEATPOUCH_LARGE: // Fill, Empty
+            case ItemID.HG_FURPOUCH_SMALL: // Fill, Empty
+            case ItemID.HG_FURPOUCH_MED: // Fill, Empty
+            case ItemID.HG_FURPOUCH_LARGE: // Fill, Empty
                 switch (menuOption.toLowerCase()) {
                     // These items act as long term storage, and are more like banks
                     // Items are not used directly from them either
@@ -408,19 +552,20 @@ public class ProfitTrackerPlugin extends Plugin
 
                 // case ItemID.BASKET: //Fill, remove-one, empty | fill | basket turns into different name like "Bananas(#)"
                 //Empty sack
-            case ItemID.BOLT_POUCH: //Open(remove interface) | | bolts can be worn via armor interface extra ammo slot
+            case ItemID.XBOWS_BOLT_POUCH: //Open(remove interface) | | bolts can be worn via armor interface extra ammo slot
                 //Rune pouch // Covered by withdraw interface
 
             case ItemID.FLAMTAER_BAG: // Fill, empty | empty (dumps into inventory) | items can be used directly from sack
-            case ItemID.MASTER_SCROLL_BOOK: // Interface with remove option | items can be used from book via activate and teleport
+            case ItemID.BOOKOFSCROLLS_CHARGED: // Interface with remove option | items can be used from book via activate and teleport
+            case ItemID.BOOKOFSCROLLS_EMPTY: // Interface with remove option | items can be used from book via activate and teleport
             case ItemID.GNOMISH_FIRELIGHTER: // Check, uncharge | Firelighter charges used directly from box when burning logs
-            case ItemID.STEEL_KEY_RING: //Add keys via use on ring | remove via remove interface
+            case ItemID.FAVOUR_KEY_RING: //Add keys via use on ring | remove via remove interface
 
-            case ItemID.LOG_BASKET: // Fill, Check(dialog based withdraw), Close/Open | Empty
+            case ItemID.LOG_BASKET_CLOSED: // Fill, Check(dialog based withdraw), Close/Open | Empty
             case ItemID.FORESTRY_KIT: // View(kit has withdraw interface), Fill | Use(dumps to bank) | rations used directly from kit
-            case ItemID.FORESTRY_BASKET: // Fill, view(kit has withdraw interface/basket has none) | use (dumps to bank) | rations used directly from kit
+            case ItemID.FORESTRY_BASKET_CLOSED: // Fill, view(kit has withdraw interface/basket has none) | use (dumps to bank) | rations used directly from kit
 
-            case ItemID.REAGENT_POUCH: // Fill, open, empty, use, check | Use (dumps to bank)
+            case ItemID.MM_SECONDARY_POUCH: // Fill, open, empty, use, check | Use (dumps to bank)
                 switch (menuOption.toLowerCase()) {
                     // Interacting with these things pulls items from volatile unrecorded space
                     // Coal bag could be filled from bank to use in smithing, or filled from mining
@@ -435,40 +580,40 @@ public class ProfitTrackerPlugin extends Plugin
 
         // If items can be placed directly into the container, skipping inventory, track profit to not miss emptying
         switch (event.getItemId()) {
-            case ItemID.OPEN_FISH_SACK_BARREL:
-            case ItemID.OPEN_FISH_BARREL:
+            case ItemID.FISH_SACK_BARREL_OPEN:
+            case ItemID.FISH_BARREL_OPEN:
 
             //Coffins can only be emptied via configure, which doesn't report an ItemId we can see for emptying
-            case ItemID.BRONZE_COFFIN: // Fill, configure, open
-            case ItemID.BLACK_COFFIN:
-            case ItemID.STEEL_COFFIN:
-            case ItemID.SILVER_COFFIN:
-            case ItemID.GOLD_COFFIN:
+            case ItemID.SHADES_COFFIN_BRONZE: // Fill, configure, open
+            case ItemID.SHADES_COFFIN_BLACK:
+            case ItemID.SHADES_COFFIN_STEEL:
+            case ItemID.SHADES_COFFIN_SILVER:
+            case ItemID.SHADES_COFFIN_GOLD:
 
-            case ItemID.OPEN_BRONZE_COFFIN:
-            case ItemID.OPEN_BLACK_COFFIN:
-            case ItemID.OPEN_STEEL_COFFIN:
-            case ItemID.OPEN_SILVER_COFFIN:
-            case ItemID.OPEN_GOLD_COFFIN: // Fill, configure, close
+            case ItemID.SHADES_COFFIN_BRONZE_OPEN:
+            case ItemID.SHADES_COFFIN_BLACK_OPEN:
+            case ItemID.SHADES_COFFIN_STEEL_OPEN:
+            case ItemID.SHADES_COFFIN_SILVER_OPEN:
+            case ItemID.SHADES_COFFIN_GOLD_OPEN: // Fill, configure, close
 
-            case ItemID.OPEN_GEM_BAG: // Fill, Empty
-            case ItemID.OPEN_COAL_BAG: // Fill, Empty
+            case ItemID.GEM_BAG_OPEN: // Fill, Empty
+            case ItemID.COAL_BAG_OPEN: // Fill, Empty
 
-            case ItemID.OPEN_HERB_SACK:
-            case ItemID.OPEN_SEED_BOX:
+            case ItemID.SLAYER_HERB_SACK_OPEN:
+            case ItemID.SEED_BOX_OPEN: //Fill, Empty, Check, Close
 
-            case ItemID.OPEN_LOG_BASKET:
-            case ItemID.OPEN_FORESTRY_BASKET:
+            case ItemID.LOG_BASKET_OPEN:
+            case ItemID.FORESTRY_BASKET_OPEN:
 
-            case ItemID.SMALL_MEAT_POUCH_OPEN: // Fill, Empty
-            case ItemID.LARGE_MEAT_POUCH_OPEN: // Fill, Empty
-            case ItemID.SMALL_FUR_POUCH_OPEN: // Fill, Empty
-            case ItemID.MEDIUM_FUR_POUCH_OPEN: // Fill, Empty
-            case ItemID.LARGE_FUR_POUCH_OPEN: // Fill, Empty
+            case ItemID.HG_MEATPOUCH_SMALL_OPEN: // Fill, Empty
+            case ItemID.HG_MEATPOUCH_LARGE_OPEN: // Fill, Empty
+            case ItemID.HG_FURPOUCH_SMALL_OPEN: // Fill, Empty
+            case ItemID.HG_FURPOUCH_MED_OPEN: // Fill, Empty
+            case ItemID.HG_FURPOUCH_LARGE_OPEN: // Fill, Empty
 
             case ItemID.LOOTING_BAG: // Open, Deposit(store interface) | view (deposit interface) | Commonly opened and closed
 
-            case ItemID.OPEN_REAGENT_POUCH:
+            case ItemID.MM_SECONDARY_POUCH_OPEN: // Reagent pouch
                 switch (menuOption.toLowerCase()) {
                     // Interacting with these things pulls items from volatile unrecorded space
                     // Coal bag could be filled from bank to use in smithing, or filled from mining
@@ -497,16 +642,31 @@ public class ProfitTrackerPlugin extends Plugin
 }
 
 package com.profittracker;
+import net.runelite.api.Item;
+
+/**
+ * Data structure for holding information about a players possessions
+ * Should be associated with a particular player, or account type like Leagues/Standard/Beta
+ */
+public class ProfitTrackerPossessions {
+    public Item[] inventoryItems;
+    public Item[] bankItems;
+    public Item[] grandExchangeItems;
+}
+package com.profittracker;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.events.ScriptPreFired;
-import net.runelite.api.widgets.InterfaceID;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.ItemID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.game.ItemManager;
 import net.runelite.client.util.AsyncBufferedImage;
 import net.runelite.client.util.ImageUtil;
 
+import javax.inject.Inject;
 import java.awt.*;
 
 import static net.runelite.api.ScriptID.XPDROPS_SETDROPSIZE;
@@ -520,7 +680,7 @@ public class ProfitTrackerGoldDrops {
        which is intended to generate xp drops for maxed out skills.
        Fake XP Drops are composed of a skill sprite,
         and a text widget with a mod icon (<img=11> in text)
-       So to create a gold drop, we create a fake xp drop, and interefere in the middle,
+       So to create a gold drop, we create a fake xp drop, and interfere in the middle,
        and change the sprite and text to our liking.
 
        Flow is:
@@ -530,13 +690,26 @@ public class ProfitTrackerGoldDrops {
 
        A more correct way to do this is probably by calling Item.GetImage with wanted
        coin quantity, which will give us correct coin icon and correct text,
-       and simply drawing that image ourselfs somehow. Instead of using xp drop mechanism.
+       and simply drawing that image ourselves somehow. Instead of using xp drop mechanism.
      */
 
+    // Values for each variant of coin sprite, used to help set up and access dynamic coin sprites
+    private static final int[] COINS_SPRITES = {
+            1,
+            2,
+            3,
+            4,
+            5,
+            25,
+            100,
+            250,
+            1000,
+            10000
+    };
     /*
     Free sprite id for the gold icons.
      */
-    private static final int COINS_SPRITE_ID = -1337;
+    private static final int COINS_SPRITE_ID_START = -1337;
 
     // Skill ordinal to send in the fake xp drop script.
     // doesn't matter which skill expect it's better not be attack/defense/magic to avoid collision with
@@ -552,6 +725,8 @@ public class ProfitTrackerGoldDrops {
      */
     private final ItemManager itemManager;
     private final Client client;
+    @Inject
+    private ProfitTrackerConfig config;
 
     /* var currentGoldDropValue will have
     the gold value of the current ongoing gold drop. 2 purposes:
@@ -560,10 +735,11 @@ public class ProfitTrackerGoldDrops {
     */
     private long currentGoldDropValue;
 
-    ProfitTrackerGoldDrops(Client client, ItemManager itemManager)
+    ProfitTrackerGoldDrops(Client client, ItemManager itemManager, ProfitTrackerConfig config)
     {
         this.client = client;
         this.itemManager = itemManager;
+        this.config = config;
 
         prepareCoinSprite();
 
@@ -613,7 +789,7 @@ public class ProfitTrackerGoldDrops {
         Widget[] xpDropWidgetChildren;
 
         // get widget from ID
-        xpDropWidget = client.getWidget(InterfaceID.EXPERIENCE_TRACKER, xpDropWidgetId & 0xFFFF);
+        xpDropWidget = client.getWidget(InterfaceID.XP_DROPS, xpDropWidgetId & 0xFFFF);
 
         if (xpDropWidget == null)
         {
@@ -652,17 +828,23 @@ public class ProfitTrackerGoldDrops {
             // reset text color for all regular xpdrops
             resetXpDropTextColor(dropTextWidget);
         }
-
-
     }
+
     private void xpDropToGoldDrop(Widget dropTextWidget, Widget dropSpriteWidget, long goldDropValue)
     {
         /*
         Change xpdrop icon and text, to make a gold drop
          */
 
-
-        dropTextWidget.setText(formatGoldDropText(goldDropValue));
+        if (config.shortDrops()) {
+            dropTextWidget.setText(formatGoldDropText(goldDropValue));
+        } else {
+            // Remove disabled icon from string
+            String formattedValue = dropTextWidget.getText();
+            formattedValue = formattedValue.substring(formattedValue.indexOf("> ") + 2);
+            // Restore negative symbol
+            dropTextWidget.setText((goldDropValue < 0 ? "-" : "") + formattedValue);
+        }
 
         if (goldDropValue > 0)
         {
@@ -676,8 +858,18 @@ public class ProfitTrackerGoldDrops {
         }
 
         // change skill sprite to coin sprite
-        dropSpriteWidget.setSpriteId(COINS_SPRITE_ID);
-
+        if (config.iconStyle() == ProfitTrackerIconType.DYNAMIC){
+            for (int spriteIndex = 0; spriteIndex < COINS_SPRITES.length; spriteIndex++){
+                if (Math.abs(goldDropValue) < COINS_SPRITES[spriteIndex]){
+                    dropSpriteWidget.setSpriteId(COINS_SPRITE_ID_START - spriteIndex + 1);
+                    break;
+                } else if (spriteIndex == COINS_SPRITES.length - 1) {
+                    dropSpriteWidget.setSpriteId(COINS_SPRITE_ID_START - spriteIndex);
+                }
+            }
+        } else {
+            dropSpriteWidget.setSpriteId(COINS_SPRITE_ID_START - config.iconStyle().ordinal() + 1);
+        }
     }
 
     private void prepareCoinSprite()
@@ -689,23 +881,26 @@ public class ProfitTrackerGoldDrops {
 
         */
 
-        AsyncBufferedImage coin_image_raw;
+        //Create a sprite for each coin type
+        for (int spriteIndex = 0; spriteIndex < COINS_SPRITES.length; spriteIndex++){
+            AsyncBufferedImage coin_image_raw;
 
-        // get image object by coin item id
-        coin_image_raw = itemManager.getImage(ItemID.COINS_995, 10000, false);
+            // get image object by coin item id
+            coin_image_raw = itemManager.getImage(ItemID.COINS, COINS_SPRITES[spriteIndex], false);
 
-        // since getImage returns an AsyncBufferedImage, which is not loaded initially,
-        // we schedule sprite conversion and sprite override for when the image is actually loaded
-        coin_image_raw.onLoaded(() -> {
-            final SpritePixels coin_sprite;
+            // since getImage returns an AsyncBufferedImage, which is not loaded initially,
+            // we schedule sprite conversion and sprite override for when the image is actually loaded
+            int finalSpriteIndex = spriteIndex;
+            coin_image_raw.onLoaded(() -> {
+                final SpritePixels coin_sprite;
 
-            // convert image to sprite
-            coin_sprite = ImageUtil.getImageSpritePixels(coin_image_raw, client);
+                // convert image to sprite
+                coin_sprite = ImageUtil.getImageSpritePixels(coin_image_raw, client);
 
-            // register new coin sprite by overriding a free sprite id
-            client.getSpriteOverrides().put(COINS_SPRITE_ID, coin_sprite);
-        });
-
+                // register new coin sprite by overriding a free sprite id
+                client.getSpriteOverrides().put(COINS_SPRITE_ID_START - finalSpriteIndex, coin_sprite);
+            });
+        }
     }
 
     public void requestGoldDrop(long amount)
@@ -723,23 +918,42 @@ public class ProfitTrackerGoldDrops {
         // 1. skill ordinal - we will replace the icon anyway
         // 2. value - since we want to be able to pass negative numbers, we pass the value using
         // currentGoldDropValue instead of this argument
+        String formattedAmount = formatGoldDropText(currentGoldDropValue);
 
-        client.runScript(XPDROP_DISABLED, XPDROP_SKILL, XPDROP_VALUE);
-
+        if (config.shortDrops()) {
+            /*
+            Modifying the value of xpdrops later can cause substantial dead space between the text and sprite.
+            Passing a value into the runScript for xpdrops will set the sprite position based on the text sent
+            taking up more/less space. The particular character also makes minor adjustments, as the rendering is
+            not a monospace font. This could be eliminated if we can figure out how to reposition the sprite, or
+            eliminate the invisible error icon that causes the dead space, and get the rendered drop to recalculate
+            sprite position based on our custom text.
+             */
+            int sizeAdjustingValue = 1;
+            sizeAdjustingValue = formattedAmount.length() > 3 ? 6 : sizeAdjustingValue;
+            sizeAdjustingValue = formattedAmount.length() > 4 ? 60 : sizeAdjustingValue;
+            sizeAdjustingValue = formattedAmount.length() > 4 && formattedAmount.contains(".") ? 10 : sizeAdjustingValue;
+            sizeAdjustingValue = formattedAmount.length() == 4 && !formattedAmount.contains(".") ? 11 : sizeAdjustingValue;
+            client.runScript(XPDROP_DISABLED, XPDROP_SKILL, sizeAdjustingValue);
+        }
+        else
+        {
+            client.runScript(XPDROP_DISABLED, XPDROP_SKILL, (int) Math.abs(currentGoldDropValue));
+        }
     }
 
     private void resetXpDropTextColor(Widget xpDropTextWidget)
     {
         // taken from XpDropPlugin
         EnumComposition colorEnum = client.getEnum(EnumID.XPDROP_COLORS);
-        int defaultColorId = client.getVarbitValue(Varbits.EXPERIENCE_DROP_COLOR);
+        int defaultColorId = client.getVarbitValue(VarbitID.XPDROPS_COLOUR);
         int color = colorEnum.getIntValue(defaultColorId);
         xpDropTextWidget.setTextColor(color);
     }
 
     private String formatGoldDropText(long goldDropValue)
     {
-        // Format gold value to fit in xp drop to avoid being cutoff by gold sprite
+        // Format gold value to fit in xp drop to avoid being cut off by gold sprite
         // 999
         // 1.0K
         // 20K
@@ -747,7 +961,7 @@ public class ProfitTrackerGoldDrops {
         // 1.0M
 
         float goldValueRep = goldDropValue;
-        String suffix = "";
+        String suffix;
         boolean useDecimal = false;
         if (Math.abs(goldDropValue) < 1000L) { // 1-999
             return Long.toString(goldDropValue);
@@ -784,11 +998,12 @@ public class ProfitTrackerGoldDrops {
         {
             return "ALOT";
         }
+        double resultValue = Long.signum(goldDropValue) * Math.floor(Math.abs(goldValueRep) * 10) / 10;
         if(useDecimal)
         {
-            return String.format("%.1f%s", Math.floor(goldValueRep * 10) / 10, suffix);
-        }else{
-            return String.format("%.0f%s", Math.floor(goldValueRep * 10) / 10, suffix);
+            return String.format("%.1f%s", resultValue, suffix);
+        } else {
+            return String.format("%.0f%s", resultValue, suffix);
         }
     }
 }
@@ -798,6 +1013,7 @@ package com.profittracker;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
 
 /**
  * The ProfitTrackerConfig class is used to provide user preferences to the ProfitTrackerPlugin.
@@ -806,10 +1022,27 @@ import net.runelite.client.config.ConfigItem;
 public interface ProfitTrackerConfig extends Config
 {
 
+    @ConfigSection(
+            name = "Visual",
+            description = "Settings for what the plugin features look like.",
+            position =  0,
+            closedByDefault = false
+    )
+    String visualSettings = "Visual";
+
+    @ConfigSection(
+            name = "Behavior",
+            description = "Settings for calculation behavior.",
+            position =  1,
+            closedByDefault = false
+    )
+    String behaviorSettings = "Behavior";
+
     @ConfigItem(
             keyName = "goldDrops",
-            name = "Show value changes (gold drops) ",
-            description = "Show each profit increase or decrease"
+            name = "Show value changes (gold drops)",
+            description = "Show each profit increase or decrease.",
+            section = visualSettings
     )
     default boolean goldDrops()
     {
@@ -819,21 +1052,70 @@ public interface ProfitTrackerConfig extends Config
     @ConfigItem(
             keyName = "autoStart",
             name = "Automatically start tracking",
-            description = "Automatically begin tracking profit on session start."
+            description = "Automatically begin tracking profit on session start.",
+            section = behaviorSettings
     )
     default boolean autoStart()
     {
         return true;
     }
+
+    @ConfigItem(
+            keyName = "shortDrops",
+            name = "Shorten drop numbers",
+            description = "Shorten drop numbers like 1.2K instead of 1,223, or 10M instead of 10,000,000.",
+            section = visualSettings
+    )
+    default boolean shortDrops()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "iconStyle",
+            name = "Icon style",
+            description = "Dynamically adjust the coin icon based on the drop value, or select a specific icon.",
+            section = visualSettings
+    )
+    default ProfitTrackerIconType iconStyle()
+    {
+        return ProfitTrackerIconType.DYNAMIC;
+    }
+
+    @ConfigItem(
+            keyName = "estimateUntradeables",
+            name = "Estimate untradeable item values",
+            description = "Some untradeable items will utilize equivalent values of the best items they can convert into.",
+            section = behaviorSettings
+    )
+    default boolean estimateUntradeables()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "onlineOnlyRate",
+            name = "Online only rate",
+            description = "Show profit rate only for time spent logged in.",
+            section = visualSettings
+    )
+    default boolean onlineOnlyRate()
+    {
+        return false;
+    }
 }
 
 
 package com.profittracker;
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.ui.overlay.components.LineComponent;
 import net.runelite.client.ui.overlay.components.PanelComponent;
 import net.runelite.client.ui.overlay.components.TitleComponent;
+import net.runelite.client.ui.overlay.tooltip.Tooltip;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
 
 import javax.inject.Inject;
 import javax.swing.*;
@@ -846,23 +1128,43 @@ import java.text.DecimalFormat;
 public class ProfitTrackerOverlay extends Overlay {
     private long profitValue;
     private long startTimeMillies;
+    private long activeTicks;
+    private long lastTickMillies;
     private boolean inProfitTrackSession;
+    private boolean hasBankData;
 
     private final ProfitTrackerConfig ptConfig;
+    private final ProfitTrackerPlugin ptPlugin;
     private final PanelComponent panelComponent = new PanelComponent();
+
+    private static final String RESET_MENU_OPTION = "Reset";
+    private static final int MILLISECONDS_PER_TICK = 600;
 
     public static String FormatIntegerWithCommas(long value) {
         DecimalFormat df = new DecimalFormat("###,###,###");
         return df.format(value);
     }
     @Inject
-    private ProfitTrackerOverlay(ProfitTrackerConfig config)
+    private TooltipManager tooltipManager;
+    @Inject
+    private Client client;
+    @Inject
+    private ProfitTrackerOverlay(ProfitTrackerConfig config, ProfitTrackerPlugin trackerPlugin)
     {
         setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
         profitValue = 0L;
         ptConfig = config;
         startTimeMillies = 0;
+        activeTicks = 0;
+        lastTickMillies = 0;
         inProfitTrackSession = false;
+        hasBankData = false;
+        ptPlugin = trackerPlugin;
+        this.addMenuEntry(MenuAction.RUNELITE_OVERLAY, RESET_MENU_OPTION, "Profit Tracker",menuEntry ->
+                {
+                    ptPlugin.resetSession();
+                    profitValue = 0;
+                });
     }
 
     /**
@@ -873,20 +1175,28 @@ public class ProfitTrackerOverlay extends Overlay {
     @Override
     public Dimension render(Graphics2D graphics) {
         String titleText = "Profit Tracker:";
-        long secondsElapsed;
+        long millisecondsElapsed;
         long profitRateValue;
 
         if (startTimeMillies > 0)
         {
-            secondsElapsed = (System.currentTimeMillis() - startTimeMillies) / 1000;
+            if (ptConfig.onlineOnlyRate()){
+                millisecondsElapsed = (long)(Math.max(0, activeTicks - 1)  * MILLISECONDS_PER_TICK);
+                //Add duration since last tick to ensure timer pacing isn't uneven
+                if (lastTickMillies != 0){
+                    millisecondsElapsed += System.currentTimeMillis() - lastTickMillies;
+                }
+            } else {
+                millisecondsElapsed = (System.currentTimeMillis() - startTimeMillies);
+            }
         }
         else
         {
             // there was never any session
-            secondsElapsed = 0;
+            millisecondsElapsed = 0;
         }
 
-        profitRateValue = calculateProfitHourly(secondsElapsed, profitValue);
+        profitRateValue = calculateProfitHourly(millisecondsElapsed, profitValue);
 
         // Not sure how this can occur, but it was recommended to do so
         panelComponent.getChildren().clear();
@@ -894,7 +1204,7 @@ public class ProfitTrackerOverlay extends Overlay {
         // Build overlay title
         panelComponent.getChildren().add(TitleComponent.builder()
                 .text(titleText)
-                .color(Color.GREEN)
+                .color(hasBankData ? Color.GREEN : Color.YELLOW)
                 .build());
 
         if (!inProfitTrackSession)
@@ -908,6 +1218,17 @@ public class ProfitTrackerOverlay extends Overlay {
 
         }
 
+        // Show tooltip warning on mouse hover if user hasn't opened bank yet
+        Point mousePoint = new Point(client.getMouseCanvasPosition().getX(),client.getMouseCanvasPosition().getY());
+        if(this.getBounds().contains(mousePoint) && ! hasBankData)
+        {
+            String tooltipString =
+                    "Open bank first to ensure accurate tracking.</br>" +
+                    "Otherwise, GE offer interaction or emptying containers from deposit boxes may be incorrect.";
+
+            tooltipManager.add(new Tooltip(tooltipString));
+        }
+
         // Set the size of the overlay (width)
         panelComponent.setPreferredSize(new Dimension(
                 graphics.getFontMetrics().stringWidth(titleText) + 40,
@@ -916,7 +1237,7 @@ public class ProfitTrackerOverlay extends Overlay {
         // elapsed time
         panelComponent.getChildren().add(LineComponent.builder()
                 .left("Time:")
-                .right(formatTimeIntervalFromSec(secondsElapsed))
+                .right(formatTimeIntervalFromMs(millisecondsElapsed, false))
                 .build());
 
         // Profit
@@ -954,6 +1275,15 @@ public class ProfitTrackerOverlay extends Overlay {
         );
     }
 
+    public void updateActiveTicks(final long newValue) {
+        SwingUtilities.invokeLater(() ->
+                {
+                    activeTicks = newValue;
+                    lastTickMillies = System.currentTimeMillis();
+                }
+        );
+    }
+
     public void startSession()
     {
         SwingUtilities.invokeLater(() ->
@@ -961,34 +1291,46 @@ public class ProfitTrackerOverlay extends Overlay {
         );
     }
 
-    private static String formatTimeIntervalFromSec(final long totalSecElapsed)
+    public void setBankStatus(boolean bankReady)
+    {
+        SwingUtilities.invokeLater(() ->
+                hasBankData = bankReady
+        );
+    }
+
+    private static String formatTimeIntervalFromMs(final long totalMsElapsed, boolean showMilliseconds)
     {
         /*
         elapsed seconds to format HH:MM:SS
          */
-        final long sec = totalSecElapsed % 60;
-        final long min = (totalSecElapsed / 60) % 60;
-        final long hr = totalSecElapsed / 3600;
+        final long ms = totalMsElapsed % 1000;
+        final long sec = totalMsElapsed / 1000 % 60;
+        final long min = (totalMsElapsed / 60000) % 60;
+        final long hr = totalMsElapsed / 3600000;
 
-        return String.format("%02d:%02d:%02d", hr, min, sec);
+        if (showMilliseconds) {
+            return String.format("%02d:%02d:%02d.%03d", hr, min, sec, ms);
+        } else {
+            return String.format("%02d:%02d:%02d", hr, min, sec);
+        }
     }
 
-    static long calculateProfitHourly(long secondsElapsed, long profit)
+    static long calculateProfitHourly(long millisecondsElapsed, long profit)
     {
         long averageProfitThousandForHour;
-        long averageProfitForSecond;
+        double averageProfitPerMillisecond;
 
-        if (secondsElapsed > 0)
+        if (millisecondsElapsed > 0)
         {
-            averageProfitForSecond = (profit) / secondsElapsed;
+            averageProfitPerMillisecond = (double)profit / millisecondsElapsed;
         }
         else
         {
             // can't divide by zero, not enough time has passed
-            averageProfitForSecond = 0;
+            averageProfitPerMillisecond = 0;
         }
 
-        averageProfitThousandForHour = averageProfitForSecond * 3600 / 1000;
+        averageProfitThousandForHour = (long)(averageProfitPerMillisecond * 3600);
 
         return averageProfitThousandForHour;
     }
@@ -996,12 +1338,32 @@ public class ProfitTrackerOverlay extends Overlay {
 
 package com.profittracker;
 
+public enum ProfitTrackerIconType {
+    DYNAMIC,
+    COINS_1,
+    COINS_2,
+    COINS_3,
+    COINS_4,
+    COINS_5,
+    COINS_25,
+    COINS_100,
+    COINS_250,
+    COINS_1000,
+    COINS_10000
+}
+package com.profittracker;
+
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.client.game.ItemManager;
 import org.apache.commons.lang3.ArrayUtils;
+import net.runelite.api.gameval.ItemID;
+import net.runelite.api.gameval.VarbitID;
+import net.runelite.api.gameval.InventoryID;
 
+import javax.inject.Inject;
 import java.util.*;
+import java.util.stream.Collectors;
 import java.util.stream.LongStream;
 
 @Slf4j
@@ -1016,32 +1378,79 @@ public class ProfitTrackerInventoryValue {
     static final int EMPTY_SLOT_ITEMID = -1;
 
     private final int[] RUNE_POUCH_ITEM_IDS = {
-            ItemID.RUNE_POUCH,
-            ItemID.RUNE_POUCH_L,
+            ItemID.BH_RUNE_POUCH,
+            ItemID.BH_RUNE_POUCH_TROUVER,
             ItemID.DIVINE_RUNE_POUCH,
-            ItemID.DIVINE_RUNE_POUCH_L
+            ItemID.DIVINE_RUNE_POUCH_TROUVER
     };
 
     private final int[] RUNE_POUCH_AMOUNT_VARBITS = {
-            Varbits.RUNE_POUCH_AMOUNT1,
-            Varbits.RUNE_POUCH_AMOUNT2,
-            Varbits.RUNE_POUCH_AMOUNT3,
-            Varbits.RUNE_POUCH_AMOUNT4
+            VarbitID.RUNE_POUCH_QUANTITY_1,
+            VarbitID.RUNE_POUCH_QUANTITY_2,
+            VarbitID.RUNE_POUCH_QUANTITY_3,
+            VarbitID.RUNE_POUCH_QUANTITY_4
     };
 
     private final int[] RUNE_POUCH_RUNE_VARBITS = {
-            Varbits.RUNE_POUCH_RUNE1,
-            Varbits.RUNE_POUCH_RUNE2,
-            Varbits.RUNE_POUCH_RUNE3,
-            Varbits.RUNE_POUCH_RUNE4
+            VarbitID.RUNE_POUCH_TYPE_1,
+            VarbitID.RUNE_POUCH_TYPE_2,
+            VarbitID.RUNE_POUCH_TYPE_3,
+            VarbitID.RUNE_POUCH_TYPE_4
+    };
+
+    private final int[] COLLECTION_BOX_INVENTORY_IDS = {
+            InventoryID.TRADINGPOST_SELL_0,
+            InventoryID.TRADINGPOST_SELL_1,
+            InventoryID.TRADINGPOST_SELL_2,
+            InventoryID.TRADINGPOST_SELL_3,
+            InventoryID.TRADINGPOST_SELL_4,
+            InventoryID.TRADINGPOST_SELL_5,
+            InventoryID.GE_COLLECT_6,
+            InventoryID.GE_COLLECT_7
     };
 
     private final ItemManager itemManager;
     private final Client client;
+    @Inject
+    private ProfitTrackerConfig config;
+    private GrandExchangeOfferData[] offers = new GrandExchangeOfferData[8];
 
-    public ProfitTrackerInventoryValue( Client client, ItemManager itemManager) {
+    /**
+     * Data storage for GE offers as the normal object always maintains a reference,
+     * and we need to be able to compare changes that have occurred
+     */
+    private static class GrandExchangeOfferData{
+        int quantitySold;
+        int id;
+        int totalQuantity;
+        int price;
+        int spent;
+        GrandExchangeOfferState state;
+
+        public GrandExchangeOfferData(GrandExchangeOffer offer){
+            this.quantitySold = offer.getQuantitySold();
+            this.id = offer.getItemId();
+            this.totalQuantity = offer.getTotalQuantity();
+            this.price = offer.getPrice();
+            this.spent = offer.getSpent();
+            this.state = offer.getState();
+        }
+    }
+
+    public ProfitTrackerInventoryValue( Client client, ItemManager itemManager, ProfitTrackerConfig config) {
         this.client = client;
         this.itemManager = itemManager;
+        this.config = config;
+    }
+
+    public void setOffers(GrandExchangeOffer[] offers){
+        if (offers == null){
+            this.offers = new GrandExchangeOfferData[8];
+            return;
+        }
+        for (int index = 0; index < offers.length; index++){
+            this.offers[index] = new GrandExchangeOfferData(offers[index]);
+        }
     }
 
     private long calculateItemValue(Item item) {
@@ -1073,18 +1482,16 @@ public class ProfitTrackerInventoryValue {
         log.debug(String.format("calculateItemValue itemId = %d", itemId));
 
         // multiply quantity  by GE value
-        return item.getQuantity() * (itemManager.getItemPrice(itemId));
+        return (long) item.getQuantity() * (itemManager.getItemPrice(itemId));
     }
 
-    public long calculateContainerValue(InventoryID ContainerID)
+    public long calculateContainerValue(int containerID)
     {
         /*
         calculate total inventory value
          */
 
-        long newInventoryValue;
-
-        ItemContainer container = client.getItemContainer(ContainerID);
+        ItemContainer container = client.getItemContainer(containerID);
 
         if (container == null)
         {
@@ -1098,10 +1505,11 @@ public class ProfitTrackerInventoryValue {
 
     /**
      * Calculates the value of an array of items
-     * @param items
-     * @return
      */
     public long calculateItemValue(Item[] items) {
+        if (config.estimateUntradeables()){
+            items = replaceUntradeables(items);
+        }
         return Arrays.stream(items).flatMapToLong(item ->
                 LongStream.of(calculateItemValue(item))
         ).sum();
@@ -1113,7 +1521,7 @@ public class ProfitTrackerInventoryValue {
         calculate total inventory value
          */
 
-        return calculateContainerValue(InventoryID.INVENTORY);
+        return calculateContainerValue(InventoryID.INV);
 
     }
 
@@ -1122,7 +1530,7 @@ public class ProfitTrackerInventoryValue {
         /*
         calculate total equipment value
          */
-        return calculateContainerValue(InventoryID.EQUIPMENT);
+        return calculateContainerValue(InventoryID.WORN);
     }
 
     public long calculateRunePouchValue()
@@ -1148,7 +1556,7 @@ public class ProfitTrackerInventoryValue {
             return 0;
         }
         log.debug(String.format("calculateRuneValue runeId = %d", runeId));
-        return itemManager.getItemPrice(runePouchEnum.getIntValue(runeId)) * runeQuantity;
+        return (long)(itemManager.getItemPrice(runePouchEnum.getIntValue(runeId))) * runeQuantity;
     }
 
     public long calculateInventoryAndEquipmentValue()
@@ -1165,9 +1573,8 @@ public class ProfitTrackerInventoryValue {
      * @return Array of items from inventory and equipment containers
      */
     public Item[] getInventoryAndEquipmentContents(){
-        ItemContainer inventoryContainer = client.getItemContainer(InventoryID.INVENTORY);
-        ItemContainer equipmentContainer = client.getItemContainer(InventoryID.EQUIPMENT);
-
+        ItemContainer inventoryContainer = client.getItemContainer(InventoryID.INV);
+        ItemContainer equipmentContainer = client.getItemContainer(InventoryID.WORN);
 
         if (inventoryContainer == null || equipmentContainer == null)
         {
@@ -1191,6 +1598,54 @@ public class ProfitTrackerInventoryValue {
         return expandContainers(bankContainer.getItems());
     }
 
+    public Item[] getGrandExchangeContents(){
+        ArrayList<Item> items = new ArrayList<> ();
+        //Unclear why, but without an intermediate storage for this variable, just doing items.add(new ...) caused improper quantities
+        Item coins;
+        for (GrandExchangeOfferData offer : offers) {
+            if (offer == null) {
+                items.add(new Item(-1, 0));
+                continue;
+            }
+            switch (offer.state) {
+                case BOUGHT:
+                case BUYING:
+                    coins = new Item(ItemID.COINS, offer.price * (offer.totalQuantity - offer.quantitySold)); //Gold left to spend
+                    items.add(coins);
+                    break;
+                case SOLD:
+                case SELLING:
+                    items.add(new Item(offer.id, offer.totalQuantity - offer.quantitySold)); //Items left to sell
+                    break;
+                case CANCELLED_BUY:
+                case CANCELLED_SELL:
+                    //All pending value in the offer will be moved to the collection item container
+                    break;
+                case EMPTY:
+                default:
+                    items.add(new Item(-1, 0));
+                    break;
+            }
+        }
+        return ArrayUtils.addAll(items.toArray(new Item[0]), getCollectionBoxContents());
+    }
+
+    /**
+     * Gets all items sitting in the collection box for GE offers.
+     * Can only access this data when the interface is open, avoid calling from something like onGrandExchangeOfferChanged
+     * which can happen at any time.
+     */
+    private Item[] getCollectionBoxContents(){
+        Item[] items = new Item[0];
+        for (int collectionBoxInventoryId : COLLECTION_BOX_INVENTORY_IDS) {
+            ItemContainer collectionBox = client.getItemContainer(collectionBoxInventoryId);
+            if (collectionBox != null) {
+                items = ArrayUtils.addAll(items, collectionBox.getItems());
+            }
+        }
+        return items;
+    }
+
     private Item[] expandContainers(Item[] items){
         Item[] extraItems = new Item[0];
         for (int i = 0; i < items.length; i++){
@@ -1202,6 +1657,97 @@ public class ProfitTrackerInventoryValue {
             }
         }
         return ArrayUtils.addAll(items,extraItems);
+    }
+
+    /**
+     * Replaces various untradeable items with items they can be converted into, or coin values of those items
+     */
+    private Item[] replaceUntradeables(Item[] items){
+        Item[] extraItems = new Item[0];
+        Item[] resultItems = items.clone();
+        for (int i = 0; i < resultItems.length; i++){
+            boolean replaceItem = true;
+            switch (resultItems[i].getId()){
+                case ItemID.MINNOW:
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.RAW_SHARK,resultItems[i].getQuantity() / 40));
+                    break;
+                //Mark of grace for amylase crystals seems to be covered already by the GE value checker
+                case ItemID.VARLAMORE_WYRM_AGILITY_TERMITE:
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.AMYLASE,resultItems[i].getQuantity()));
+                    break;
+                case ItemID.AGILITYARENA_TICKET: //Old agility arena ticket for pirate's hook
+                case ItemID.AGILITYARENA_VOUCHER: //Brimhaven voucher for pirate's hook
+                    long hookValue = calculateItemValue(new Item(ItemID.PIRATEHOOK, 1));
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * hookValue / 800)));
+                    break;
+                case ItemID.STAR_DUST:
+                case ItemID.STAR_DUST_25:
+                case ItemID.STAR_DUST_75:
+                case ItemID.STAR_DUST_125:
+                case ItemID.STAR_DUST_175:
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.SOFTCLAY,resultItems[i].getQuantity() * 2 / 3));
+                    break;
+                case ItemID.MOTHERLODE_NUGGET:
+                case ItemID.MGUILD_MINERALS:
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.SOFTCLAY,resultItems[i].getQuantity() * 10));
+                    break;
+                case ItemID.FORESTRY_CURRENCY: //Anima bark for felling axe handle
+                    long handleValue = calculateItemValue(new Item(ItemID.FORESTRY_2H_AXE_HANDLE, 1)) - calculateItemValue(new Item(ItemID.OAK_LOGS, 500));
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * handleValue / 10000)));
+                    break;
+                case ItemID.PRIF_CRYSTAL_SHARD: //Crystal shard high alch
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,resultItems[i].getQuantity() * 6000));
+                    break;
+                case ItemID.PRIF_CRYSTAL_SHARD_CRUSHED:
+                    // Profit from making divine super combat, used for crystal shards/dust
+                    long potionProfit = calculateItemValue(new Item(ItemID._4DOSEDIVINECOMBAT, 1)) - calculateItemValue(new Item(ItemID._4DOSE2COMBAT,1));
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * potionProfit / 4)));
+                    break;
+                case ItemID.TZHAAR_TOKEN: //Tokkul for onyx
+                    long onyxValue = calculateItemValue(new Item(ItemID.ONYX, 1));
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * onyxValue / 300000)));
+                    break;
+                case ItemID.ABYSSAL_PEARL: //Abyssal pearls for ring of the elements
+                    long roteValue = calculateItemValue(new Item(ItemID.RING_OF_ELEMENTS, 1));
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * roteValue / 400)));
+                    break;
+                case ItemID.VILLAGE_TRADE_STICKS: //Trading sticks for gout tubers
+                    long tuberValue = calculateItemValue(new Item(ItemID.VILLAGE_RARE_TUBER, 1));
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * tuberValue / 120)));
+                    break;
+                case ItemID.FOSSIL_MERMAID_TEAR: //Mermaid tears for merfolk trident
+                    long tridentValue = calculateItemValue(new Item(ItemID.MERFOLK_TRIDENT, 1));
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * tridentValue / 400)));
+                    break;
+                case ItemID.KONAR_KEY: //Brimstone key high alch
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.COINS,(int)(resultItems[i].getQuantity() * 48000)));
+                    break;
+                case ItemID.BIRD_EGG_BLUE: //Bird eggs can be traded in for seed nests
+                case ItemID.BIRD_EGG_RED:
+                case ItemID.BIRD_EGG_GREEN:
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.BIRD_NEST_EMPTY,resultItems[i].getQuantity()));
+                    break;
+                case ItemID.BIRD_NEST_EGG_BLUE:
+                case ItemID.BIRD_NEST_EGG_RED:
+                case ItemID.BIRD_NEST_EGG_GREEN:
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.BIRD_NEST_EMPTY,resultItems[i].getQuantity() * 2));
+                    break;
+                case ItemID.MAGIC_IMP_BOX_FULL:
+                case ItemID.MAGIC_IMP_BOX_HALF:
+                    //Replace un-tradeable magic imp boxes with regular ones for value check
+                    //Otherwise using them and opening the bank would cause confusing small profits
+                    extraItems = ArrayUtils.add(extraItems,new Item(ItemID.MAGIC_IMP_BOX,resultItems[i].getQuantity()));
+                    break;
+                //TODO Seedlings: Have unwatered seedlings turn into the seed + pot, and the watered versions into saplings
+                default:
+                    replaceItem = false;
+                    break;
+            }
+            if (replaceItem) {
+                resultItems[i] = new Item(-1,0);
+            }
+        }
+        return ArrayUtils.addAll(resultItems,extraItems);
     }
 
     private Item[] getRunePouchItems(){
@@ -1218,42 +1764,41 @@ public class ProfitTrackerInventoryValue {
     }
 
     /**
+     * Converts the given item array into a map
+     * @return Map of item ID -> QTY
+     */
+    private Map<Integer, Integer> mapItemArray(Item[] items){
+        return Arrays.stream(items)
+                .filter((item) -> item.getQuantity() > 0)
+                .collect(Collectors.toMap(Item::getId, Item::getQuantity, Integer::sum));
+    }
+
+    /**
      * Compares the two arrays, returning an array of item differences
      * For example, dropping a shark would be an array of 1 shark item, with quantity -1
-     * @param originalItems
-     * @param newItems
-     * @return
+     * @return Array of items with quantity set to the difference
      */
     public Item[] getItemCollectionDifference(Item[] originalItems, Item[] newItems){
-        //Iterate over each item, finding any instances of its existence from before
-        Item[] negativeItems = originalItems.clone();
-        for (int i = 0; i < originalItems.length; i++){
-            negativeItems[i] = new Item(originalItems[i].getId(),-originalItems[i].getQuantity());
+        if (config.estimateUntradeables()){
+            //Replace untradeables with their equivalent items.
+            //The replaceUntradeables function is inaccurate for very small amounts, so we need to perform it over the source
+            //with larger quantities instead of over the result difference between collections which generally is just 1 item.
+            //For example, a single stardust = 2/3rds of a soft clay, which is smaller than 1, and so its quantity is truncated by the Item object.
+            originalItems = replaceUntradeables(originalItems);
+            newItems = replaceUntradeables(newItems);
         }
-        Item[] itemIntermediateDifference = ArrayUtils.addAll(negativeItems,newItems);
+        Map<Integer, Integer> originalItemList = mapItemArray(originalItems);
+        Map<Integer, Integer> newItemList = mapItemArray(newItems);
+        //Subtract old quantities from new to get difference
+        originalItemList.forEach((id, quantity) -> newItemList.merge(id, -quantity,(a,b)-> {
+            int sum = a + b;
+            //Returning null for merge removes the entry
+            return sum != 0 ? sum : null;
+        }));
 
-        //Create a nicer looking item list with only the actual changes
-        HashMap<Integer, Integer> itemDifferenceHash = new HashMap<>();
-
-        for (int i = 0; i < itemIntermediateDifference.length; i++){
-            int itemID = itemIntermediateDifference[i].getId();
-            itemDifferenceHash.putIfAbsent(itemID, 0);
-            itemDifferenceHash.put(itemID, itemDifferenceHash.get(itemID) + itemIntermediateDifference[i].getQuantity());
-        }
-
-        Iterator mapIt = itemDifferenceHash.entrySet().iterator();
-        while (mapIt.hasNext()){
-            Map.Entry pair = (Map.Entry)mapIt.next();
-            if ((Integer)(pair.getValue()) == 0){
-                mapIt.remove();
-            }
-        }
+        //Convert back to item array
         List<Item> itemDifference = new ArrayList<>();
-        mapIt = itemDifferenceHash.entrySet().iterator();
-        while (mapIt.hasNext()){
-            Map.Entry pair = (Map.Entry)mapIt.next();
-            itemDifference.add(new Item((Integer)pair.getKey(),(Integer)pair.getValue()));
-        }
+        newItemList.forEach((id, quantity) -> itemDifference.add(new Item(id,quantity)));
 
         return itemDifference.toArray(new Item[0]);
     }
