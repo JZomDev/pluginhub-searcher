@@ -71,15 +71,9 @@ public class LootFiltersPanel extends PluginPanel {
         var bottom = new JPanel(new FlowLayout(FlowLayout.LEFT));
 
         var label = new JLabel("Active filter:");
-        var createNew = createIconButton("create_filter",
-                "Create a new empty filter.",
-                this::onCreateEmptyFilter);
         var importClipboard = createIconButton("paste_icon",
                 "Import filter from clipboard.",
                 this::onImportClipboard);
-        var importConfig = createIconButton("import_config",
-                "Import item highlight and hide lists into a new filter. Doing this will also reset those lists.",
-                this::onImportConfig);
 
         var reloadFilters = createIconButton("reload_icon",
                 "Reload filters from disk.",
@@ -167,6 +161,16 @@ public class LootFiltersPanel extends PluginPanel {
         var newSrc = getClipboard();
         if (newSrc == null) {
             plugin.addChatMessage("Import failed: no text in clipboard.");
+            return;
+        }
+
+        if (newSrc.startsWith("https://filterscape.xyz/import")) {
+            plugin.addChatMessage("This is a link to import a filter on filterscape.xyz, taking you there now...");
+            try {
+                Desktop.getDesktop().browse(URI.create(newSrc + "&pluginRedirect=true"));
+            } catch (Exception ex) {
+                log.warn("open filterscape.xyz", ex);
+            }
             return;
         }
 
@@ -374,6 +378,7 @@ import java.util.concurrent.Executors;
 
 import static com.lootfilters.util.FilterUtil.withConfigRules;
 import static net.runelite.client.RuneLite.RUNELITE_DIR;
+import static net.runelite.client.util.ColorUtil.colorToHexCode;
 import static net.runelite.client.util.ImageUtil.loadImageResource;
 
 @Slf4j
@@ -612,9 +617,6 @@ public class LootFiltersPlugin extends Plugin {
 
 	private void addItem(Tile tile, PluginTileItem item) {
 		var match = getActiveFilter().findMatch(this, item);
-		if (match == null) {
-			return;
-		}
 
 		displayIndex.put(item, match);
 		if (match.isShowLootbeam()) {
@@ -627,8 +629,11 @@ public class LootFiltersPlugin extends Plugin {
 		if (match.getSound() != null && config.soundVolume() > 0) {
 			queuedAudio.add(match.getSound());
 		}
-		if (match.getIcon() != null) {
+		if (match.getIcon() != null && !match.isCompact()) {
 			iconIndex.inc(match.getIcon(), item);
+		}
+		if(match.isCompact()){
+			iconIndex.inc(match.getIcon(), item,config.compactRenderSize());
 		}
 	}
 
@@ -637,7 +642,7 @@ public class LootFiltersPlugin extends Plugin {
 		lootbeamIndex.remove(tile, item);
 		displayIndex.remove(item);
 		if (display != null && display.getIcon() != null) {
-			iconIndex.dec(display.getIcon(), item);
+			iconIndex.dec(display.getIcon(), item, display.isCompact()? config.compactRenderSize() : 16);
 		}
 	}
 
@@ -681,7 +686,10 @@ public class LootFiltersPlugin extends Plugin {
 
 	private void flushChatMessages() {
 		for (var msg : queuedChatMessages) {
-			var chatMsg = String.format("<col=00ffff>[Loot Filters]</col>: %s", msg);
+			// CA_ID:{id}|<msg> is used to embed CA information into a GAMEMESSAGE chat. A side effect of this is that
+			// whenever you have |s in a chat message, everything before the first | gets cut off. So, we just throw one
+			// at the front of everything as a prophylactic measure since we might show || tokens in parse errors.
+			var chatMsg = String.format("|<col=%s>[Loot Filters]</col>: %s", colorToHexCode(config.chatPrefixColor()), msg);
 			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMsg, "loot-filters", false);
 		}
 		queuedChatMessages.clear();
@@ -963,7 +971,6 @@ public class FilterUtil {
      */
     public static LootFilter withConfigRules(LootFilter filter, LootFiltersConfig config) {
         var withConfig = new ArrayList<MatcherConfig>();
-        withConfig.add(MatcherConfig.showUnmatched(config.showUnmatchedItems()));
 
         withConfig.add(MatcherConfig.ownershipFilter(config.ownershipFilter()));
         withConfig.add(MatcherConfig.itemSpawnFilter(config.itemSpawnFilter()));
@@ -1125,6 +1132,8 @@ import com.lootfilters.model.FontMode;
 import com.lootfilters.model.PluginTileItem;
 import com.lootfilters.model.ValueDisplayType;
 import com.lootfilters.util.TextComponent;
+import lombok.Getter;
+import lombok.Setter;
 import lombok.Value;
 import net.runelite.api.Client;
 import net.runelite.api.ItemID;
@@ -1137,6 +1146,7 @@ import net.runelite.client.ui.overlay.OverlayPosition;
 import net.runelite.client.ui.overlay.components.ProgressPieComponent;
 
 import javax.inject.Inject;
+import java.awt.AlphaComposite;
 import java.awt.BasicStroke;
 import java.awt.Color;
 import java.awt.Dimension;
@@ -1145,23 +1155,24 @@ import java.awt.Point;
 import java.awt.Rectangle;
 import java.time.Duration;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
 import static com.lootfilters.util.TextUtil.abbreviate;
 import static com.lootfilters.util.TextUtil.abbreviateValue;
 import static com.lootfilters.util.TextUtil.withParentheses;
-import static java.util.stream.Collectors.counting;
-import static java.util.stream.Collectors.groupingBy;
+import static net.runelite.api.Perspective.getCanvasImageLocation;
 import static net.runelite.api.Perspective.getCanvasTextLocation;
 import static net.runelite.api.Perspective.getCanvasTilePoly;
+import static net.runelite.client.ui.FontManager.getRunescapeSmallFont;
 
 public class LootFiltersOverlay extends Overlay {
     private static final int BOX_PAD = 2;
     private static final int CLICKBOX_SIZE = 8;
     private static final int TIMER_RADIUS = 5;
+    private static final int DEFAULT_IMAGE_HEIGHT = 32;
+    private static final int DEFAULT_IMAGE_WIDTH = 36;
 
     private final Client client;
     private final LootFiltersPlugin plugin;
@@ -1188,7 +1199,7 @@ public class LootFiltersOverlay extends Overlay {
         }
 
         var mouse = client.getMouseCanvasPosition();
-        var hoveredItem = -1;
+        var hoveredItem = new AtomicInteger(-1);
         var hoveredHide = new AtomicInteger(-1);
         var hoveredHighlight = new AtomicInteger(-1);
 
@@ -1196,28 +1207,40 @@ public class LootFiltersOverlay extends Overlay {
             highlightTiles(g, entry.getKey(), entry.getValue());
         }
         for (var entry : plugin.getTileItemIndex().entrySet()) {
-            var items = entry.getValue();
-            var itemCounts = items.stream()
-                    .collect(groupingBy(it -> new OverlayKey(it.getId(), it.getQuantity()), counting()));
-
+            var items = createItemCollection(entry.getValue());
             var tile = entry.getKey();
             var currentOffset = 0;
-            var rendered = new ArrayList<OverlayKey>();
-            for (var item : items) {
+            var compactRowPosition = 0;
+
+
+            var remainingCompactMatches = items.get(true).size();
+
+            for (var item : items.get(true)) {
+                var effectiveRowLength = config.compactRenderRowLength() > remainingCompactMatches ? remainingCompactMatches : config.compactRenderRowLength();
+                var textHeight = renderCompact(item.getOverlayKey().getDisplayConfig(), g, item.getFirstItem(), tile,
+                        item.getCounts().getCount(), item.getCounts().getQuantity(), currentOffset, mouse,
+                        hoveredItem::set, compactRowPosition, effectiveRowLength);
+                if (compactRowPosition >= config.compactRenderRowLength() - 1) {
+                    compactRowPosition = 0;
+                    currentOffset += textHeight + BOX_PAD + 3;
+                    remainingCompactMatches -= config.compactRenderRowLength();
+                } else {
+                    compactRowPosition++;
+                }
+            }
+
+            if (!items.get(true).isEmpty()) {
+                currentOffset += config.compactRenderSize() / 2;
+                if (compactRowPosition > 0) {
+                    currentOffset += config.compactRenderSize() + BOX_PAD + 2;
+                }
+            }
+
+            // non-compact
+
+            for (var item : items.get(false)) {
                 var leftOffset = 0;
-
-                var renderKey = new OverlayKey(item.getId(), item.getQuantity());
-                if (rendered.contains(renderKey)) {
-                    continue;
-                }
-                rendered.add(renderKey);
-
-                var count = itemCounts.get(renderKey);
-
-                var match = plugin.getDisplayIndex().get(item);
-                if (match == null) {
-                    continue;
-                }
+                var match = item.getOverlayKey().getDisplayConfig();
 
                 var overrideHidden = plugin.isHotkeyActive() && config.hotkeyShowHiddenItems();
                 if (match.isHideOverlay() && !overrideHidden) {
@@ -1236,7 +1259,7 @@ public class LootFiltersOverlay extends Overlay {
                     g.setFont(match.getFont());
                 } // otherwise we don't have to do anything, the font is already set
 
-                var displayText = buildDisplayText(item, count, match);
+                var displayText = buildDisplayText(item.getFirstItem(), item.getCounts().getCount(), item.getCounts().getQuantity(), match);
                 var textPoint = getCanvasTextLocation(client, g, loc, displayText, tile.getItemLayer().getHeight() + config.overlayZOffset());
                 if (textPoint == null) {
                     continue;
@@ -1271,35 +1294,118 @@ public class LootFiltersOverlay extends Overlay {
                     g.drawRect(boundingBox.x, boundingBox.y, boundingBox.width, boundingBox.height);
                 }
                 if (plugin.isHotkeyActive() && boundingBox.contains(mouse.getX(), mouse.getY())) {
-                    hoveredItem = item.getId();
-
+                    hoveredItem.set(item.getOverlayKey().getId());
                     g.setColor(match.isHidden() ? config.hiddenColor() : Color.WHITE);
                     g.drawRect(boundingBox.x, boundingBox.y, boundingBox.width, boundingBox.height);
                 }
                 if (config.hotkeyShowClickboxes() && plugin.isHotkeyActive()) {
-                    renderClickboxes(g, boundingBox, item, match, hoveredHide::set, hoveredHighlight::set);
+                    renderClickboxes(g, boundingBox, item.getFirstItem(), match, hoveredHide::set, hoveredHighlight::set);
                 }
 
                 text.render(g);
 
                 if (match.getIcon() != null) {
-                    var cacheKey = match.getIcon().getCacheKey(item);
+                    var cacheKey = match.getIcon().getCacheKey(item.getFirstItem());
                     var d = renderIcon(g, cacheKey, textPoint, currentOffset);
                     leftOffset += d.width;
                 }
                 if (match.isShowDespawn() || plugin.isHotkeyActive()) {
                     var type = plugin.isHotkeyActive() ? DespawnTimerType.PIE : config.despawnTimerType();
-                    renderDespawnTimer(g, type, item, textPoint, textWidth, fm.getHeight(), currentOffset, leftOffset);
+                    renderDespawnTimer(g, type, item.getFirstItem(), textPoint, textWidth, currentOffset, leftOffset, false);
                 }
 
                 currentOffset += textHeight + BOX_PAD + 3;
             }
         }
 
-        plugin.setHoveredItem(hoveredItem);
+        plugin.setHoveredItem(hoveredItem.get());
         plugin.setHoveredHide(hoveredHide.get());
         plugin.setHoveredHighlight(hoveredHighlight.get());
         return null;
+    }
+
+    private int renderCompact(DisplayConfig display, Graphics2D g, PluginTileItem item, Tile tile, long count, long quantity,
+                              int currentOffset, net.runelite.api.Point mouse, Consumer<Integer> onHoveredItem, int rowOffset,
+                              int rowSize) {
+        var overrideHidden = plugin.isHotkeyActive() && config.hotkeyShowHiddenItems();
+        if (display.isHideOverlay() && !overrideHidden) {
+            return -1;
+        }
+
+        var loc = LocalPoint.fromWorld(client.getTopLevelWorldView(), tile.getWorldLocation());
+        if (loc == null) {
+            return -1;
+        }
+        if (tile.getItemLayer() == null) {
+            return -1;
+        }
+
+        g.setFont(getRunescapeSmallFont()); // force the small font in compact mode because it's small
+
+        var fm = g.getFontMetrics(g.getFont());
+        var boxHeight = config.compactRenderSize();
+        var boxWidth = Math.round(DEFAULT_IMAGE_WIDTH * boxHeight / (float) DEFAULT_IMAGE_HEIGHT);
+
+        var image = plugin.getIconIndex().get(display.getIcon().getCacheKey(item, config.compactRenderSize()));
+        if (image == null) {
+            return -1;
+        }
+
+        boxHeight = image.getHeight();
+        boxWidth = image.getWidth();
+        var fullBoxWidth = boxWidth + 4;
+        var imagePoint = getCanvasImageLocation(client, loc, image, tile.getItemLayer().getHeight() + config.overlayZOffset());
+        if (imagePoint == null) {
+            return -1;
+        }
+        // item square size- 1 px padding outside the bounding box, 1 px inside, item width, 1 px, 1 px.
+        var boundingBox = new Rectangle(
+                imagePoint.getX() + (fullBoxWidth) * rowOffset - Math.round(fullBoxWidth * ((rowSize - 1) / 2f)), imagePoint.getY() - currentOffset - boxHeight,
+                boxWidth + 2, boxHeight + 2
+        );
+
+        if (display.getBackgroundColor() != null) {
+            g.setColor(display.getBackgroundColor());
+            g.fillRect(boundingBox.x, boundingBox.y, boundingBox.width, boundingBox.height);
+        }
+        if (display.getBorderColor() != null) {
+            g.setColor(display.getBorderColor());
+            g.drawRect(boundingBox.x, boundingBox.y, boundingBox.width, boundingBox.height);
+        }
+        if (plugin.isHotkeyActive() && boundingBox.contains(mouse.getX(), mouse.getY())) {
+            onHoveredItem.accept(item.getId());
+
+            g.setColor(display.isHidden() ? config.hiddenColor() : Color.WHITE);
+            g.drawRect(boundingBox.x, boundingBox.y, boundingBox.width, boundingBox.height);
+        }
+        var displayText = "";
+        if (quantity > 1) {
+            if (quantity < 1000) {
+                displayText += quantity;
+            } else if (quantity < 99500) {
+                displayText += String.format("%.0fK", (float) quantity / 1e3);
+            } else {
+                displayText += "Lots!";
+            }
+        }
+
+        g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, display.getTextColor().getAlpha() / 255f));
+        g.drawImage(image, boundingBox.x + BOX_PAD / 2, boundingBox.y + BOX_PAD / 2, null);
+        if (display.isShowDespawn() || plugin.isHotkeyActive()) {
+            var type = plugin.isHotkeyActive() ? DespawnTimerType.PIE : config.despawnTimerType();
+            renderDespawnTimer(g, type, item, new net.runelite.api.Point(boundingBox.x + BOX_PAD / 2, boundingBox.y + boundingBox.height), boxWidth + 2, 0, 0, true);
+        }
+        g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 1));
+        if (count > 1) {
+            displayText += "x" + count;
+        }
+        var text = new TextComponent();
+        text.setText(displayText);
+        text.setColor(display.isHidden() ? config.hiddenColor() : display.getTextColor());
+        text.setPosition(new Point(boundingBox.x + BOX_PAD / 2, boundingBox.y + fm.getHeight() + BOX_PAD / 2));
+        text.render(g);
+
+        return image.getHeight();
     }
 
     private Color getDespawnTextColor(PluginTileItem item) {
@@ -1312,12 +1418,12 @@ public class LootFiltersOverlay extends Overlay {
         return Color.GREEN;
     }
 
-    private String buildDisplayText(PluginTileItem item, long unstackedCount, DisplayConfig display) {
+    private String buildDisplayText(PluginTileItem item, int unstackedCount, int quantity, DisplayConfig display) {
         var text = item.getName();
 
         // BOTH of these can be true, we want them to be visually different either way
-        if (item.getQuantity() > 1) {
-            text += " (" + abbreviate(item.getQuantity()) + ")";
+        if (quantity > 1) {
+            text += " (" + abbreviate(quantity) + ")";
         }
         if (unstackedCount > 1) {
             text += " x" + unstackedCount;
@@ -1329,8 +1435,8 @@ public class LootFiltersOverlay extends Overlay {
             return text;
         }
 
-        var ge = item.getGePrice() * item.getQuantity();
-        var ha = item.getHaPrice() * item.getQuantity();
+        var ge = item.getGePrice() * quantity;
+        var ha = item.getHaPrice() * quantity;
         switch (showBecauseHotkey ? ValueDisplayType.BOTH : config.valueDisplayType()) {
             case HIGHEST:
                 return ge == 0 && ha == 0 ? text
@@ -1403,7 +1509,8 @@ public class LootFiltersOverlay extends Overlay {
         g.drawString("audio: " + plugin.getQueuedAudio().size() + ", icon: " + plugin.getIconIndex().size(), 0, 80);
     }
 
-    private void renderDespawnTimer(Graphics2D g, DespawnTimerType type, PluginTileItem item, net.runelite.api.Point textPoint, int textWidth, int textHeight, int yOffset, int leftOffset) {
+    private void renderDespawnTimer(Graphics2D g, DespawnTimerType type, PluginTileItem
+            item, net.runelite.api.Point textPoint, int textWidth, int yOffset, int leftOffset, boolean compact) {
         var ticksRemaining = item.getDespawnTime() - client.getTickCount();
         if (ticksRemaining < 0) { // doesn't despawn
             return;
@@ -1412,15 +1519,23 @@ public class LootFiltersOverlay extends Overlay {
             return;
         }
 
-        if (type == DespawnTimerType.TICKS || type == DespawnTimerType.SECONDS) {
+        if (compact) { // bar
+            var total = item.getDespawnTime() - item.getSpawnTime();
+            var remaining = item.getDespawnTime() - plugin.getClient().getTickCount();
+            var bar = new Rectangle(textPoint.getX(), textPoint.getY() - 3, textWidth * remaining / total, 3);
+            g.setColor(getDespawnTextColor(item));
+            g.fillRect(bar.x, bar.y, bar.width, bar.height);
+        } else if (type == DespawnTimerType.TICKS || type == DespawnTimerType.SECONDS) {
             var text = new TextComponent();
-            text.setText(type == DespawnTimerType.TICKS
+            var timeRounding = "%.1f";
+            var displyString = type == DespawnTimerType.TICKS
                     ? Integer.toString(ticksRemaining)
-                    : String.format("%.1f", (Duration.between(Instant.now(), item.getDespawnInstant())).toMillis() / 1000f));
+                    : String.format(timeRounding, (Duration.between(Instant.now(), item.getDespawnInstant())).toMillis() / 1000f);
+            text.setText(displyString);
             text.setColor(getDespawnTextColor(item));
             text.setPosition(new Point(textPoint.getX() + textWidth + 2 + 1, textPoint.getY() - yOffset));
             text.render(g);
-        } else {
+        } else { // pie
             var timer = new ProgressPieComponent();
             var total = item.getDespawnTime() - item.getSpawnTime();
             var remaining = item.getDespawnTime() - plugin.getClient().getTickCount();
@@ -1470,7 +1585,7 @@ public class LootFiltersOverlay extends Overlay {
 
         for (var item : items) {
             var match = plugin.getDisplayIndex().get(item);
-            if (match != null && match.isHighlightTile()) {
+            if (match.isHighlightTile()) {
                 highlightTile(g, tile, match);
             }
         }
@@ -1506,11 +1621,58 @@ public class LootFiltersOverlay extends Overlay {
         return new Dimension(image.getWidth() + BOX_PAD, image.getHeight());
     }
 
+    private Map<Boolean, Deque<RenderItem>> createItemCollection(List<PluginTileItem> items) {
+        Map<Boolean, Deque<RenderItem>> itemCollection = new HashMap<>();
+        itemCollection.put(true, new ArrayDeque<>());
+        itemCollection.put(false, new ArrayDeque<>());
+
+        var countMap = new HashMap<OverlayKey, ItemCounts>();
+        for (var item : items) {
+            var match = plugin.getDisplayIndex().get(item);
+            var key = new OverlayKey(item.getId(), match);
+            var existingVal = countMap.get(key);
+            if (existingVal == null) {
+                var quant = new ItemCounts(1, item.getQuantity());
+                countMap.put(key, quant);
+                itemCollection.get(key.displayConfig.isCompact()).add(new RenderItem(item, key, quant));
+            } else {
+                if (item.isStackable()) {
+                    existingVal.quantity += item.getQuantity();
+                }
+                existingVal.count++;
+            }
+        }
+        return itemCollection;
+    }
+
     @Value
     private static class OverlayKey {
-        int id, quantity;
+        int id;
+        DisplayConfig displayConfig;
+    }
+
+    @Value
+    private static class RenderItem {
+        PluginTileItem firstItem;
+        OverlayKey overlayKey;
+        ItemCounts counts;
+    }
+
+    @Getter
+    @Setter
+    private static class ItemCounts {
+        //Number of individual items/stacks
+        int count;
+        //Total sum of all stacks combined
+        int quantity;
+
+        public ItemCounts(int count, int quantity) {
+            this.count = count;
+            this.quantity = quantity;
+        }
     }
 }
+
 
 package com.lootfilters;
 
@@ -1572,6 +1734,8 @@ import net.runelite.client.ui.FontManager;
 
 import java.awt.Color;
 import java.awt.Font;
+import java.util.ArrayList;
+import java.util.List;
 
 @Getter
 @Builder(toBuilder = true)
@@ -1587,6 +1751,7 @@ public class DisplayConfig {
     private final Boolean hidden;
     private final Boolean showLootbeam;
     private final Boolean showValue;
+    private final Boolean compact;
     private final Boolean showDespawn;
     private final Boolean notify;
     private final TextAccent textAccent;
@@ -1604,6 +1769,9 @@ public class DisplayConfig {
     private final Integer menuSort;
     private final BufferedImageProvider icon;
 
+    // ideally this would be in EvalDisplayConfig which extends DisplayConfig but that's just more code tbh
+    private final List<Integer> evalTrace;
+
     public DisplayConfig(Color textColor) {
         this.textColor = textColor;
         backgroundColor = null;
@@ -1611,6 +1779,7 @@ public class DisplayConfig {
         hidden = false;
         showLootbeam = false;
         showValue = false;
+        compact = false; // compact is currently a config-only setting and not supported in rs2f
         showDespawn = false;
         notify = false;
         textAccent = null;
@@ -1625,6 +1794,11 @@ public class DisplayConfig {
         sound = null;
         menuSort = null;
         icon = null;
+        evalTrace = new ArrayList<>();
+    }
+
+    public SoundProvider getSound() {
+        return !isHidden() ? sound : null;
     }
 
     public Color getLootbeamColor() {
@@ -1633,6 +1807,10 @@ public class DisplayConfig {
 
     public Color getTextColor() {
         return textColor != null ? textColor : Color.WHITE;
+    }
+
+    public BufferedImageProvider getIcon() {
+        return isCompact() ? new BufferedImageProvider.CurrentItem() : icon;
     }
 
     public Color getMenuTextColor() {
@@ -1671,6 +1849,10 @@ public class DisplayConfig {
     public boolean isHighlightTile() { return !isHidden() && highlightTile != null && highlightTile; }
     public boolean isHideOverlay() { return isHidden() || (hideOverlay != null && hideOverlay); }
 
+    public boolean isCompact() {
+        return compact != null && compact;
+    }
+
     public DisplayConfig merge(DisplayConfig other) {
         var b = toBuilder();
         if (other.textColor != null) { b.textColor(other.textColor); }
@@ -1679,6 +1861,7 @@ public class DisplayConfig {
         if (other.hidden != null) { b.hidden(other.hidden); }
         if (other.showLootbeam != null) { b.showLootbeam(other.showLootbeam); }
         if (other.showValue != null) { b.showValue(other.showValue); }
+        if (other.compact != null) { b.compact(other.compact); }
         if (other.showDespawn != null) { b.showDespawn(other.showDespawn); }
         if (other.notify != null) { b.notify(other.notify); }
         if (other.textAccent != null) { b.textAccent(other.textAccent); }
@@ -2544,6 +2727,10 @@ import static com.lootfilters.lang.Token.Type.RULE;
 import static com.lootfilters.lang.Token.Type.STMT_END;
 import static com.lootfilters.lang.Token.Type.TRUE;
 
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// !! DO NOT add features to the RS2F language without consulting Rikten X first. !!
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+//
 // Parser somewhat mixes canonical stages 2 (parse) and 3/4 (syntax/semantic analysis) but the filter language is
 // restricted enough that it should be fine for now.
 @RequiredArgsConstructor
@@ -2561,9 +2748,9 @@ public class Parser {
             if (tok.is(META)) {
                 parseMeta();
             } else if (tok.is(IF) || tok.is(RULE)) {
-                parseMatcher(true);
+                parseMatcher(true, tok.getLocation().getLineNumber());
             } else if (tok.is(APPLY)) {
-                parseMatcher(false);
+                parseMatcher(false, tok.getLocation().getLineNumber());
             } else {
                 throw new ParseException("unexpected token", tok);
             }
@@ -2604,7 +2791,7 @@ public class Parser {
         }
     }
 
-    private void parseMatcher(boolean isTerminal) {
+    private void parseMatcher(boolean isTerminal, int sourceLine) {
         var operators = new Stack<Token>();
         var rulesPostfix = new ArrayList<Rule>();
         tokens.walkExpression(EXPR_START, EXPR_END, it -> {
@@ -2712,7 +2899,7 @@ public class Parser {
         }
         tokens.takeExpect(BLOCK_END);
 
-        matchers.add(new MatcherConfig(buildRule(rulesPostfix), builder.build(), isTerminal));
+        matchers.add(new MatcherConfig(buildRule(rulesPostfix), builder.build(), isTerminal, sourceLine));
     }
 
     private void unwindUnary(Stack<Token> operators, ArrayList<Rule> postfix) {
@@ -3221,13 +3408,15 @@ import java.util.stream.Collectors;
 import static com.lootfilters.util.CollectionUtil.append;
 import static com.lootfilters.util.TextUtil.quote;
 
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// !! DO NOT add features to the RS2F language without consulting Rikten X first. !!
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 @RequiredArgsConstructor
 public class Preprocessor {
     private final TokenStream tokens;
 
     private final Map<String, Define> defines = new HashMap<>();
     private final List<Token> preproc = new ArrayList<>(); // pre-expansion w/ all preproc lines removed
-
 
     public TokenStream preprocess() throws PreprocessException {
         while (tokens.isNotEmpty()) {
@@ -3242,7 +3431,6 @@ public class Preprocessor {
                 }
             }
         }
-
 
         return new TokenStream(expandDefines(new ArrayList<>(), new TokenStream(preproc)));
     }
@@ -3370,6 +3558,9 @@ import java.util.stream.Collectors;
 import static com.lootfilters.util.TextUtil.isLegalIdent;
 import static com.lootfilters.util.TextUtil.isNumeric;
 
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+// !! DO NOT add features to the RS2F language without consulting Rikten X first. !!
+// !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 @RequiredArgsConstructor
 public class Lexer {
     private static final LinkedHashMap<String, Token.Type> STATICS = new LinkedHashMap<>() {{
@@ -3670,9 +3861,10 @@ import static com.lootfilters.LootFiltersPlugin.ICON_DIRECTORY;
 
 @Slf4j
 public abstract class BufferedImageProvider {
-    public abstract BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item);
+    //Height only applies to item icons
+    public abstract BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item, int... height);
 
-    public abstract CacheKey getCacheKey(PluginTileItem item);
+    public abstract CacheKey getCacheKey(PluginTileItem item, int... height);
 
     @AllArgsConstructor
     @EqualsAndHashCode(callSuper = false)
@@ -3681,7 +3873,7 @@ public abstract class BufferedImageProvider {
         private final int index;
 
         @Override
-        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item, int... height) {
             try {
                 return plugin.getSpriteManager().getSprite(spriteId, index);
             } catch (ArrayIndexOutOfBoundsException e) {
@@ -3691,8 +3883,8 @@ public abstract class BufferedImageProvider {
         }
 
         @Override
-        public CacheKey getCacheKey(PluginTileItem item) {
-            return new CacheKey(0, spriteId, index, "");
+        public CacheKey getCacheKey(PluginTileItem item, int... height) {
+            return new CacheKey(0, spriteId, index, "", 16);
         }
     }
 
@@ -3702,14 +3894,15 @@ public abstract class BufferedImageProvider {
         private final int itemId;
 
         @Override
-        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item, int... height) {
             var image = plugin.getItemManager().getImage(itemId);
-            return ImageUtil.resizeImage(image, image.getWidth() / 2, image.getHeight() / 2);
+            var imageHeight = height.length >= 1 ? height[0] : 16;
+            return ImageUtil.resizeImage(image, image.getWidth() * imageHeight / image.getHeight(), imageHeight,true);
         }
 
         @Override
-        public CacheKey getCacheKey(PluginTileItem item) {
-            return new CacheKey(1, itemId, 0, "");
+        public CacheKey getCacheKey(PluginTileItem item, int... height) {
+            return new CacheKey(1, itemId, 0, "",height.length >= 1 ? height[0] : 16);
         }
     }
 
@@ -3719,7 +3912,7 @@ public abstract class BufferedImageProvider {
         private final String filename;
 
         @Override
-        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item, int... height) {
             try {
                 return ImageIO.read(new java.io.File(ICON_DIRECTORY, filename));
             } catch (Exception e) {
@@ -3729,22 +3922,23 @@ public abstract class BufferedImageProvider {
         }
 
         @Override
-        public CacheKey getCacheKey(PluginTileItem item) {
-            return new CacheKey(2, 0, 0, filename);
+        public CacheKey getCacheKey(PluginTileItem item, int... height) {
+            return new CacheKey(2, 0, 0, filename,16);
         }
     }
 
     @EqualsAndHashCode(callSuper = false)
     public static final class CurrentItem extends BufferedImageProvider {
         @Override
-        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item) {
+        public BufferedImage getImage(LootFiltersPlugin plugin, PluginTileItem item, int... height) {
             var image = plugin.getItemManager().getImage(item.getId(), item.getQuantity(), false);
-            return ImageUtil.resizeImage(image, image.getWidth() / 2, image.getHeight() / 2);
+            var imageHeight = height.length >= 1 ? height[0] : 16;
+            return ImageUtil.resizeImage(image, image.getWidth() * imageHeight / image.getHeight(), imageHeight,true);
         }
 
         @Override
-        public CacheKey getCacheKey(PluginTileItem item) {
-            return new CacheKey(3, item.getId(), item.getQuantity(), "");
+        public CacheKey getCacheKey(PluginTileItem item, int... height) {
+            return new CacheKey(3, item.getId(), item.getQuantity(), "", height.length >= 1 ? height[0] : 16);
         }
     }
 
@@ -3753,6 +3947,7 @@ public abstract class BufferedImageProvider {
         int type;
         int param0, param1;
         String param2;
+        int height;
     }
 }
 
@@ -3902,7 +4097,6 @@ public enum DespawnTimerType {
     TICKS("ticks"),
     SECONDS("seconds"),
     PIE("pie");
-
     private final String label;
 
     @Override
@@ -3919,6 +4113,7 @@ import lombok.RequiredArgsConstructor;
 import java.awt.image.BufferedImage;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.Optional;
 
 @RequiredArgsConstructor
 public class IconIndex {
@@ -3929,10 +4124,10 @@ public class IconIndex {
         return index.containsKey(key) ? index.get(key).image : null;
     }
 
-    public void inc(BufferedImageProvider provider, PluginTileItem item) {
-        index.compute(provider.getCacheKey(item), (k, entry) -> {
+    public void inc(BufferedImageProvider provider, PluginTileItem item, int... height) {
+        index.compute(provider.getCacheKey(item, height), (k, entry) -> {
             if (entry == null) {
-                return new CacheEntry(provider.getImage(plugin, item));
+                return new CacheEntry(provider.getImage(plugin, item, height));
             }
 
             ++entry.refCount;
@@ -3940,12 +4135,11 @@ public class IconIndex {
         });
     }
 
-    public void dec(BufferedImageProvider provider, PluginTileItem item) {
-        index.compute(provider.getCacheKey(item), (k, entry) -> {
+    public void dec(BufferedImageProvider provider, PluginTileItem item, int... height) {
+        index.compute(provider.getCacheKey(item, height), (k, entry) -> {
             if (entry == null) {
                 return null;
             }
-
             --entry.refCount;
             return entry.refCount == 0 ? null : entry;
         });
@@ -3965,7 +4159,7 @@ public class IconIndex {
             for (var item : entry.getValue()) {
                 var match = plugin.getActiveFilter().findMatch(plugin, item);
                 if (match != null && match.getIcon() != null) {
-                    inc(match.getIcon(), item);
+                    inc(match.getIcon(), item, match.isCompact() ? plugin.getConfig().compactRenderSize() : 16);
                 }
             }
         }
@@ -4013,6 +4207,7 @@ package com.lootfilters.model;
 import com.lootfilters.DisplayConfig;
 import com.lootfilters.LootFiltersPlugin;
 import lombok.AllArgsConstructor;
+import lombok.NonNull;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -4022,11 +4217,11 @@ public class DisplayConfigIndex {
     private final LootFiltersPlugin plugin;
     private final Map<PluginTileItem, DisplayConfig> index = new HashMap<>();
 
-    public DisplayConfig get(PluginTileItem item) {
+    public @NonNull DisplayConfig get(PluginTileItem item) {
         return index.get(item);
     }
 
-    public void put(PluginTileItem item, DisplayConfig display) {
+    public void put(PluginTileItem item, @NonNull DisplayConfig display) {
         index.put(item, display);
     }
 
@@ -4047,9 +4242,7 @@ public class DisplayConfigIndex {
         for (var entry : plugin.getTileItemIndex().entrySet()) {
             for (var item : entry.getValue()) {
                 var match = plugin.getActiveFilter().findMatch(plugin, item);
-                if (match != null) {
-                    index.put(item, match);
-                }
+                index.put(item, match);
             }
         }
     }
@@ -4143,6 +4336,7 @@ import com.lootfilters.serde.ColorSerializer;
 import com.lootfilters.serde.RuleDeserializer;
 import lombok.EqualsAndHashCode;
 import lombok.Getter;
+import lombok.NonNull;
 import lombok.Setter;
 import lombok.ToString;
 import net.runelite.api.coords.WorldPoint;
@@ -4224,39 +4418,22 @@ public class LootFilter {
         return fromSourcesWithPreamble(Map.of(UNKNOWN_SOURCE_NAME, source));
     }
 
-    public String toJson(Gson gson) {
-        var ggson = gson.newBuilder()
-                .registerTypeAdapter(Color.class, new ColorSerializer())
-                .create();
-        return ggson.toJson(this);
-    }
-
-    public DisplayConfig findMatch(LootFiltersPlugin plugin, PluginTileItem item) {
-        DisplayConfig display = null;
+    public @NonNull DisplayConfig findMatch(LootFiltersPlugin plugin, PluginTileItem item) {
+        var display = new DisplayConfig(Color.WHITE).toBuilder()
+                .compact(plugin.getConfig().compactMode())
+                .build();
         for (var matcher : matchers) {
             if (!matcher.getRule().test(plugin, item)) {
                 continue;
             }
 
+            display = display.merge(matcher.getDisplay());
+            display.getEvalTrace().add(matcher.getSourceLine());
             if (matcher.isTerminal()) {
-                return display == null
-                        ? matcher.getDisplay()
-                        : display.merge(matcher.getDisplay());
-            } else {
-                display = display == null
-                        ? matcher.getDisplay()
-                        : display.merge(matcher.getDisplay());
+                return display;
             }
         }
         return display;
-    }
-
-    public boolean isInActivationArea(WorldPoint p) {
-        if (activationArea == null) {
-            return false;
-        }
-        return p.getX() >= activationArea[0] && p.getY() >= activationArea[1] && p.getPlane() >= activationArea[2]
-                && p.getX() <= activationArea[3] && p.getY() <= activationArea[4] && p.getPlane() <= activationArea[5];
     }
 }
 
@@ -4280,6 +4457,7 @@ import lombok.Getter;
 import lombok.ToString;
 import net.runelite.api.TileItem;
 import net.runelite.api.Varbits;
+import net.runelite.api.gameval.VarbitID;
 
 import java.awt.Color;
 import java.util.Arrays;
@@ -4294,30 +4472,25 @@ public class MatcherConfig {
     private final Rule rule;
     private final DisplayConfig display;
     private final boolean isTerminal;
-
-    public MatcherConfig(Rule rule, DisplayConfig display) {
-        this.rule = rule;
-        this.display = display;
-        this.isTerminal = true;
-    }
+    private final int sourceLine;
 
     public MatcherConfig withDisplay(Consumer<DisplayConfig.DisplayConfigBuilder> consumer) {
         var builder = display.toBuilder();
         consumer.accept(builder);
-        return new MatcherConfig(rule, builder.build(), isTerminal);
+        return new MatcherConfig(rule, builder.build(), isTerminal, sourceLine);
     }
 
     public static MatcherConfig ownershipFilter(boolean enabled) {
         var rule = new Rule("") {
             @Override public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
-                var accountType = plugin.getClient().getVarbitValue(Varbits.ACCOUNT_TYPE);
+                var accountType = plugin.getClient().getVarbitValue(VarbitID.IRONMAN);
                 return enabled && accountType != 0 && item.getOwnership() == TileItem.OWNERSHIP_OTHER;
             }
         };
         var display = DisplayConfig.builder()
                 .hidden(true)
                 .build();
-        return new MatcherConfig(rule, display);
+        return new MatcherConfig(rule, display, true, -1);
     }
 
     public static MatcherConfig itemSpawnFilter(boolean enabled) {
@@ -4329,19 +4502,7 @@ public class MatcherConfig {
         var display = DisplayConfig.builder()
                 .hidden(true)
                 .build();
-        return new MatcherConfig(rule, display);
-    }
-
-    public static MatcherConfig showUnmatched(boolean enabled) {
-        var rule = new Rule("") {
-            @Override public boolean test(LootFiltersPlugin plugin, PluginTileItem item) {
-                return enabled;
-            }
-        };
-        var display = DisplayConfig.builder()
-                .textColor(java.awt.Color.WHITE)
-                .build();
-        return new MatcherConfig(rule, display, false);
+        return new MatcherConfig(rule, display, true, -2);
     }
 
     public static MatcherConfig highlight(LootFiltersConfig config) {
@@ -4374,7 +4535,7 @@ public class MatcherConfig {
                 .menuSort(config.highlightMenuSort())
                 .sound(sound)
                 .build();
-        return new MatcherConfig(rule, display);
+        return new MatcherConfig(rule, display, true, -3);
     }
 
     public static MatcherConfig hide(String rawNames) {
@@ -4387,7 +4548,7 @@ public class MatcherConfig {
         var display = DisplayConfig.builder()
                 .hidden(true)
                 .build();
-        return new MatcherConfig(rule, display);
+        return new MatcherConfig(rule, display, true, -4);
     }
 }
 
@@ -4403,6 +4564,7 @@ import java.awt.Color;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -4430,10 +4592,6 @@ public class MenuEntryComposer {
 
         var item = items.get(0);
         var match = plugin.getDisplayIndex().get(item);
-        if (match == null) {
-            entry.setTarget(buildTargetText(item, DisplayConfig.DEFAULT_MENU_TEXT_COLOR));
-            return;
-        }
 
         entry.setDeprioritized(plugin.getConfig().deprioritizeHidden() && match.isHidden());
         var color = match.isHidden() && plugin.getConfig().recolorHidden()
@@ -4450,6 +4608,9 @@ public class MenuEntryComposer {
         var entries = sortEntries(plugin.getClient().getMenu().getMenuEntries());
         if (plugin.getConfig().collapseEntries()) {
             entries = collapseEntries(entries);
+        }
+        if (plugin.getConfig().showAnalyzer()) {
+            entries = addAnalyzers(entries);
         }
         plugin.getClient().getMenu().setMenuEntries(entries);
     }
@@ -4500,6 +4661,41 @@ public class MenuEntryComposer {
         return collapsed.toArray(MenuEntry[]::new);
     }
 
+    private MenuEntry[] addAnalyzers(MenuEntry[] entries) {
+        return Arrays.stream(entries)
+                .flatMap(it -> isGroundItem(it, false)
+                        ? Stream.of(it, getAnalyzer(it))
+                        : Stream.of(it))
+                .toArray(MenuEntry[]::new);
+    }
+
+    private MenuEntry getAnalyzer(MenuEntry entry) {
+        var item = getItemsForEntry(entry).get(0);
+        var display = plugin.getDisplayIndex().get(item);
+        Consumer<MenuEntry> onClick = (e) -> {
+            var trace = display.getEvalTrace();
+            if (trace.isEmpty()) {
+                plugin.addChatMessage(item.getName() + " did not match any config list or filter rule.");
+            } else if (trace.size() == 1 && trace.get(0) == -4) {
+                plugin.addChatMessage(item.getName() + " is hidden by the 'Item lists' -> 'Hidden items' setting.");
+            } else if (trace.size() == 1 && trace.get(0) == -3) {
+                plugin.addChatMessage(item.getName() + " is highlighted by the 'Item lists' -> 'Highlighted items' setting.");
+            } else if (trace.size() == 1 && trace.get(0) == -2) {
+                plugin.addChatMessage(item.getName() + " is hidden by the 'General' -> 'Item spawn filter' setting.");
+            } else if (trace.size() == 1 && trace.get(0) == -1) {
+                plugin.addChatMessage(item.getName() + " is hidden by the 'General' -> 'Ownership filter' setting.");
+            } else {
+                plugin.addChatMessage(item.getName() + " matched lines " + trace);
+            }
+        };
+
+        return plugin.getClient().getMenu().createMenuEntry(-1)
+                .setOption("[Loot Filters]: Analyze")
+                .setTarget(entry.getTarget())
+                .setType(MenuAction.RUNELITE)
+                .onClick(onClick);
+    }
+
     private MenuEntry withCount(MenuEntry entry, long count) {
         return count > 1
                 ? entry.setTarget(entry.getTarget() + " x" + count)
@@ -4520,14 +4716,18 @@ public class MenuEntryComposer {
         return colorTag(color) + text;
     }
 
-    private static boolean isGroundItem(MenuEntry entry) {
+    private static boolean isGroundItem(MenuEntry entry, boolean includeExamine) {
         var type = entry.getType();
         return type == MenuAction.GROUND_ITEM_FIRST_OPTION
                 || type == MenuAction.GROUND_ITEM_SECOND_OPTION
                 || type == MenuAction.GROUND_ITEM_THIRD_OPTION
                 || type == MenuAction.GROUND_ITEM_FOURTH_OPTION
                 || type == MenuAction.GROUND_ITEM_FIFTH_OPTION
-                || type == MenuAction.EXAMINE_ITEM_GROUND;
+                || includeExamine && type == MenuAction.EXAMINE_ITEM_GROUND;
+    }
+
+    private static boolean isGroundItem(MenuEntry entry) {
+        return isGroundItem(entry, true);
     }
 
     // The results of a menu entry lookup are "indeterminate" if the item was stackable, and we found more than one.
@@ -4649,6 +4849,14 @@ public interface LootFiltersConfig extends Config {
             position = 0
     )
     String general = "general";
+    @ConfigItem(
+            keyName = "chatPrefixColor",
+            name = "Chat prefix color",
+            description = "Color of the chat prefix used to identify messages from this plugin.",
+            section = general,
+            position = -3
+    )
+    default Color chatPrefixColor() { return Color.decode("#00ffff"); }
     String CONFIG_KEY_FETCH_DEFAULT_FILTERS = "fetchDefaultFilters";
     @ConfigItem(
             keyName = CONFIG_KEY_FETCH_DEFAULT_FILTERS,
@@ -4658,14 +4866,6 @@ public interface LootFiltersConfig extends Config {
             position = -2
     )
     default boolean fetchDefaultFilters() { return true; }
-    @ConfigItem(
-            keyName = "showUnmatchedItems",
-            name = "Show unmatched items",
-            description = "Give a default text overlay to items that don't match the active filter.",
-            section = general,
-            position = 1
-    )
-    default boolean showUnmatchedItems() { return true; }
     @ConfigItem(
             keyName = "ownershipFilter",
             name = "Ownership filter",
@@ -4825,7 +5025,7 @@ public interface LootFiltersConfig extends Config {
             name = "Highlight tiles",
             description = "Always highlight tiles, regardless of filter config.",
             section = displayOverrides,
-            position = 24
+            position = 26
     )
     default boolean highlightTiles() { return false; }
     @ConfigItem(
@@ -4882,6 +5082,32 @@ public interface LootFiltersConfig extends Config {
     )
     @Range(max = 32)
     default int overlayZOffset() { return 16; }
+    @ConfigItem(
+            keyName = "compactMode",
+            name = "Compact mode",
+            description = "Enable the \"compact\" overlay mode which renders icons instead of item names.<br>Certain display properties, such as the type of despawn timer, do not apply in compact mode.",
+            section = displayOverrides,
+            position = 100
+    )
+    default boolean compactMode() { return false; }
+    @Range(min = 22, max = 32)
+    @ConfigItem(
+            keyName = "compactRenderSize",
+            name = "Compact: icon height",
+            description = "Icon size for compact item rendering. Specifically, height in pixels, although it will sometimes adjust it slightly to preserve aspect ratio.",
+            section = displayOverrides,
+            position = 101
+    )
+    default int compactRenderSize() { return 26; }
+    @ConfigItem(
+            keyName = "compactRenderRowLength",
+            name = "Compact: row size",
+            description = "How many items to render per row for compact items.",
+            section = displayOverrides,
+            position = 102
+    )
+    @Range(min = 1, max = 128)
+    default int compactRenderRowLength() { return 4; }
 
     @ConfigSection(
             name = "Item lists",
@@ -4917,6 +5143,7 @@ public interface LootFiltersConfig extends Config {
             section = itemLists,
             position = 2
     )
+    @Alpha
     default Color highlightColor() { return Color.decode("#aa00ff"); }
     @ConfigItem(
             keyName = "highlightLootbeam",
@@ -4934,28 +5161,21 @@ public interface LootFiltersConfig extends Config {
             position = 4
     )
     default boolean highlightNotify() { return false; }
-
-    @ConfigSection(
-            name = "Advanced highlight display",
-            description = "Configure advanced item highlight display. Not all filter-based display properties are supported.",
-            position = 9
-    )
-    String hdd = "Highlight display";
-    @ConfigItem(position = 0, section = hdd,
+    @ConfigItem(position = 5, section = itemLists,
             keyName = "hdBackgroundColor", name = "Background", description = "")
     @Alpha default Color higlightBackgroundColor() { return null; }
-    @ConfigItem(position = 1, section = hdd,
+    @ConfigItem(position = 6, section = itemLists,
             keyName = "hdBorderColor", name = "Border", description = "")
-    @Alpha default Color highlightBorderColor() { return null; }
-    @ConfigItem(position = 2, section = hdd,
+    @Alpha default Color highlightBorderColor() { return Color.decode("#aa00ff"); }
+    @ConfigItem(position = 7, section = itemLists,
             keyName = "hdLootbeamColor", name = "Lootbeam", description = "")
     @Alpha default Color highlightLootbeamColor() { return null; }
-    @ConfigItem(position = 3, section = hdd,
+    @ConfigItem(position = 8, section = itemLists,
             keyName = "hdMenuTextColor", name = "Menu text", description = "")
     @Alpha default Color highlightMenuTextColor() { return null; }
-    @ConfigItem(position = 4, section = hdd, keyName = "hdMenuSort", name = "Menu sort priority", description = "")
+    @ConfigItem(position = 9, section = itemLists, keyName = "hdMenuSort", name = "Menu sort priority", description = "")
     default int highlightMenuSort() { return 0; }
-    @ConfigItem(position = 9, section = hdd,
+    @ConfigItem(position = 10, section = itemLists,
             keyName = "hdSound", name = "Sound", description = "Can be one of two types of values:<br><br>A number: play a game sound effect by ID<br>A string: play a custom audio file from .runelite/loot-filters/sounds, not all sound formats are supported")
     default String highlightSound() { return ""; }
 
@@ -4967,12 +5187,28 @@ public interface LootFiltersConfig extends Config {
     String itemValueRules = "itemValueRules";
     @ConfigItem(
             keyName = "itemValueRulesReadme",
-            name = "readme (hover over this)",
-            description = "Unlike the ground items plugin, item value rules are managed by your active loot filter.<br>Both of the default filters shipped with the plugin - FilterScape and Joe's filter - include item value tiers with thresholds similar to that of the ground items plugin.<br>You can configure both the value thresholds and display settings for these on https://filterscape.xyz/.<br><br>(this toggle has no effect)",
+            name = "README (hover)",
+            description = "Unlike the ground items plugin, item value rules are managed by your active loot filter.<br>Both of the default filters shipped with the plugin - FilterScape and Joe's filter - include item value tiers with thresholds similar to that of the ground items plugin.<br>You can configure both the value thresholds and display settings for these on https://filterscape.xyz/.",
             section = itemValueRules,
             position = 0
     )
-    default boolean itemValueRulesReadme() { return false; }
+    void itemValueRulesReadme();
+
+    @ConfigSection(
+            name = "Advanced",
+            description = "Don't use these unless you know what you're doing.",
+            position = 999
+    )
+    String advanced = "advanced";
+    @ConfigItem(
+            keyName = "showAnalyzer",
+            name = "Menu: add Analyzers",
+            description = "Adds an \"Analyze\" right-click menu entry for each ground item that tells you how a given" +
+                    " item was evaluated against your plugin config and loot filter. Useful for debugging.",
+            section = advanced,
+            position = 0
+    )
+    default boolean showAnalyzer() { return false; }
 }
 
 package com.lootfilters;
