@@ -11,9 +11,34 @@ public interface LuckyClanBingoConfig extends Config
     @ConfigItem(
             keyName = "Webhook",
             name = "Webhook link",
-            description = "Discord webhook link"
+            description = "Discord webhook link or API proxy URL",
+            warning = "<html>If you are using a link here that is not a Discord Webhook,"
+                        + "<br>make sure you trust the source."
+                        + "<br>"
+                        + "<br>Any communication over the internet sends your IP address with it,"
+                        + "<br>meaning whoever hosts the server that this plugin is sending screenshots to"
+                        + "<br>will have your in-game name and IP address."
     ) default String webhookLink(){
         return "";
+    }
+    
+    @ConfigItem(
+            keyName = "apiKey",
+            name = "API Key",
+            description = "API key for authentication with proxy (Only leave empty if using discord webhook)",
+            secret = true
+    ) default String apiKey(){
+        return "";
+    }
+
+    @ConfigItem(
+            keyName = "testLink",
+            name = "Test Link",
+            description = "Test if your link is set correctly by checking this.",
+            position = 3
+    )
+    default boolean testLink(){
+        return false;
     }
 }
 
@@ -26,11 +51,9 @@ import javax.imageio.ImageIO;
 import javax.inject.Inject;
 
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.ChatMessageType;
-import net.runelite.api.Client;
-import net.runelite.api.ItemComposition;
+import net.runelite.api.*;
 import net.runelite.api.events.ChatMessage;
-import net.runelite.api.NpcID;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
@@ -64,10 +87,16 @@ public class LuckyClanBingoPlugin extends Plugin {
     private Client client;
 
     @Inject
+    private ClientThread clientThread;
+
+    @Inject
     private LuckyClanBingoConfig config;
 
     @Inject
     private ItemManager itemManager;
+
+    @Inject
+    private ConfigManager configManager;
 
     @Inject
     private DrawManager drawManager;
@@ -95,12 +124,8 @@ public class LuckyClanBingoPlugin extends Plugin {
 
         webhookLink = config.webhookLink();
 
-        try {
-            if (!loadItems())
-                log.error("[Lucky Clan Bingo] ERROR - could not load.");
-        } catch (Exception e) {
-            log.error(e.getMessage());
-        }
+        loadItems();
+
     }
 
     @Override
@@ -108,23 +133,33 @@ public class LuckyClanBingoPlugin extends Plugin {
         log.info("[Lucky Clan Bingo] shutting down.");
     }
 
-    private boolean loadItems() throws Exception {
+    private void loadItems() throws Exception {
 
-        try (InputStream s = getClass().getResourceAsStream("/items.txt");
-             InputStreamReader streamReader = new InputStreamReader(s, StandardCharsets.UTF_8);
-             BufferedReader reader = new BufferedReader(streamReader)) {
+        Request.Builder requestBuilder = new Request.Builder().url("https://raw.githubusercontent.com/EwwItsMike/LuckyClanBingo/refs/heads/master/src/main/resources/items.txt");
 
-            for (String line; (line = reader.readLine()) != null; ) {
-                if (line.isEmpty() || line.charAt(0) == '#')
-                    continue;
-                items.add(line.toLowerCase(Locale.ROOT).trim());
+        okHttpClient.newCall(requestBuilder.get().build()).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                log.error("Could not load items list from Github.");
             }
 
-            return true;
-        } catch (Exception e) {
-            log.error("[Lucky Clan Bingo] ERROR - could not open items list.\n {}", e.getMessage());
-        }
-        return false;
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (response.isSuccessful()){
+                    BufferedReader reader = new BufferedReader(response.body().charStream());
+                    for (String line; (line = reader.readLine()) != null; ){
+                        if (line.isEmpty() || line.charAt(0) == '#')
+                            continue;
+                        items.add(line.toLowerCase(Locale.ROOT).trim());
+                        log.warn(line);
+                    }
+
+                    log.info("Successfully loaded items list.");
+
+                    response.close();
+                }
+            }
+        });
     }
 
     @Subscribe
@@ -134,6 +169,58 @@ public class LuckyClanBingoPlugin extends Plugin {
 
         log.info("[Lucky Clan Bingo] - Config changed -- updating Webhook link");
         webhookLink = config.webhookLink();
+
+        if (config.testLink()){
+            testLink();
+        }
+    }
+
+    private void testLink(){
+        if (config.webhookLink().isEmpty() || client.getGameState() != GameState.LOGGED_IN){
+            configManager.unsetConfiguration("LuckyClanBingo", "testLink");
+            return;
+        }
+
+        Request.Builder requestBuilder = new Request.Builder();
+        try {
+            requestBuilder.url(config.webhookLink());
+        }
+        catch (IllegalArgumentException e){
+            sendChatMessage("Plugin failed to connect to the specified link.");
+            return;
+        }
+
+        if (!config.apiKey().isEmpty()) {
+            requestBuilder.header("X-API-Key", config.apiKey());
+        }
+
+        Request request = requestBuilder.get().build();
+
+        okHttpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                sendChatMessage("Lucky Clan Bingo plugin failed to connect to the specified link.");
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (response.code() == 200){
+                    sendChatMessage("Lucky Clan Bingo plugin is successfully set up!");
+                    response.close();
+                }
+                else {
+                    sendChatMessage("Lucky Clan Bingo plugin could connect to the destination, but it responded with an error.");
+                    response.close();
+                }
+            }
+        });
+
+        // Set config checkmark back to False
+        configManager.unsetConfiguration("LuckyClanBingo", "testLink");
+    }
+
+    private void sendChatMessage(String message){
+        clientThread.invokeLater(() -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "Lucky", message, null));
     }
 
     @Subscribe
@@ -309,7 +396,14 @@ public class LuckyClanBingoPlugin extends Plugin {
                 continue;
             }
 
-            Request request = new Request.Builder().url(url).post(requestBody).build();
+            // If Api key provided, use it as header, if not then not
+            Request.Builder requestBuilder = new Request.Builder().url(url);
+
+            if (!config.apiKey().isEmpty()) {
+                requestBuilder.header("X-API-Key", config.apiKey());
+            }
+
+            Request request = requestBuilder.post(requestBody).build();
 
             okHttpClient.newCall(request).enqueue(new Callback() {
                 @Override
