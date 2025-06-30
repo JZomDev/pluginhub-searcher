@@ -1,0 +1,586 @@
+package com.zulrahloot;
+
+import java.awt.Color;
+import net.runelite.client.config.Alpha;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Range;
+
+@ConfigGroup("zulrahloot")
+public interface ZulrahLootLocatorConfig extends Config {
+  @ConfigItem(
+      keyName = "lootTileColor",
+      name = "Loot Tile Color",
+      description = "Color of the tile where loot is expected to appear")
+  @Alpha
+  default Color lootTileColor() {
+    return new Color(255, 255, 0, 100); // yellow
+  }
+
+  @Range(min = 0, max = 500)
+  @ConfigItem(
+      keyName = "hpThreshold",
+      name = "Zulrah HP Threshold",
+      description = "Show loot tile when Zulrah is at or below this HP (0-500)")
+  default int hpThreshold() {
+    return 0;
+  }
+}
+
+package com.zulrahloot;
+
+import java.awt.BasicStroke;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.Polygon;
+import javax.inject.Inject;
+import net.runelite.api.Client;
+import net.runelite.api.Perspective;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayUtil;
+
+public class ZulrahLootLocatorOverlay extends Overlay {
+  private final Client client;
+  private final ZulrahLootLocatorPlugin plugin;
+  private final ZulrahLootLocatorConfig config;
+
+  @Inject
+  public ZulrahLootLocatorOverlay(
+      Client client, ZulrahLootLocatorPlugin plugin, ZulrahLootLocatorConfig config) {
+    this.client = client;
+    this.plugin = plugin;
+    this.config = config;
+
+    setPosition(OverlayPosition.DYNAMIC);
+    setLayer(OverlayLayer.ABOVE_SCENE);
+  }
+
+  @Override
+  public Dimension render(Graphics2D graphics) {
+    if (!shouldRender()) {
+      return null;
+    }
+
+    WorldPoint lootTile = plugin.getCurrentLootTile();
+    if (lootTile == null || client.getPlane() != lootTile.getPlane()) {
+      return null;
+    }
+
+    LocalPoint localPoint = LocalPoint.fromWorld(client, lootTile);
+    if (localPoint == null) {
+      return null;
+    }
+
+    Polygon poly = Perspective.getCanvasTilePoly(client, localPoint);
+    if (poly == null) {
+      return null;
+    }
+
+    Color baseColor = config.lootTileColor();
+    int baseAlpha = baseColor.getAlpha();
+
+    int finalAlpha = baseAlpha;
+
+    if (plugin.isZulrahDying()) {
+      int clientTicksElapsed = client.getGameCycle() - plugin.getFadeStartClientTick();
+      int fadeClientTicks = ZulrahLootLocatorPlugin.ZULRAH_DEATH_TICKS * 30;
+      if (clientTicksElapsed < fadeClientTicks) {
+        float fadeRatio = 1f - (clientTicksElapsed / (float) fadeClientTicks);
+        finalAlpha = Math.round(baseAlpha * fadeRatio);
+      } else {
+        return null; // Fully faded out
+      }
+    }
+
+    Color borderColor =
+        new Color(baseColor.getRed(), baseColor.getGreen(), baseColor.getBlue(), finalAlpha);
+    Color fillColor =
+        new Color(baseColor.getRed(), baseColor.getGreen(), baseColor.getBlue(), finalAlpha);
+
+    OverlayUtil.renderPolygon(graphics, poly, borderColor, fillColor, new BasicStroke(2));
+
+    return null;
+  }
+
+  private boolean shouldRender() {
+    boolean zulrahUnderThreshold =
+        ((float) plugin.getLastZulrahHealthRatio() / (float) plugin.getLastZulrahHealthScale())
+                * ZulrahLootLocatorPlugin.ZULRAH_MAX_HP
+            <= config.hpThreshold();
+
+    return plugin.isZulrahDying() || zulrahUnderThreshold;
+  }
+}
+
+package com.zulrahloot;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.CollisionData;
+import net.runelite.api.CollisionDataFlag;
+import net.runelite.api.NPC;
+import net.runelite.api.WorldView;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.AnimationChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.NpcSpawned;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+
+@Slf4j
+@PluginDescriptor(
+    name = "Zulrah Loot Locator",
+    description = "Highlight where Zulrah loot will spawn",
+    tags = {"highlight", "overlay", "zulrah", "loot"})
+public class ZulrahLootLocatorPlugin extends Plugin {
+  @Inject private Client client;
+
+  @Getter private NPC zulrah = null;
+  private int[][] collisionMap = null;
+  private WorldPoint playerLocation = null;
+  @Getter private int lastZulrahHealthRatio = -1;
+  @Getter private int lastZulrahHealthScale = -1;
+  public static final int ZULRAH_DEATH_ANIM = 5804;
+  public static final int ZULRAH_DEATH_TICKS = 7;
+  public static final int ZULRAH_MAX_HP = 500;
+  public static final String ZULRAH_NAME = "Zulrah";
+
+  @Inject private ZulrahLootLocatorOverlay lootTileOverlay;
+  @Inject private net.runelite.client.ui.overlay.OverlayManager overlayManager;
+  @Getter private WorldPoint currentLootTile;
+
+  private int tickCount = 0;
+  @Getter private int fadeStartClientTick = -1;
+  @Getter private boolean isZulrahDying = false;
+
+  @Override
+  protected void startUp() throws Exception {
+    overlayManager.add(lootTileOverlay);
+    log.info("ZulrahLootLocator Started");
+  }
+
+  @Override
+  protected void shutDown() throws Exception {
+    overlayManager.remove(lootTileOverlay);
+    log.info("ZulrahLootLocator Stopped");
+  }
+
+  @Subscribe
+  public void onGameTick(GameTick event) {
+    playerLocation = client.getLocalPlayer().getWorldLocation();
+    if (zulrah == null || playerLocation == null || collisionMap == null) {
+      handleFade();
+      return;
+    }
+
+    WorldView wv = client.getTopLevelWorldView();
+    zulrah = wv.npcs().byIndex(zulrah.getIndex());
+    if (zulrah == null) {
+      // Zulrah finished dying
+      return;
+    }
+
+    // Zulrah is alive
+    int baseX = client.getTopLevelWorldView().getBaseX();
+    int baseY = client.getTopLevelWorldView().getBaseY();
+    WorldPoint zulrahSW = zulrah.getWorldLocation();
+    currentLootTile =
+        LootPlacement.getLootDestinationTile(zulrahSW, playerLocation, collisionMap, baseX, baseY);
+
+    if (zulrah.getHealthRatio() > -1) {
+      lastZulrahHealthRatio = zulrah.getHealthRatio();
+    }
+    if (zulrah.getHealthScale() > -1) {
+      lastZulrahHealthScale = zulrah.getHealthScale();
+    }
+
+    // Cancel fade if it was active
+    isZulrahDying = false;
+    fadeStartClientTick = -1;
+  }
+
+  @Subscribe
+  public void onNpcSpawned(NpcSpawned npcSpawned) {
+    final NPC npc = npcSpawned.getNpc();
+    final String npcName = npc.getName();
+
+    if (npcName == null) {
+      return;
+    }
+
+    if (npcName.equals(ZULRAH_NAME)) {
+      zulrah = npc;
+      collisionMap = getCollisionMap();
+    }
+  }
+
+  private void handleFade() {
+    if (isZulrahDying) {
+      tickCount++;
+
+      if (tickCount >= ZULRAH_DEATH_TICKS) {
+        currentLootTile = null;
+        isZulrahDying = false;
+        tickCount = 0;
+      }
+    }
+  }
+
+  public int[][] getCollisionMap() {
+    CollisionData collisions = client.getTopLevelWorldView().getCollisionMaps()[0];
+    int[][] originalFlags = collisions.getFlags();
+
+    int[][] flags = new int[originalFlags.length][];
+    for (int x = 0; x < originalFlags.length; x++) {
+      flags[x] = originalFlags[x].clone();
+    }
+
+    /* From Mod Ash:
+     *
+     * When Zulrah dies, it wipes any poison cloud sites in case there's a cloud there. It does this by spawning invisible scenery pieces on their SW corners. The invisible scenery is only meant to be spawned for 1 tick, but the game engine's behaviour has changed in the last year or so regarding scenery spawned temporarily in instances, and what happens when the spawn expires. That'd probably account for it.
+     */
+    int[][] invisibleWallCoords = {
+      {52, 52},
+      {56, 55},
+      {56, 58},
+      {56, 61},
+      {46, 56},
+      {46, 59}
+    };
+
+    for (int[] coord : invisibleWallCoords) {
+      int x = coord[0];
+      int y = coord[1];
+      if (x >= 0 && x < flags.length && y >= 0 && y < flags[x].length) {
+        flags[x][y] |= CollisionDataFlag.BLOCK_MOVEMENT_FULL;
+      }
+    }
+
+    return flags;
+  }
+
+  @Subscribe
+  public void onAnimationChanged(AnimationChanged event) {
+    if (event.getActor().getAnimation() == ZULRAH_DEATH_ANIM) {
+      isZulrahDying = true;
+      fadeStartClientTick = client.getGameCycle();
+      zulrah = null;
+      lastZulrahHealthRatio = -1;
+      lastZulrahHealthScale = -1;
+    }
+  }
+
+  @Provides
+  ZulrahLootLocatorConfig provideConfig(ConfigManager configManager) {
+    return configManager.getConfig(ZulrahLootLocatorConfig.class);
+  }
+}
+
+package com.zulrahloot;
+
+import net.runelite.api.CollisionDataFlag;
+import net.runelite.api.coords.WorldPoint;
+
+public class LootPlacement {
+
+  public enum LootDirection {
+    DIAGONAL,
+    CARDINAL
+  }
+
+  public enum AbsoluteDirection {
+    NORTH,
+    SOUTH,
+    EAST,
+    WEST,
+    NORTHEAST,
+    NORTHWEST,
+    SOUTHEAST,
+    SOUTHWEST
+  }
+
+  public static LootDirection getLootDirection(int dx, int dy) {
+    int absDx = Math.abs(dx);
+    int absDy = Math.abs(dy);
+
+    if (absDx == 2 * absDy || absDy == 2 * absDx) {
+      // tie breaker case
+      if (dx < 0 && absDx < absDy) {
+        // west case
+        return LootDirection.CARDINAL;
+      } else if (dx > 0 && absDx > absDy) {
+        // east case
+        return LootDirection.CARDINAL;
+      } else {
+        return LootDirection.DIAGONAL;
+      }
+    } else if (absDx > 2 * absDy || absDy > 2 * absDx) {
+      // one axis delta is clearly dominant by more than 2x
+      return LootDirection.CARDINAL;
+    } else {
+      return LootDirection.DIAGONAL;
+    }
+  }
+
+  public static AbsoluteDirection resolveLootDirection(int dx, int dy, LootDirection direction) {
+    if (direction == LootDirection.CARDINAL) {
+      if (Math.abs(dx) > Math.abs(dy)) {
+        return dx > 0 ? AbsoluteDirection.EAST : AbsoluteDirection.WEST;
+      } else {
+        return dy > 0 ? AbsoluteDirection.NORTH : AbsoluteDirection.SOUTH;
+      }
+    } else { // DIAGONAL
+      if (dx > 0 && dy > 0) return AbsoluteDirection.NORTHEAST;
+      if (dx < 0 && dy > 0) return AbsoluteDirection.NORTHWEST;
+      if (dx > 0 && dy < 0) return AbsoluteDirection.SOUTHEAST;
+      return AbsoluteDirection.SOUTHWEST;
+    }
+  }
+
+  public static WorldPoint getLootDestinationTile(
+      WorldPoint zulrah, WorldPoint player, int[][] collisionMap, int baseX, int baseY) {
+    // Use Zulrah's center tile
+    int zulrahX = zulrah.getX() + 2;
+    int zulrahY = zulrah.getY() + 2;
+
+    int dx = zulrahX - player.getX();
+    int dy = zulrahY - player.getY();
+
+    LootDirection lootDirection = LootPlacement.getLootDirection(dx, dy);
+    AbsoluteDirection absoluteDirection = LootPlacement.resolveLootDirection(dx, dy, lootDirection);
+
+    int currX = player.getX() - baseX;
+    int currY = player.getY() - baseY;
+    int lastValidDiagonalX = currX;
+    int lastValidDiagonalY = currY;
+
+    int maxSteps = 20;
+
+    if ((collisionMap[currX][currY] & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0) {
+      return new WorldPoint(currX + baseX, currY + baseY, player.getPlane());
+    }
+
+    int stepX = 0;
+    int stepY = 0;
+
+    switch (absoluteDirection) {
+      case NORTH:
+        stepY = 1;
+        break;
+      case SOUTH:
+        stepY = -1;
+        break;
+      case EAST:
+        stepX = 1;
+        break;
+      case WEST:
+        stepX = -1;
+        break;
+      case NORTHEAST:
+        stepX = 1;
+        stepY = 1;
+        break;
+      case NORTHWEST:
+        stepX = -1;
+        stepY = 1;
+        break;
+      case SOUTHEAST:
+        stepX = 1;
+        stepY = -1;
+        break;
+      case SOUTHWEST:
+        stepX = -1;
+        stepY = -1;
+        break;
+    }
+
+    if (lootDirection == LootDirection.CARDINAL) {
+      for (int i = 0; i < maxSteps; i++) {
+        currX += stepX;
+        currY += stepY;
+
+        if (currX < 0
+            || currY < 0
+            || currX >= collisionMap.length
+            || currY >= collisionMap[0].length) {
+          break;
+        }
+
+        int flag = collisionMap[currX][currY];
+        if ((flag & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0) {
+          currX -= stepX;
+          currY -= stepY;
+          break;
+        }
+      }
+      return new WorldPoint(currX + baseX, currY + baseY, player.getPlane());
+    } else {
+      // Diagonal staircase pattern: start with N/S
+      for (int i = 0; i < maxSteps; i++) {
+        // Step in Y (N/S)
+        currY += stepY;
+        if (currX < 0
+            || currY < 0
+            || currX >= collisionMap.length
+            || currY >= collisionMap[0].length
+            || (collisionMap[currX][currY] & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0) {
+          break;
+        }
+
+        // Step in X (E/W)
+        currX += stepX;
+        if (currX < 0
+            || currY < 0
+            || currX >= collisionMap.length
+            || currY >= collisionMap[0].length
+            || (collisionMap[currX][currY] & CollisionDataFlag.BLOCK_MOVEMENT_FULL) != 0) {
+          break;
+        }
+
+        lastValidDiagonalX = currX;
+        lastValidDiagonalY = currY;
+      }
+
+      return new WorldPoint(
+          lastValidDiagonalX + baseX, lastValidDiagonalY + baseY, player.getPlane());
+    }
+  }
+}
+
+package com.zulrahloot;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+import com.zulrahloot.LootPlacement.AbsoluteDirection;
+import com.zulrahloot.LootPlacement.LootDirection;
+import org.junit.jupiter.api.Test;
+
+public class LootPlacementTest {
+
+  @Test
+  public void testTieBreakerCases() {
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(-4, 8), "-4, 8 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL,
+        LootPlacement.getLootDirection(-4, -8),
+        "-4, -8 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(8, 4), "8, 4 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(8, -4), "8, -4 should be CARDINAL");
+
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(-8, 4), "-8, 4 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL,
+        LootPlacement.getLootDirection(-8, -4),
+        "-8, -4 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(4, 8), "4, 8 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(4, -8), "4, -8 should be DIAGONAL");
+  }
+
+  @Test
+  public void testClearlyDominantAxisCases() {
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(9, 4), "9, 4 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(9, -4), "9, -4 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(-9, 4), "-9, 4 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL,
+        LootPlacement.getLootDirection(-9, -4),
+        "-9, -4 should be CARDINAL");
+
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(4, 9), "4, 9 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(4, -9), "4, -9 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL, LootPlacement.getLootDirection(-4, 9), "-4, 9 should be CARDINAL");
+    assertEquals(
+        LootDirection.CARDINAL,
+        LootPlacement.getLootDirection(-4, -9),
+        "-4, -9 should be CARDINAL");
+  }
+
+  @Test
+  public void testNoClearlyDominantAxisCases() {
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(7, 4), "7, 4 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(7, -4), "7, -4 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(-7, 4), "-7, 4 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL,
+        LootPlacement.getLootDirection(-7, -4),
+        "-7, -4 should be DIAGONAL");
+
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(4, 7), "4, 7 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(4, -7), "4, -7 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL, LootPlacement.getLootDirection(-4, 7), "-4, 7 should be DIAGONAL");
+    assertEquals(
+        LootDirection.DIAGONAL,
+        LootPlacement.getLootDirection(-4, -7),
+        "-4, -7 should be DIAGONAL");
+  }
+
+  @Test
+  public void testResolveLootDirection_Cardinal() {
+    assertEquals(
+        AbsoluteDirection.EAST, LootPlacement.resolveLootDirection(5, 0, LootDirection.CARDINAL));
+    assertEquals(
+        AbsoluteDirection.WEST, LootPlacement.resolveLootDirection(-5, 0, LootDirection.CARDINAL));
+    assertEquals(
+        AbsoluteDirection.NORTH, LootPlacement.resolveLootDirection(0, 5, LootDirection.CARDINAL));
+    assertEquals(
+        AbsoluteDirection.SOUTH, LootPlacement.resolveLootDirection(0, -5, LootDirection.CARDINAL));
+  }
+
+  @Test
+  public void testResolveLootDirection_Diagonal() {
+    assertEquals(
+        AbsoluteDirection.SOUTHWEST,
+        LootPlacement.resolveLootDirection(-4, -4, LootPlacement.LootDirection.DIAGONAL));
+    assertEquals(
+        AbsoluteDirection.SOUTHEAST,
+        LootPlacement.resolveLootDirection(4, -4, LootPlacement.LootDirection.DIAGONAL));
+    assertEquals(
+        AbsoluteDirection.NORTHWEST,
+        LootPlacement.resolveLootDirection(-4, 4, LootPlacement.LootDirection.DIAGONAL));
+    assertEquals(
+        AbsoluteDirection.NORTHEAST,
+        LootPlacement.resolveLootDirection(4, 4, LootPlacement.LootDirection.DIAGONAL));
+  }
+}
+
+package com.zulrahloot;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ZulrahLootLocatorPluginTest {
+  public static void main(String[] args) throws Exception {
+    ExternalPluginManager.loadBuiltin(ZulrahLootLocatorPlugin.class);
+    RuneLite.main(args);
+  }
+}
+
