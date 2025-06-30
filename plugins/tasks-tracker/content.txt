@@ -1303,6 +1303,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -1343,14 +1346,19 @@ public class TaskService
 	private final HashMap<String, int[]> sortedIndexes = new HashMap<>();
 	private HashMap<String, TaskType> _taskTypes = new HashMap<>();
 	private HashSet<Integer> currentTaskTypeVarps = new HashSet<>();
+	private final ExecutorService futureExecutor = Executors.newSingleThreadExecutor();
 
     public CompletableFuture<Boolean> setTaskType(String taskTypeJsonName) {
-        TaskType newTaskType = getTaskTypesByJsonName().get(taskTypeJsonName);
-        if (newTaskType == null) {
-            log.error("unsupported task type {}, falling back to COMBAT", taskTypeJsonName);
-            newTaskType = getTaskTypesByJsonName().get("COMBAT");
-        }
-        return this.setTaskType(newTaskType);
+        return getTaskTypesByJsonName().thenCompose(taskTypes ->
+        {
+            TaskType newTaskType = taskTypes.get(taskTypeJsonName);
+            if (newTaskType == null)
+            {
+                log.error("unsupported task type {}, falling back to COMBAT", taskTypeJsonName);
+                newTaskType = taskTypes.get("COMBAT");
+            }
+            return this.setTaskType(newTaskType);
+        });
     }
 
     private CompletableFuture<Boolean> loadAllTasksStructData(Collection<TaskFromStruct> tasks) {
@@ -1405,16 +1413,20 @@ public class TaskService
                 return CompletableFuture.completedFuture(false);
             }
 
-            try {
-                Collection<TaskDefinition> taskDefinitions = taskDataClient.getTaskDefinitions(currentTaskType.getTaskJsonName());
-                for (TaskDefinition definition : taskDefinitions) {
-                    TaskFromStruct task = new TaskFromStruct(currentTaskType, definition);
-                    newTasks.add(task);
+            CompletableFuture<Boolean> future = new CompletableFuture<>();
+            futureExecutor.submit(() -> {
+                try {
+                    Collection<TaskDefinition> taskDefinitions = taskDataClient.getTaskDefinitions(currentTaskType.getTaskJsonName());
+                    for (TaskDefinition definition : taskDefinitions) {
+                        TaskFromStruct task = new TaskFromStruct(currentTaskType, definition);
+                        newTasks.add(task);
+                    }
+                    loadAllTasksStructData(newTasks).thenApply(future::complete);
+                } catch (Exception e3) {
+                    future.completeExceptionally(e3);
                 }
-                return loadAllTasksStructData(newTasks);
-            } catch (Exception e3) {
-                return CompletableFuture.failedFuture(e3);
-            }
+            });
+            return future;
         }).thenCompose(areTasksLoaded -> {
             if (!areTasksLoaded) {
                 return CompletableFuture.completedFuture(false);
@@ -1493,22 +1505,34 @@ public class TaskService
 	 *
 	 * @return Hashmap of TaskType indexed by task type json name
 	 */
-	public HashMap<String, TaskType> getTaskTypesByJsonName()
+	public CompletableFuture<HashMap<String, TaskType>> getTaskTypesByJsonName()
 	{
 		if (_taskTypes.size() > 0)
 		{
-			return _taskTypes;
+			return CompletableFuture.completedFuture(_taskTypes);
 		}
 
 		try
 		{
-			_taskTypes = taskDataClient.getTaskTypes();
-			return _taskTypes;
+			CompletableFuture<HashMap<String, TaskType>> future = new CompletableFuture<>();
+			futureExecutor.submit(() ->
+			{
+				try
+				{
+					_taskTypes = taskDataClient.getTaskTypes();
+					future.complete(_taskTypes);
+				}
+				catch (Exception e) {
+					future.completeExceptionally(e);
+				}
+			});
+
+			return future;
 		}
 		catch (Exception ex)
 		{
 			log.error("Unable to populate task types from data client", ex);
-			return new HashMap<>();
+			return CompletableFuture.completedFuture(new HashMap<>());
 		}
 	}
 
@@ -2082,6 +2106,7 @@ public class TasksTrackerPlugin extends Plugin
 	@Override
 	protected void shutDown()
 	{
+		pluginPanel.hideLoggedInPanel();
 		pluginPanel = null;
 		taskService.clearTaskTypes();
 		clientToolbar.removeNavigation(navButton);
@@ -2408,7 +2433,6 @@ public class TasksTrackerPlugin extends Plugin
 					task.setTracked(false);
 				}
 				log.debug("process taskFromStruct {} ({}) {}", task.getStringParam("name"), task.getIntParam("id"), isTaskCompleted);
-				SwingUtilities.invokeLater(() -> pluginPanel.refresh(task));
 				future.complete(isTaskCompleted);
 			}
 			catch (Exception ex)
@@ -2441,7 +2465,19 @@ public class TasksTrackerPlugin extends Plugin
 		}
 
 		CompletableFuture<Void> allTasksFuture = CompletableFuture.allOf(taskFutures.toArray(new CompletableFuture[0]));
-		return allTasksFuture.thenApply(v -> true);
+		return allTasksFuture
+			.thenRun(() -> {
+				if (varpId != null)
+				{
+					for (TaskFromStruct task : tasks)
+					{
+						SwingUtilities.invokeLater(() -> pluginPanel.refresh(task));
+					}
+				} else {
+					SwingUtilities.invokeLater(() -> pluginPanel.refresh(null));
+				}
+			})
+			.thenApply(v -> true);
 	}
 
 	private String getCurrentTaskTypeExportJson()
@@ -3172,30 +3208,10 @@ public class LoggedInPanel extends JPanel
 		northPanel.setLayout(layout);
 		northPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
 
-		ArrayList<ComboItem<TaskType>> taskTypeItems = new ArrayList<>();
-		taskService.getTaskTypesByJsonName().forEach((taskTypeJsonName, taskType) -> taskTypeItems.add(new ComboItem(taskType, taskType.getName())));
-		ComboItem<TaskType>[] comboItemsArray = taskTypeItems.toArray(new ComboItem[0]);
-		taskTypeDropdown = new JComboBox<>(comboItemsArray);
+		taskTypeDropdown = new JComboBox<>();
 		taskTypeDropdown.setAlignmentX(LEFT_ALIGNMENT);
-
-        TaskType currentTaskType = taskService.getCurrentTaskType();
-        ComboItem<TaskType> currentTaskTypeComboItem = Arrays.stream(comboItemsArray)
-                .filter(item -> item.getValue().equals(currentTaskType))
-                .findFirst().orElseGet(() -> comboItemsArray[0]);
-        taskTypeDropdown.setSelectedItem(currentTaskTypeComboItem);
-        taskTypeDropdown.addActionListener(e -> {
-            TaskType taskType = taskTypeDropdown.getItemAt(taskTypeDropdown.getSelectedIndex()).getValue();
-            taskService.setTaskType(taskType).thenAccept(wasTaskTypeChanged -> {
-                if (wasTaskTypeChanged) {
-					SwingUtilities.invokeLater(() ->
-					{
-						redraw();
-						refresh(null);
-					});
-                }
-            });
-        });
-        taskTypeDropdown.setFocusable(false);
+		taskTypeDropdown.setFocusable(false);
+		initTaskTypeDropdownAsync();
 
 		// Wrapper for collapsible sub-filter menu
 		JPanel subFilterWrapper = new JPanel();
@@ -3386,6 +3402,35 @@ public class LoggedInPanel extends JPanel
 
 		collapseBtn.setText(countInclusive + " inclusive, "  + countExclusive + " exclusive filters");
 	}
+
+	private void initTaskTypeDropdownAsync() {
+		TaskType currentTaskType = taskService.getCurrentTaskType();
+		taskService.getTaskTypesByJsonName().thenAccept(taskTypes -> {
+			ArrayList<ComboItem<TaskType>> taskTypeItems = new ArrayList<>();
+			taskTypes.forEach((taskTypeJsonName, taskType) -> {
+				ComboItem<TaskType> item = new ComboItem<>(taskType, taskType.getName());
+				taskTypeItems.add(item);
+				taskTypeDropdown.addItem(item);
+			});
+
+			ComboItem<TaskType> currentTaskTypeComboItem = taskTypeItems.stream()
+					.filter(item -> item.getValue().equals(currentTaskType))
+					.findFirst().orElseGet(() -> taskTypeItems.get(0));
+			taskTypeDropdown.setSelectedItem(currentTaskTypeComboItem);
+			taskTypeDropdown.addActionListener(e -> {
+				TaskType taskType = taskTypeDropdown.getItemAt(taskTypeDropdown.getSelectedIndex()).getValue();
+				taskService.setTaskType(taskType).thenAccept(wasTaskTypeChanged ->{
+					if (wasTaskTypeChanged) {
+						SwingUtilities.invokeLater(() ->
+						{
+							redraw();
+							refresh(null);
+						});
+					}
+				});
+			});
+		});
+	}
 }
 package net.reldo.taskstracker.panel;
 
@@ -3410,7 +3455,7 @@ public class TasksTrackerPluginPanel extends PluginPanel
 
 	public TaskListPanel taskListPanel;
 
-	private boolean loggedIn = false;
+	private boolean loggedInPanelVisible = false;
 	private TaskService taskService;
 
 	public TasksTrackerPluginPanel(TasksTrackerPlugin plugin, TasksTrackerConfig config, SpriteManager spriteManager, TaskService taskService)
@@ -3439,7 +3484,7 @@ public class TasksTrackerPluginPanel extends PluginPanel
 
 	public void redraw()
 	{
-		if (loggedIn)
+		if (loggedInPanelVisible)
 		{
 			loggedInPanel.redraw();
 		}
@@ -3447,7 +3492,7 @@ public class TasksTrackerPluginPanel extends PluginPanel
 
 	public void refresh(TaskFromStruct task)
 	{
-		if (loggedIn)
+		if (loggedInPanelVisible)
 		{
 			loggedInPanel.refresh(task);
 		}
@@ -3457,29 +3502,48 @@ public class TasksTrackerPluginPanel extends PluginPanel
 	{
 		if(SwingUtilities.isEventDispatchThread())
 		{
-            if (loggedIn != this.loggedIn)
-            {
-                if (loggedIn)
-                {
-                    loggedOutPanel.setVisible(false);
-                    loggedInPanel.setVisible(true);
-                }
-                else
-                {
-                    loggedInPanel.setVisible(false);
-                    loggedOutPanel.setVisible(true);
-                }
-
-                validate();
-                repaint();
-            }
-            this.loggedIn = loggedIn;
+			updateVisiblePanel(loggedIn);
 		}
 		else
 		{
 			log.error("Failed to update loggedIn state - not event dispatch thread.");
 		}
 	}
+
+	public void hideLoggedInPanel()
+	{
+		if(SwingUtilities.isEventDispatchThread())
+		{
+			updateVisiblePanel(false);
+		}
+		else
+		{
+			log.error("Failed to update logged in panel visibility - not event dispatch thread.");
+		}
+	}
+
+	private void updateVisiblePanel(boolean loggedInPanelVisible)
+	{
+		if (loggedInPanelVisible != this.loggedInPanelVisible)
+		{
+			if (loggedInPanelVisible)
+			{
+				loggedOutPanel.setVisible(false);
+				loggedInPanel.setVisible(true);
+			}
+			else
+			{
+				loggedInPanel.setVisible(false);
+				loggedOutPanel.setVisible(true);
+			}
+
+			validate();
+			repaint();
+		}
+		this.loggedInPanelVisible = loggedInPanelVisible;
+	}
+
+
 }
 package net.reldo.taskstracker.panel;
 
