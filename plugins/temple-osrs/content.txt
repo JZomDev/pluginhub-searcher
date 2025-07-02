@@ -228,22 +228,44 @@ public class TempleSyncData
 
 package com.templeosrs.util.api;
 
+import com.google.gson.annotations.SerializedName;
+import lombok.Value;
+
+@Value
+public class APIError {
+    @SerializedName("Code")
+    int code;
+
+    @SerializedName("Message")
+    String message;
+
+    public String toString() {
+        return "HTTP " + code + ": " + message;
+    }
+}
+package com.templeosrs.util.api;
+
 import com.google.gson.Gson;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.callback.ClientThread;
 import okhttp3.*;
 import org.jetbrains.annotations.NotNull;
 
 import javax.inject.Inject;
 
-import java.util.concurrent.TimeUnit;
+import java.io.IOException;
+import java.util.Objects;
+import java.util.concurrent.ScheduledExecutorService;
 
 import static net.runelite.http.api.RuneLiteAPI.JSON;
 
+@Slf4j
 public class RequestManager {
     @Inject
-    Gson gson;
+    OkHttpClient okHttpClient;
 
     @Inject
-    OkHttpClient okHttpClient;
+    private Gson gson;
 
     protected final String scheme = "https";
 
@@ -259,53 +281,114 @@ public class RequestManager {
     }
 
     /**
-     * Initiates a request with no timeout.
+     * Initiates a synchronous request with no timeout.
      * @param request The request to be sent.
-     * @param callback The callback to handle the response.
+     * @return The request data.
+     * @throws IOException The request error.
      */
-    private void doRequest(Request request, Callback callback)
-    {
-        okHttpClient.newCall(request).enqueue(callback);
+    private String doRequest(Request request) throws IOException {
+        try (Response response = okHttpClient.newCall(request).execute()) {
+            if (!response.isSuccessful()) {
+                throw new IOException(String.format("HTTP error fetching %s: %s", request.url(), response.code()));
+            }
+
+            String body = Objects.requireNonNull(response.body()).string();
+
+            if (body.isEmpty()) {
+                throw new IOException(String.format("Empty response body was returned from %s", request.url()));
+            }
+
+            return body;
+        }
     }
 
     /**
-     * Initiates a request with the given timeout.
-     * @param request The request to be sent.
-     * @param callback The callback to handle the response.
-     */
-    private void doRequest(Request request, Callback callback, long timeout)
-    {
-        Call call = okHttpClient.newCall(request);
-        call.timeout().timeout(timeout, TimeUnit.SECONDS);
-        call.enqueue(callback);
-    }
-
-    /**
-     * Initiates a GET request.
+     * Initiates a synchronous GET request.
      * @param url The URL to send the request to.
-     * @param callback The callback to handle the response.
      */
-    protected void get(@NotNull HttpUrl url, Callback callback)
-    {
+    protected String get(@NotNull HttpUrl url) throws IOException {
         final Request request = buildRequest(url).get().build();
 
-        doRequest(request, callback);
+        return doRequest(request);
     }
 
     /**
-     * Initiates a POST request with the given data.
-     * @param url The URL to send the request to.
+     * Initiates a synchronous POST request with the given data.
+     *
+     * @param url  The URL to send the request to.
      * @param data The data to be sent in the request body.
-     * @param callback The callback to handle the response.
      */
-    protected void post(@NotNull HttpUrl url, @NotNull Object data, Callback callback)
-    {
+    protected String post(@NotNull HttpUrl url, @NotNull Object data) throws IOException {
         final Request request = buildRequest(url)
-            .post(RequestBody.create(JSON, gson.toJson(data)))
-            .build();
+                .post(RequestBody.create(JSON, gson.toJson(data)))
+                .build();
 
-        doRequest(request, callback, 3);
-    };
+        return doRequest(request);
+    }
+}
+
+package com.templeosrs.util.api;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public class QuadraticBackoffStrategy {
+    @Getter
+    @Setter
+    private boolean submitting = false;
+
+    private int requestAttemptCount = 0;
+    private int cycleCount = 0;
+
+    public void reset()
+    {
+        submitting = false;
+        requestAttemptCount = 0;
+        cycleCount = 0;
+    }
+
+    public void beginNewRequestAttempt()
+    {
+        requestAttemptCount++;
+    }
+
+    public void finishCycle()
+    {
+        submitting = false;
+    }
+
+    public boolean shouldSkipRequest()
+    {
+        cycleCount++;
+
+        final boolean shouldSkip = Math.pow((int) Math.sqrt(cycleCount), 2) != cycleCount;
+
+        if (shouldSkip) {
+            setSubmitting(false);
+
+            log.debug("⚠️ Skipping request due to backoff configuration");
+        } else {
+            beginNewRequestAttempt();
+        }
+
+        return shouldSkip;
+    }
+
+    public boolean isRequestLimitReached()
+    {
+        int maxRetries = 3;
+        final boolean isRequestLimitReached = requestAttemptCount >= maxRetries;
+
+        if (isRequestLimitReached) {
+            log.error("❌ Maximum number of retries reached; aborting request!");
+
+            reset();
+        }
+
+        return isRequestLimitReached;
+    }
 }
 
 package com.templeosrs.util;
@@ -1096,144 +1179,429 @@ public enum CurrentTopRanges
 
 package com.templeosrs.util.collections;
 
+import com.google.gson.Gson;
+import com.templeosrs.util.api.APIError;
 import com.templeosrs.util.api.RequestManager;
 import com.templeosrs.util.collections.autosync.PlayerDataSync;
-import okhttp3.Callback;
-import okhttp3.HttpUrl;
+import com.templeosrs.util.collections.data.PlayerDataSubmission;
+import com.templeosrs.util.collections.data.PlayerInfoResponse;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
 import org.jetbrains.annotations.NotNull;
 
+import javax.inject.Inject;
+import java.io.IOException;
+
+@Slf4j
 public class CollectionLogRequestManager extends RequestManager {
+    @Inject
+    private Gson gson;
+
     /**
      * Uploads newly obtained collection log items to the server.
      * Used by the auto-sync feature to automatically synchronise the collection log.
-     * 
+     *
      * @param data The data to be uploaded.
-     * @param callback The callback to handle the response.
+     * @return The API response data
      */
-    public void uploadObtainedCollectionLogItems(@NotNull PlayerDataSync data, Callback callback)
-    {
+    public String uploadObtainedCollectionLogItems(@NotNull PlayerDataSync data) throws IOException {
         final HttpUrl url = new HttpUrl.Builder()
                 .scheme(scheme)
                 .host(host)
                 .addPathSegments("api/collection-log/sync_new_collections.php")
                 .build();
 
-        post(url, data, callback);
+        return post(url, data);
     }
 
     /**
      * Uploads the full collection log to the server.
      * Triggered by the Collection Log Sync button.
-     * 
+     *
      * @param data The data to be uploaded.
-     * @param callback The callback to handle the response.
      */
-    public void uploadFullCollectionLog(@NotNull PlayerDataSubmission data, Callback callback)
-    {
+    public void uploadFullCollectionLog(@NotNull PlayerDataSubmission data) throws IOException {
         final HttpUrl url = new HttpUrl.Builder()
                 .scheme(scheme)
                 .host(host)
                 .addPathSegments("api/collection-log/sync_collection.php")
                 .build();
 
-        post(url, data, callback);
+        post(url, data);
     }
 
     /**
-     * Retrieves the collection log manifest from the server.
-     * The manifest contains information that maps the collection log items to their respective IDs/varbits.
-     * 
-     * @param callback The callback to handle the response.
+     * Retrieves player info from the Player Info endpoint
+     *
+     * @param username The username to check
+     * @link <a href="https://templeosrs.com/api_doc.php#Player_Information">Player Info API</a>
      */
-    public void getCollectionLogManifest(Callback callback)
+    @NotNull
+    public PlayerInfoResponse.Data getPlayerInfo(@NotNull String username) throws IOException, NullPointerException {
+        final HttpUrl url = new HttpUrl.Builder()
+                .scheme(scheme)
+                .host(host)
+                .addPathSegments("api/player_info.php")
+                .addQueryParameter("player", username)
+                .addQueryParameter("cloginfo", "1")
+                .addQueryParameter("formattedrsn", "1")
+                .build();
+
+
+        String response = get(url);
+
+        PlayerInfoResponse playerInfoResponse = gson.fromJson(response, PlayerInfoResponse.class);
+        PlayerInfoResponse.Data data = playerInfoResponse.getData();
+        APIError error = playerInfoResponse.getError();
+
+        if (error != null) {
+            if (error.getCode() == 402) {
+                throw new NullPointerException("Player has no TempleOSRS profile");
+            }
+
+            throw new IOException(String.valueOf(error));
+        }
+
+        if (data != null) {
+            return data;
+        }
+
+        throw new IOException("Unexpected response format: " + response);
+    }
+
+    /**
+     * Retrieves the given player's full collection log
+     * @param username The username to query
+     * @return The collection log data
+     * @link <a href="https://templeosrs.com/api_doc.php#Player_Collection_Log">Player Collection Log API</a>
+     */
+    public String getPlayerCollectionLog(@NotNull String username)
     {
         final HttpUrl url = new HttpUrl.Builder()
                 .scheme(scheme)
                 .host(host)
-                .addPathSegments("collection-log/manifest.json")
+                .addPathSegments("api/collection-log/player_collection_log.php")
+                .addQueryParameter("player", username)
+                .addQueryParameter("categories", "all")
+                .addQueryParameter("includenames", "1")
+                .addQueryParameter("onlyitems", "1")
                 .build();
 
-        get(url, callback);
+        try {
+            String response = get(url);
+
+            if (response.contains("\"Code\":402") && response.contains("has not synced")) {
+                return "error:unsynced";
+            }
+
+            return response;
+        } catch (Exception e) {
+            log.error("❌ Exception while fetching log for {}: {}", username, e.getMessage());
+
+            return null;
+        }
     }
 }
 
-/*
- * Copyright (c) 2025, andmcadams
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+package com.templeosrs.util.collections.utils;
 
-package com.templeosrs.util.collections;
+public class PlayerNameUtils {
+    /**
+     * Normalises the player's name by removing Ironman prefixes and formatting.
+     * @param playerName The player name to normalise.
+     * @return The normalised player name.
+     */
+    public static String normalizePlayerName(String playerName) {
+        if (playerName == null) return "";
 
-import lombok.Data;
+        // Replace non-breaking space and other unusual whitespace with normal space
+        String normalizedName = playerName.replace('\u00A0', ' ')
+                .replaceAll("\\s+", " ")
+                .trim();
 
-import java.util.ArrayList;
+        // Remove known Ironman prefixes
+        String[] ironmanPrefixes = {"Ultimate Ironman", "Hardcore Ironman", "Ironman"};
+        for (String prefix : ironmanPrefixes) {
+            if (normalizedName.startsWith(prefix)) {
+                normalizedName = normalizedName.replaceFirst(prefix, "").trim();
+                break;
+            }
+        }
 
-@Data
-public class Manifest
-{
-    final int version = 1;
-    public final int[] varbits = new int[0];
-    public final int[] varps = new int[0];
-    public final ArrayList<Integer> collections = new ArrayList<>();
+        // Remove <img=xx> tags
+        normalizedName = normalizedName.replaceAll("<img=\\d+>", "").trim();
+
+        // Replace spaces with underscores and lowercase
+        normalizedName = normalizedName.replace(' ', '_').toLowerCase();
+
+        return normalizedName;
+    }
 }
-/*
- * Copyright (c) 2025, andmcadams
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
+package com.templeosrs.util.collections.utils;
 
-package com.templeosrs.util.collections;
+import lombok.Value;
 
-import lombok.AllArgsConstructor;
-import lombok.Data;
+import java.util.Map;
+import java.util.Set;
 
-@Data
-@AllArgsConstructor
-public class PlayerDataSubmission
-{
-    private String username;
-    private String profile;
-    private long playerHash;
-    private PlayerData data;
+@Value
+public class CollectionLogCacheData {
+    Set<Integer> itemIds;
+    Map<Integer, Set<Integer>> categoryItems;
+    Map<String, Integer> categoryStructIds;
+    Map<Integer, Set<String>> categorySlugs;
+}
+
+package com.templeosrs.util.collections.utils;
+
+import com.templeosrs.util.collections.CollectionLogCategorySlug;
+import com.templeosrs.util.collections.data.CollectionLogCategory;
+import java.util.Arrays;
+import java.util.LinkedHashSet;
+import net.runelite.api.gameval.ItemID;
+
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+public class CollectionLogCategoryUtils {
+    /**
+     * Category aliases to be used in the !col command. e.g. "!col kree"
+     */
+    public static final Map<String, CollectionLogCategorySlug> CATEGORY_ALIASES = Map.<String, CollectionLogCategorySlug>ofEntries(
+            // === Bosses ===
+            Map.entry("armadyl", CollectionLogCategorySlug.kreearra),
+            Map.entry("kree", CollectionLogCategorySlug.kreearra),
+            Map.entry("arma", CollectionLogCategorySlug.kreearra),
+            Map.entry("archaeologist", CollectionLogCategorySlug.crazy_archaeologist),
+            Map.entry("crazy", CollectionLogCategorySlug.crazy_archaeologist),
+            Map.entry("barrows", CollectionLogCategorySlug.barrows_chests),
+            Map.entry("artio", CollectionLogCategorySlug.callisto_and_artio),
+            Map.entry("callisto", CollectionLogCategorySlug.callisto_and_artio),
+            Map.entry("vetion", CollectionLogCategorySlug.vetion_and_calvarion),
+            Map.entry("calvarion", CollectionLogCategorySlug.vetion_and_calvarion),
+            Map.entry("calv", CollectionLogCategorySlug.vetion_and_calvarion),
+            Map.entry("vet", CollectionLogCategorySlug.vetion_and_calvarion),
+            Map.entry("corp", CollectionLogCategorySlug.corporeal_beast),
+            Map.entry("corporeal", CollectionLogCategorySlug.corporeal_beast),
+            Map.entry("dagannoth", CollectionLogCategorySlug.dagannoth_kings),
+            Map.entry("dk", CollectionLogCategorySlug.dagannoth_kings),
+            Map.entry("dks", CollectionLogCategorySlug.dagannoth_kings),
+            Map.entry("duke", CollectionLogCategorySlug.duke_sucellus),
+            Map.entry("sucellus", CollectionLogCategorySlug.duke_sucellus),
+            Map.entry("elemental", CollectionLogCategorySlug.chaos_elemental),
+            Map.entry("fanatic", CollectionLogCategorySlug.chaos_fanatic),
+            Map.entry("graardor", CollectionLogCategorySlug.general_graardor),
+            Map.entry("bandos", CollectionLogCategorySlug.general_graardor),
+            Map.entry("grotesque", CollectionLogCategorySlug.grotesque_guardians),
+            Map.entry("gg", CollectionLogCategorySlug.grotesque_guardians),
+            Map.entry("ggs", CollectionLogCategorySlug.grotesque_guardians),
+            Map.entry("hydra", CollectionLogCategorySlug.alchemical_hydra),
+            Map.entry("alchemical" , CollectionLogCategorySlug.alchemical_hydra),
+            Map.entry("kbd", CollectionLogCategorySlug.king_black_dragon),
+            Map.entry("kalphite", CollectionLogCategorySlug.kalphite_queen),
+            Map.entry("kril", CollectionLogCategorySlug.kril_tsutsaroth),
+            Map.entry("zammy", CollectionLogCategorySlug.kril_tsutsaroth),
+            Map.entry("zamorak", CollectionLogCategorySlug.kril_tsutsaroth),
+            Map.entry("leviathan", CollectionLogCategorySlug.the_leviathan),
+            Map.entry("levi", CollectionLogCategorySlug.the_leviathan),
+            Map.entry("mole", CollectionLogCategorySlug.giant_mole),
+            Map.entry("moons", CollectionLogCategorySlug.moons_of_peril),
+            Map.entry("muspah", CollectionLogCategorySlug.phantom_muspah),
+            Map.entry("nightmare", CollectionLogCategorySlug.the_nightmare),
+            Map.entry("phosani", CollectionLogCategorySlug.the_nightmare),
+            Map.entry("phn", CollectionLogCategorySlug.the_nightmare),
+            Map.entry("sire", CollectionLogCategorySlug.abyssal_sire),
+            Map.entry("spindel", CollectionLogCategorySlug.venenatis_and_spindel),
+            Map.entry("venenatis", CollectionLogCategorySlug.venenatis_and_spindel),
+            Map.entry("thermonuclear", CollectionLogCategorySlug.thermonuclear_smoke_devil),
+            Map.entry("thermy", CollectionLogCategorySlug.thermonuclear_smoke_devil),
+            Map.entry("titans", CollectionLogCategorySlug.royal_titans),
+            Map.entry("royal", CollectionLogCategorySlug.royal_titans),
+            Map.entry("rt", CollectionLogCategorySlug.royal_titans),
+            Map.entry("tormented", CollectionLogCategorySlug.tormented_demons),
+            Map.entry("tds", CollectionLogCategorySlug.tormented_demons),
+            Map.entry("whisperer", CollectionLogCategorySlug.the_whisperer),
+            Map.entry("whisp", CollectionLogCategorySlug.the_whisperer),
+            Map.entry("zilyana", CollectionLogCategorySlug.commander_zilyana),
+            Map.entry("sara", CollectionLogCategorySlug.commander_zilyana),
+            Map.entry("zily" , CollectionLogCategorySlug.commander_zilyana),
+            Map.entry("saradomin" , CollectionLogCategorySlug.commander_zilyana),
+            Map.entry("amox", CollectionLogCategorySlug.amoxliatl),
+            Map.entry("vork", CollectionLogCategorySlug.vorkath),
+            Map.entry("huey", CollectionLogCategorySlug.hueycoatl),
+            Map.entry("vard", CollectionLogCategorySlug.vardorvis),
+            Map.entry("zul", CollectionLogCategorySlug.zulrah),
+
+            // === Clue Scrolls ===
+            Map.entry("beginner_clue", CollectionLogCategorySlug.beginner_treasure_trails),
+            Map.entry("easy_clue", CollectionLogCategorySlug.easy_treasure_trails),
+            Map.entry("elite_clue", CollectionLogCategorySlug.elite_treasure_trails),
+            Map.entry("hard_clue", CollectionLogCategorySlug.hard_treasure_trails),
+            Map.entry("master_clue", CollectionLogCategorySlug.master_treasure_trails),
+            Map.entry("medium_clue", CollectionLogCategorySlug.medium_treasure_trails),
+            Map.entry("shared_clue", CollectionLogCategorySlug.shared_treasure_trail_rewards),
+            Map.entry("beginner", CollectionLogCategorySlug.beginner_treasure_trails),
+            Map.entry("easy", CollectionLogCategorySlug.easy_treasure_trails),
+            Map.entry("medium", CollectionLogCategorySlug.medium_treasure_trails),
+            Map.entry("hard", CollectionLogCategorySlug.hard_treasure_trails),
+            Map.entry("elite", CollectionLogCategorySlug.elite_treasure_trails),
+            Map.entry("master", CollectionLogCategorySlug.master_treasure_trails),
+            Map.entry("shared", CollectionLogCategorySlug.shared_treasure_trail_rewards),
+
+
+            // === Minigames & Activities ===
+            Map.entry("aerial", CollectionLogCategorySlug.aerial_fishing),
+            Map.entry("champions", CollectionLogCategorySlug.champions_challenge),
+            Map.entry("chompy", CollectionLogCategorySlug.chompy_bird_hunting),
+            Map.entry("creature", CollectionLogCategorySlug.creature_creation),
+            Map.entry("den", CollectionLogCategorySlug.rogues_den),
+            Map.entry("druids", CollectionLogCategorySlug.elder_chaos_druids),
+            Map.entry("events", CollectionLogCategorySlug.random_events),
+            Map.entry("experiment", CollectionLogCategorySlug.gloughs_experiments),
+            Map.entry("glough", CollectionLogCategorySlug.gloughs_experiments),
+            Map.entry("fossil", CollectionLogCategorySlug.fossil_island_notes),
+            Map.entry("gotr", CollectionLogCategorySlug.guardians_of_the_rift),
+            Map.entry("rift", CollectionLogCategorySlug.guardians_of_the_rift),
+            Map.entry("hunter", CollectionLogCategorySlug.hunter_guild),
+            Map.entry("lms", CollectionLogCategorySlug.last_man_standing),
+            Map.entry("mixology", CollectionLogCategorySlug.mastering_mixology),
+            Map.entry("mlm", CollectionLogCategorySlug.motherlode_mine),
+            Map.entry("monkey", CollectionLogCategorySlug.monkey_backpacks),
+            Map.entry("notes", CollectionLogCategorySlug.my_notes),
+            Map.entry("pest", CollectionLogCategorySlug.pest_control),
+            Map.entry("revs", CollectionLogCategorySlug.revenants),
+            Map.entry("rev", CollectionLogCategorySlug.revenants),
+            Map.entry("rooftop", CollectionLogCategorySlug.rooftop_agility),
+            Map.entry("sepulchre", CollectionLogCategorySlug.hallowed_sepulchre),
+            Map.entry("hs", CollectionLogCategorySlug.hallowed_sepulchre),
+            Map.entry("shades", CollectionLogCategorySlug.shades_of_mortton),
+            Map.entry("shayzien", CollectionLogCategorySlug.shayzien_armour),
+            Map.entry("stars", CollectionLogCategorySlug.shooting_stars),
+            Map.entry("trekking", CollectionLogCategorySlug.temple_trekking),
+            Map.entry("tithe", CollectionLogCategorySlug.tithe_farm),
+            Map.entry("brewing", CollectionLogCategorySlug.trouble_brewing),
+            Map.entry("trouble", CollectionLogCategorySlug.trouble_brewing),
+            Map.entry("tb", CollectionLogCategorySlug.trouble_brewing),
+            Map.entry("volcanic", CollectionLogCategorySlug.volcanic_mine),
+            Map.entry("wyrm", CollectionLogCategorySlug.colossal_wyrm_agility),
+            Map.entry("ba", CollectionLogCategorySlug.barbarian_assault),
+            Map.entry("assault", CollectionLogCategorySlug.barbarian_assault),
+            Map.entry("barbarian", CollectionLogCategorySlug.barbarian_assault),
+            Map.entry("brimhaven", CollectionLogCategorySlug.brimhaven_agility_arena),
+            Map.entry("trawler", CollectionLogCategorySlug.fishing_trawler),
+            Map.entry("wars", CollectionLogCategorySlug.castle_wars),
+
+            // === Miscellaneous ===
+            Map.entry("misc", CollectionLogCategorySlug.miscellaneous),
+            Map.entry("pets", CollectionLogCategorySlug.all_pets),
+            Map.entry("skilling", CollectionLogCategorySlug.skilling_pets),
+
+            // === Raids & Endgame ===
+            Map.entry("cg", CollectionLogCategorySlug.the_gauntlet),
+            Map.entry("gauntlet", CollectionLogCategorySlug.the_gauntlet),
+            Map.entry("colosseum", CollectionLogCategorySlug.fortis_colosseum),
+            Map.entry("colo", CollectionLogCategorySlug.fortis_colosseum),
+            Map.entry("cox", CollectionLogCategorySlug.chambers_of_xeric),
+            Map.entry("chambers", CollectionLogCategorySlug.chambers_of_xeric),
+            Map.entry("fightcaves", CollectionLogCategorySlug.the_fight_caves),
+            Map.entry("jad", CollectionLogCategorySlug.the_fight_caves),
+            Map.entry("foundry", CollectionLogCategorySlug.giants_foundry),
+            Map.entry("homes", CollectionLogCategorySlug.mahogany_homes),
+            Map.entry("mahogany", CollectionLogCategorySlug.mahogany_homes),
+            Map.entry("inferno", CollectionLogCategorySlug.the_inferno),
+            Map.entry("zuk", CollectionLogCategorySlug.the_inferno),
+            Map.entry("mta", CollectionLogCategorySlug.magic_training_arena),
+            Map.entry("restaurant", CollectionLogCategorySlug.gnome_restaurant),
+            Map.entry("toa", CollectionLogCategorySlug.tombs_of_amascut),
+            Map.entry("tombs", CollectionLogCategorySlug.tombs_of_amascut),
+            Map.entry("tob", CollectionLogCategorySlug.theatre_of_blood),
+            Map.entry("theatre", CollectionLogCategorySlug.theatre_of_blood)
+    );
+
+    /**
+     * Builds a list of alises grouped by their category slug,
+     * e.g. kreearra=[armadyl, kree, arma]
+     * Used to provide a list of aliases when using the help commands
+     */
+    public static final Map<String, Set<String>> INVERTED_ALIASES = CATEGORY_ALIASES
+            .entrySet()
+            .stream()
+            .collect(
+                Collectors.groupingBy(
+                    item -> item.getValue().toString(),
+                    Collectors.mapping(
+                        Map.Entry::getKey,
+                        Collectors.toSet()
+                    )
+                )
+            );
+
+    public static final Map<String, CollectionLogCategory> CUSTOM_CATEGORIES = Map.ofEntries(
+            Map.entry(
+                CollectionLogCategorySlug.gilded.name(),
+                new CollectionLogCategory(
+                    "Gilded",
+					new LinkedHashSet<>(
+						Arrays.asList(
+							ItemID.RUNE_FULL_HELM_GOLDPLATE,
+							ItemID.RUNE_PLATEBODY_GOLDPLATE,
+							ItemID.RUNE_PLATELEGS_GOLDPLATE,
+							ItemID.RUNE_PLATESKIRT_GOLDPLATE,
+							ItemID.RUNE_KITESHIELD_GOLDPLATE,
+							ItemID.RUNE_MED_HELM_GOLD,
+							ItemID.RUNE_CHAINBODY_GOLD,
+							ItemID.RUNE_SQ_SHIELD_GOLD,
+							ItemID.RUNE_2H_SWORD_GOLD,
+							ItemID.RUNE_SPEAR_GOLD,
+							ItemID.BRUT_RUNE_SPEAR_GOLD,
+							ItemID.RUNE_SCIMITAR_GOLD,
+							ItemID.RUNE_BOOTS_GOLD,
+							ItemID.TRAIL_GILDED_DHIDE_COIF,
+							ItemID.TRAIL_GILDED_DHIDE_VAMBRACES,
+							ItemID.TRAIL_GILDED_DHIDE_TOP,
+							ItemID.TRAIL_GILDED_DHIDE_CHAPS,
+							ItemID.TRAIL_GILDED_PICKAXE,
+							ItemID.TRAIL_GILDED_AXE,
+							ItemID.TRAIL_GILDED_SPADE
+						)
+					)
+                )
+            ),
+            Map.entry(
+                CollectionLogCategorySlug.thirdage.name(),
+                new CollectionLogCategory(
+                    "Third age",
+					new LinkedHashSet<>(
+						Arrays.asList(
+							ItemID._3A_PICKAXE,
+							ItemID._3A_AXE,
+							ItemID._3A_DRUIDIC_TOP,
+							ItemID._3A_DRUIDIC_BOTTOMS,
+							ItemID._3A_DRUIDIC_STAFF,
+							ItemID._3A_DRUIDIC_CLOAK,
+							ItemID.TRAIL_FIGHTER_SWORD,
+							ItemID.TRAIL_MAGE_WAND,
+							ItemID.TRAIL_THIRD_CAPE,
+							ItemID.TRAIL_RANGER_BOW,
+							ItemID.TRAIL_RANGER_COIF,
+							ItemID.TRAIL_RANGER_TORSO,
+							ItemID.TRAIL_RANGER_LEGS,
+							ItemID.TRAIL_RANGER_VAMBRACES,
+							ItemID.TRAIL_MAGE_HAT,
+							ItemID.TRAIL_MAGE_TORSO,
+							ItemID.TRAIL_MAGE_LEGS,
+							ItemID.TRAIL_MAGE_AMULET,
+							ItemID.TRAIL_FIGHTER_HELM,
+							ItemID.TRAIL_SILVER_PLATE_CHEST,
+							ItemID.TRAIL_SILVER_PLATE_LEGS,
+							ItemID.TRAIL_SILVER_PLATE_SKIRT,
+							ItemID.TRAIL_FIGHTER_SHIELD
+						)
+					)
+                )
+            )
+    );
 }
 /*
  * Copyright (c) 2025, andmcadams
@@ -1281,7 +1649,6 @@ import static java.lang.Math.round;
 @Slf4j
 @Singleton
 public class SyncButtonManager {
-
     private static final int COLLECTION_LOG_SETUP = 7797;
     private static final int[] SPRITE_IDS_INACTIVE = {
             SpriteID.DIALOG_BACKGROUND,
@@ -1314,27 +1681,23 @@ public class SyncButtonManager {
     private static final int BUTTON_OFFSET = CLOSE_BUTTON_OFFSET + 5;
     private int lastAttemptedUpdate = -1;
 
-    private final Client client;
-    private final ClientThread clientThread;
-    private final EventBus eventBus;
+    @Inject
+    private Client client;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private EventBus eventBus;
+
+    @Inject
+    private CollectionLogManager collectionLogManager;
 
     @Getter
     @Setter
-    private boolean syncAllowed;
-
-    @Inject
-    private SyncButtonManager(
-            Client client,
-            ClientThread clientThread,
-            EventBus eventBus
-    ) {
-        this.client = client;
-        this.clientThread = clientThread;
-        this.eventBus = eventBus;
-    }
+    private boolean fullSyncRequested = false;
 
     public void startUp() {
-        setSyncAllowed(false);
         eventBus.register(this);
         clientThread.invokeLater(() -> tryAddButton(this::onButtonClick));
     }
@@ -1380,9 +1743,14 @@ public class SyncButtonManager {
             client.addChatMessage(ChatMessageType.CONSOLE, "TempleOSRS", "Last update within 30 seconds. You can update again in " + round((lastAttemptedUpdate + 50 - client.getTickCount()) * 0.6) + " seconds.", "TempleOSRS");
             return;
         }
+
         lastAttemptedUpdate = client.getTickCount();
 
-        setSyncAllowed(true);
+        setFullSyncRequested(true);
+
+        // Clear the previously obtained item list to avoid duplicating items when counts change
+        collectionLogManager.getObtainedCollectionLogItems().clear();
+
         client.menuAction(-1, 40697932, MenuAction.CC_OP, 1, -1, "Search", null);
         client.runScript(2240);
         client.addChatMessage(ChatMessageType.CONSOLE, "TempleOSRS", "Your collection log data is being sent to TempleOSRS...", "TempleOSRS");
@@ -1527,171 +1895,1084 @@ public class SyncButtonManager {
         }
     }
 }
-package com.templeosrs.util.collections.autosync;
+/*
+ * Copyright (c) 2025, andmcadams
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+package com.templeosrs.util.collections.data;
+
+import lombok.AllArgsConstructor;
+import lombok.Value;
+
+@Value
+@AllArgsConstructor
+public class PlayerDataSubmission
+{
+    String username;
+    String profile;
+    long playerHash;
+    PlayerData data;
+}
+package com.templeosrs.util.collections.data;
+
+import com.google.gson.annotations.SerializedName;
+import com.templeosrs.util.api.APIError;
+import lombok.Value;
+
+import java.util.Set;
+
+@Value
+public class CollectionLogResponse {
+    @Value
+    public static class Data {
+        String player;
+        @SerializedName("last_changed") String lastChanged;
+        Set<ObtainedCollectionItem> items;
+    }
+
+    Data data;
+    APIError error;
+}
+
+package com.templeosrs.util.collections.data;
+
+import lombok.Value;
+import lombok.experimental.NonFinal;
+import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
+
+import java.sql.Timestamp;
+
+@Value
+public class ObtainedCollectionItem {
+    int id;
+    @Nullable @NonFinal String name;
+    int count;
+    String date;
+
+    public ObtainedCollectionItem(int id, int count) {
+        this.id = id;
+        this.count = count;
+        this.date = null;
+        this.name = null;
+    }
+
+    public ObtainedCollectionItem(int id, @NotNull String name, int count) {
+        this.id = id;
+        this.name = name;
+        this.count = count;
+        this.date = null;
+    }
+
+    public ObtainedCollectionItem(int id, @NotNull String name, int count, String date) {
+        this.id = id;
+        this.name = name;
+        this.count = count;
+        this.date = date;
+    }
+
+    public Timestamp getDate()
+    {
+        if (this.date == null) {
+            return null;
+        }
+
+        return Timestamp.valueOf(this.date);
+    }
+}
+
+/*
+ * Copyright (c) 2025, andmcadams
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+package com.templeosrs.util.collections.data;
+
+import lombok.Value;
+import net.runelite.client.config.RuneScapeProfileType;
+
+@Value
+public class PlayerProfile
+{
+    String username;
+    RuneScapeProfileType profileType;
+}
+package com.templeosrs.util.collections.data;
+
+import java.util.Set;
+import lombok.Value;
+
+@Value
+public class CollectionLogCategory {
+    String title;
+    Set<Integer> items;
+}
+
+package com.templeosrs.util.collections.data;
+
+import com.google.gson.annotations.SerializedName;
+import com.templeosrs.util.api.APIError;
+import lombok.Value;
+
+import javax.annotation.Nullable;
+
+@Value
+public class PlayerInfoResponse {
+    @Value
+    public static class CollectionLog {
+        @Nullable
+        @SerializedName("last_changed")
+        String lastChanged;
+    }
+
+    @Value
+    public static class Data {
+        @SerializedName("collection_log")
+        CollectionLog collectionLog;
+
+        @SerializedName("player_name_with_capitalization")
+        String playerNameWithCapitalization;
+    }
+
+    @Nullable
+    Data data;
+
+    @Nullable
+    APIError error;
+}
+
+/*
+ * Copyright (c) 2025, andmcadams
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+package com.templeosrs.util.collections.data;
 
 import lombok.AllArgsConstructor;
 import lombok.Data;
 
+import java.util.Set;
+
 @Data
 @AllArgsConstructor
-public class ObtainedItem {
-    String name;
-    int id;
+public class PlayerData
+{
+    public int totalCollectionsAvailable;
+    public Set<ObtainedCollectionItem> obtainedItems;
+}
+package com.templeosrs.util.collections.data;
+
+import com.google.gson.annotations.SerializedName;
+import com.templeosrs.util.api.APIError;
+import lombok.Value;
+
+import javax.annotation.Nullable;
+
+@Value
+public class CollectionLogSyncResponse {
+    @Value
+    public static class Data {
+        @SerializedName("sync_date")
+        String syncDate;
+
+        @SerializedName("sync_date_unix")
+        int syncDateUnix;
+
+        @SerializedName("last_changed")
+        String lastChanged;
+
+        @SerializedName("last_changed_unix")
+        int lastChangedUnix;
+
+        String username;
+
+        String message;
+    }
+
+    @Nullable
+    Data data;
+
+    @Nullable
+    APIError error;
+}
+
+package com.templeosrs.util.collections.parser;
+
+import com.google.gson.*;
+import java.sql.Connection;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.sql.Timestamp;
+import java.util.*;
+
+import com.templeosrs.util.api.APIError;
+import com.templeosrs.util.collections.data.CollectionLogResponse;
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
+import com.templeosrs.util.collections.database.CollectionDatabase;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Slf4j
+@Singleton
+public class CollectionParser {
+    @Inject
+    private Gson gson;
+
+    /**
+     * Parses the Temple API response to a map of collection log items
+     * @param rawUsername The username associated with the response
+     * @param json The raw JSON response from the Player Collection Log endpoint
+     */
+    public void parseAndStore(String rawUsername, String json)
+    {
+        final String username = rawUsername.toLowerCase();
+
+        log.debug("🧹 Starting parse() for user: {}...", username);
+
+        CollectionLogResponse collectionLogResponse;
+
+        // Log the raw JSON for debugging purposes
+        log.debug("Raw JSON: {}", json);
+
+        try {
+            // Directly parse the JSON string using Gson
+            collectionLogResponse = gson.fromJson(json, CollectionLogResponse.class);
+        } catch (JsonSyntaxException e) {
+            log.error("❌ Failed to parse JSON for {}: {}", username, e.getMessage());
+
+            return;
+        } catch (Exception e) {
+            log.error("❌ Unexpected error while parsing JSON for {}: {}", username, e.getMessage());
+
+            return;
+        }
+
+        CollectionLogResponse.Data data = collectionLogResponse.getData();
+        APIError error = collectionLogResponse.getError();
+
+        // Handle error response
+        if (error != null) {
+            String errorMessage = error.getMessage();
+
+            if (errorMessage.contains("Player has not synced")){
+                log.warn("⚠️ Player {} has not synced their collection log yet.", username);
+            } else {
+                log.warn("⚠️ API error for {}: {}", username, errorMessage);
+            }
+
+            return; // Stop further processing for this player
+        }
+
+        // Handle success response
+        if (data != null) {
+            Set<ObtainedCollectionItem> itemList = new HashSet<>();
+
+            for (ObtainedCollectionItem item : data.getItems()) {
+                log.debug("➡️ Queuing: {} x{} @ {}", item.getName(), item.getCount(), item.getDate());
+                itemList.add(item);
+            }
+
+            log.debug("✅ Parsed {} items for {}.", itemList.size(), username);
+
+            if (itemList.isEmpty()) {
+                log.warn("⚠️ No items found to store for {}", username);
+
+                return;
+            }
+
+            log.debug("🧹 Starting store() for user: {}...", username);
+
+            CollectionDatabase.upsertItemsBatch(username, itemList, Timestamp.valueOf(data.getLastChanged()));
+
+            int itemCount = itemList.size();
+
+            log.debug("✅ Parsed and inserted {} items total for {}.", itemCount, username);
+
+            // ✅ Manually shut down the database after insert
+            try (Connection conn = CollectionDatabase.getConnection();
+                 Statement stmt = conn.createStatement()
+            ) {
+                stmt.execute("SHUTDOWN");
+                log.debug("🚗 Manually closed H2 database after sync.");
+            } catch (SQLException e) {
+                log.error("⚠️ Error while trying to shut down the database", e);
+            }
+        }
+    }
+}
+package com.templeosrs.util.collections.database;
+
+import com.google.common.collect.HashMultiset;
+import com.google.common.collect.Multiset;
+import com.google.common.collect.Multisets;
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+import org.apache.commons.lang3.StringUtils;
+import org.jetbrains.annotations.NotNull;
+
+import javax.inject.Singleton;
+import java.io.File;
+import java.sql.*;
+import java.util.*;
+
+@Slf4j
+@Singleton
+public class CollectionDatabase {
+    private static final String DB_URL = "jdbc:h2:file:" + RuneLite.RUNELITE_DIR + "/templeosrs/runelite-collections;AUTO_SERVER=TRUE;DB_CLOSE_DELAY=-1";
+
+    private static final String COLLECTION_LOG_CACHE_TABLE_NAME = "collection_log_cache";
+    private static final String PLAYER_METADATA_TABLE_NAME = "player_metadata";
+
+    static {
+        File pluginDir = new File(RuneLite.RUNELITE_DIR, "templeosrs");
+        if (!pluginDir.exists()) {
+            if (!pluginDir.mkdirs()) {
+                log.warn("⚠️ Failed to create plugin directory at {}", pluginDir.getAbsolutePath());
+            }
+        }
+    }
+
+    public static Connection getConnection() throws SQLException {
+        return DriverManager.getConnection(DB_URL);
+    }
+
+    public static void init() {
+        try {
+            // 🚨 Required for Plugin Hub: explicitly load the H2 JDBC driver
+            Class.forName("org.h2.Driver");
+
+            try (Connection conn = getConnection(); Statement stmt = conn.createStatement()) {
+                final String createCollectionLogCacheTableSql = String.format(
+                        "CREATE TABLE IF NOT EXISTS %s(" +
+                                "id IDENTITY PRIMARY KEY, " +
+                                "item_id INT, " +
+                                "item_name VARCHAR(255), " +
+                                "item_count INT, " +
+                                "player_name VARCHAR(255)" +
+                        ")",
+                        COLLECTION_LOG_CACHE_TABLE_NAME
+                );
+
+                final String createPlayerMetadataTableSql = String.format(
+                        "CREATE TABLE IF NOT EXISTS %s(" +
+                                "id IDENTITY PRIMARY KEY, " +
+                                "player_name VARCHAR(255), " +
+                                "last_changed TIMESTAMP, " +
+                                "last_accessed TIMESTAMP" +
+                        ")",
+                        PLAYER_METADATA_TABLE_NAME
+                );
+
+                stmt.executeUpdate(createCollectionLogCacheTableSql);
+                stmt.executeUpdate(createPlayerMetadataTableSql);
+            }
+        } catch (ClassNotFoundException e) {
+            log.warn("H2 Driver class not found: {}", e.getMessage());
+        } catch (SQLException e) {
+            log.warn("Database initialization failed: {}", e.getMessage());
+        }
+    }
+
+    private static void addColumnIfNotExists(Connection conn, String table, String column, String type) throws SQLException {
+        String checkQuery = "SELECT * FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND COLUMN_NAME = ?";
+        try (PreparedStatement ps = conn.prepareStatement(checkQuery)) {
+            ps.setString(1, table.toUpperCase());
+            ps.setString(2, column.toUpperCase());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    try (Statement stmt = conn.createStatement()) {
+                        stmt.executeUpdate("ALTER TABLE " + table + " ADD COLUMN " + column + " " + type);
+                    }
+                }
+            }
+        }
+    }
+
+    public static boolean hasPlayerData(String playerName) {
+        String sql = String.format("SELECT 1 FROM %s WHERE player_name = ? LIMIT 1", COLLECTION_LOG_CACHE_TABLE_NAME);
+
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, playerName.toLowerCase());
+            ResultSet rs = ps.executeQuery();
+            return rs.next();
+        } catch (SQLException e) {
+            log.warn("Error checking player data: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Saves the API response data to the API cache table
+     * @param playerName The player name associated with the response
+     * @param items The items to persist to the database
+     */
+    public static void upsertItemsBatch(
+            @NotNull String playerName,
+            @NotNull Set<ObtainedCollectionItem> items,
+            Timestamp lastChanged
+    ) {
+        try (Connection conn = getConnection()) {
+            conn.setAutoCommit(false);
+
+            try (
+                PreparedStatement ps1 = conn.prepareStatement(
+                    String.format("MERGE INTO %s USING DUAL ", COLLECTION_LOG_CACHE_TABLE_NAME) +
+                    "ON item_id = ? AND player_name = ? " +
+                    "WHEN MATCHED THEN UPDATE SET item_count = ? " +
+                    "WHEN NOT MATCHED THEN INSERT (player_name, item_id, item_count, item_name) VALUES (?, ?, ?, ?)"
+                );
+                PreparedStatement ps2 = conn.prepareStatement(
+                    String.format("MERGE INTO %s USING DUAL ", PLAYER_METADATA_TABLE_NAME) +
+                    "ON player_name = ? " +
+                    "WHEN MATCHED THEN UPDATE SET last_changed = ?, last_accessed = ? " +
+                    "WHEN NOT MATCHED THEN INSERT (player_name, last_changed, last_accessed) VALUES (?, ?, ?)"
+                )
+            )
+            {
+                final String lowerPlayerName = playerName.toLowerCase();
+                final Timestamp lastAccessed = new Timestamp(System.currentTimeMillis());
+
+                for (ObtainedCollectionItem item : items) {
+                    final int itemId = item.getId();
+                    final int itemCount = item.getCount();
+
+                    ps1.setInt(1, itemId);
+                    ps1.setString(2, lowerPlayerName);
+                    ps1.setInt(3, itemCount);
+                    ps1.setString(4, lowerPlayerName);
+                    ps1.setInt(5, itemId);
+                    ps1.setInt(6, itemCount);
+                    ps1.setString(7, item.getName());
+
+                    ps1.addBatch();
+                }
+
+                ps2.setString(1, lowerPlayerName);
+                ps2.setTimestamp(2, lastChanged);
+                ps2.setTimestamp(3, lastAccessed);
+                ps2.setString(4, lowerPlayerName);
+                ps2.setTimestamp(5, lastChanged);
+                ps2.setTimestamp(6, lastAccessed);
+
+                ps1.executeBatch();
+                ps2.execute();
+            }
+
+            conn.commit();
+        } catch (SQLException e) {
+            log.warn("Error inserting items to the API cache: {}", e.getMessage());
+        }
+    }
+
+    public static Multiset<Integer> getCollectionLogDiff(String playerName, Multiset<Integer> collectionLogItems)
+    {
+        try (Connection conn = getConnection())
+        {
+            try (PreparedStatement ps = conn.prepareStatement(
+                String.format(
+                    "SELECT item_count, item_id FROM %s WHERE player_name = ? AND item_id = ? LIMIT 1",
+                        COLLECTION_LOG_CACHE_TABLE_NAME
+                )
+            ))
+            {
+                final Multiset<Integer> foundItems = HashMultiset.create();
+
+                for (Multiset.Entry<Integer> entry : collectionLogItems.entrySet())
+                {
+                    final int itemId = entry.getElement();
+
+                    ps.setString(1, playerName.toLowerCase());
+                    ps.setInt(2, itemId);
+
+                    final ResultSet rs = ps.executeQuery();
+
+                    if (rs.next())
+                    {
+                        final int rsItemCount = rs.getInt("item_count");
+                        final int rsItemId = rs.getInt("item_id");
+
+                        foundItems.add(rsItemId, rsItemCount);
+                    }
+                }
+
+                return Multisets.difference(collectionLogItems, foundItems);
+            }
+        } catch (SQLException e) {
+            log.warn("Error comparing collection log: {}", e.getMessage());
+
+            return null;
+        }
+    }
+
+    public static Timestamp getLatestTimestamp(String playerName) {
+        String sql = String.format("SELECT last_changed FROM %s WHERE player_name = ?", PLAYER_METADATA_TABLE_NAME);
+
+        try (Connection conn = getConnection(); PreparedStatement ps = conn.prepareStatement(sql)) {
+            ps.setString(1, playerName.toLowerCase());
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                return rs.getTimestamp(1);
+            }
+        } catch (SQLException e) {
+            log.warn("Error fetching latest timestamp: {}", e.getMessage());
+        }
+
+        return null;
+    }
+
+    public static void clearAll() {
+        try (Connection conn = getConnection();
+             Statement stmt = conn.createStatement())
+        {
+            stmt.executeUpdate(String.format("DELETE FROM %s", COLLECTION_LOG_CACHE_TABLE_NAME));
+        } catch (SQLException e) {
+            log.warn("Error clearing all items: {}", e.getMessage());
+        }
+    }
+
+    public static Set<ObtainedCollectionItem> getItemsByCategory(String playerName, Set<Integer> categoryItems) {
+        Map<Integer, ObtainedCollectionItem> items = new HashMap<>();
+
+        try (Connection conn = getConnection();
+             PreparedStatement ps1 = conn.prepareStatement(
+                 String.format(
+                     "SELECT item_id, item_name, item_count FROM %s WHERE player_name = ? AND item_id IN (%s)",
+                     COLLECTION_LOG_CACHE_TABLE_NAME,
+                     StringUtils.repeat("?", ",", categoryItems.size())
+                 )
+             );
+             PreparedStatement ps2 = conn.prepareStatement(
+                String.format("UPDATE %s ", PLAYER_METADATA_TABLE_NAME) +
+                "SET last_accessed = ? " +
+                "WHERE player_name = ?"
+             );
+        )
+        {
+            conn.setAutoCommit(false);
+
+            final Timestamp lastAccessed = new Timestamp(System.currentTimeMillis());
+            final String lowerPlayerName = playerName.toLowerCase();
+            
+            ps1.setString(1, playerName.toLowerCase());
+                        
+            int paramIndex = 2;
+            for (int id : categoryItems)
+            {
+                ps1.setInt(paramIndex, id);
+                paramIndex++;
+            }
+
+            try (ResultSet rs = ps1.executeQuery()) {
+                while (rs.next()) {
+                    int itemId = rs.getInt("item_id");
+                    String itemName = rs.getString("item_name");
+                    int count = rs.getInt("item_count");
+
+                    items.put(itemId, new ObtainedCollectionItem(itemId, itemName, count));
+                }
+            }
+
+            ps2.setTimestamp(1, lastAccessed);
+            ps2.setString(2, lowerPlayerName);
+
+            ps2.execute();
+
+            conn.commit();
+        } catch (SQLException e) {
+            log.warn("Error fetching items by category: {}", e.getMessage());
+        }
+
+        Set<ObtainedCollectionItem> sortedItems = new LinkedHashSet<>();
+
+        // Sorts the database response to match the order found in the log tab
+        for (int itemId : categoryItems)
+        {
+            if (items.containsKey(itemId))
+            {
+                sortedItems.add(items.get(itemId));
+            }
+        }
+
+        return sortedItems;
+    }
+
+    public static void pruneOldPlayers(String yourUsername, int maxPlayers) {
+        try (Connection conn = getConnection();
+             PreparedStatement ps1 = conn.prepareStatement(
+             "SELECT player_name, MIN(last_accessed) as oldest " +
+                 String.format("FROM %s ", COLLECTION_LOG_CACHE_TABLE_NAME) +
+                 "WHERE player_name != ? " +
+                 "GROUP BY player_name " +
+                 "ORDER BY oldest ASC"
+             );
+             PreparedStatement deleteStmt = conn.prepareStatement(
+                 String.format(
+                     "DELETE FROM %s AS a INNER JOIN %s AS b WHERE a.player_name = b.player_name AND a.player_name = ?",
+                     COLLECTION_LOG_CACHE_TABLE_NAME,
+                     PLAYER_METADATA_TABLE_NAME
+                 )
+             );
+        ) {
+            ps1.setString(1, yourUsername.toLowerCase());
+            ResultSet rs = ps1.executeQuery();
+
+            int count = 0;
+            List<String> playersToRemove = new ArrayList<>();
+
+            while (rs.next()) {
+                count++;
+                if (count > maxPlayers) {
+                    playersToRemove.add(rs.getString("player_name"));
+                }
+            }
+
+            for (String name : playersToRemove) {
+                log.debug("\uD83E\uDDF9 Pruning cached player: {}", name);
+                deleteStmt.setString(1, name);
+                deleteStmt.executeUpdate();
+            }
+        } catch (SQLException e) {
+            log.warn("Error pruning old players: {}", e.getMessage());
+        }
+    }
 }
 
 package com.templeosrs.util.collections.autosync;
 
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ServerNpcLoot;
+import net.runelite.client.game.ItemManager;
+
+import javax.inject.Inject;
+
+@Slf4j
+public class CollectionLogAutoSyncServerNpcLootSubscriber
+{
+	@Inject
+	private CollectionLogAutoSyncManager collectionLogAutoSyncManager;
+
+	@Inject
+	private ItemManager itemManager;
+
+	/**
+	 * This method is called when an NPC loot event is received.
+	 * If any items in the loot match the newly obtained collection log item names,
+	 * they are added to a list of items awaiting a server sync and the sync countdown is started.
+	 */
+	@Subscribe
+	private void onServerNpcLoot(ServerNpcLoot serverNpcLoot)
+	{
+		if (collectionLogAutoSyncManager.obtainedItemNames.isEmpty())
+		{
+			return;
+		}
+
+		final int previousPendingSyncItemsCount = collectionLogAutoSyncManager.pendingSyncItems.size();
+
+		serverNpcLoot.getItems().forEach(item ->
+		{
+			final int itemId = item.getId();
+			final int itemCount = item.getQuantity();
+			final String itemName = itemManager.getItemComposition(itemId).getName();
+
+			if (collectionLogAutoSyncManager.obtainedItemNames.contains(itemName))
+			{
+				collectionLogAutoSyncManager.pendingSyncItems.add(new ObtainedCollectionItem(itemId, itemName, itemCount));
+				collectionLogAutoSyncManager.obtainedItemNames.remove(itemName);
+			}
+		});
+		
+		if (previousPendingSyncItemsCount < collectionLogAutoSyncManager.pendingSyncItems.size())
+		{
+			collectionLogAutoSyncManager.startSyncCountdown();
+		}
+	}
+}
+
+package com.templeosrs.util.collections.autosync;
+
+import com.google.common.collect.HashMultiset;
+import com.google.common.collect.Multiset;
 import com.google.gson.Gson;
+import com.templeosrs.util.api.APIError;
+import com.templeosrs.util.api.QuadraticBackoffStrategy;
+import com.templeosrs.util.collections.CollectionLogManager;
 import com.templeosrs.util.collections.CollectionLogRequestManager;
-import com.templeosrs.util.collections.PlayerProfile;
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
+import com.templeosrs.util.collections.data.PlayerProfile;
+import com.templeosrs.util.collections.database.CollectionDatabase;
+import com.templeosrs.util.collections.data.CollectionLogSyncResponse;
 import lombok.Getter;
+import lombok.Setter;
+import lombok.Synchronized;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.RuneScapeProfileType;
 import net.runelite.client.eventbus.EventBus;
-import okhttp3.*;
-import org.apache.commons.lang3.tuple.Pair;
-import org.jetbrains.annotations.NotNull;
+import net.runelite.client.eventbus.Subscribe;
 import org.jetbrains.annotations.Nullable;
 
 import javax.inject.Inject;
 import java.io.IOException;
+import java.sql.Timestamp;
 import java.util.HashSet;
+import java.util.Set;
 
 @Slf4j
-public class CollectionLogAutoSyncManager {
-    
-    @Inject
-    private CollectionLogAutoSyncChatMessageSubscriber collectionLogAutoSyncChatMessageSubscriber;
+public class CollectionLogAutoSyncManager
+{
+	@Inject
+	private CollectionLogAutoSyncChatMessageSubscriber collectionLogAutoSyncChatMessageSubscriber;
 
-    @Inject
-    private CollectionLogAutoSyncItemContainerChangedSubscriber collectionLogAutoSyncItemContainerChangedSubscriber;
+	@Inject
+	private CollectionLogAutoSyncItemContainerChangedSubscriber collectionLogAutoSyncItemContainerChangedSubscriber;
 
-    @Inject
-    private CollectionLogAutoSyncNpcLootReceivedSubscriber collectionLogAutoSyncNpcLootReceivedSubscriber;
+	@Inject
+	private CollectionLogAutoSyncServerNpcLootSubscriber collectionLogAutoSyncServerNpcLootSubscriber;
 
-    @Inject
-    private CollectionLogAutoSyncGameTickSubscriber collectionLogAutoSyncGameTickSubscriber;
+	@Inject
+	private CollectionLogAutoSyncGameTickSubscriber collectionLogAutoSyncGameTickSubscriber;
 
-    @Inject
-    private CollectionLogAutoSyncConfigChecker collectionLogAutoSyncConfigChecker;
+	@Inject
+	private CollectionLogAutoSyncConfigChecker collectionLogAutoSyncConfigChecker;
 
-    @Inject
-    private LoggedInState loggedInState;
-    
-    @Inject
-    private OkHttpClient okHttpClient;
-    
-    @Inject
-    private Gson gson;
-    
-    @Inject
-    private Client client;
-    
-    @Inject
-    private EventBus eventBus;
+	@Inject
+	private LoggedInState loggedInState;
 
-    @Inject
-    private CollectionLogRequestManager requestManager;
+	@Inject
+	private Client client;
 
-    @Getter
-    protected final HashSet<String> obtainedItemNames = new HashSet<>();
-    
-    @Getter
-    @Nullable
-    private Integer gameTickToSync;
+	@Inject
+	private ClientThread clientThread;
 
-    /**
-     * Keeps track of what item IDs are pending a server sync
-     */
-    @Getter
-    protected final HashSet<Pair<String, Integer>> pendingSyncItems = new HashSet<>();
+	@Inject
+	private EventBus eventBus;
 
-    public void startUp()
-    {
-        eventBus.register(collectionLogAutoSyncChatMessageSubscriber);
-        eventBus.register(collectionLogAutoSyncItemContainerChangedSubscriber);
-        eventBus.register(collectionLogAutoSyncNpcLootReceivedSubscriber);
-        eventBus.register(collectionLogAutoSyncGameTickSubscriber);
-        eventBus.register(collectionLogAutoSyncConfigChecker);
-        eventBus.register(loggedInState);
+	@Inject
+	private CollectionLogRequestManager requestManager;
 
-        collectionLogAutoSyncConfigChecker.startUp();
-    }
+	@Inject
+	private CollectionLogManager collectionLogManager;
 
-    public void shutDown()
-    {
-        eventBus.unregister(collectionLogAutoSyncChatMessageSubscriber);
-        eventBus.unregister(collectionLogAutoSyncItemContainerChangedSubscriber);
-        eventBus.unregister(collectionLogAutoSyncNpcLootReceivedSubscriber);
-        eventBus.unregister(collectionLogAutoSyncGameTickSubscriber);
-        eventBus.unregister(collectionLogAutoSyncConfigChecker);
-        eventBus.unregister(loggedInState);
+	@Inject
+	private Gson gson;
 
-        collectionLogAutoSyncConfigChecker.shutDown();
-    }
-    
-    /**
-     * Starts the sync countdown.
-     * This utilises a 17-tick delay (which corresponds to a roughly 10-second wait) as a way to batch requests.
-     * This is useful for when multiple items are obtained in quick succession, such as Chompy Hats.
-     */
-    public void startSyncCountdown()
-    {
-        final int syncDelayInTicks = 17;
+	@Getter
+	protected final HashSet<String> obtainedItemNames = new HashSet<>();
 
-        gameTickToSync = client.getTickCount() + syncDelayInTicks;
-    }
+	@Getter
+	@Nullable
+	private Integer gameTickToSync;
 
-    /**
-     * Resets the sync countdown.
-     * Used after the request has successfully completed.
-     */
-    public void resetSyncCountdown()
-    {
-        gameTickToSync = null;
-    }
+	@Getter
+	@Setter
+	private boolean triggerSyncAllowed;
 
-    /**
-     * Uploads the obtained collection log items to the server.
-     * This is called when the sync countdown has completed and there are items pending a sync.
-     */
-    synchronized public void uploadObtainedCollectionLogItems()
-    {
-        String username = client.getLocalPlayer().getName();
-        RuneScapeProfileType profileType = RuneScapeProfileType.getCurrent(client);
-        PlayerProfile profileKey = new PlayerProfile(username, profileType);
-        
-        PlayerDataSync submission = new PlayerDataSync(
-                profileKey.getUsername(),
-                profileKey.getProfileType().name(),
-                client.getAccountHash(),
-                pendingSyncItems.stream().map(item -> new ObtainedItem(item.getKey(), item.getValue())).toArray()
-        );
+	@Getter
+	@Setter
+	private boolean logOpenAutoSync;
 
-        requestManager.uploadObtainedCollectionLogItems(submission, new Callback() {
-            @Override
-            public void onFailure(@NotNull Call call, @NotNull IOException e) {
-//                 log.debug("Failed to submit: ", e);
-            }
+	@Getter
+	@Setter
+	private boolean computingDiff;
 
-            @Override
-            public void onResponse(@NotNull Call call, @NotNull Response response) {
-                try {
-                    if (!response.isSuccessful()) {
-//                         log.debug("Failed to submit: {}", response.code());
-                        return;
-                    }
+	@Getter
+	QuadraticBackoffStrategy backoffStrategy = new QuadraticBackoffStrategy();
 
-                    obtainedItemNames.clear();
-                    pendingSyncItems.clear();
-                } finally {
-                    response.close();
-                }
-            }
-        });
+	/**
+	 * Keeps track of what item IDs are pending a server sync
+	 */
+	@Getter
+	protected final HashSet<ObtainedCollectionItem> pendingSyncItems = new HashSet<>();
 
-    }
+	public void startUp()
+	{
+		eventBus.register(this);
+		eventBus.register(collectionLogAutoSyncChatMessageSubscriber);
+		eventBus.register(collectionLogAutoSyncItemContainerChangedSubscriber);
+		eventBus.register(collectionLogAutoSyncServerNpcLootSubscriber);
+		eventBus.register(collectionLogAutoSyncGameTickSubscriber);
+		eventBus.register(collectionLogAutoSyncConfigChecker);
+		eventBus.register(loggedInState);
+
+		collectionLogAutoSyncConfigChecker.startUp();
+	}
+
+	public void shutDown()
+	{
+		eventBus.unregister(this);
+		eventBus.unregister(collectionLogAutoSyncChatMessageSubscriber);
+		eventBus.unregister(collectionLogAutoSyncItemContainerChangedSubscriber);
+		eventBus.unregister(collectionLogAutoSyncServerNpcLootSubscriber);
+		eventBus.unregister(collectionLogAutoSyncGameTickSubscriber);
+		eventBus.unregister(collectionLogAutoSyncConfigChecker);
+		eventBus.unregister(loggedInState);
+
+		collectionLogAutoSyncConfigChecker.shutDown();
+
+		obtainedItemNames.clear();
+		clearSyncCountdown();
+	}
+
+	@Subscribe
+	public void onWidgetLoaded(WidgetLoaded widgetLoaded)
+	{
+		if (widgetLoaded.getGroupId() == InterfaceID.COLLECTION)
+		{
+			setLogOpenAutoSync(true);
+			setTriggerSyncAllowed(true);
+
+			// Clear the previously obtained item list to avoid duplicating items when counts change
+			collectionLogManager.getObtainedCollectionLogItems().clear();
+		}
+	}
+
+	@Subscribe
+	public void onScriptPostFired(ScriptPostFired scriptPostFired)
+	{
+		if (scriptPostFired.getScriptId() == 7797 && isTriggerSyncAllowed())
+		{
+			clientThread.invokeLater(() -> {
+				client.menuAction(-1, 40697932, MenuAction.CC_OP, 1, -1, "Search", null);
+				client.menuAction(-1, 40697932, MenuAction.CC_OP, 1, -1, "Back", null);
+
+				setTriggerSyncAllowed(false);
+
+				gameTickToSync = client.getTickCount() + 3;
+			});
+		}
+	}
+
+	/**
+	 * Starts the sync countdown.
+	 * This utilises a 17-tick delay (which corresponds to a roughly 10-second wait) as a way to batch requests.
+	 * This is useful for when multiple items are obtained in quick succession, such as Chompy Hats.
+	 */
+	public void startSyncCountdown()
+	{
+		final int syncDelayInTicks = 17;
+
+		gameTickToSync = client.getTickCount() + syncDelayInTicks;
+	}
+
+	/**
+	 * Resets the sync countdown.
+	 * Used after the request has successfully completed.
+	 */
+	public void clearSyncCountdown()
+	{
+		backoffStrategy.reset();
+		setLogOpenAutoSync(false);
+		gameTickToSync = null;
+	}
+
+	public void computeCollectionLogDiff()
+	{
+		try
+		{
+			String username = client.getLocalPlayer().getName();
+
+			if (username == null || !CollectionDatabase.hasPlayerData(username))
+			{
+				log.debug("No saved log items were found, falling back to a full sync for {}", username);
+
+				clearSyncCountdown();
+
+				return;
+			}
+
+			log.debug("Computing collection log diff for {}", username);
+
+			Set<ObtainedCollectionItem> obtainedCollectionLogItems = collectionLogManager.getObtainedCollectionLogItems();
+
+			final Multiset<Integer> collectionLogItemIdCountMap = HashMultiset.create();
+
+			for (ObtainedCollectionItem item : obtainedCollectionLogItems)
+			{
+				final int itemId = item.getId();
+				final int itemCount = item.getCount();
+
+				collectionLogItemIdCountMap.add(itemId, itemCount);
+			}
+
+			final Multiset<Integer> itemDiff = CollectionDatabase.getCollectionLogDiff(username, collectionLogItemIdCountMap);
+
+			if (itemDiff == null || itemDiff.isEmpty())
+			{
+				log.debug("No log items have been changed since the last sync for {}", username);
+
+				// No items to sync, stop processing
+				clearSyncCountdown();
+
+				return;
+			}
+
+			log.debug("Found {} changed log item(s) since the last sync: {}", itemDiff.elementSet().size(), itemDiff);
+
+			// Add the log items found in the diff to the pending sync items set
+			obtainedCollectionLogItems
+				.stream()
+				// Name check isn't technically needed here, but it helps suppress warnings
+				.filter(item -> itemDiff.contains(item.getId()) && item.getName() != null)
+				.map(item -> new ObtainedCollectionItem(item.getId(), item.getName(), item.getCount()))
+				.forEach(pendingSyncItems::add);
+		}
+		finally
+		{
+			setComputingDiff(false);
+		}
+	}
+
+	/**
+	 * Uploads the obtained collection log items to the server.
+	 * This is called when the sync countdown has completed and there are items pending a sync.
+	 */
+	@Synchronized
+	public void uploadObtainedCollectionLogItems()
+	{
+		if (backoffStrategy.shouldSkipRequest())
+		{
+			return;
+		}
+
+		String username = client.getLocalPlayer().getName();
+
+		if (username == null)
+		{
+			return;
+		}
+
+		RuneScapeProfileType profileType = RuneScapeProfileType.getCurrent(client);
+		PlayerProfile profileKey = new PlayerProfile(username, profileType);
+
+		PlayerDataSync submission = new PlayerDataSync(
+			profileKey.getUsername(),
+			profileKey.getProfileType().name(),
+			client.getAccountHash(),
+			pendingSyncItems
+		);
+
+		try
+		{
+			String response = requestManager.uploadObtainedCollectionLogItems(submission);
+
+			CollectionLogSyncResponse collectionLogSyncResponse = gson.fromJson(response, CollectionLogSyncResponse.class);
+			String lastChangedTimestamp = getLastChangedTimestamp(collectionLogSyncResponse, response);
+
+			log.debug("response: {}, lastChanged: {}", response, lastChangedTimestamp);
+
+			// Saves the new/updated items to the API cache to prevent refetching the entire log
+			CollectionDatabase.upsertItemsBatch(username, pendingSyncItems, Timestamp.valueOf(lastChangedTimestamp));
+
+			obtainedItemNames.clear();
+			pendingSyncItems.clear();
+
+			clearSyncCountdown();
+
+			log.debug("Successfully synchronised new log items for {}", submission.getUsername());
+		}
+		catch (IOException | NullPointerException e)
+		{
+			log.error("❌ Failed to upload obtained collection log items: {}", e.getMessage());
+		}
+		finally
+		{
+			backoffStrategy.finishCycle();
+		}
+	}
+
+	private String getLastChangedTimestamp(CollectionLogSyncResponse collectionLogSyncResponse, String response) throws IOException
+	{
+		APIError error = collectionLogSyncResponse.getError();
+		CollectionLogSyncResponse.Data data = collectionLogSyncResponse.getData();
+
+		if (error == null && data == null)
+		{
+			clearSyncCountdown();
+
+			throw new NullPointerException("Unexpected response format from the collection log sync endpoint: " + response);
+		}
+
+		if (error != null)
+		{
+			clearSyncCountdown();
+
+			throw new IOException(String.valueOf(error));
+		}
+
+		return data.getLastChanged();
+	}
 }
 
 package com.templeosrs.util.collections.autosync;
@@ -1699,6 +2980,7 @@ package com.templeosrs.util.collections.autosync;
 import com.google.common.collect.HashMultiset;
 import com.google.common.collect.Multiset;
 import com.google.common.collect.Multisets;
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.events.ItemContainerChanged;
@@ -1747,9 +3029,10 @@ public class CollectionLogAutoSyncItemContainerChangedSubscriber
         inventoryDifference.entrySet().forEach(item -> {
             String itemName = itemManager.getItemComposition(item.getElement()).getName();
             int itemId = item.getElement();
+            int itemCount = item.getCount();
 
             if (collectionLogAutoSyncManager.obtainedItemNames.contains(itemName)) {
-                collectionLogAutoSyncManager.pendingSyncItems.add(Pair.of(itemName, itemId));
+                collectionLogAutoSyncManager.pendingSyncItems.add(new ObtainedCollectionItem(itemId, itemName, itemCount));
                 collectionLogAutoSyncManager.obtainedItemNames.remove(itemName);
             }
         });
@@ -1815,11 +3098,13 @@ public class LoggedInState {
 }
 package com.templeosrs.util.collections.autosync;
 
+import com.templeosrs.util.api.QuadraticBackoffStrategy;
+import com.templeosrs.util.collections.CollectionLogManager;
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.events.GameTick;
 import net.runelite.client.eventbus.Subscribe;
-import org.apache.commons.lang3.tuple.Pair;
 
 import javax.inject.Inject;
 import java.util.HashSet;
@@ -1830,6 +3115,9 @@ public class CollectionLogAutoSyncGameTickSubscriber
 {
     @Inject
     private CollectionLogAutoSyncManager collectionLogAutoSyncManager;
+
+    @Inject
+    private CollectionLogManager collectionLogManager;
 
     @Inject
     private Client client;
@@ -1845,68 +3133,41 @@ public class CollectionLogAutoSyncGameTickSubscriber
     @Subscribe
     public void onGameTick(GameTick gameTick)
     {
-        final Integer gameTickToSync = collectionLogAutoSyncManager.getGameTickToSync();
-        final HashSet<Pair<String, Integer>> pendingSyncItems = collectionLogAutoSyncManager.getPendingSyncItems();
+        QuadraticBackoffStrategy backoffStrategy = collectionLogAutoSyncManager.getBackoffStrategy();
 
-        // Note: There shouldn't be an instance of gameTickToSync
-        // being non-null without items in the pendingSyncItems set.
+        if (backoffStrategy.isRequestLimitReached()) {
+            collectionLogAutoSyncManager.clearSyncCountdown();
+            return;
+        }
+
+        if (backoffStrategy.isSubmitting() || collectionLogAutoSyncManager.isComputingDiff()) {
+            return;
+        }
+
+        final Integer gameTickToSync = collectionLogAutoSyncManager.getGameTickToSync();
+        final HashSet<ObtainedCollectionItem> pendingSyncItems = collectionLogAutoSyncManager.getPendingSyncItems();
+
+        // Add any diffed items to the pendingSync list when the log has been opened
+        if (
+            gameTickToSync != null &&
+            client.getTickCount() >= gameTickToSync &&
+            collectionLogAutoSyncManager.isLogOpenAutoSync() &&
+            pendingSyncItems.isEmpty()
+        ) {
+            collectionLogAutoSyncManager.setComputingDiff(true);
+            scheduledExecutorService.execute(collectionLogAutoSyncManager::computeCollectionLogDiff);
+
+            return;
+        }
+
         if (gameTickToSync == null || pendingSyncItems.isEmpty()) {
             return;
         }
 
         // Sync new collection log items when the game has reached correct tick.
         if (client.getTickCount() >= gameTickToSync) {
-            collectionLogAutoSyncManager.resetSyncCountdown();
+            backoffStrategy.setSubmitting(true);
             scheduledExecutorService.execute(collectionLogAutoSyncManager::uploadObtainedCollectionLogItems);
-        }
-    }
-}
-
-package com.templeosrs.util.collections.autosync;
-
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.NpcLootReceived;
-import net.runelite.client.game.ItemManager;
-import org.apache.commons.lang3.tuple.Pair;
-
-import javax.inject.Inject;
-
-@Slf4j
-public class CollectionLogAutoSyncNpcLootReceivedSubscriber
-{
-    @Inject
-    private CollectionLogAutoSyncManager collectionLogAutoSyncManager;
-
-    @Inject
-    private ItemManager itemManager;
-
-    /**
-     * This method is called when an NPC loot event is received.
-     * If any items in the loot match the newly obtained collection log item names,
-     * they are added to a list of items awaiting a server sync and the sync countdown is started.
-     */
-    @Subscribe
-    private void onNpcLootReceived(NpcLootReceived npcLootReceived)
-    {
-        if (collectionLogAutoSyncManager.obtainedItemNames.isEmpty()) {
-            return;
-        }
-
-        final int previousPendingSyncItemsCount = collectionLogAutoSyncManager.pendingSyncItems.size();
-
-        npcLootReceived.getItems().forEach(item -> {
-            final int itemId = item.getId();
-            final String itemName = itemManager.getItemComposition(itemId).getName();
-
-            if (collectionLogAutoSyncManager.obtainedItemNames.contains(itemName)) {
-                collectionLogAutoSyncManager.pendingSyncItems.add(Pair.of(itemName, itemId));
-                collectionLogAutoSyncManager.obtainedItemNames.remove(itemName);
-            }
-        });
-
-        if (previousPendingSyncItemsCount < collectionLogAutoSyncManager.pendingSyncItems.size()) {
-            collectionLogAutoSyncManager.startSyncCountdown();
         }
     }
 }
@@ -1981,8 +3242,11 @@ public class CollectionLogAutoSyncChatMessageSubscriber
 
 package com.templeosrs.util.collections.autosync;
 
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
 import lombok.AllArgsConstructor;
 import lombok.Data;
+
+import java.util.Set;
 
 @Data
 @AllArgsConstructor
@@ -1991,7 +3255,7 @@ public class PlayerDataSync
     private String username;
     private String profile;
     private long playerHash;
-    private Object[] items;
+    private Set<ObtainedCollectionItem> items;
 }
 package com.templeosrs.util.collections.autosync;
 
@@ -2073,10 +3337,11 @@ public class CollectionLogAutoSyncConfigChecker {
     /**
      * Checks for OPTION_COLLECTION_NEW_ITEM varbit value changes and runs the warning message check.
      * This is also ran when logging in, as the game doesn't load varbits immediately.
+     * Don't read varbits during a world hop because they seem to always be 0
      */
     @Subscribe
     private void onVarbitChanged(VarbitChanged varbitChanged) {
-        if (varbitChanged.getVarbitId() == VarbitID.OPTION_COLLECTION_NEW_ITEM) {
+        if (varbitChanged.getVarbitId() == VarbitID.OPTION_COLLECTION_NEW_ITEM && client.getGameState() != GameState.HOPPING) {
             checkAndWarnForCollectionLogNotificationSetting(varbitChanged.getValue());
         }
     }
@@ -2114,95 +3379,24 @@ public class CollectionLogAutoSyncConfigChecker {
     }
 }
 
-/*
- * Copyright (c) 2025, andmcadams
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
 package com.templeosrs.util.collections;
 
-import lombok.Value;
-import net.runelite.client.config.RuneScapeProfileType;
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
 
-@Value
-public class PlayerProfile
-{
-    String username;
-    RuneScapeProfileType profileType;
-}
-/*
- * Copyright (c) 2025, andmcadams
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+/**
+ * All available category groups (i.e. tabs) mapped to their in-game struct IDs
  */
+@RequiredArgsConstructor
+public enum CollectionLogCategoryGroup {
+    bosses(471),
+    raids(472),
+    clues(473),
+    minigames(474),
+    other(475);
 
-package com.templeosrs.util.collections;
-
-import lombok.AllArgsConstructor;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-import java.util.HashMap;
-import java.util.Map;
-
-@Data
-@NoArgsConstructor
-@AllArgsConstructor
-public class PlayerData
-{
-    public Integer collectionLogItemCount = null;
-    public String collectionLogSlots = "";
-    public Map<Integer, Integer> collectionLogCounts = new HashMap<>();
-
-    public boolean isEmpty()
-    {
-        return collectionLogSlots.isEmpty() && collectionLogItemCount == null;
-    }
-
-    public void clearCollectionLog()
-    {
-        collectionLogSlots = "";
-        collectionLogItemCount = null;
-    }
+    @Getter
+    private final int structId;
 }
 /*
  * Copyright (c) 2025, andmcadams
@@ -2230,433 +3424,1566 @@ public class PlayerData
  */
 package com.templeosrs.util.collections;
 
-import com.google.gson.Gson;
-import com.google.gson.JsonParseException;
 import com.templeosrs.TempleOSRSConfig;
 import com.templeosrs.TempleOSRSPlugin;
+import com.templeosrs.util.api.QuadraticBackoffStrategy;
 import com.templeosrs.util.collections.autosync.CollectionLogAutoSyncManager;
+import com.templeosrs.util.collections.chatcommands.CollectionLogChatCommandChatMessageSubscriber;
+import com.templeosrs.util.collections.data.*;
+import com.templeosrs.util.collections.database.CollectionDatabase;
+import com.templeosrs.util.collections.services.CollectionLogService;
+import com.templeosrs.util.collections.utils.CollectionLogCacheData;
 import lombok.Getter;
+import lombok.Synchronized;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
 import net.runelite.client.config.RuneScapeProfileType;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.ItemManager;
-import okhttp3.*;
-import org.jetbrains.annotations.NotNull;
+import org.jetbrains.annotations.Nullable;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Slf4j
 @Singleton
-public class CollectionLogManager {
-    private final int VARBITS_ARCHIVE_ID = 14;
+public class CollectionLogManager
+{
+	@Inject
+	private ItemManager itemManager;
 
-    private static final String MANIFEST_URL = "https://templeosrs.com/collection-log/manifest.json";
-    private static final String SUBMIT_URL = "https://templeosrs.com/api/collection-log/sync_collection.php";
-    private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
-    private final Map<Integer, VarbitComposition> varbitCompositions = new HashMap<>();
+	@Inject
+	private SyncButtonManager syncButtonManager;
 
-    private Manifest manifest;
-    private final Map<PlayerProfile, PlayerData> playerDataMap = new HashMap<>();
-    private int cyclesSinceSuccessfulCall = 0;
+	@Inject
+	private ScheduledExecutorService scheduledExecutorService;
 
-    /**
-     * Keeps track of what collection log slots the user has set
-     */
-    @Getter
-    protected final BitSet clogItemsBitSet = new BitSet();
+	@Getter
+	@Inject
+	private Client client;
 
-    /**
-     * Keeps track of the item count for each collection log item
-     */
-    @Getter
-    protected final Map<Integer, Integer> clogItemsCountSet = new HashMap<>();
+	@Getter
+	@Inject
+	private ClientThread clientThread;
 
-    // Map item ids to bit index in the bitset
-    @Getter
-    private final HashMap<Integer, Integer> collectionLogItemIdToBitsetIndex = new HashMap<>();
+	@Inject
+	private EventBus eventBus;
 
-    private int tickCollectionLogScriptFired = -1;
+	@Inject
+	private CollectionLogAutoSyncManager collectionLogAutoSyncManager;
 
-    private final HashSet<Integer> collectionLogItemIdsFromCache = new HashSet<>();
+	@Inject
+	private TempleOSRSPlugin templeOSRSPlugin;
 
+	@Inject
+	private CollectionLogRequestManager requestManager;
+
+	@Inject
+	private CollectionLogService collectionLogService;
+
+	@Inject
+	private CollectionLogChatCommandChatMessageSubscriber collectionLogChatCommandChatMessageSubscriber;
+
+	@Inject
+	private CollectionLogRequestManager collectionLogRequestManager;
+
+	@Nullable
+	private Integer gameTickToSync;
+
+	/**
+	 * List of items found in the collection log, computed by reading the in-game enums/structs.
+	 */
+	private final Set<Integer> collectionLogItemsFromCache = new HashSet<>();
+
+	/**
+	 * Unique list of all obtained collection log items
+	 */
+	@Getter
+	private final Set<ObtainedCollectionItem> obtainedCollectionLogItems = new HashSet<>();
+
+	/**
+	 * Maps in-game categories to the list of items they contain. Pulled from the in-game cache, where the key is the
+	 * category struct ID (e.g. <a href="https://chisel.weirdgloop.org/structs/index.html?type=structs&id=493">STRUCT #493</a>)
+	 * and the value is the contents of the enum found in <a href="https://chisel.weirdgloop.org/structs/index.html?type=params&id=690">PARAM #690</a>.
+	 */
+	@Getter
+	private static final Map<Integer, Set<Integer>> collectionLogCategoryItemMap = new HashMap<>();
+
+	/**
+	 * Maps slugified category names (e.g. guardians_of_the_rift) to their in-game struct ID
+	 */
+	@Getter
+	private static final Map<String, Integer> collectionLogCategoryStructIdMap = new HashMap<>();
+
+	/**
+	 * Maps top level tabs (e.g. "Bosses") to their containing categories.
+	 * Used to list the available categories when using the "!col help ___" commands
+	 */
+	@Getter
+	private static final Map<Integer, Set<String>> collectionLogCategoryTabSlugs = new LinkedHashMap<>();
+
+	@Getter
+	private final QuadraticBackoffStrategy backoffStrategy = new QuadraticBackoffStrategy();
+
+	public void startUp()
+	{
+		eventBus.register(this);
+
+		CollectionDatabase.init();
+
+		if (templeOSRSPlugin.getConfig().enableClogChatCommand())
+		{
+			collectionLogChatCommandChatMessageSubscriber.startUp();
+		}
+
+		if (templeOSRSPlugin.getConfig().autoSyncClog())
+		{
+			collectionLogAutoSyncManager.startUp();
+		}
+
+		clientThread.invoke(() -> {
+			if (client.getIndexConfig() == null || client.getGameState().ordinal() < GameState.LOGIN_SCREEN.ordinal())
+			{
+				return false;
+			}
+
+			CollectionLogCacheData collectionLogCacheData = parseCacheForClog();
+
+			collectionLogItemsFromCache.addAll(collectionLogCacheData.getItemIds());
+			collectionLogCategoryItemMap.putAll(collectionLogCacheData.getCategoryItems());
+			collectionLogCategoryStructIdMap.putAll(collectionLogCacheData.getCategoryStructIds());
+			collectionLogCategoryTabSlugs.putAll(collectionLogCacheData.getCategorySlugs());
+
+			return true;
+		});
+	}
+
+	public void shutDown()
+	{
+		eventBus.unregister(this);
+
+		if (templeOSRSPlugin.getConfig().enableClogChatCommand())
+		{
+			collectionLogChatCommandChatMessageSubscriber.shutDown();
+		}
+
+		if (templeOSRSPlugin.getConfig().autoSyncClog())
+		{
+			collectionLogAutoSyncManager.shutDown();
+		}
+
+		syncButtonManager.shutDown();
+
+		obtainedCollectionLogItems.clear();
+		collectionLogItemsFromCache.clear();
+		collectionLogCategoryItemMap.clear();
+	}
+
+	@Subscribe
+	private void onConfigChanged(ConfigChanged configChanged)
+	{
+		if (!configChanged.getGroup().equals(TempleOSRSConfig.TEMPLE_OSRS_CONFIG_GROUP))
+		{
+			return;
+		}
+
+		if (templeOSRSPlugin.getConfig().autoSyncClog())
+		{
+			collectionLogAutoSyncManager.startUp();
+		}
+		else
+		{
+			collectionLogAutoSyncManager.shutDown();
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick gameTick)
+	{
+		if (backoffStrategy.isRequestLimitReached())
+		{
+			gameTickToSync = null;
+
+			return;
+		}
+
+		if (!backoffStrategy.isSubmitting() && gameTickToSync != null && client.getTickCount() >= gameTickToSync)
+		{
+			backoffStrategy.setSubmitting(true);
+			scheduledExecutorService.execute(this::submitTask);
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		GameState state = gameStateChanged.getGameState();
+
+		switch (state)
+		{
+			// When hopping, we need to clear any state related to the player
+			case HOPPING:
+			case LOGGING_IN:
+			case CONNECTION_LOST:
+				break;
+			case LOGGED_IN:
+			{
+				// Attempt to synchronise the player's collection log on login
+				clientThread.invokeLater(() -> {
+					final String username = client.getLocalPlayer().getName();
+
+					// Wait for username to be available
+					if (username == null)
+					{
+						return false;
+					}
+
+					try
+					{
+						String lastChanged = collectionLogRequestManager
+							.getPlayerInfo(username)
+							.getCollectionLog()
+							.getLastChanged();
+
+
+						// Skip sync if the player's collection log doesn't exist, or has already been saved and is up-to-date
+						if (
+							lastChanged == null ||
+								(collectionLogService.isDataFresh(username, lastChanged) && CollectionDatabase.hasPlayerData(username))
+						)
+						{
+							return true;
+						}
+
+						collectionLogService.syncCollectionLog();
+
+						return true;
+					}
+					catch (NullPointerException | IOException e)
+					{
+						// If an error occurs then bail early to avoid infinite retries
+						return true;
+					}
+				});
+			}
+		}
+	}
+
+	/**
+	 * Handles updating the collection log after the log has opened or the Temple sync button has been pressed.
+	 */
+	@Subscribe
+	public void onScriptPreFired(ScriptPreFired preFired)
+	{
+		if (preFired.getScriptId() == 4100)
+		{
+			if (collectionLogItemsFromCache.isEmpty())
+			{
+				return;
+			}
+
+			// Submit the collection log data three ticks after the first script prefires
+			// This gives the game time to build the obtained items set and resolves an issue
+			// that caused players with large logs to miss items in their sync data
+			gameTickToSync = client.getTickCount() + 3;
+
+			Object[] args = preFired.getScriptEvent().getArguments();
+			int itemId = (int) args[1];
+			int itemCount = (int) args[2];
+			String itemName = itemManager.getItemComposition(itemId).getName();
+
+			obtainedCollectionLogItems.add(new ObtainedCollectionItem(itemId, itemName, itemCount));
+		}
+	}
+
+	@Synchronized
+	public void submitTask()
+	{
+		// TODO: do we want other GameStates?
+		if (client.getGameState() != GameState.LOGGED_IN || client.getLocalPlayer().getName() == null)
+		{
+			log.error("⚠️ Aborting sync as the player is no longer logged in");
+
+			return;
+		}
+
+		if (backoffStrategy.shouldSkipRequest())
+		{
+			return;
+		}
+
+		String username = client.getLocalPlayer().getName();
+
+		final boolean hasPlayerData = CollectionDatabase.hasPlayerData(username);
+
+		if (hasPlayerData && !syncButtonManager.isFullSyncRequested())
+		{
+			backoffStrategy.reset();
+			gameTickToSync = null;
+
+			return;
+		}
+
+		// If no API player data exists or if the sync button has been pressed, upload the entire log
+		submitPlayerData();
+	}
+
+	private void submitPlayerData()
+	{
+		String username = client.getLocalPlayer().getName();
+
+		// Do not send if slot data wasn't generated
+		if (obtainedCollectionLogItems.isEmpty())
+		{
+			log.error("❌ No obtained items have been set for {}", username);
+
+			gameTickToSync = null;
+			backoffStrategy.reset();
+
+			return;
+		}
+
+		RuneScapeProfileType profileType = RuneScapeProfileType.getCurrent(client);
+		PlayerProfile profileKey = new PlayerProfile(username, profileType);
+
+		// Only IDs and counts are useful in the request
+		Set<ObtainedCollectionItem> preparedItems = obtainedCollectionLogItems
+			.stream()
+			.map(item -> new ObtainedCollectionItem(item.getId(), item.getCount()))
+			.collect(Collectors.toSet());
+
+		int totalCollectionsAvailable = collectionLogItemsFromCache.size();
+
+		PlayerData playerData = new PlayerData(totalCollectionsAvailable, preparedItems);
+
+		PlayerDataSubmission submission = new PlayerDataSubmission(
+			profileKey.getUsername(),
+			profileKey.getProfileType().name(),
+			client.getAccountHash(),
+			playerData
+		);
+
+		try
+		{
+			requestManager.uploadFullCollectionLog(submission);
+			syncButtonManager.setFullSyncRequested(false);
+			gameTickToSync = null;
+
+			log.debug("Successfully submitted collection log for {}", submission.getUsername());
+		}
+		catch (IOException e)
+		{
+			log.error("❌ Failed to upload collection log for {}", submission.getUsername());
+		}
+		finally
+		{
+			backoffStrategy.finishCycle();
+		}
+	}
+
+	/**
+	 * Parse the enums and structs in the cache to figure out which item ids exist in the collection log.
+	 */
+	private CollectionLogCacheData parseCacheForClog()
+	{
+		Set<Integer> items = new HashSet<>();
+		Map<Integer, Set<Integer>> categoryItems = new HashMap<>();
+		Map<String, Integer> categoryStructIds = new HashMap<>();
+		Map<Integer, Set<String>> categorySlugs = new LinkedHashMap<>();
+
+		final Pattern specialCharacterPattern = Pattern.compile("['()]", Pattern.CASE_INSENSITIVE);
+
+		// Some items with data saved on them have replacements to fix a duping issue (satchels, flamtaer bag)
+		// Enum 3721 contains a mapping of the item ids to replace -> ids to replace them with
+		EnumComposition replacements = client.getEnum(3721);
+
+		// 2102 - Struct that contains the highest level tabs in the collection log (Bosses, Raids, etc)
+		// https://chisel.weirdgloop.org/structs/index.html?type=enums&id=2102
+		int[] topLevelTabStructIds = client.getEnum(2102).getIntVals();
+		for (int topLevelTabStructIndex : topLevelTabStructIds)
+		{
+			// The collection log top level tab structs contain a param that points to the enum
+			// that contains the pointers to sub tabs.
+			// ex: https://chisel.weirdgloop.org/structs/index.html?type=structs&id=471
+			StructComposition topLevelTabStruct = client.getStructComposition(topLevelTabStructIndex);
+
+			Set<String> singleCategorySlugSet = new LinkedHashSet<>();
+
+			// Param 683 contains the pointer to the enum that contains the subtabs ids
+			// ex: https://chisel.weirdgloop.org/structs/index.html?type=enums&id=2103
+			int[] subtabStructIndices = client.getEnum(topLevelTabStruct.getIntValue(683)).getIntVals();
+			for (int subtabStructIndex : subtabStructIndices)
+			{
+
+				// The subtab structs are for subtabs in the collection log (Commander Zilyana, Chambers of Xeric, etc.)
+				// and contain a pointer to the enum that contains all the item ids for that tab.
+				// ex subtab struct: https://chisel.weirdgloop.org/structs/index.html?type=structs&id=476
+				// ex subtab enum: https://chisel.weirdgloop.org/structs/index.html?type=enums&id=2109
+				StructComposition subtabStruct = client.getStructComposition(subtabStructIndex);
+
+				int[] clogItems = client.getEnum(subtabStruct.getIntValue(690)).getIntVals();
+
+				// Gets a slugified version of the category title
+				// (e.g. Master Treasure Trails (Rare) -> master_treasure_trails_rare)
+				String normalizedCategoryName = specialCharacterPattern
+					.matcher(
+						subtabStruct.getStringValue(689)
+							.toLowerCase()
+							.replaceAll(" ", "_")
+					)
+					.replaceAll("");
+
+				Set<Integer> itemSet = new LinkedHashSet<>();
+
+				for (int clogItemId : clogItems)
+				{
+					final int replacementId = replacements.getIntValue(clogItemId);
+
+					itemSet.add(
+						replacementId == -1
+							? clogItemId
+							: replacementId
+					);
+				}
+
+				items.addAll(itemSet);
+				categoryItems.put(subtabStructIndex, itemSet);
+				categoryStructIds.put(normalizedCategoryName, subtabStructIndex);
+				singleCategorySlugSet.add(normalizedCategoryName);
+			}
+
+			categorySlugs.put(topLevelTabStructIndex, singleCategorySlugSet);
+		}
+
+		return new CollectionLogCacheData(items, categoryItems, categoryStructIds, categorySlugs);
+	}
+}
+
+package com.templeosrs.util.collections;
+
+import lombok.RequiredArgsConstructor;
+
+/**
+ * Categories that can be used in the chat command.
+ * Note: the command falls back to the input value, so may capture items not in this list if it has not been updated
+ *
+ * @link <a href="https://templeosrs.com/api/collection-log/category_parameters.php">Full category list</a>
+ */
+@RequiredArgsConstructor
+public enum CollectionLogCategorySlug {
+    // Bosses
+    abyssal_sire,
+    alchemical_hydra,
+    amoxliatl,
+    araxxor,
+    barrows_chests,
+    bryophyta,
+    callisto_and_artio,
+    cerberus,
+    chaos_elemental,
+    chaos_fanatic,
+    commander_zilyana,
+    corporeal_beast,
+    crazy_archaeologist,
+    dagannoth_kings,
+    duke_sucellus,
+    the_fight_caves,
+    fortis_colosseum,
+    the_gauntlet,
+    general_graardor,
+    giant_mole,
+    grotesque_guardians,
+    hespori,
+    hueycoatl,
+    the_inferno,
+    kalphite_queen,
+    king_black_dragon,
+    kraken,
+    kreearra,
+    kril_tsutsaroth,
+    the_leviathan,
+    moons_of_peril,
+    nex,
+    the_nightmare,
+    obor,
+    phantom_muspah,
+    royal_titans,
+    sarachnis,
+    scorpia,
+    scurrius,
+    skotizo,
+    tempoross,
+    thermonuclear_smoke_devil,
+    vardorvis,
+    venenatis_and_spindel,
+    vetion_and_calvarion,
+    vorkath,
+    the_whisperer,
+    wintertodt,
+    yama,
+    zalcano,
+    zulrah,
+
+    // Raids
+    chambers_of_xeric,
+    theatre_of_blood,
+    tombs_of_amascut,
+
+    // Clues
+    beginner_treasure_trails,
+    easy_treasure_trails,
+    medium_treasure_trails,
+    hard_treasure_trails,
+    elite_treasure_trails,
+    master_treasure_trails,
+    hard_treasure_trails_rare,
+    elite_treasure_trails_rare,
+    master_treasure_trails_rare,
+    shared_treasure_trail_rewards,
+
+    // Minigames
+    barbarian_assault,
+    brimhaven_agility_arena,
+    castle_wars,
+    fishing_trawler,
+    giants_foundry,
+    gnome_restaurant,
+    guardians_of_the_rift,
+    hallowed_sepulchre,
+    last_man_standing,
+    magic_training_arena,
+    mahogany_homes,
+    mastering_mixology,
+    pest_control,
+    rogues_den,
+    shades_of_mortton,
+    soul_wars,
+    temple_trekking,
+    tithe_farm,
+    trouble_brewing,
+    volcanic_mine,
+    aerial_fishing,
+
+    // Other
+    all_pets,
+    camdozaal,
+    champions_challenge,
+    chompy_bird_hunting,
+    colossal_wyrm_agility,
+    creature_creation,
+    cyclopes,
+    elder_chaos_druids,
+    forestry,
+    fossil_island_notes,
+    gloughs_experiments,
+    hunter_guild,
+    monkey_backpacks,
+    motherlode_mine,
+    my_notes,
+    random_events,
+    revenants,
+    rooftop_agility,
+    shayzien_armour,
+    shooting_stars,
+    skilling_pets,
+    slayer,
+    tormented_demons,
+    tzhaar,
+    miscellaneous,
+
+    // Custom
+    gilded,
+    thirdage,
+}
+package com.templeosrs.util.collections.chatcommands;
+
+import com.templeosrs.util.collections.chatcommands.commands.*;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.ScriptCallbackEvent;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+
+import javax.inject.Inject;
+import java.util.*;
+
+@Slf4j
+public class CollectionLogChatCommandChatMessageSubscriber
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private EventBus eventBus;
+
+	@Inject
+	private DisplayPlayerCollectionLogChatCommand displayPlayerCollectionLogChatCommand;
+
+	@Inject
+	private ListAllHelpCommandsChatCommand helpCommandsChatCommand;
+
+	@Inject
+	private ListAllBossCategoriesChatCommand bossCategoriesChatCommand;
+
+	@Inject
+	private ListAllCluesCategoriesChatCommand cluesCategoriesChatCommand;
+
+	@Inject
+	private ListAllRaidsCategoriesChatCommand raidsCategoriesChatCommand;
+
+	@Inject
+	private ListAllCustomCategoriesChatCommand customCategoriesChatCommand;
+
+	@Inject
+	private ListAllMinigamesCategoriesChatCommand minigamesCategoriesChatCommand;
+
+	@Inject
+	private ListAllOtherCategoriesChatCommand otherCategoriesChatCommand;
+
+	private final Set<ChatMessageType> allowedMessageTypes = Set.of(
+		ChatMessageType.PUBLICCHAT,
+		ChatMessageType.FRIENDSCHAT,
+		ChatMessageType.PRIVATECHAT,
+		ChatMessageType.CLAN_CHAT,
+		ChatMessageType.CLAN_GIM_MESSAGE,
+		ChatMessageType.CLAN_GUEST_CHAT
+	);
+
+	public static Map<String, ChatCommand> chatCommands = new LinkedHashMap<>();
+
+	public void startUp()
+	{
+		eventBus.register(this);
+
+		chatCommands.put(displayPlayerCollectionLogChatCommand.trigger, displayPlayerCollectionLogChatCommand);
+		chatCommands.put(helpCommandsChatCommand.trigger, helpCommandsChatCommand);
+		chatCommands.put(bossCategoriesChatCommand.trigger, bossCategoriesChatCommand);
+		chatCommands.put(raidsCategoriesChatCommand.trigger, raidsCategoriesChatCommand);
+		chatCommands.put(cluesCategoriesChatCommand.trigger, cluesCategoriesChatCommand);
+		chatCommands.put(minigamesCategoriesChatCommand.trigger, minigamesCategoriesChatCommand);
+		chatCommands.put(otherCategoriesChatCommand.trigger, otherCategoriesChatCommand);
+		chatCommands.put(customCategoriesChatCommand.trigger, customCategoriesChatCommand);
+	}
+
+	public void shutDown()
+	{
+		eventBus.unregister(this);
+
+		chatCommands.values().forEach(ChatCommand::shutDown);
+		chatCommands.clear();
+	}
+
+	@Subscribe(priority = -2) // Run after ChatMessageManager
+	public void onChatMessage(ChatMessage event)
+	{
+		final ChatMessageType type = event.getType();
+		final String rawMessage = event.getMessage().trim();
+
+		final String COLLECTION_LOG_CHAT_TRIGGER = "!col ";
+
+		// Only react to public, private, or clan chat messages that begin with "!col "
+		if (!allowedMessageTypes.contains(type) || !rawMessage.toLowerCase().startsWith(COLLECTION_LOG_CHAT_TRIGGER))
+		{
+			return;
+		}
+
+		ChatCommand chatCommand = chatCommands.get(rawMessage.toLowerCase());
+
+		if (chatCommand != null)
+		{
+			chatCommand.execute(event);
+
+			return;
+		}
+
+		displayPlayerCollectionLogChatCommand.command(event);
+	}
+
+	/**
+	 * Prevents the help commands from being rendered to the chat for anyone with the plugin installed
+	 */
+	@Subscribe
+	public void onScriptCallbackEvent(ScriptCallbackEvent event)
+	{
+		if (!event.getEventName().equals("chatFilterCheck"))
+		{
+			return;
+		}
+
+		int[] intStack = client.getIntStack();
+		int intStackSize = client.getIntStackSize();
+		Object[] objectStack = client.getObjectStack();
+		int objectStackSize = client.getObjectStackSize();
+
+		final int messageType = intStack[intStackSize - 2];
+		String message = (String) objectStack[objectStackSize - 1];
+		ChatMessageType chatMessageType = ChatMessageType.of(messageType);
+
+		if (!allowedMessageTypes.contains(chatMessageType))
+		{
+			return;
+		}
+
+		Set<String> hiddenChatCommands = Set.of("!col list", "!col help");
+
+		for (String hiddenChatCommand : hiddenChatCommands)
+		{
+			if (message.toLowerCase().startsWith(hiddenChatCommand))
+			{
+				intStack[intStackSize - 3] = 0;
+
+				break;
+			}
+		}
+	}
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import com.templeosrs.util.collections.data.CollectionLogCategory;
+import com.templeosrs.util.collections.utils.CollectionLogCategoryUtils;
+import java.util.List;
+import java.util.stream.Collectors;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.QueuedMessage;
+
+import java.util.Map;
+
+public class ListAllCustomCategoriesChatCommand extends ChatCommand {
+    public ListAllCustomCategoriesChatCommand()
+    {
+        super("!col list custom", "Lists all available custom categories", true);
+    }
+
+    @Override
+    public void command(ChatMessage event)
+    {
+        clientThread.invoke(() -> {
+            chatMessageManager.queue(
+                QueuedMessage.builder()
+                    .type(ChatMessageType.CONSOLE)
+                    .runeLiteFormattedMessage(buildAvailableCategoriesMessage("custom"))
+                    .build()
+            );
+
+			List<Integer> iconItemIds = CollectionLogCategoryUtils.CUSTOM_CATEGORIES
+				.values()
+				.stream()
+				.map(item -> item.getItems().iterator().next())
+				.collect(Collectors.toList());
+
+			loadItemIcons(iconItemIds);
+
+			int i = 0;
+
+            for (Map.Entry<String, CollectionLogCategory> customCategory : CollectionLogCategoryUtils.CUSTOM_CATEGORIES.entrySet()) {
+				int iconIndex = itemIconIndexes.get(iconItemIds.get(i++));
+
+                chatMessageManager.queue(
+                    QueuedMessage.builder()
+                        .type(ChatMessageType.CONSOLE)
+                        .runeLiteFormattedMessage(
+                            new ChatMessageBuilder()
+                                .append(ChatColorType.NORMAL)
+								.img(iconIndex)
+                                .append(customCategory.getValue().getTitle())
+                                .append(": ")
+                                .append(ChatColorType.HIGHLIGHT)
+                                .append(customCategory.getKey())
+                                .build()
+                        )
+                        .build()
+                );
+            }
+
+            client.refreshChat();
+        });
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.util.collections.CollectionLogCategoryGroup;
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import net.runelite.api.events.ChatMessage;
+
+public class ListAllCluesCategoriesChatCommand extends ChatCommand {
+    public ListAllCluesCategoriesChatCommand()
+    {
+        super("!col list clues", "Lists all available clues categories", true);
+    }
+
+    @Override
+    public void command(ChatMessage event)
+    {
+        listAvailableCollectionLogCategories(CollectionLogCategoryGroup.clues);
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.util.collections.CollectionLogCategoryGroup;
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.events.ChatMessage;
+
+@Slf4j
+public class ListAllBossCategoriesChatCommand extends ChatCommand {
+    public ListAllBossCategoriesChatCommand()
+    {
+        super("!col list bosses", "Lists all available boss categories", true);
+    }
+
+    @Override
+    public void command(ChatMessage event)
+    {
+        listAvailableCollectionLogCategories(CollectionLogCategoryGroup.bosses);
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import com.templeosrs.util.collections.chatcommands.CollectionLogChatCommandChatMessageSubscriber;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.util.Text;
+
+import java.util.Map;
+
+public class ListAllHelpCommandsChatCommand extends ChatCommand {
+    public ListAllHelpCommandsChatCommand()
+    {
+        super("!col help", "Lists all available help commands", true);
+    }
+
+    @Override
+    public void command(ChatMessage event)
+    {
+        clientThread.invoke(() -> {
+            chatMessageManager.queue(
+                QueuedMessage.builder()
+                    .type(ChatMessageType.CONSOLE)
+                    .runeLiteFormattedMessage("Available help commands:")
+                    .build()
+            );
+
+            for (Map.Entry<String, ChatCommand> helpCommandMessage : CollectionLogChatCommandChatMessageSubscriber.chatCommands.entrySet())
+            {
+                // Output a list of all available help commands, excluding the current one
+                // (the player must already know the command to even trigger this)
+                if (!helpCommandMessage.getKey().equals(this.trigger)) {
+                    chatMessageManager.queue(
+                        QueuedMessage.builder()
+                            .type(ChatMessageType.CONSOLE)
+                            .runeLiteFormattedMessage(
+                                    new ChatMessageBuilder()
+                                        .append(ChatColorType.HIGHLIGHT)
+                                        .append(helpCommandMessage.getKey())
+                                        .append(": ")
+                                        .append(ChatColorType.NORMAL)
+                                        .append(Text.escapeJagex(helpCommandMessage.getValue().description))
+                                        .build()
+                            )
+                            .build()
+                    );
+                }
+            }
+
+            client.refreshChat();
+        });
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.util.collections.CollectionLogCategoryGroup;
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import net.runelite.api.events.ChatMessage;
+
+public class ListAllRaidsCategoriesChatCommand extends ChatCommand {
+    public ListAllRaidsCategoriesChatCommand()
+    {
+        super("!col list raids", "Lists all available raids categories", true);
+    }
+
+    @Override
+    public void command(ChatMessage event)
+    {
+        listAvailableCollectionLogCategories(CollectionLogCategoryGroup.raids);
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.util.collections.CollectionLogCategoryGroup;
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import net.runelite.api.events.ChatMessage;
+
+public class ListAllOtherCategoriesChatCommand extends ChatCommand {
+    public ListAllOtherCategoriesChatCommand()
+    {
+        super("!col list other", "Lists all available other categories", true);
+    }
+
+    @Override
+    public void command(ChatMessage event)
+    {
+        listAvailableCollectionLogCategories(CollectionLogCategoryGroup.other);
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.TempleOSRSPlugin;
+import com.templeosrs.util.collections.CollectionLogCategorySlug;
+import com.templeosrs.util.collections.CollectionLogManager;
+import com.templeosrs.util.collections.CollectionLogRequestManager;
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import com.templeosrs.util.collections.data.CollectionLogCategory;
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
+import com.templeosrs.util.collections.data.PlayerInfoResponse;
+import com.templeosrs.util.collections.database.CollectionDatabase;
+import com.templeosrs.util.collections.parser.CollectionParser;
+import com.templeosrs.util.collections.services.CollectionLogService;
+import com.templeosrs.util.collections.utils.CollectionLogCategoryUtils;
+import com.templeosrs.util.collections.utils.PlayerNameUtils;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.StructComposition;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+
+import javax.inject.Inject;
+import java.io.IOException;
+import java.util.*;
+import java.util.concurrent.ScheduledExecutorService;
+
+@Slf4j
+public class DisplayPlayerCollectionLogChatCommand extends ChatCommand  {
     @Inject
-    private SyncButtonManager syncButtonManager;
+    private ChatMessageManager chatMessageManager;
 
     @Inject
     private ScheduledExecutorService scheduledExecutorService;
 
     @Inject
-    private Gson gson;
-
-    @Inject
-    private ItemManager itemManager;
-
-    @Getter
-    @Inject
-    private Client client;
-
-    @Getter
-    @Inject
-    private ClientThread clientThread;
-
-    @Inject
-    private EventBus eventBus;
-
-    @Inject
-    private CollectionLogAutoSyncManager collectionLogAutoSyncManager;
+    private CollectionLogRequestManager collectionLogRequestManager;
 
     @Inject
     private TempleOSRSPlugin templeOSRSPlugin;
 
     @Inject
-    private ConfigManager configManager;
+    private CollectionParser collectionParser;
 
     @Inject
-    private CollectionLogRequestManager requestManager;
+    private CollectionLogService collectionLogService;
 
-    public void startUp() {
-        eventBus.register(this);
+    public DisplayPlayerCollectionLogChatCommand()
+	{
+		super("!col ", "Displays the player's collection log for a given boss. May also be used to display other players' logs, e.g. !col kree CousinOfKos", false);
+	}
 
-        if (templeOSRSPlugin.getConfig().autoSyncClog()) {
-            collectionLogAutoSyncManager.startUp();
+    @Override
+    public void command(ChatMessage event)
+	{
+        final String rawMessage = event.getMessage().trim();
+
+        String[] parts = rawMessage.substring(5).trim().split(" ", 2);
+
+        if (parts.length == 0) {
+            return;
         }
 
-        clientThread.invoke(() -> {
-            if (client.getIndexConfig() == null || client.getGameState().ordinal() < GameState.LOGIN_SCREEN.ordinal()) {
-                return false;
-            }
-            collectionLogItemIdsFromCache.addAll(parseCacheForClog());
+        // Normalize boss name
+        String bossInput = parts[0].trim().replace(' ', '_').toLowerCase();
+        CollectionLogCategory category = getCategoryFromMessageInput(bossInput);
 
-            populateCollectionLogItemIdToBitsetIndex();
-            final int[] varbitIds = client.getIndexConfig().getFileIds(VARBITS_ARCHIVE_ID);
-            for (int id : varbitIds) {
-                varbitCompositions.put(id, client.getVarbit(id));
+        // Determine target player (specified or sender)
+        String playerName = (parts.length == 2) ? parts[1].trim() : event.getName();
+        String normalizedPlayerName = PlayerNameUtils.normalizePlayerName(playerName);  // Normalize the player name for the API call
+        String localName = PlayerNameUtils.normalizePlayerName(client.getLocalPlayer().getName());
+        boolean isLocalPlayer = normalizedPlayerName.equalsIgnoreCase(localName);
+
+        if (category == null) {
+            if (isLocalPlayer) {
+                log.warn("❌ No alias or category found for {}", bossInput);
+
+                final String errorMessage = new ChatMessageBuilder()
+                    .append(ChatColorType.NORMAL)
+                    .append("Use ")
+                    .append(ChatColorType.HIGHLIGHT)
+                    .append("!col help")
+                    .append(ChatColorType.NORMAL)
+                    .append(" to help find the correct category.")
+                    .build();
+
+                chatMessageManager.queue(
+                    QueuedMessage.builder()
+                        .type(ChatMessageType.CONSOLE)
+                        .runeLiteFormattedMessage(errorMessage)
+                        .build()
+                );
             }
-            return true;
+
+            overwriteMessage(
+                new ChatMessageBuilder()
+                    .append(ChatColorType.HIGHLIGHT)
+                    .append(bossInput)
+                    .append(ChatColorType.NORMAL)
+                    .append(" is not a valid collection log category or alias.")
+                    .build(),
+                event.getMessageNode()
+            );
+
+            return;
+        }
+
+        scheduledExecutorService.execute(() ->
+        {
+            PlayerInfoResponse.Data playerInfo = getPlayerInfo(normalizedPlayerName, event);
+
+            if (playerInfo == null) {
+                // Error messages are handled when getting the player info
+                return;
+            }
+
+            String prettyPlayerName = playerInfo.getPlayerNameWithCapitalization();
+
+            if (playerInfo.getCollectionLog().getLastChanged() == null) {
+                overwriteMessage(
+                    new ChatMessageBuilder()
+                        .append(ChatColorType.NORMAL)
+                        .append("No TempleOSRS collection log found for ")
+                        .append(ChatColorType.HIGHLIGHT)
+                        .append(prettyPlayerName)
+                        .append(".")
+                        .build(),
+                    event.getMessageNode()
+                );
+
+                return;
+            }
+
+            String lastChanged = playerInfo.getCollectionLog().getLastChanged();
+
+            final boolean isDataStale = !collectionLogService.isDataFresh(normalizedPlayerName, lastChanged);
+            final boolean hasLocalData = CollectionDatabase.hasPlayerData(normalizedPlayerName);
+            final boolean shouldUpdate = !hasLocalData || isDataStale;
+
+            if (shouldUpdate)
+            {
+                log.debug("📭 No local data for '{}', fetching from API...", normalizedPlayerName);
+                String json = collectionLogRequestManager.getPlayerCollectionLog(normalizedPlayerName);
+
+                if (json == null) {
+                    log.warn("❌ No data fetched for user: {}", normalizedPlayerName);
+
+                    overwriteMessage(
+                        new ChatMessageBuilder()
+                            .append(ChatColorType.NORMAL)
+                            .append("Failed to fetch log for ")
+                            .append(ChatColorType.HIGHLIGHT)
+                            .append(prettyPlayerName)
+                            .append(ChatColorType.NORMAL)
+                            .append(".")
+                            .build(),
+                        event.getMessageNode()
+                    );
+
+                    return;
+                }
+
+                if (!isLocalPlayer) {
+                    CollectionDatabase.pruneOldPlayers(localName, templeOSRSPlugin.getConfig().maxCachedPlayers());
+                }
+
+                collectionParser.parseAndStore(PlayerNameUtils.normalizePlayerName(playerName), json);
+            }
+            else
+            {
+                log.debug("✔️ Found cached data for '{}'", normalizedPlayerName);
+            }
+
+            // Fetch the requested category
+            Set<ObtainedCollectionItem> items = CollectionDatabase.getItemsByCategory(
+                    normalizedPlayerName,
+					new LinkedHashSet<>(category.getItems())
+            );
+
+            loadItemIcons(
+				items
+					.stream()
+					.map(ObtainedCollectionItem::getId)
+					.collect(Collectors.toList())
+			);
+
+            ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder();
+            String categoryName = category.getTitle();
+
+            // If sender's name is same as the player being queried, omit the player's name
+            if (!event.getName().equalsIgnoreCase(playerName)) {
+                chatMessageBuilder
+                        .append(ChatColorType.HIGHLIGHT)
+                        .append(prettyPlayerName + "'s ")
+                        .append(categoryName)
+                        .append(ChatColorType.NORMAL)
+                        .append(": ");
+            } else {
+                chatMessageBuilder.append(categoryName).append(": ");
+            }
+
+            if (items.isEmpty()) {
+                chatMessageBuilder.append("No obtained collection log items.");
+            } else {
+                int i = 0;
+
+                for (ObtainedCollectionItem item : items)
+                {
+                    Integer iconIndex = itemIconIndexes.get(item.getId());
+
+                    if (iconIndex != null) {
+                        chatMessageBuilder.img(iconIndex);
+                    }
+
+                    chatMessageBuilder
+                            .append("x")
+                            .append(String.valueOf(item.getCount()));
+
+                    if (i++ < items.size() - 1) {
+                        chatMessageBuilder.append(", ");
+                    }
+                }
+            }
+
+            overwriteMessage(chatMessageBuilder.build(), event.getMessageNode());
         });
-
-        checkManifest();
     }
+
+    private PlayerInfoResponse.Data getPlayerInfo(String playerName, ChatMessage chatMessage)
+    {
+        try {
+            return collectionLogRequestManager.getPlayerInfo(playerName);
+        } catch (NullPointerException e) {
+            overwriteMessage(
+                new ChatMessageBuilder()
+                    .append(ChatColorType.NORMAL)
+                    .append("Unable to find ")
+                    .append(ChatColorType.HIGHLIGHT)
+                    .append(playerName)
+                    .append(ChatColorType.NORMAL)
+                    .append(" on TempleOSRS.")
+                    .build(),
+                chatMessage.getMessageNode()
+            );
+        } catch (IOException e) {
+            overwriteMessage(
+                new ChatMessageBuilder()
+                    .append(ChatColorType.NORMAL)
+                    .append("Failed to fetch from TempleOSRS.")
+                    .build(),
+                chatMessage.getMessageNode()
+            );
+        }
+
+        return null;
+    }
+
+    private String getCategoryKeyFromMessageInput(String bossInput)
+    {
+        try {
+            final CollectionLogCategorySlug categorySlug = Objects.requireNonNullElseGet(
+                    CollectionLogCategoryUtils.CATEGORY_ALIASES.get(bossInput),
+                    () -> CollectionLogCategorySlug.valueOf(bossInput)
+            );
+
+            return categorySlug.toString();
+        } catch (IllegalArgumentException e) {
+            return bossInput;
+        }
+    }
+
+    private CollectionLogCategory getCategoryFromMessageInput(String bossInput)
+    {
+        String categoryKey = getCategoryKeyFromMessageInput(bossInput);
+        CollectionLogCategory customCategory = CollectionLogCategoryUtils.CUSTOM_CATEGORIES.get(bossInput);
+
+        if (customCategory != null) {
+            return customCategory;
+        }
+
+        try {
+            int structId = CollectionLogManager.getCollectionLogCategoryStructIdMap().get(categoryKey);
+
+            StructComposition categoryStruct = client.getStructComposition(structId);
+            String categoryTitle = categoryStruct.getStringValue(689);
+            Set<Integer> categoryItems = CollectionLogManager.getCollectionLogCategoryItemMap().get(categoryStruct.getId());
+
+            return new CollectionLogCategory(categoryTitle,categoryItems);
+        } catch (NullPointerException e) {
+            return null;
+        }
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands.commands;
+
+import com.templeosrs.util.collections.CollectionLogCategoryGroup;
+import com.templeosrs.util.collections.chatcommands.ChatCommand;
+import net.runelite.api.events.ChatMessage;
+
+public class ListAllMinigamesCategoriesChatCommand extends ChatCommand {
+    public ListAllMinigamesCategoriesChatCommand()
+    {
+        super("!col list minigames", "Lists all available minigames categories", true);
+    }
+
+    @Override
+    public void command(ChatMessage event)
+    {
+        listAvailableCollectionLogCategories(CollectionLogCategoryGroup.minigames);
+    }
+}
+
+package com.templeosrs.util.collections.chatcommands;
+
+import com.templeosrs.util.collections.CollectionLogCategoryGroup;
+import com.templeosrs.util.collections.CollectionLogManager;
+import com.templeosrs.util.collections.utils.CollectionLogCategoryUtils;
+import com.templeosrs.util.collections.utils.PlayerNameUtils;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.game.ChatIconManager;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.util.AsyncBufferedImage;
+import net.runelite.client.util.ImageUtil;
+
+import javax.inject.Inject;
+import java.awt.image.BufferedImage;
+import java.util.Set;
+
+@Slf4j
+public abstract class ChatCommand {
+    public ChatCommand(String trigger, String description, boolean onlyShowForLocalPlayer)
+    {
+        this.trigger = trigger;
+        this.description = description;
+        this.onlyShowForLocalPlayer = onlyShowForLocalPlayer;
+    }
+
+    @Inject
+    protected Client client;
+
+    @Inject
+    protected ClientThread clientThread;
+
+    @Inject
+    protected ChatMessageManager chatMessageManager;
+
+    @Inject
+    protected ItemManager itemManager;
+
+    /**
+     * The chat message that triggers the command, e.g. "!col help"
+     */
+    public String trigger;
+
+    /**
+     * The description given to the command when listed by the "!col help" command
+     */
+    public String description;
+
+    /**
+     * If true, hide the message from all other players except the local player
+     */
+    private final boolean onlyShowForLocalPlayer;
+
+	/**
+	 * Maintain a map of item IDs to their respective index in the icon list
+	 */
+	protected final Map<Integer, Integer> itemIconIndexes = new HashMap<>();
+
+	/**
+	 * Maintain a list of previously seen item icons to avoid loading them twice
+	 */
+	protected final Set<Integer> loadedItemIds = new HashSet<>();
+
+    /**
+     * Checks whether the message sender is the currently logged in player
+     * @param event the ChatMessage event
+     * @return true if the message sender if the currently logged in player
+     */
+    public boolean isOtherPlayer(ChatMessage event)
+    {
+        String localName = PlayerNameUtils.normalizePlayerName(client.getLocalPlayer().getName());
+        String senderName = PlayerNameUtils.normalizePlayerName(event.getName());
+
+        return !senderName.equalsIgnoreCase(localName);
+    }
+
+    public String buildAvailableCategoriesMessage(String category)
+    {
+        return new ChatMessageBuilder()
+            .append(ChatColorType.NORMAL)
+            .append("Available ")
+            .append(ChatColorType.HIGHLIGHT)
+            .append(category)
+            .append(ChatColorType.NORMAL)
+            .append(" categories:")
+            .build();
+    }
+
+    public void overwriteMessage(String newMessage, MessageNode messageNode)
+    {
+        messageNode.setRuneLiteFormatMessage(newMessage);
+        client.refreshChat();
+    }
+
+    /**
+     * Outputs a list of all available collection log categories.
+     * As this is derived from the in-game cache,
+     * it will always be up-to-date with the latest changes (unless a new tab is added).
+     * @param categoryGroup The category group (i.e. tab) for which to list items
+     */
+    public void listAvailableCollectionLogCategories(CollectionLogCategoryGroup categoryGroup)
+    {
+        clientThread.invoke(() -> {
+            chatMessageManager.queue(
+                QueuedMessage.builder()
+                    .type(ChatMessageType.CONSOLE)
+                    .runeLiteFormattedMessage(buildAvailableCategoriesMessage(categoryGroup.toString()))
+                    .build()
+            );
+
+            Set<String> categorySlugs = CollectionLogManager
+                    .getCollectionLogCategoryTabSlugs()
+                    .get(categoryGroup.getStructId());
+
+			List<Integer> iconItemIds = categorySlugs.stream().map(slug -> {
+				int structId = CollectionLogManager.getCollectionLogCategoryStructIdMap().get(slug);
+				Set<Integer> categoryItems = CollectionLogManager.getCollectionLogCategoryItemMap().get(structId);
+
+				return new ArrayList<>(categoryItems).get(0);
+			}).collect(Collectors.toList());
+
+			loadItemIcons(iconItemIds);
+
+			int i = 0;
+
+            for (String categorySlug : categorySlugs) {
+                int structId = CollectionLogManager.getCollectionLogCategoryStructIdMap().get(categorySlug);
+                String categoryTitle = client.getStructComposition(structId).getStringValue(689);
+				int iconIndex = itemIconIndexes.get(iconItemIds.get(i++));
+
+				ChatMessageBuilder chatMessageBuilder = new ChatMessageBuilder()
+                        .append(ChatColorType.NORMAL)
+						.img(iconIndex)
+                        .append(categoryTitle)
+                        .append(": ");
+
+                Set<String> categoryAliases = CollectionLogCategoryUtils.INVERTED_ALIASES.get(categorySlug);
+
+                chatMessageBuilder
+                        .append(ChatColorType.HIGHLIGHT)
+                        .append(
+                            categoryAliases == null
+                                ? categorySlug
+                                : String.join(", ", categoryAliases)
+                        );
+
+                chatMessageManager.queue(
+                    QueuedMessage.builder()
+                        .type(ChatMessageType.CONSOLE)
+                        .runeLiteFormattedMessage(chatMessageBuilder.build())
+                        .build()
+                );
+            }
+
+            client.refreshChat();
+        });
+    }
+
+	/**
+	 * Loads the in-game icons for a given item list, ready to be used in the chat message.
+	 * @param iconItemIds The item list for which to load item icons.
+	 */
+	protected void loadItemIcons(List<Integer> iconItemIds)
+	{
+		// Starting with an empty list, we find which icons haven't previously been seen
+		List<Integer> newItems = new ArrayList<>();
+
+		for (int itemId : iconItemIds) {
+			if (!loadedItemIds.contains(itemId)) {
+				newItems.add(itemId);
+				loadedItemIds.add(itemId);
+			}
+		}
+
+		if (newItems.isEmpty()) {
+			return;
+		}
+
+		final IndexedSprite[] modIcons = client.getModIcons();
+
+		assert modIcons != null;
+
+		final IndexedSprite[] newModIcons = Arrays.copyOf(modIcons, modIcons.length + iconItemIds.size());
+		final int iconIndex = modIcons.length;
+
+		client.setModIcons(newModIcons);
+
+		int i = 0;
+
+		for (int itemId : iconItemIds) {
+			final AsyncBufferedImage img = itemManager.getImage(itemId);
+			final int idx = iconIndex + i++;
+
+			itemIconIndexes.put(itemId, idx);
+
+			img.onLoaded(() ->
+			{
+				final BufferedImage image = ImageUtil.resizeImage(img, 18, 16);
+				final IndexedSprite sprite = ImageUtil.getImageIndexedSprite(image, client);
+				// modicons array might be replaced in between when we assign it and the callback,
+				// so fetch modicons again
+				client.getModIcons()[idx] = sprite;
+			});
+		}
+	}
+
+    /**
+     * Executes the chat command handler.
+     * If it has been configured to only show for the current player, it will not be triggered for anyone else.
+     * @param event The chat message event
+     */
+    public void execute(ChatMessage event)
+    {
+        if (onlyShowForLocalPlayer && isOtherPlayer(event)) {
+            return;
+        }
+
+        command(event);
+    }
+
+    public void command(ChatMessage event) {}
 
     public void shutDown() {
-        eventBus.unregister(this);
+		itemIconIndexes.clear();
+		loadedItemIds.clear();
+	}
+}
 
-        if (templeOSRSPlugin.getConfig().autoSyncClog()) {
-            collectionLogAutoSyncManager.shutDown();
-        }
+package com.templeosrs.util.collections.services;
 
-        clogItemsBitSet.clear();
-        clogItemsCountSet.clear();
-        syncButtonManager.shutDown();
-    }
+import com.templeosrs.util.collections.CollectionLogRequestManager;
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
+import com.templeosrs.util.collections.database.CollectionDatabase;
+import com.templeosrs.util.collections.parser.CollectionParser;
+import com.templeosrs.util.collections.utils.PlayerNameUtils;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import org.jetbrains.annotations.NotNull;
 
-    @Subscribe
-    private void onConfigChanged(ConfigChanged configChanged)
+import javax.inject.Inject;
+import java.sql.Timestamp;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ScheduledExecutorService;
+
+@Slf4j
+public class CollectionLogService {
+    @Inject
+    private CollectionLogRequestManager collectionLogRequestManager;
+
+    @Inject
+    private ScheduledExecutorService scheduledExecutorService;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private CollectionParser collectionParser;
+
+    /**
+     * Compares the timestamp of the latest collection log to the saved data.
+     * @param username The username to check
+     * @return True if the saved data is the latest available.
+     */
+    public boolean isDataFresh(@NotNull String username, @NotNull String lastChanged)
     {
-        if (!configChanged.getGroup().equals(TempleOSRSConfig.TEMPLE_OSRS_CONFIG_GROUP)) {
-            return;
-        }
+        Timestamp dbTimestamp = CollectionDatabase.getLatestTimestamp(username);
+        Timestamp apiTimestamp = Timestamp.valueOf(lastChanged);
 
-        if (templeOSRSPlugin.getConfig().autoSyncClog()) {
-            collectionLogAutoSyncManager.startUp();
-        } else {
-            collectionLogAutoSyncManager.shutDown();
-        }
+        log.debug("🕒 [Compare] {} | DB: {} | API: {}", username, dbTimestamp, apiTimestamp);
+
+        return dbTimestamp != null && !dbTimestamp.before(apiTimestamp);
     }
 
-    @Subscribe
-    public void onGameTick(GameTick gameTick) {
-        // Submit the collection log data two ticks after the first script prefires
-        if (tickCollectionLogScriptFired != -1 &&
-                tickCollectionLogScriptFired + 2 < client.getTickCount()) {
-            tickCollectionLogScriptFired = -1;
-            if (manifest == null) {
-                client.addChatMessage(ChatMessageType.CONSOLE, "TempleOSRS", "Failed to sync collection log. Try restarting the TempleOSRS plugin.", "TempleOSRS");
+    /**
+     * Synchronises the player's cached collection log.
+     */
+    public void syncCollectionLog() {
+        scheduledExecutorService.execute(() -> {
+            log.debug("🔄 Starting syncCollectionLog()...");
+
+            if (client.getLocalPlayer() == null) {
+                log.warn("⚠️ Local player is null — not logged in yet.");
                 return;
             }
-            scheduledExecutorService.execute(this::submitTask);
-        }
-    }
 
-    @Subscribe
-    public void onGameStateChanged(GameStateChanged gameStateChanged) {
-        GameState state = gameStateChanged.getGameState();
-        switch (state) {
-            // When hopping, we need to clear any state related to the player
-            case HOPPING:
-            case LOGGING_IN:
-            case CONNECTION_LOST:
-                clogItemsBitSet.clear();
-                clogItemsCountSet.clear();
-                break;
-        }
-    }
+            String username = Objects.requireNonNull(client.getLocalPlayer().getName()).toLowerCase();
 
-    /**
-     * Finds the index this itemId is assigned to in the collections mapping.
-     *
-     * @param itemId: The itemId to look up
-     * @return The index of the bit that represents the given itemId, if it is in the map. -1 otherwise.
-     */
-    private int lookupCollectionLogItemIndex(int itemId) {
-        // The map has not loaded yet, or failed to load.
-        if (collectionLogItemIdToBitsetIndex.isEmpty()) {
-            return -1;
-        }
+            log.debug("👤 Detected username: {}", username);
 
-        Integer result = collectionLogItemIdToBitsetIndex.get(itemId);
+            String json = collectionLogRequestManager.getPlayerCollectionLog(username);
 
-        return Objects.requireNonNullElse(result, -1);
-    }
+            log.debug("📥 Fetched JSON: {} characters", json != null ? json.length() : 0);
 
-    /**
-     * Handles updating the collection log after the Temple sync button has been pressed.
-     */
-    @Subscribe
-    public void onScriptPreFired(ScriptPreFired preFired) {
-        if (syncButtonManager.isSyncAllowed() && preFired.getScriptId() == 4100) {
-            tickCollectionLogScriptFired = client.getTickCount();
-            if (collectionLogItemIdToBitsetIndex.isEmpty()) {
+            if (json == null || json.isEmpty()) {
+                log.error("❌ Empty or null response from Temple API");
                 return;
             }
-            Object[] args = preFired.getScriptEvent().getArguments();
-            int itemId = (int) args[1];
-            int itemCount = (int) args[2];
 
-            int idx = lookupCollectionLogItemIndex(itemId);
-            // We should never return -1 under normal circumstances
-            if (idx != -1) {
-                clogItemsBitSet.set(idx);
-                clogItemsCountSet.put(idx, itemCount);
-            }
-        }
-    }
+            log.debug("🧩 Parsing and storing JSON...");
 
-    synchronized public void submitTask() {
-        // If sync hasn't been toggled to be allowed
-        if (!syncButtonManager.isSyncAllowed()) {
-            return;
-        }
+            collectionParser.parseAndStore(PlayerNameUtils.normalizePlayerName(username), json);
 
-        // TODO: do we want other GameStates?
-        if (client.getGameState() != GameState.LOGGED_IN || varbitCompositions.isEmpty()) {
-            return;
-        }
-
-        if (manifest == null || client.getLocalPlayer() == null) {
-//			log.debug("Skipped due to bad manifest: {}", manifest);
-            return;
-        }
-
-        String username = client.getLocalPlayer().getName();
-        RuneScapeProfileType profileType = RuneScapeProfileType.getCurrent(client);
-        PlayerProfile profileKey = new PlayerProfile(username, profileType);
-
-        PlayerData newPlayerData = getPlayerData();
-        PlayerData oldPlayerData = playerDataMap.computeIfAbsent(profileKey, k -> new PlayerData());
-
-
-        // Uncomment below WikiSync code if we ever want to disable sync requests with no item changes
-        // For now item counts might still change even if no new items were obtained - might be worth looking into returning here if not even item count changes
-
-        // Subtraction is done in place so newPlayerData becomes a map of only changed fields
-/*
-        subtract(newPlayerData, oldPlayerData);
-
-        if (newPlayerData.isEmpty()) {
-            return;
-        }*/
-
-        // Do not send if slot data wasn't generated
-        if (newPlayerData.collectionLogSlots.isEmpty()) {
-            return;
-        }
-
-        submitPlayerData(profileKey, newPlayerData, oldPlayerData);
-    }
-
-    public void manifestTask() {
-        if (client.getGameState() == GameState.LOGGED_IN) {
-            checkManifest();
-        }
-    }
-
-    private PlayerData getPlayerData() {
-        PlayerData out = new PlayerData();
-
-        out.collectionLogSlots = Base64.getEncoder().encodeToString(clogItemsBitSet.toByteArray());
-        out.collectionLogCounts = clogItemsCountSet;
-        out.collectionLogItemCount = collectionLogItemIdsFromCache.size();
-
-        return out;
-    }
-
-    private void subtract(PlayerData newPlayerData, PlayerData oldPlayerData) {
-        if (newPlayerData.collectionLogSlots.equals(oldPlayerData.collectionLogSlots))
-            newPlayerData.clearCollectionLog();
-    }
-
-    private void merge(PlayerData oldPlayerData, PlayerData delta) {
-        oldPlayerData.collectionLogSlots = delta.collectionLogSlots;
-        oldPlayerData.collectionLogItemCount = delta.collectionLogItemCount;
-    }
-
-    private void submitPlayerData(PlayerProfile profileKey, PlayerData delta, PlayerData old) {
-        // If cyclesSinceSuccessfulCall is not a perfect square, we should not try to submit.
-        // This gives us quadratic backoff.
-        cyclesSinceSuccessfulCall += 1;
-        if (Math.pow((int) Math.sqrt(cyclesSinceSuccessfulCall), 2) != cyclesSinceSuccessfulCall) {
-            return;
-        }
-
-        PlayerDataSubmission submission = new PlayerDataSubmission(
-                profileKey.getUsername(),
-                profileKey.getProfileType().name(),
-                client.getAccountHash(),
-                delta
-        );
-
-        requestManager.uploadFullCollectionLog(submission, new Callback() {
-            @Override
-            public void onFailure(@NotNull Call call, @NotNull IOException e) {
-//				log.debug("Failed to submit: ", e);
-            }
-
-            @Override
-            public void onResponse(@NotNull Call call, @NotNull Response response) {
-                try {
-                    if (!response.isSuccessful()) {
-//						log.debug("Failed to submit: {}", response.code());
-                        return;
-                    }
-                    merge(old, delta);
-                    cyclesSinceSuccessfulCall = 0;
-                } finally {
-                    response.close();
-                }
-            }
+            log.debug("✅ Parsing complete.");
         });
-    }
-
-    private void checkManifest() {
-        requestManager.getCollectionLogManifest(new Callback() {
-            @Override
-            public void onFailure(Call call, IOException e) {
-//				log.debug("Failed to get manifest: ", e);
-            }
-
-            @Override
-            public void onResponse(Call call, Response response) {
-                try {
-                    if (!response.isSuccessful()) {
-//						log.debug("Failed to get manifest: {}", response.code());
-                        return;
-                    }
-                    InputStream in = response.body().byteStream();
-                    manifest = gson.fromJson(new InputStreamReader(in, StandardCharsets.UTF_8), Manifest.class);
-                    populateCollectionLogItemIdToBitsetIndex();
-                } catch (JsonParseException e) {
-//                    System.out.println("Failed to parse manifest,");
-                } finally {
-                    response.close();
-                }
-            }
-        });
-    }
-
-    private void populateCollectionLogItemIdToBitsetIndex() {
-        if (manifest == null) {
-//			System.out.println("Manifest is not present so the collection log bitset index will not be updated");
-            return;
-        }
-        clientThread.invoke(() -> {
-            // Add missing keys in order to the map. Order is extremely important here so
-            // we get a stable map given the same cache data.
-            List<Integer> itemIdsMissingFromManifest = collectionLogItemIdsFromCache
-                    .stream()
-                    .filter((t) -> !manifest.collections.contains(t))
-                    .sorted()
-                    .collect(Collectors.toList());
-
-            int currentIndex = 0;
-            collectionLogItemIdToBitsetIndex.clear();
-            for (Integer itemId : manifest.collections)
-                collectionLogItemIdToBitsetIndex.put(itemId, currentIndex++);
-            for (Integer missingItemId : itemIdsMissingFromManifest) {
-                collectionLogItemIdToBitsetIndex.put(missingItemId, currentIndex++);
-            }
-        });
-    }
-
-    /**
-     * Parse the enums and structs in the cache to figure out which item ids
-     * exist in the collection log. This can be diffed with the manifest to
-     * determine the item ids that need to be appended to the end of the
-     * bitset we send to the TempleOSRS server.
-     */
-    private HashSet<Integer> parseCacheForClog() {
-        HashSet<Integer> itemIds = new HashSet<>();
-        // 2102 - Struct that contains the highest level tabs in the collection log (Bosses, Raids, etc)
-        // https://chisel.weirdgloop.org/structs/index.html?type=enums&id=2102
-        int[] topLevelTabStructIds = client.getEnum(2102).getIntVals();
-        for (int topLevelTabStructIndex : topLevelTabStructIds) {
-            // The collection log top level tab structs contain a param that points to the enum
-            // that contains the pointers to sub tabs.
-            // ex: https://chisel.weirdgloop.org/structs/index.html?type=structs&id=471
-            StructComposition topLevelTabStruct = client.getStructComposition(topLevelTabStructIndex);
-
-            // Param 683 contains the pointer to the enum that contains the subtabs ids
-            // ex: https://chisel.weirdgloop.org/structs/index.html?type=enums&id=2103
-            int[] subtabStructIndices = client.getEnum(topLevelTabStruct.getIntValue(683)).getIntVals();
-            for (int subtabStructIndex : subtabStructIndices) {
-
-                // The subtab structs are for subtabs in the collection log (Commander Zilyana, Chambers of Xeric, etc.)
-                // and contain a pointer to the enum that contains all the item ids for that tab.
-                // ex subtab struct: https://chisel.weirdgloop.org/structs/index.html?type=structs&id=476
-                // ex subtab enum: https://chisel.weirdgloop.org/structs/index.html?type=enums&id=2109
-                StructComposition subtabStruct = client.getStructComposition(subtabStructIndex);
-                int[] clogItems = client.getEnum(subtabStruct.getIntValue(690)).getIntVals();
-                for (int clogItemId : clogItems) itemIds.add(clogItemId);
-            }
-        }
-
-        // Some items with data saved on them have replacements to fix a duping issue (satchels, flamtaer bag)
-        // Enum 3721 contains a mapping of the item ids to replace -> ids to replace them with
-        EnumComposition replacements = client.getEnum(3721);
-        for (int badItemId : replacements.getKeys())
-            itemIds.remove(badItemId);
-        for (int goodItemId : replacements.getIntVals())
-            itemIds.add(goodItemId);
-
-        return itemIds;
-    }
-
-
-    private int getVarbitValue(int varbitId) {
-        VarbitComposition v = varbitCompositions.get(varbitId);
-        if (v == null) {
-            return -1;
-        }
-
-        int value = client.getVarpValue(v.getIndex());
-        int lsb = v.getLeastSignificantBit();
-        int msb = v.getMostSignificantBit();
-        int mask = (1 << ((msb - lsb) + 1)) - 1;
-        return (value >> lsb) & mask;
     }
 }
 
@@ -6456,6 +8783,7 @@ import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
 import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
 
 @ConfigGroup("TempleOSRS")
 public interface TempleOSRSConfig extends Config
@@ -6729,6 +9057,28 @@ public interface TempleOSRSConfig extends Config
 	{
 		return false;
 	}
+
+	@ConfigItem(
+			keyName = "enableClogChatCommand",
+			name = "Enable !col chat command",
+			description = "When enabled, the plugin will detect any !col chat messages and replace the contents with " +
+					"TempleOSRS log data, if available",
+			position = 4,
+			section = clogOptions
+	)
+	default boolean enableClogChatCommand() { return true; }
+
+	@Range(min = 50, max = 200)
+	@ConfigItem(
+			keyName = "maxCachedPlayers",
+			name = "Max Cached Players",
+			description = "Maximum number of players to keep in the database (excluding yourself)." +
+					" The more players the more MB kept on database. " +
+					"Default number of players in database is 50",
+			position = 3,
+			section = clogOptions
+	)
+	default int maxCachedPlayers() { return 50; }
 }
 
 package com.templeosrs;
@@ -6943,6 +9293,7 @@ public class MockedCollectionLogAutoSyncTest extends MockedTest {
 
 package com.templeosrs.collectionlog.autosync;
 
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
 import net.runelite.api.gameval.ItemID;
 import net.runelite.client.events.NpcLootReceived;
 import net.runelite.client.game.ItemStack;
@@ -6957,110 +9308,110 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.mockito.Mockito.when;
 
-public class CollectionLogAutoSyncNpcLootReceivedSubscriberTest extends MockedCollectionLogAutoSyncTest
+public class CollectionLogAutoSyncServerNpcLootSubscriberTest extends MockedCollectionLogAutoSyncTest
 {
-    @BeforeEach
-    // In-game, the chat message triggers before the loot is received, so emulate this in the tests
-    void setupChatMessageEventAndTrigger()
-    {
-        triggerNewCollectionLogItemChatMessageEvent("Twisted bow");
-    }
-    
-    @Test
-    @DisplayName("Ensure the pending sync items list is not modified when the obtained items list is empty")
-    void doesNotAddToPendingItemsWhenObtainedItemsListIsEmpty()
-    {
-        collectionLogAutoSyncManager.getObtainedItemNames().clear();
+	// In-game, the chat message triggers before the loot is received, so emulate this in the tests
+	@BeforeEach
+	void setupChatMessageEventAndTrigger()
+	{
+		triggerNewCollectionLogItemChatMessageEvent("Twisted bow");
+	}
 
-        NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
-                new ItemStack[]{}
-        );
+	@Test
+	@DisplayName("Ensure the pending sync items list is not modified when the obtained items list is empty")
+	void doesNotAddToPendingItemsWhenObtainedItemsListIsEmpty()
+	{
+		collectionLogAutoSyncManager.getObtainedItemNames().clear();
 
-        eventBus.post(npcLootReceived);
+		NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
+			new ItemStack[]{}
+		);
 
-        assertEquals(new HashSet<>(), collectionLogAutoSyncManager.getPendingSyncItems());
-    }
+		eventBus.post(npcLootReceived);
 
-    @Test
-    @DisplayName("Ensure the sync countdown timer is not started when the obtained items list is empty")
-    void doesNotStartSyncCountdownWhenObtainedItemsListIsEmpty()
-    {
-        NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
-                new ItemStack[]{}
-        );
+		assertEquals(new HashSet<>(), collectionLogAutoSyncManager.getPendingSyncItems());
+	}
 
-        eventBus.post(npcLootReceived);
+	@Test
+	@DisplayName("Ensure the sync countdown timer is not started when the obtained items list is empty")
+	void doesNotStartSyncCountdownWhenObtainedItemsListIsEmpty()
+	{
+		NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
+			new ItemStack[]{}
+		);
 
-        assertNull(collectionLogAutoSyncManager.getGameTickToSync());
-    }
+		eventBus.post(npcLootReceived);
 
-    @Test
-    @DisplayName("Ensure the pending sync items list is not modified when the loot received is not found in the obtained items list")
-    void doesNotAddToPendingItemsWhenLootIsNotInObtainedItemsList()
-    {
-        NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
-                new ItemStack[]{
-                        new ItemStack(ItemID.BONES, 1)
-                }
-        );
+		assertNull(collectionLogAutoSyncManager.getGameTickToSync());
+	}
 
-        eventBus.post(npcLootReceived);
+	@Test
+	@DisplayName("Ensure the pending sync items list is not modified when the loot received is not found in the obtained items list")
+	void doesNotAddToPendingItemsWhenLootIsNotInObtainedItemsList()
+	{
+		NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
+			new ItemStack[]{
+				new ItemStack(ItemID.BONES, 1)
+			}
+		);
 
-        assertEquals(new HashSet<>(), collectionLogAutoSyncManager.getPendingSyncItems());
-    }
+		eventBus.post(npcLootReceived);
 
-    @Test
-    @DisplayName("Ensure the sync countdown timer is not started when the loot received is not found in the obtained items list")
-    void doesNotStartSyncCountdownWhenLootIsNotInObtainedItemsList()
-    {
-        NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
-                new ItemStack[]{
-                        new ItemStack(ItemID.BONES, 1)
-                }
-        );
+		assertEquals(new HashSet<>(), collectionLogAutoSyncManager.getPendingSyncItems());
+	}
 
-        eventBus.post(npcLootReceived);
+	@Test
+	@DisplayName("Ensure the sync countdown timer is not started when the loot received is not found in the obtained items list")
+	void doesNotStartSyncCountdownWhenLootIsNotInObtainedItemsList()
+	{
+		NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
+			new ItemStack[]{
+				new ItemStack(ItemID.BONES, 1)
+			}
+		);
 
-        assertNull(collectionLogAutoSyncManager.getGameTickToSync());
-    }
+		eventBus.post(npcLootReceived);
 
-    @Test
-    @DisplayName("Ensure the pending sync items list is modified when the loot received is found in the obtained items list")
-    void addsToPendingItemsWhenLootIsInObtainedItemsList()
-    {
-        when(itemComposition.getName()).thenReturn("Twisted bow");
+		assertNull(collectionLogAutoSyncManager.getGameTickToSync());
+	}
 
-        NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
-                new ItemStack[]{
-                        new ItemStack(ItemID.TWISTED_BOW, 1)
-                }
-        );
+	@Test
+	@DisplayName("Ensure the pending sync items list is modified when the loot received is found in the obtained items list")
+	void addsToPendingItemsWhenLootIsInObtainedItemsList()
+	{
+		when(itemComposition.getName()).thenReturn("Twisted bow");
 
-        eventBus.post(npcLootReceived);
+		NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
+			new ItemStack[]{
+				new ItemStack(ItemID.TWISTED_BOW, 42)
+			}
+		);
 
-        final HashSet<Pair<String, Integer>> expectedHashSet = new HashSet<>();
-        expectedHashSet.add(Pair.of("Twisted bow", ItemID.TWISTED_BOW));
+		eventBus.post(npcLootReceived);
 
-        assertEquals(expectedHashSet, collectionLogAutoSyncManager.getPendingSyncItems());
-    }
+		final HashSet<ObtainedCollectionItem> expectedHashSet = new HashSet<>();
+		expectedHashSet.add(new ObtainedCollectionItem(ItemID.TWISTED_BOW, "Twisted bow", 42));
 
-    @Test
-    @DisplayName("Ensure the sync countdown timer is started when the loot received is found in the obtained items list")
-    void startsSyncCountdownTimerWhenLootIsInObtainedItemsList()
-    {
-        when(itemComposition.getName()).thenReturn("Twisted bow");
-        when(client.getTickCount()).thenReturn(100);
+		assertEquals(expectedHashSet, collectionLogAutoSyncManager.getPendingSyncItems());
+	}
 
-        NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
-                new ItemStack[]{
-                        new ItemStack(ItemID.TWISTED_BOW, 1)
-                }
-        );
+	@Test
+	@DisplayName("Ensure the sync countdown timer is started when the loot received is found in the obtained items list")
+	void startsSyncCountdownTimerWhenLootIsInObtainedItemsList()
+	{
+		when(itemComposition.getName()).thenReturn("Twisted bow");
+		when(client.getTickCount()).thenReturn(100);
 
-        eventBus.post(npcLootReceived);
+		NpcLootReceived npcLootReceived = buildNpcLootReceivedEvent(
+			new ItemStack[]{
+				new ItemStack(ItemID.TWISTED_BOW, 1)
+			}
+		);
 
-        assertEquals(117, collectionLogAutoSyncManager.getGameTickToSync());
-    }
+		eventBus.post(npcLootReceived);
+
+		assertEquals(117, collectionLogAutoSyncManager.getGameTickToSync());
+	}
 }
 
 package com.templeosrs.collectionlog.autosync;
@@ -7197,6 +9548,7 @@ public class CollectionLogAutoSyncChatMessageSubscriberTest extends MockedCollec
 
 package com.templeosrs.collectionlog.autosync;
 
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
 import net.runelite.api.events.GameTick;
 import org.apache.commons.lang3.tuple.Pair;
 import org.junit.jupiter.api.DisplayName;
@@ -7212,7 +9564,9 @@ public class CollectionLogAutoSyncGameTickSubscriberTest extends MockedCollectio
     {
         GameTick gameTick = new GameTick();
 
-        collectionLogAutoSyncManager.getPendingSyncItems().add(Pair.of("Item name", 1));
+        collectionLogAutoSyncManager.getPendingSyncItems().add(
+            new ObtainedCollectionItem(1, "Item name", 1)
+        );
 
         eventBus.post(gameTick);
 
@@ -7239,7 +9593,9 @@ public class CollectionLogAutoSyncGameTickSubscriberTest extends MockedCollectio
         GameTick gameTick = new GameTick();
 
         collectionLogAutoSyncManager.startSyncCountdown();
-        collectionLogAutoSyncManager.getPendingSyncItems().add(Pair.of("Item name", 1));
+        collectionLogAutoSyncManager.getPendingSyncItems().add(
+            new ObtainedCollectionItem(1, "Item name", 1)
+        );
 
         final String username = "CousinOfKos";
         final long accountHash = 1234567890;
@@ -7257,6 +9613,7 @@ public class CollectionLogAutoSyncGameTickSubscriberTest extends MockedCollectio
 
 package com.templeosrs.collectionlog.autosync;
 
+import com.templeosrs.util.collections.data.ObtainedCollectionItem;
 import net.runelite.api.Item;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.events.ItemContainerChanged;
@@ -7318,7 +9675,7 @@ public class CollectionLogAutoSyncItemContainerChangedSubscriberTest extends Moc
     void addsToPendingItemsWhenInventoryItemsMatchObtainedItems()
     {
         final Item[] mockItems = {
-                new Item(ItemID.TWISTED_BOW, 1)
+                new Item(ItemID.TWISTED_BOW, 42)
         };
 
         ItemContainerChanged itemContainerChanged = buildItemContainerChangedEvent(
@@ -7330,8 +9687,8 @@ public class CollectionLogAutoSyncItemContainerChangedSubscriberTest extends Moc
 
         eventBus.post(itemContainerChanged);
 
-        HashSet<Pair<String, Integer>> expectedHashSet = new HashSet<>();
-        expectedHashSet.add(Pair.of("Twisted bow", ItemID.TWISTED_BOW));
+        HashSet<ObtainedCollectionItem> expectedHashSet = new HashSet<>();
+        expectedHashSet.add(new ObtainedCollectionItem(ItemID.TWISTED_BOW, "Twisted bow", 42));
 
         assertEquals(expectedHashSet, collectionLogAutoSyncManager.getPendingSyncItems());
     }
@@ -7366,7 +9723,7 @@ public class CollectionLogAutoSyncItemContainerChangedSubscriberTest extends Moc
         triggerNewCollectionLogItemChatMessageEvent("Graceful boots");
 
         final Item[] mockItems = { new Item(ItemID.GRACEFUL_BOOTS, 1) };
-        final HashSet<Pair<String, Integer>> expectedHashSet = new HashSet<>();
+        final HashSet<ObtainedCollectionItem> expectedHashSet = new HashSet<>();
 
         ItemContainerChanged itemContainerChanged = new ItemContainerChanged(InventoryID.INV, itemContainer);
         when(itemContainer.getItems()).thenReturn(mockItems);
@@ -7375,7 +9732,7 @@ public class CollectionLogAutoSyncItemContainerChangedSubscriberTest extends Moc
         when(gracefulBootsItemComposition.getName()).thenReturn("Graceful boots");
         when(itemManager.getItemComposition(ItemID.GRACEFUL_BOOTS)).thenReturn(gracefulBootsItemComposition);
 
-        expectedHashSet.add(Pair.of("Graceful boots", ItemID.GRACEFUL_BOOTS));
+        expectedHashSet.add(new ObtainedCollectionItem(ItemID.GRACEFUL_BOOTS, "Graceful boots", 1));
 
         eventBus.post(itemContainerChanged);
 
@@ -7396,7 +9753,7 @@ public class CollectionLogAutoSyncItemContainerChangedSubscriberTest extends Moc
         when(gracefulBootsWyrmItemComposition.getName()).thenReturn("Graceful boots");
         when(itemManager.getItemComposition(ItemID.GRACEFUL_BOOTS_WYRM)).thenReturn(gracefulBootsWyrmItemComposition);
 
-        expectedHashSet.add(Pair.of("Graceful boots", ItemID.GRACEFUL_BOOTS_WYRM));
+        expectedHashSet.add(new ObtainedCollectionItem(ItemID.GRACEFUL_BOOTS_WYRM, "Graceful boots", 1));
 
         eventBus.post(itemContainerChanged2);
 
