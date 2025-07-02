@@ -36,7 +36,7 @@ public class EmojiPalettePlugin extends Plugin
 		emojiPanel.init();
 		final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/icon.png");
 
-		navButton = NavigationButton.builder().tooltip("Emoji Picker").icon(icon).priority(10).panel(emojiPanel).build();
+		navButton = NavigationButton.builder().tooltip("Emoji Palette").icon(icon).priority(10).panel(emojiPanel).build();
 
 		clientToolbar.addNavigation(navButton);
 	}
