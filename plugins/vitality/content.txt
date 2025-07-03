@@ -56,8 +56,8 @@ public class VitalityOverlay extends Overlay {
 
         int value = config.ignoreRegen() ? 1:0;
 
-        //if (plugin.getDifference() <= value) return null;
-        //if (plugin.getTimer() > 100) return null;
+        if (plugin.getDifference() <= value) return null;
+        if (plugin.getTimer() > 100) return null;
         plugin.setTimer(plugin.getTimer()+1);
 
         BufferedImage image = drawHitsplat(plugin.getDifference());
