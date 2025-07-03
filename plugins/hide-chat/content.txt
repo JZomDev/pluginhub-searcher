@@ -80,6 +80,7 @@ public class HideChatPlugin extends Plugin implements KeyListener {
 	protected void startUp() throws Exception {
 		keyManager.registerKeyListener(this); // Register the key listener
 		toggleChatBox(); // Ensure chatbox visibility is set based on config on startup
+		hideInCombat = config.hideInPvm() || config.hideInPvp(); // Initialize hideInCombat based on config
 	}
 
 	@Override
@@ -199,6 +200,7 @@ public class HideChatPlugin extends Plugin implements KeyListener {
 
 			// Disable combat override and combat option when user manually toggles
 			// Only if the hotkey is pressed while it is currently hidden b/c of combat
+
 			if (hideInCombat && combatOverrideActive) {
 				configManager.setConfiguration("hidechat", "hideInCombat", false);
 				combatOverrideActive = false;
@@ -209,6 +211,7 @@ public class HideChatPlugin extends Plugin implements KeyListener {
 		}
 	}
 
+	// Check combat skill has changed - checks if in combat or not
 	@Subscribe
 	public void onStatChanged(StatChanged event) {
 		Skill skill = event.getSkill();
