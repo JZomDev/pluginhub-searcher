@@ -7,6 +7,7 @@ import net.runelite.client.RuneLite;
 import javax.inject.Inject;
 import java.io.*;
 import java.lang.reflect.Type;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 
@@ -36,10 +37,53 @@ public class SessionHandler
     {
         if (!notesFile.exists()) return;
 
-        try (Reader reader = new FileReader(notesFile))
+        try (Reader reader = new InputStreamReader(new FileInputStream(notesFile), StandardCharsets.UTF_8))
         {
             Type type = new TypeToken<Map<String, String>>() {}.getType();
-            playerNotes = gson.fromJson(reader, type);
+            Map<String, String> rawNotes = gson.fromJson(reader, type);
+
+            boolean changed = false;
+            Map<String, String> cleaned = new HashMap<>();
+
+            for (Map.Entry<String, String> entry : rawNotes.entrySet())
+            {
+                String rawName = entry.getKey();
+                String rawNote = entry.getValue();
+
+                String cleanName = sanitize(rawName);
+                String cleanNote = sanitizeNote(rawNote);
+
+                if (cleaned.containsKey(cleanName))
+                {
+                    String existingNote = cleaned.get(cleanName);
+
+                    // Merge if note is different and not already part of the current one
+                    if (!existingNote.equals(cleanNote) && !cleanNote.isEmpty())
+                    {
+                        if (!existingNote.toLowerCase().contains(cleanNote.toLowerCase()))
+                        {
+                            String mergedNote = existingNote + " --- " + cleanNote;
+                            cleaned.put(cleanName, mergedNote);
+                            changed = true;
+                        }
+                    }
+                }
+                else
+                {
+                    cleaned.put(cleanName, cleanNote);
+                    if (!cleanName.equals(rawName) || !cleanNote.equals(rawNote))
+                    {
+                        changed = true;
+                    }
+                }
+            }
+
+            this.playerNotes = cleaned;
+
+            if (changed)
+            {
+                saveNotes(); // Re-save fixed file
+            }
         }
         catch (IOException e)
         {
@@ -47,9 +91,10 @@ public class SessionHandler
         }
     }
 
+
     public void saveNotes()
     {
-        try (Writer writer = new FileWriter(notesFile))
+        try (Writer writer = new OutputStreamWriter(new FileOutputStream(notesFile), StandardCharsets.UTF_8))
         {
             gson.toJson(playerNotes, writer);
         }
@@ -69,15 +114,47 @@ public class SessionHandler
         return playerNotes.getOrDefault(playerName, "");
     }
 
+    private String sanitize(String input)
+    {
+        if (input == null)
+        {
+            return "";
+        }
+
+        return input
+                .replace('\uFFFD', ' ')             // Replace the replacement character with a space
+                .replace('\u00A0', ' ')             // Replace non-breaking spaces with regular space
+                .replaceAll("[^A-Za-z0-9 ]", "")     // Keep A-Z, a-z, 0-9, and spaces only
+                .replaceAll("\\s{2,}", " ")          // Collapse multiple spaces into a single space
+                .trim();
+    }
+
+    private String sanitizeNote(String note)
+    {
+        if (note == null)
+        {
+            return "";
+        }
+
+        return note
+                .replace('\u00A0', ' ')   // Replace non-breaking space
+                .replaceAll("\\p{C}", "") // Remove control characters
+                .trim();
+    }
+
+
     public void updateNote(String playerName, String note)
     {
-        if (note == null || note.trim().isEmpty())
+        playerName = sanitize(playerName);
+        note = sanitizeNote(note);
+
+        if (note.isEmpty())
         {
             playerNotes.remove(playerName);
         }
         else
         {
-            playerNotes.put(playerName, note.trim());
+            playerNotes.put(playerName, note);
         }
 
         saveNotes();
@@ -85,6 +162,317 @@ public class SessionHandler
 
 }
 
+/*
+ * Copyright (c) 2018, John Pettenger
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+
+//thanks & credits to hiscores plugin!
+package com.BHPages;
+
+import com.google.common.collect.EvictingQueue;
+import com.google.inject.Inject;
+import java.awt.event.KeyEvent;
+import java.awt.event.KeyListener;
+import java.util.Arrays;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.regex.Pattern;
+import javax.inject.Singleton;
+import javax.swing.SwingUtilities;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.Document;
+import javax.swing.text.JTextComponent;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Friend;
+import net.runelite.api.FriendsChatManager;
+import net.runelite.api.Nameable;
+import net.runelite.api.NameableContainer;
+import net.runelite.api.Player;
+import net.runelite.api.WorldView;
+import net.runelite.api.clan.ClanID;
+import net.runelite.api.clan.ClanMember;
+import net.runelite.api.clan.ClanSettings;
+
+@Slf4j
+@Singleton
+class NameAutocompleter implements KeyListener
+{
+    /**
+     * Non-breaking space character.
+     */
+    private static final String NBSP = Character.toString((char)160);
+
+    /**
+     * Character class for characters that cannot be in an RSN.
+     */
+    private static final Pattern INVALID_CHARS = Pattern.compile("[^a-zA-Z0-9_ -]");
+
+    private static final int MAX_SEARCH_HISTORY = 25;
+
+    private final Client client;
+    //private final HiscoreConfig hiscoreConfig;
+    private final BHP_Config BHPconfig;
+
+    private final EvictingQueue<String> searchHistory = EvictingQueue.create(MAX_SEARCH_HISTORY);
+
+    /**
+     * The name currently being autocompleted.
+     */
+    private String autocompleteName;
+
+    /**
+     * Pattern for the name currently being autocompleted.
+     */
+    private Pattern autocompleteNamePattern;
+
+    @Inject
+    private NameAutocompleter(Client client, BHP_Config config)
+    {
+        this.client = client;
+        this.BHPconfig = config;
+    }
+
+    @Override
+    public void keyPressed(KeyEvent e)
+    {
+
+    }
+
+    @Override
+    public void keyReleased(KeyEvent e)
+    {
+
+    }
+
+    @Override
+    public void keyTyped(KeyEvent e)
+    {
+        if (!BHPconfig.autocomplete())
+        {
+            return;
+        }
+
+        final JTextComponent input = (JTextComponent)e.getSource();
+        final String inputText = input.getText();
+
+        // Only autocomplete if the selection end is at the end of the text.
+        if (input.getSelectionEnd() != inputText.length())
+        {
+            return;
+        }
+
+        // Character to be inserted at the selection start.
+        final String charToInsert = Character.toString(e.getKeyChar());
+
+        // Don't attempt to autocomplete if the name is invalid.
+        // This condition is also true when the user presses a key like backspace.
+        if (INVALID_CHARS.matcher(charToInsert).find()
+                || INVALID_CHARS.matcher(inputText).find())
+        {
+            return;
+        }
+
+        // Check if we are already autocompleting.
+        if (autocompleteName != null && autocompleteNamePattern.matcher(inputText).matches())
+        {
+            if (isExpectedNext(input, charToInsert))
+            {
+                try
+                {
+                    // Insert the character and move the selection.
+                    final int insertIndex = input.getSelectionStart();
+                    Document doc = input.getDocument();
+                    doc.remove(insertIndex, 1);
+                    doc.insertString(insertIndex, charToInsert, null);
+                    input.select(insertIndex + 1, input.getSelectionEnd());
+                }
+                catch (BadLocationException ex)
+                {
+                    log.warn("Could not insert character.", ex);
+                }
+
+                // Prevent default behavior.
+                e.consume();
+            }
+            else // Character to insert does not match current autocompletion. Look for another name.
+            {
+                newAutocomplete(e);
+            }
+        }
+        else // Search for a name to autocomplete
+        {
+            newAutocomplete(e);
+        }
+    }
+
+    private void newAutocomplete(KeyEvent e)
+    {
+        final JTextComponent input = (JTextComponent)e.getSource();
+        final String inputText = input.getText();
+        final String nameStart = inputText.substring(0, input.getSelectionStart()) + e.getKeyChar();
+
+        if (findAutocompleteName(nameStart))
+        {
+            // Assert this.autocompleteName != null
+            final String name = this.autocompleteName;
+            SwingUtilities.invokeLater(() ->
+            {
+                try
+                {
+                    input.getDocument().insertString(
+                            nameStart.length(),
+                            name.substring(nameStart.length()),
+                            null);
+                    input.select(nameStart.length(), name.length());
+                }
+                catch (BadLocationException ex)
+                {
+                    log.warn("Could not autocomplete name.", ex);
+                }
+            });
+        }
+    }
+
+    private boolean findAutocompleteName(String nameStart)
+    {
+        final Pattern pattern;
+        Optional<String> autocompleteName;
+
+        // Pattern to match names that start with nameStart.
+        // Allows spaces to be represented as common whitespaces, underscores,
+        // hyphens, or non-breaking spaces.
+        // Matching non-breaking spaces is necessary because the API
+        // returns non-breaking spaces when a name has whitespace.
+        pattern = Pattern.compile(
+                "(?i)^" + nameStart.replaceAll("[ _-]", "[ _" + NBSP + "-]") + ".+?");
+
+        // Search all previous successful queries
+        autocompleteName = searchHistory.stream()
+                .filter(n -> pattern.matcher(n).matches())
+                .findFirst();
+
+        // Search friends if previous searches weren't matched
+        if (!autocompleteName.isPresent())
+        {
+            NameableContainer<Friend> friendContainer = client.getFriendContainer();
+            if (friendContainer != null)
+            {
+                autocompleteName = Arrays.stream(friendContainer.getMembers())
+                        .map(Nameable::getName)
+                        .filter(n -> pattern.matcher(n).matches())
+                        .findFirst();
+            }
+        }
+
+        // Search friends chat if a friend wasn't found
+        if (!autocompleteName.isPresent())
+        {
+            final FriendsChatManager friendsChatManager = client.getFriendsChatManager();
+            if (friendsChatManager != null)
+            {
+                autocompleteName = Arrays.stream(friendsChatManager.getMembers())
+                        .map(Nameable::getName)
+                        .filter(n -> pattern.matcher(n).matches())
+                        .findFirst();
+            }
+        }
+
+        // Search clans
+        if (!autocompleteName.isPresent())
+        {
+            final ClanSettings[] clanSettings = {
+                    client.getClanSettings(ClanID.CLAN),
+                    client.getClanSettings(ClanID.GROUP_IRONMAN),
+                    client.getGuestClanSettings()
+            };
+            autocompleteName = Arrays.stream(clanSettings)
+                    .filter(Objects::nonNull)
+                    .flatMap(cs -> cs.getMembers().stream())
+                    .map(ClanMember::getName)
+                    .filter(n -> pattern.matcher(n).matches())
+                    .findFirst();
+        }
+
+        // Search cached players if a friend wasn't found
+        if (!autocompleteName.isPresent())
+        {
+            WorldView wv = client.getTopLevelWorldView();
+            autocompleteName = wv.players().stream()
+                    .filter(Objects::nonNull)
+                    .map(Player::getName)
+                    .filter(Objects::nonNull)
+                    .filter(n -> pattern.matcher(n).matches())
+                    .findFirst();
+        }
+
+        if (autocompleteName.isPresent())
+        {
+            this.autocompleteName = autocompleteName.get().replace(NBSP, " ");
+            this.autocompleteNamePattern = Pattern.compile(
+                    "(?i)^" + this.autocompleteName.replaceAll("[ _-]", "[ _-]") + "$");
+        }
+        else
+        {
+            this.autocompleteName = null;
+            this.autocompleteNamePattern = null;
+        }
+
+        return autocompleteName.isPresent();
+    }
+
+    void addToSearchHistory(@NonNull String name)
+    {
+        if (!searchHistory.contains(name))
+        {
+            searchHistory.offer(name);
+        }
+    }
+
+    private boolean isExpectedNext(JTextComponent input, String nextChar)
+    {
+        String expected;
+        if (input.getSelectionStart() < input.getSelectionEnd())
+        {
+            try
+            {
+                expected = input.getText(input.getSelectionStart(), 1);
+            }
+            catch (BadLocationException ex)
+            {
+                log.warn("Could not get first character from input selection.", ex);
+                return false;
+            }
+        }
+        else
+        {
+            expected = "";
+        }
+        return nextChar.equalsIgnoreCase(expected);
+    }
+}
 package com.BHPages;
 
 import javax.inject.Inject;
@@ -105,6 +493,7 @@ import net.runelite.client.hiscore.*;
 import static net.runelite.api.SpriteID.TAB_COMBAT;
 import static net.runelite.client.hiscore.HiscoreSkill.*;
 
+
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.PluginPanel;
@@ -114,6 +503,7 @@ import net.runelite.client.util.ImageUtil;
 import java.awt.*;
 import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
+import java.awt.event.KeyListener;
 import java.awt.image.BufferedImage;
 import java.util.HashMap;
 import java.util.List;
@@ -129,14 +519,17 @@ public class BHP_Panel extends PluginPanel
 
     private final BHP_Plugin BHPplugin;
     private final BHP_Config BHPconfig;
+    private final NameAutocompleter nameAutocompleter;
     private final HiscoreClient hiscoreClient;
     private final SessionHandler sessionHandler;
+    //group to hold all the skill levels & cmb level
+    private final SpriteManager spriteManager;
 
     //panel assets
     private final JPanel BHP_Panel = new JPanel(new GridBagLayout());
     private final IconTextField opp_nameText;
     private final JButton opp_search_button;
-    private final JButton opp_save_button;
+    //private final JButton opp_save_button;
     private final JTextArea notesEditor;
     private final JPanel totalPanel;
     private final JPanel statsPanel;
@@ -149,8 +542,8 @@ public class BHP_Panel extends PluginPanel
     //Runescape character usernames are limited to 12 chars
     int MAX_USERNAME_LENGTH = 12;
 
-    //group to hold all the skill levels & cmb level
-    private final SpriteManager spriteManager;
+    //Making string scope bigger for cleaner code
+    String autosaveMessage = "Click outside of the textbox to trigger AutoSave for your target notes!";
 
     // Not an enummap because we need null keys for combat
     private final Map<HiscoreSkill, JLabel> skillLabels = new HashMap<>();
@@ -174,12 +567,13 @@ public class BHP_Panel extends PluginPanel
     private boolean loading = false;
 
     @Inject
-    BHP_Panel(Client client, BHP_Plugin plugin, BHP_Config config, SessionHandler sessionHandler, SpriteManager spriteManager, HiscoreClient hiscoreClient)  //BHP_Panel(Client client, BHP_Plugin plugin, BHP_Config config, SpriteManager spriteManager, HiscoreClient hiscoreClient)
+    BHP_Panel(Client client, BHP_Plugin plugin, BHP_Config config, NameAutocompleter nameAutocompleter, HiscoreClient hiscoreClient, SessionHandler sessionHandler, SpriteManager spriteManager )  //BHP_Panel(Client client, BHP_Plugin plugin, BHP_Config config, SpriteManager spriteManager, HiscoreClient hiscoreClient)
     {
         this.BHPplugin = plugin;
         this.BHPconfig = config;
-        this.sessionHandler = sessionHandler;
+        this.nameAutocompleter = nameAutocompleter;
         this.hiscoreClient = hiscoreClient;
+        this.sessionHandler = sessionHandler;
         this.spriteManager = spriteManager;
 
         setBorder(BorderFactory.createEmptyBorder(10, 10, 0, 10));
@@ -215,8 +609,6 @@ public class BHP_Panel extends PluginPanel
         c.gridy = 0;
         add(opp_nameText, c);
 
-        c.insets = new Insets(0, 0, 10, 10);
-
         //search button to display players
         opp_search_button = new JButton("Search");
         opp_search_button.addActionListener(evt ->
@@ -225,37 +617,14 @@ public class BHP_Panel extends PluginPanel
             lookup(searchName);
         });
         c.weightx = 1;
-        c.gridwidth = 1;
+        c.gridwidth = 2;
         c.fill = GridBagConstraints.HORIZONTAL;
         c.gridx = 0;
         c.gridy = 1;
         add(opp_search_button, c);
 
-        c.insets = new Insets(0, 0, 10, 0);
-
-        notesEditor = new JTextArea();  // need to define the note editor area before the save button to grab text
-
-        //save button to store player data
-        opp_save_button = new JButton("Save");
-        opp_save_button.addActionListener( e ->
-        {
-            String note = notesEditor.getText();
-            String playerName = opp_nameText.getText();
-
-            if(!note.isEmpty() && !playerName.isEmpty())
-            {
-                sessionHandler.updateNote(playerName, note);
-                postSaveMsg("[+]BH Pages: Note for " + playerName + " has been updated.");
-            }
-        });
-        c.weightx = 1;
-        c.gridwidth = 1;
-        c.fill = GridBagConstraints.HORIZONTAL;
-        c.gridx = 1;
-        c.gridy = 1;
-        add(opp_save_button, c);
-
-        //note area for player notes - see note above for declaration.
+        notesEditor = new JTextArea();
+        notesEditor.setForeground(Color.WHITE);
         notesEditor.setBackground(ColorScheme.DARKER_GRAY_COLOR);
         notesEditor.setLineWrap(true);
         notesEditor.setWrapStyleWord(true);
@@ -266,7 +635,12 @@ public class BHP_Panel extends PluginPanel
             @Override
             public void focusGained(FocusEvent e)
             {
-
+                String note = notesEditor.getText();
+                if(note.equals(autosaveMessage))
+                {
+                    notesEditor.setForeground(Color.WHITE);
+                    notesEditor.setText("");
+                }
             }
 
             @Override
@@ -274,6 +648,9 @@ public class BHP_Panel extends PluginPanel
             {
                 String note = notesEditor.getText();
                 String playerName = opp_nameText.getText();
+
+                //ensure we aren't saving this message as the note
+                if(note.equals(autosaveMessage)) return;
 
                 if(!note.isEmpty() && !playerName.isEmpty())
                 {
@@ -381,15 +758,30 @@ public class BHP_Panel extends PluginPanel
         c.gridy = 6;
         add(minigamePanel, c);
 
+        addInputKeyListener(nameAutocompleter);
+
     }
 
+    void shutdown()
+    {
+        removeInputKeyListener(nameAutocompleter);
+    }
 //asset functions
 
     public void lookup(String username)
     {
         opp_nameText.setText(username);
         String note = sessionHandler.getNoteForPlayer(username);
-        notesEditor.setText(note);
+        if(note.isEmpty())
+        {
+            notesEditor.setForeground(Color.GRAY);
+            notesEditor.setText(autosaveMessage);
+        }
+        else
+        {
+            notesEditor.setForeground(Color.WHITE);
+            notesEditor.setText(note);
+        }
         lookup();
     }
 
@@ -443,7 +835,6 @@ public class BHP_Panel extends PluginPanel
                     {
                         if (ex != null)
                         {
-                            //not save message but you need to tell users if error.
                             postSaveMsg("Error fetching Hiscore data " + ex.getMessage());
                         }
 
@@ -468,8 +859,7 @@ public class BHP_Panel extends PluginPanel
         assert SwingUtilities.isEventDispatchThread();
         repaint();
 
-        //to be added later (v2?) ---v
-        //nameAutocompleter.addToSearchHistory(result.getPlayer().toLowerCase());
+        nameAutocompleter.addToSearchHistory(result.getPlayer().toLowerCase());
 
         for (Map.Entry<HiscoreSkill, JLabel> entry : skillLabels.entrySet())
         {
@@ -561,6 +951,16 @@ public class BHP_Panel extends PluginPanel
         skillPanel.add(label);
 
         return skillPanel;
+    }
+
+    void addInputKeyListener(KeyListener l)
+    {
+        this.opp_nameText.addKeyListener(l);
+    }
+
+    void removeInputKeyListener(KeyListener l)
+    {
+        this.opp_nameText.removeKeyListener(l);
     }
 
     private String detailsHtml(HiscoreResult result, HiscoreSkill skill)
@@ -862,7 +1262,9 @@ public class BHP_Plugin extends Plugin {
 	protected void shutDown() throws Exception {
 
 		sessionHandler.saveNotes();
+		BHPpanel.shutdown();
 		clientToolbar.removeNavigation(navButton);
+
 	}
 
 
@@ -920,6 +1322,17 @@ public interface BHP_Config extends Config
 			description = "Display levels over 99 in the hiscore panel."
 	)
 	default boolean virtualLevels()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			position = 2,
+			keyName = "autocomplete",
+			name = "Autocomplete",
+			description = "Predict names when typing a name to lookup."
+	)
+	default boolean autocomplete()
 	{
 		return true;
 	}
