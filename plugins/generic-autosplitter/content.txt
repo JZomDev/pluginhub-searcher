@@ -1,0 +1,735 @@
+package com.genericautosplitter;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+@ConfigGroup("autosplitter")
+public interface GenericAutosplitterConfig extends Config
+{
+	@ConfigItem(
+			position = 0,
+			keyName = "port",
+			name = "Port",
+			description = "Port for the LiveSplit server. (Restart required)"
+	)
+	default int port() {
+		return 16834;
+	}
+
+	@ConfigSection(
+			name = "Customization Instructions",
+			description = "Instructions",
+			position = 1
+	)
+	String instructionsSection = "instructionsSect";
+
+	@ConfigItem(
+			keyName = "instructions",
+			name = "Instructions",
+			description = "Instructions",
+			position = 1,
+			section = "instructionsSect"
+	)
+	default String instructions()
+	{
+		return "Better instructions are in the readme (right click plugin -> support)\n" +
+				"Open LiveSplit. Right click it and start TCP Server. Open the RuneLite sidebar and press connect. " +
+				"To add automatic splits, first make sure you have splits showing on LiveSplit. " +
+				"Get the Watchdog plugin from the plugin hub. Create any trigger you want, " +
+				"and give it a PluginMessage trigger with the namespace \"Autosplitter\" and name \"split\"";
+
+	}
+
+}
+
+package com.genericautosplitter;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.PluginMessage;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.awt.image.BufferedImage;
+import java.math.BigDecimal;
+import java.math.RoundingMode;
+import java.time.Instant;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Generic Autosplitter",
+	description = "Syncs LiveSplit to your time played and sends splits on Watchdog events"
+)
+public class GenericAutosplitterPlugin extends Plugin
+{
+	protected static final Logger logger = LoggerFactory.getLogger(GenericAutosplitterPlugin.class);
+
+	protected int ticks;
+	protected int offset;
+	protected boolean useOffset = false;
+
+	private int minutes = 0;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private GenericAutosplitterConfig config;
+
+	@Inject
+	private ConfigManager configManager;
+
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	// side panel
+	private NavigationButton navButton;
+	private GenericAutosplitterPanel panel;
+	private LivesplitController livesplitController;
+
+	// is the timer running?
+    boolean started = false;
+	boolean paused = false;
+	protected long before;
+	protected GameState lastState;
+	protected int ticksThisLogin = 0;
+
+	@Provides
+	GenericAutosplitterConfig provideConfig(ConfigManager configManager) {
+		return configManager.getConfig(GenericAutosplitterConfig.class);
+	}
+
+	@Override
+	protected void startUp() {
+		final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/autosplitter_icon.png");
+		livesplitController = new LivesplitController(client, config, this);
+		panel = new GenericAutosplitterPanel(client, config,this, livesplitController);
+		navButton = NavigationButton.builder().tooltip("Generic Autosplitter")
+				.icon(icon).priority(6).panel(panel).build();
+		clientToolbar.addNavigation(navButton);
+		panel.startPanel();
+	}
+
+	@Override
+	protected void shutDown() {
+		disconnect();
+		clientToolbar.removeNavigation(navButton);
+
+	}
+
+	public void connect() {
+		livesplitController.tryConnect();
+
+		if (livesplitController.connected) {
+			panel.setConnected();
+
+			offset = loadTime();
+			panel.loadOffset(offset);
+			if (useOffset) {
+				panel.enableOffset();
+			} else {
+				panel.disableOffset();
+			}
+		}
+	}
+
+	public void disconnect() {
+		livesplitController.disconnect();
+		panel.setDisconnected();
+
+		started = false;
+		paused = false;
+		ticks = 0;
+		offset = 0;
+	}
+
+	/*
+	 * Event handlers
+	 */
+
+	@Subscribe
+	public void onGameTick(GameTick event) {
+		if (started && !paused) {
+			ticks += 1;
+			ticksThisLogin += 1;
+			long now = Instant.now().toEpochMilli();
+			int lostTicks = (int) Math.floor((now - before) / (1000.0f * 0.6f));
+
+			if (lostTicks > ticksThisLogin) {
+				// Our tick count is off by more than 600ms
+				// logger.info("Should have been logged in for {} ticks, was actually {}", lostTicks, ticksThisLogin);
+				ticks += lostTicks - ticksThisLogin;
+				setTime();
+				before = now;
+				ticksThisLogin = 0;
+			}
+		}
+	}
+
+	@Subscribe
+	public void onPluginMessage(PluginMessage event) {
+		if ("autosplitter".equalsIgnoreCase(event.getNamespace())) {
+			// String name = event.getName(); // in case more commands are needed in the future
+			split();
+		}
+	}
+
+	/*
+	@Subscribe
+	public void onVarClientIntChanged(VarClientIntChanged event) {
+		if (client.getVarcIntValue(526) > minutes) {
+			minutes = client.getVarcIntValue(526);
+			logger.info("New time is " + minutes + " at tick " + ticks);
+		}
+	}
+ 	*/
+
+	@Subscribe
+	private void onGameStateChanged(GameStateChanged event) {
+		GameState state = event.getGameState();
+		long now = Instant.now().toEpochMilli();
+		ticksThisLogin = 0;
+
+
+		if (started) {
+
+			if (lastState == GameState.LOADING || lastState == GameState.CONNECTION_LOST) {
+				// figure out how many GameTick events we lost, round it down, and add it to total
+				// bug: sometimes off by 1, maybe just server lag
+				int lostTicks = (int) Math.floor((now - before) / (1000.0f * 0.6f));
+				// logger.info("Giving a {}t adjustment", lostTicks);
+				ticks += lostTicks;
+			}
+
+			/* debug */
+
+			// long duration = now - before;
+			// float decimal = duration / 1000.0f;
+			// logger.info("[{}t | {}s] {}", (decimal / 0.6f), decimal, lastState);
+			/* end debug */
+
+			if (state == GameState.HOPPING || state == GameState.LOGIN_SCREEN) {
+				// adjustment makes timer more accurate, idk why
+				ticks += 2;
+			}
+
+			if (paused && (state == GameState.LOGGED_IN || state == GameState.LOADING || state == GameState.CONNECTION_LOST)) {
+				resume();
+			} else if (!paused && state == GameState.HOPPING) {
+				pauseGameTime();
+			} else if (!paused && state == GameState.LOGIN_SCREEN) {
+				pause();
+			}
+		}
+
+		before = now;
+		lastState = state;
+	}
+
+	/*
+	 * Run control flow methods
+	 */
+
+	public void startRun() {
+		reset();
+		started = true;
+		paused = false;
+		before = Instant.now().toEpochMilli();
+
+		if (useOffset) {
+			ticks = offset;
+		} else {
+			ticks = 0;
+		}
+
+		livesplitController.startRun();
+		setTime();
+
+		GameState state = client.getGameState();
+		if (state == GameState.LOGIN_SCREEN || state == GameState.HOPPING || state == GameState.LOGGING_IN) {
+			pause();
+		}
+	}
+
+	public void split() {
+		if (started) {
+			livesplitController.split();
+		}
+	}
+
+	public void pause() {
+		pauseGameTime();
+		livesplitController.pause();
+	}
+
+	public void resume() {
+		unpauseGameTime();
+		livesplitController.resume();
+	}
+
+	public void pauseGameTime() {
+		livesplitController.pauseGameTime();
+		setTime();
+		paused = true;
+	}
+
+	public void unpauseGameTime() {
+		setTime();
+		livesplitController.unpauseGameTime();
+		paused = false;
+	}
+
+	public void undo() {
+		livesplitController.undo();
+	}
+
+	public void skip() {
+		livesplitController.skip();
+	}
+
+	public void endRun() {
+		// does not automatically reset, in case the user wishes to undo
+		livesplitController.endRun();
+	}
+
+	public void reset() {
+		livesplitController.reset();
+		started = false;
+	}
+
+	public void setTime() {
+		String time = buildTimeStr(ticks);
+		livesplitController.setGameTime(time);
+		saveTime(ticks);
+	}
+
+	public void spoofTime() {
+		// go to the next tick when pausing so the timer never runs backwards
+		String time = buildTimeStr(ticks + 1);
+		livesplitController.setGameTime(time);
+		saveTime(ticks);
+	}
+
+	public void toggleOffset() {
+		if (useOffset) {
+			useOffset = false;
+			panel.disableOffset();
+		} else {
+			useOffset = true;
+			panel.enableOffset();
+		}
+	}
+
+	public String buildTimeStr(int duration) {
+		return BigDecimal.valueOf((duration) * 0.6).setScale(1, RoundingMode.HALF_UP).toString();
+	}
+
+	public int getTimePlayed() {
+		return client.getVarcIntValue(526);
+	}
+
+	private void saveTime(int duration) {
+		// logger.info("Saving time " + duration);
+		configManager.setRSProfileConfiguration("autosplitter", "duration", duration);
+	}
+
+	private int loadTime() {
+		try {
+			int time = Integer.parseInt(configManager.getRSProfileConfiguration("autosplitter", "duration"));
+			return time;
+		} catch (Exception e) {
+			return getTimePlayed() * 100;
+		}
+	}
+}
+
+package com.genericautosplitter;
+
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.PrintWriter;
+import java.net.Socket;
+
+public class LivesplitController {
+    private final Client client;
+    private final GenericAutosplitterConfig config;
+    private final GenericAutosplitterPlugin splitter;
+    private PrintWriter writer;
+    private BufferedReader reader;
+    private Socket socket;
+    protected boolean connected = false;
+
+    LivesplitController(Client client, GenericAutosplitterConfig config, GenericAutosplitterPlugin splitter) {
+        this.client = client;
+        this.config = config;
+        this.splitter = splitter;
+    }
+
+    public void tryConnect() {
+        try {
+            socket = new Socket("localhost", config.port());
+            writer = new PrintWriter(socket.getOutputStream());
+            reader = new BufferedReader(new InputStreamReader(socket.getInputStream()));
+            connected = true;
+
+        } catch (Exception e) {
+            connected = false;
+            if (client.getGameState() == GameState.LOGGED_IN) {
+                String message = "Could not start socket, did you start the LiveSplit server?";
+                client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, null);
+            }
+        }
+    }
+
+    public void disconnect() {
+        try {
+            connected = false;
+            socket.close();
+
+        } catch (Exception ignored) {}
+    }
+
+    public void sendMessage(String message) {
+        if (writer != null) {
+            writer.write(message + "\r\n");
+            writer.flush();
+        }
+    }
+
+    private String receiveMessage() {
+        if (reader != null) {
+            try {
+                return reader.readLine();
+            } catch (IOException e) {
+                return "ERROR";
+            }
+        }
+        return "ERROR";
+    }
+
+    public void startRun() {
+        sendMessage("initgametime");
+        sendMessage("starttimer");
+    }
+
+    public void split() {
+
+        pauseGameTime();
+
+        splitter.setTime();
+        sendMessage("split");
+
+        unpauseGameTime();
+
+    }
+
+    public void skip() {
+        sendMessage("skipsplit");
+    }
+
+    public void undo() {
+        sendMessage("undosplit");
+    }
+
+    public void pauseGameTime() {
+        sendMessage("pausegametime");
+    }
+
+    public void unpauseGameTime() {
+        sendMessage("unpausegametime");
+    }
+
+    public void pause() {
+        sendMessage("pause");
+    }
+
+    public void resume() {
+        sendMessage("resume");
+    }
+
+    public void setGameTime(String time) {
+        sendMessage("setgametime " + time);
+    }
+
+    public void endRun() {
+        sendMessage("getcurrenttimerphase");
+        String msg = receiveMessage();
+
+        while (!msg.equals("ERROR")) {
+            switch (msg) {
+                case "Running":
+                    sendMessage("getsplitindex");
+                    String i = receiveMessage();
+                    sendMessage("skipsplit");
+                    sendMessage("getsplitindex");
+                    String j = receiveMessage();
+                    if (i.equals(j)) {
+                        split();
+                    }
+                    break;
+                case "Paused":
+                    sendMessage("resume");
+                    break;
+                case "Ended":
+                case "NotRunning":
+                    return;
+            }
+            sendMessage("getcurrenttimerphase");
+            msg = receiveMessage();
+        }
+    }
+
+    public void reset() {
+        sendMessage("reset");
+    }
+}
+
+package com.genericautosplitter;
+
+import net.runelite.api.Client;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.PluginPanel;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import javax.swing.border.LineBorder;
+import java.awt.*;
+
+public class GenericAutosplitterPanel extends PluginPanel
+{
+    private final Client client;
+    private final GenericAutosplitterConfig config;
+    private final GenericAutosplitterPlugin splitter;
+    private final LivesplitController livesplitController;
+    private JLabel status;
+    private JLabel l_time;
+    private JTextField tf_time;
+    private JPanel tickFrame;
+    private JButton b_toggleoffset;
+    private JButton b_startreset;
+    private JPanel offsetFrame;
+    private JPanel controlFrame;
+
+    @Inject
+    GenericAutosplitterPanel(Client client, GenericAutosplitterConfig config, GenericAutosplitterPlugin splitter, LivesplitController livesplitController) {
+        this.client = client;
+        this.config = config;
+        this.splitter = splitter;
+        this.livesplitController = livesplitController;
+    }
+
+    public void startPanel() {
+        getParent().setLayout(new BorderLayout());
+        getParent().add(this, BorderLayout.CENTER);
+
+        setLayout(new BorderLayout());
+        setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        final JPanel layout = new JPanel();
+        BoxLayout boxLayout = new BoxLayout(layout, BoxLayout.Y_AXIS);
+        layout.setLayout(boxLayout);
+        add(layout, BorderLayout.NORTH);
+
+        // status
+        JPanel statusFrame = new JPanel();
+        statusFrame.setLayout(new GridBagLayout());
+        statusFrame.setBorder(BorderFactory.createTitledBorder(new LineBorder(Color.CYAN), "Status"));
+
+        status = new JLabel("Not connected");
+        status.setForeground(Color.RED);
+        statusFrame.add(status);
+
+        // connect buttons
+        JPanel connectionFrame = new JPanel();
+        connectionFrame.setLayout(new GridLayout(2, 1));
+        connectionFrame.setBorder(BorderFactory.createTitledBorder(new LineBorder(Color.CYAN), "Connection"));
+
+        JButton b_connect = new JButton("Connect");
+        JButton b_disconnect = new JButton("Disconnect");
+        b_connect.setFocusable(false);
+        b_disconnect.setFocusable(false);
+
+        b_connect.addActionListener(e -> splitter.connect());
+        b_disconnect.addActionListener(e -> splitter.disconnect());
+
+        connectionFrame.add(b_connect);
+        connectionFrame.add(b_disconnect);
+
+        // control buttons
+        controlFrame = new JPanel();
+        controlFrame.setLayout(new GridLayout(5, 1));
+        controlFrame.setBorder(BorderFactory.createTitledBorder(new LineBorder(Color.ORANGE), "Controller"));
+
+        b_startreset = new JButton("Start run");
+        b_startreset.addActionListener(e -> startOrReset());
+        JButton b_split = new JButton("Split");
+        b_split.addActionListener(e -> splitter.split());
+        JButton b_undo = new JButton("Undo split");
+        b_undo.addActionListener(e -> splitter.undo());
+        JButton b_skip = new JButton("Skip split");
+        b_skip.addActionListener(e -> splitter.skip());
+        JButton b_endrun = new JButton("Complete all remaining splits");
+        b_endrun.addActionListener(e -> splitter.endRun());
+
+        b_startreset.setFocusable(false);
+        controlFrame.add(b_startreset, BorderLayout.CENTER);
+        b_split.setFocusable(false);
+        controlFrame.add(b_split, BorderLayout.CENTER);
+        b_undo.setFocusable(false);
+        controlFrame.add(b_undo, BorderLayout.CENTER);
+        b_skip.setFocusable(false);
+        controlFrame.add(b_skip, BorderLayout.CENTER);
+        b_endrun.setFocusable(false);
+        controlFrame.add(b_endrun, BorderLayout.CENTER);
+
+        // offset
+        offsetFrame = new JPanel();
+        offsetFrame.setLayout(new GridLayout(4, 1));
+        offsetFrame.setBorder(BorderFactory.createTitledBorder(new LineBorder(Color.LIGHT_GRAY), "Offset"));
+
+        l_time = new JLabel();
+        offsetFrame.add(l_time, BorderLayout.WEST);
+
+        tickFrame = new JPanel();
+        tickFrame.setLayout(new GridLayout(1, 2));
+        JLabel l_tick = new JLabel("Ticks:");
+        tickFrame.add(l_tick);
+        tf_time = new JTextField();
+        tf_time.addActionListener(e -> updateTextField());
+        tickFrame.add(tf_time);
+        offsetFrame.add(tickFrame);
+        tickFrame.setVisible(false);
+
+        b_toggleoffset = new JButton("");
+        b_toggleoffset.addActionListener(e -> splitter.toggleOffset());
+        b_toggleoffset.setFocusable(false);
+        offsetFrame.add(b_toggleoffset);
+
+        JButton b_gametime = new JButton("Set offset to Time Played");
+        b_gametime.addActionListener(e -> setOffsetToTimePlayed());
+        b_gametime.setFocusable(false);
+        offsetFrame.add(b_gametime);
+
+        // build panel
+
+        layout.add(statusFrame);
+        layout.add(Box.createRigidArea(new Dimension(0, 15)));
+        layout.add(connectionFrame);
+        layout.add(Box.createRigidArea(new Dimension(0, 15)));
+        layout.add(controlFrame);
+        layout.add(Box.createRigidArea(new Dimension(0, 15)));
+        layout.add(offsetFrame);
+
+        offsetFrame.setVisible(false);
+        controlFrame.setVisible(false);
+    }
+
+    protected void setConnected() {
+        status.setText("Connected");
+        status.setForeground(Color.GREEN);
+        offsetFrame.setVisible(true);
+        controlFrame.setVisible(true);
+    }
+
+    protected void setDisconnected() {
+        status.setText("Not connected");
+        status.setForeground(Color.RED);
+        resetRun();
+        offsetFrame.setVisible(false);
+        controlFrame.setVisible(false);
+    }
+
+    protected void updateTextField() {
+        try {
+            int ticks = Integer.parseInt(tf_time.getText());
+            setTime(ticks);
+            splitter.offset = ticks;
+        } catch (NumberFormatException ignored) {
+        }
+    }
+
+    protected void loadOffset(int offset) {
+        tf_time.setText(offset + "");
+    }
+
+    protected void setTime(int ticks) {
+        if (splitter.useOffset) {
+            int time = ticks * 6;
+            String timeStr = String.format("%02d:%02d:%02d.%01d", (time / 10) / 3600, ((time / 10) / 60) % 60, (time / 10) % 60, time % 10);
+            l_time.setText("Next timer will start at " + timeStr);
+        }
+        tf_time.setText(ticks + "");
+    }
+
+    protected void enableOffset() {
+        tickFrame.setVisible(true);
+        updateTextField();
+        b_toggleoffset.setText("Disable offset");
+    }
+
+    protected void disableOffset() {
+        tickFrame.setVisible(false);
+        l_time.setText("Next timer will start at 0.0s");
+        b_toggleoffset.setText("Enable offset");
+    }
+
+    protected void startRun() {
+        b_startreset.setText("Reset");
+        splitter.startRun();
+        offsetFrame.setVisible(false);
+    }
+
+    protected void resetRun() {
+        b_startreset.setText("Start run");
+        splitter.reset();
+        offsetFrame.setVisible(true);
+    }
+
+    protected void startOrReset() {
+        if (!splitter.started) {
+            startRun();
+        } else {
+            resetRun();
+        }
+    }
+
+    protected void setOffsetToTimePlayed() {
+        int offset = splitter.getTimePlayed() * 100;
+        splitter.useOffset = true;
+        loadOffset(offset);
+        enableOffset();
+
+    }
+
+}
+package com.genericautosplitter;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class GenericAutosplitterPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(GenericAutosplitterPlugin.class);
+		RuneLite.main(args);
+	}
+}
