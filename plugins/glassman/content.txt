@@ -18,8 +18,6 @@ import net.runelite.client.util.ColorUtil;
 import net.runelite.client.util.ImageUtil;
 import java.awt.Color;
 import java.awt.image.BufferedImage;
-import java.time.Duration;
-import java.time.Instant;
 import java.util.*;
 import javax.inject.Inject;
 
@@ -32,17 +30,13 @@ import javax.inject.Inject;
 
 public class GlassmanPlugin extends Plugin
 {
-	@Inject
-	private Client client;
+	@Inject	private Client client;
 
-	@Inject
-	private ConfigManager configManager;
+	@Inject	private ConfigManager configManager;
 
 	private boolean playerIsFragile = true;
 	private final String GLASSMANCONFIGGROUP = "GLASSMAN";
 	private final String GLASSMANVALID = "VALID";
-	private final String GLASSMANTIMER = "TIMER";
-	private Instant sessionStart;
 
 	private final Set<WorldArea> tutorialIslandWorldArea = ImmutableSet.of(
 		new WorldArea(3053, 3072, 103, 64, 0),
@@ -61,7 +55,6 @@ public class GlassmanPlugin extends Plugin
 	{
 		if (p.getPlayer() == client.getLocalPlayer())
 		{
-			sessionStart = Instant.now();
 			if (locationIsOnTutorialIsland(client.getLocalPlayer().getWorldLocation()))
 			{
 				if (getCombatExperience() == 0) {
@@ -69,7 +62,6 @@ public class GlassmanPlugin extends Plugin
 					sendGamemodeMessage("You begin to feel fragile... as though with just one hit your journey" +
 							" will be over and your heart will shatter. How far will you get?",	Color.MAGENTA);
 					playerIsFragile = true;
-					setPlayerConfig(GLASSMANTIMER,Duration.ZERO.toString());
 					setPlayerConfig(GLASSMANVALID,Boolean.toString(playerIsFragile));
 				}
 				else
@@ -116,9 +108,6 @@ public class GlassmanPlugin extends Plugin
 
 			sendGamemodeMessage("And with one blow, your fragile heart shatters. Having taken damage, you are no" +
 					" longer worthy of Glassman status...", Color.RED);
-
-			sendGamemodeMessage("You were a Glassman for a duration of: " +
-					getTimeFragile() + " without taking damage!", Color.RED);
 		}
 	}
 
@@ -171,26 +160,10 @@ public class GlassmanPlugin extends Plugin
 	private void restoreGame(boolean removePlayerFromGamemode) {
 		playerIsFragile = false;
 		if (removePlayerFromGamemode) {removePlayerFromFragileMode();}
-		logTimePlayed();
 		setHPListeners(true);
 		setHPOrbText(client.getBoostedSkillLevel(Skill.HITPOINTS));
 		setHPStatText(client.getBoostedSkillLevel(Skill.HITPOINTS), client.getRealSkillLevel(Skill.HITPOINTS));
 		restoreSprites();
-	}
-
-	private void logTimePlayed()
-	{
-		Duration previousDuration = Duration.parse(getPlayerConfig(GLASSMANTIMER));
-		Duration finalDuration = previousDuration.plus(Duration.between(sessionStart, Instant.now()));
-		setPlayerConfig(GLASSMANTIMER,finalDuration.toString());
-	}
-
-	private String getTimeFragile()
-	{
-		Duration durationFragile = Duration.parse(getPlayerConfig(GLASSMANTIMER));
-		return durationFragile.toDaysPart() + " days and " +
-				durationFragile.toHoursPart() + " hours and " +
-				durationFragile.toMinutesPart() + " minutes.";
 	}
 
 	private void setHPListeners(boolean setListeners)
