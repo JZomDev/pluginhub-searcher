@@ -50,11 +50,6 @@ public class ImadrumMoneyPlugin extends Plugin {
 
 
     @Subscribe
-    public void onNpcLootReceived(NpcLootReceived npcLootReceived) {
-        handleReceivedLoot(npcLootReceived.getItems(), npcLootReceived.getNpc().getName());
-    }
-
-    @Subscribe
     public void onPlayerLootReceived(PlayerLootReceived playerLootReceived) {
         handleReceivedLoot(playerLootReceived.getItems(), playerLootReceived.getPlayer().getName());
     }
