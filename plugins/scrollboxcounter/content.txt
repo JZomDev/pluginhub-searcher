@@ -70,12 +70,14 @@ public interface ScrollBoxCounterConfig extends Config
 package com.scrollboxcounter;
 
 import com.google.inject.Provides;
+import java.util.Objects;
 import javax.inject.Inject;
 import java.util.HashMap;
 import java.util.Map;
 
+import lombok.Getter;
 import net.runelite.api.ChatMessageType;
-import net.runelite.api.Client;
+import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
@@ -89,6 +91,10 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.game.ItemManager;
+import net.runelite.api.Client;
+import net.runelite.api.events.WidgetClosed;
+import net.runelite.api.events.GameTick;
 
 @PluginDescriptor(
 	name = "Scroll Box Counter"
@@ -115,8 +121,8 @@ public class ScrollBoxCounterPlugin extends Plugin {
 	public static final int SCROLL_CASE_MASTER_MAJOR = 16594;
 	public static final int SCROLL_CASE_MIMIC = 16595;
 
-	@Inject
-	private Client client;
+	public static final int CLUE_SCROLL_BEGINNER = 23182;
+	public static final int CLUE_SCROLL_MASTER = 19835;
 
 	@Inject
 	private OverlayManager overlayManager;
@@ -127,17 +133,37 @@ public class ScrollBoxCounterPlugin extends Plugin {
 	@Inject
 	private ChatMessageManager chatMessageManager;
 
+	@Getter
+    @Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private Client client;
+
 	private final Map<Integer, Integer> bankItems = new HashMap<>();
+	private final Map<Integer, Integer> bankActiveClueScrolls = new HashMap<>();
+	private final Map<Integer, Integer> previousInventoryCounts = new HashMap<>();
+	private boolean bankJustClosed = false;
+	private boolean bankVisited = false;
+	private boolean suppressChatMessage = false;
+	private boolean usePendingBankItems = false;
+	private boolean suppressChatOnStartup = true;
+	private boolean wasBankOpenLastTick = false;
 
 	@Override
 	protected void startUp() {
 		overlayManager.add(overlay);
+		suppressChatOnStartup = true;
 	}
 
 	@Override
 	protected void shutDown() {
 		overlayManager.remove(overlay);
 		bankItems.clear();
+		bankActiveClueScrolls.clear();
+		previousInventoryCounts.clear();
+		bankVisited = false;
+		bankJustClosed = false;
 	}
 
 	@Provides
@@ -149,25 +175,62 @@ public class ScrollBoxCounterPlugin extends Plugin {
 	public void onItemContainerChanged(ItemContainerChanged event) {
 		if (event.getContainerId() == InventoryID.BANK) {
 			updateBankItems(event.getItemContainer());
+			bankVisited = true;
+		}
+		if (event.getContainerId() == InventoryID.INV) {
+			handleInventoryChange(event.getItemContainer());
 		}
 	}
 
+	@Subscribe
+	public void onWidgetClosed(WidgetClosed event) {
+		if (event.getGroupId() == InterfaceID.BANKMAIN) {
+			bankJustClosed = true;
+			suppressChatMessage = true;
+			usePendingBankItems = true;
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event) {
+		if (bankJustClosed) {
+			updateBankItems(client.getItemContainer(InventoryID.BANK));
+			bankJustClosed = false;
+		}
+		usePendingBankItems = false;
+		suppressChatMessage = false;
+		suppressChatOnStartup = false;
+		wasBankOpenLastTick = ScrollBoxCounterUtils.isBankOpen(client);
+	}
+
 	private void updateBankItems(ItemContainer bank) {
-		bankItems.entrySet().removeIf(entry -> ScrollBoxCounterUtils.isClueScrollBox(entry.getKey()));
+		if (bank == null) {
+			return;
+		}
+		bankItems.clear();
+		bankActiveClueScrolls.clear();
 
-		if (bank != null) {
-			Item[] items = bank.getItems();
-			for (Item item : items) {
-				if (item != null && item.getId() != -1 && item.getQuantity() > 0 && ScrollBoxCounterUtils.isClueScrollBox(item.getId())) {
-						bankItems.put(item.getId(), item.getQuantity());
-					}
-
+		Item[] items = bank.getItems();
+		for (Item item : items) {
+			if (item != null && item.getId() != -1 && item.getQuantity() > 0) {
+				if (ScrollBoxCounterUtils.isClueScrollBox(item.getId())) {
+					bankItems.put(item.getId(), item.getQuantity());
+				}
+				if (isAnyActiveClueScroll(item.getId())) {
+					bankActiveClueScrolls.put(item.getId(), item.getQuantity());
+				}
 			}
 		}
 	}
 
-	public int getBankCount(int itemId) {
-		return bankItems.getOrDefault(itemId, 0);
+	private boolean isAnyActiveClueScroll(int itemId) {
+		String[] tiers = {"Beginner", "Easy", "Medium", "Hard", "Elite", "Master"};
+		for (String tier : tiers) {
+			if (ScrollBoxCounterUtils.isActiveClueScroll(itemId, tier, itemManager)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	public void sendChatMessage(String chatMessage)
@@ -183,31 +246,105 @@ public class ScrollBoxCounterPlugin extends Plugin {
 						.runeLiteFormattedMessage(message)
 						.build());
 	}
+
+    public int getBankActiveClueScrollCount(int scrollBoxItemId) {
+        String tier = ScrollBoxCounterUtils.getScrollBoxTierName(scrollBoxItemId);
+
+        for (Map.Entry<Integer, Integer> entry : bankActiveClueScrolls.entrySet()) {
+            int itemId = entry.getKey();
+            if (ScrollBoxCounterUtils.isActiveClueScroll(itemId, tier, itemManager)) {
+                return 1;
+            }
+        }
+
+        return 0;
+    }
+
+	private void handleInventoryChange(ItemContainer inventory) {
+		if (inventory == null) {
+			return;
+		}
+		Map<Integer, Integer> currentCounts = new HashMap<>();
+		for (Item item : inventory.getItems()) {
+			if (item != null && item.getId() != -1 && ScrollBoxCounterUtils.isClueScrollBox(item.getId())) {
+				currentCounts.put(item.getId(), item.getQuantity());
+			}
+		}
+
+		if (!ScrollBoxCounterUtils.isBankOpen(client) && bankVisited) {
+			for (Map.Entry<Integer, Integer> entry : currentCounts.entrySet()) {
+				int itemId = entry.getKey();
+				int currentCount = entry.getValue();
+				int previousCount = previousInventoryCounts.getOrDefault(itemId, 0);
+
+				if (currentCount > previousCount && wasBankOpenLastTick) {
+					int withdrawn = currentCount - previousCount;
+					int oldBank = bankItems.getOrDefault(itemId, 0);
+					int newBank = Math.max(0, oldBank - withdrawn);
+					bankItems.put(itemId, newBank);
+				}
+			}
+		}
+		if (!suppressChatOnStartup && !suppressChatMessage && !ScrollBoxCounterUtils.isBankOpen(client) && Objects.requireNonNull(getConfig()).showChatMessages()) {
+			for (Map.Entry<Integer, Integer> entry : currentCounts.entrySet()) {
+				int itemId = entry.getKey();
+				int currentCount = entry.getValue();
+				int previousCount = previousInventoryCounts.getOrDefault(itemId, 0);
+				if (currentCount > previousCount) {
+					sendScrollBoxMessage(itemId, currentCount);
+				}
+			}
+		}
+		previousInventoryCounts.clear();
+		previousInventoryCounts.putAll(currentCounts);
+	}
+
+
+	private void sendScrollBoxMessage(int itemId, int inventoryCount) {
+		String tierName = ScrollBoxCounterUtils.getScrollBoxTierName(itemId);
+		int bankCount = getOverlayBankCount(itemId);
+		int totalCount = inventoryCount + bankCount;
+		int maxCount = ScrollBoxCounterUtils.getMaxClueCount(itemId, client);
+		String message = "Holding " + totalCount + "/" + maxCount + " scroll boxes / clues (" + tierName + ")";
+		sendChatMessage(message);
+	}
+
+	private ScrollBoxCounterConfig getConfig() {
+		return overlay != null ? overlay.getConfig() : null;
+	}
+
+	public boolean hasVisitedBank() {
+		return bankVisited;
+	}
+
+
+	public int getOverlayBankCount(int itemId) {
+		return bankItems.getOrDefault(itemId, 0);
+	}
+
+	public boolean isUsingPendingBankItems() {
+		return usePendingBankItems;
+	}
 }
 
 package com.scrollboxcounter;
 
 import com.google.inject.Inject;
+import lombok.Getter;
 import net.runelite.api.Client;
-import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.widgets.WidgetItem;
-import net.runelite.api.ItemContainer;
-import net.runelite.api.Item;
 import net.runelite.client.ui.FontManager;
 import net.runelite.client.ui.overlay.WidgetItemOverlay;
 
 import java.awt.*;
-import java.util.HashMap;
-import java.util.Map;
 
 public class ScrollBoxCounterOverlay extends WidgetItemOverlay
 {
+	@Getter
 	private final ScrollBoxCounterConfig config;
 	private final Client client;
 	private final ScrollBoxCounterPlugin plugin;
 	private int currentItemId;
-	private final Map<Integer, Integer> previousInventoryCounts = new HashMap<>();
-	private boolean initializedInventoryTracking = false;
 
 	@Inject
 	ScrollBoxCounterOverlay(ScrollBoxCounterConfig config, Client client, ScrollBoxCounterPlugin plugin)
@@ -222,21 +359,15 @@ public class ScrollBoxCounterOverlay extends WidgetItemOverlay
 	@Override
 	public void renderItemOverlay(Graphics2D graphics, int itemId, WidgetItem widgetItem)
 	{
+		if (plugin.isUsingPendingBankItems() && !ScrollBoxCounterUtils.isClueScrollBox(itemId)) {
+			return;
+		}
 		if (!ScrollBoxCounterUtils.isClueScrollBox(itemId))
 		{
 			return;
 		}
 
 		this.currentItemId = itemId;
-
-		if (!initializedInventoryTracking) {
-			updatePreviousInventoryCounts();
-			initializedInventoryTracking = true;
-		}
-
-		if (!isItemInBank(widgetItem)) {
-			checkInventoryChanges();
-		}
 
 		final Rectangle bounds = widgetItem.getCanvasBounds();
 		if (bounds == null)
@@ -252,7 +383,8 @@ public class ScrollBoxCounterOverlay extends WidgetItemOverlay
 
 		boolean isInBank = isItemInBank(widgetItem);
 		int maxClues = ScrollBoxCounterUtils.getMaxClueCount(itemId, client);
-		int bankCount = plugin.getBankCount(itemId);
+		int bankCount = plugin.getOverlayBankCount(itemId);
+		int activeClueScrolls = ScrollBoxCounterUtils.getActiveClueScrollCount(itemId, client, plugin.getItemManager(), plugin);
 
 		int totalCount = quantity + (isInBank ? 0 : bankCount);
 		if (isInBank)
@@ -261,7 +393,7 @@ public class ScrollBoxCounterOverlay extends WidgetItemOverlay
 			totalCount = quantity + inventoryCount;
 		}
 
-		boolean isFullStack = config.markFullStacks() && totalCount >= maxClues;
+		boolean isFullStack = config.markFullStacks() && (totalCount + activeClueScrolls) >= maxClues;
 
 		if (config.maxCluePosition() == ScrollBoxCounterConfig.MaxCluePosition.DISABLED && !config.showBanked() && !isFullStack)
 		{
@@ -291,12 +423,14 @@ public class ScrollBoxCounterOverlay extends WidgetItemOverlay
 			renderMaxClues(graphics, bounds, maxClues, textColor, config.maxCluePosition());
 		}
 
-		if (config.showBanked() && !isInBank)
+		if (config.showBanked() && !isInBank && plugin.hasVisitedBank())
 		{
-			int bankCount = plugin.getBankCount(currentItemId);
-			if (bankCount > 0)
+			int bankCount = plugin.getOverlayBankCount(currentItemId);
+			int bankActiveClues = plugin.getBankActiveClueScrollCount(currentItemId);
+			int totalBanked = bankCount + bankActiveClues;
+			if (totalBanked > 0)
 			{
-				renderBankedQuantity(graphics, bounds, bankCount, textColor);
+				renderBankedQuantity(graphics, bounds, totalBanked, textColor);
 			}
 		}
 	}
@@ -352,65 +486,16 @@ public class ScrollBoxCounterOverlay extends WidgetItemOverlay
 		graphics.drawString(bankedText, x, y);
 	}
 
-	private void checkInventoryChanges() {
-		ItemContainer inventory = client.getItemContainer(InventoryID.INV);
-		if (inventory == null) {
-			return;
-		}
-
-		Map<Integer, Integer> currentCounts = new HashMap<>();
-		for (Item item : inventory.getItems()) {
-			if (item != null && item.getId() != -1 && ScrollBoxCounterUtils.isClueScrollBox(item.getId())) {
-				currentCounts.put(item.getId(), item.getQuantity());
-			}
-		}
-
-		for (Map.Entry<Integer, Integer> entry : currentCounts.entrySet()) {
-			int itemId = entry.getKey();
-			int currentCount = entry.getValue();
-			int previousCount = previousInventoryCounts.getOrDefault(itemId, 0);
-
-			if (currentCount > previousCount) {
-				if (!ScrollBoxCounterUtils.isBankOpen(client) && config.showChatMessages()) {
-					sendScrollBoxMessage(itemId, currentCount);
-				}
-			}
-		}
-
-		previousInventoryCounts.clear();
-		previousInventoryCounts.putAll(currentCounts);
-	}
-
-	private void sendScrollBoxMessage(int itemId, int inventoryCount) {
-		String tierName = ScrollBoxCounterUtils.getScrollBoxTierName(itemId);
-		int bankCount = plugin.getBankCount(itemId);
-		int totalCount = inventoryCount + bankCount;
-		int maxCount = ScrollBoxCounterUtils.getMaxClueCount(itemId, client);
-
-		String message = "Holding " + totalCount + "/" + maxCount + " scroll boxes (" + tierName + ")";
-		plugin.sendChatMessage(message);
-	}
-
-	private void updatePreviousInventoryCounts() {
-		ItemContainer inventory = client.getItemContainer(InventoryID.INV);
-		if (inventory == null) {
-			return;
-		}
-
-		previousInventoryCounts.clear();
-		for (Item item : inventory.getItems()) {
-			if (item != null && item.getId() != -1 && ScrollBoxCounterUtils.isClueScrollBox(item.getId())) {
-				previousInventoryCounts.put(item.getId(), item.getQuantity());
-			}
-		}
-	}
 }
 
 package com.scrollboxcounter;
 
 import net.runelite.api.Client;
-import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.ItemContainer;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.Item;
+import net.runelite.api.gameval.ItemID;
+import net.runelite.client.game.ItemManager;
 
 public class ScrollBoxCounterUtils {
 
@@ -448,6 +533,61 @@ public class ScrollBoxCounterUtils {
         int tierBonus = getTierBonus(itemId, client);
         int mimicBonus = getMimicBonus(client);
         return BASE_CLUE_COUNT + tierBonus + mimicBonus;
+    }
+
+    public static int getActiveClueScrollCount(int scrollBoxItemId, Client client, ItemManager itemManager, ScrollBoxCounterPlugin plugin) {
+        String tier = getScrollBoxTierName(scrollBoxItemId);
+        int inventoryCount = getActiveClueScrollsInContainer(client.getItemContainer(InventoryID.INV), tier, itemManager);
+
+        ItemContainer bankContainer = client.getItemContainer(InventoryID.BANK);
+        int bankCount;
+        if (bankContainer != null) {
+            bankCount = getActiveClueScrollsInContainer(bankContainer, tier, itemManager);
+        } else {
+            bankCount = plugin.getBankActiveClueScrollCount(scrollBoxItemId);
+        }
+
+        return inventoryCount + bankCount;
+    }
+
+    public static int getActiveClueScrollsInContainer(ItemContainer container, String tier, ItemManager itemManager) {
+        if (container == null) {
+            return 0;
+        }
+
+        boolean hasActiveClueForTier = false;
+        for (Item item : container.getItems()) {
+            if (item != null && item.getId() != -1 && isActiveClueScroll(item.getId(), tier, itemManager)) {
+                hasActiveClueForTier = true;
+                break;
+            }
+        }
+
+        return hasActiveClueForTier ? 1 : 0;
+    }
+
+    public static boolean isActiveClueScroll(int itemId, String tier, ItemManager itemManager) {
+        if (tier.equals("Beginner") && itemId == ScrollBoxCounterPlugin.CLUE_SCROLL_BEGINNER) {
+            return true;
+        }
+        if (tier.equals("Master") && (itemId == ScrollBoxCounterPlugin.CLUE_SCROLL_MASTER || itemId == ItemID.TRAIL_MASTER_PART1)) {
+            return true;
+        }
+
+        try {
+            String itemName = itemManager.getItemComposition(itemId).getMembersName();
+            if (itemName == null) {
+                return false;
+            }
+
+            String lowerName = itemName.toLowerCase();
+            String tierLower = tier.toLowerCase();
+
+            return lowerName.contains("clue scroll (" + tierLower + ")") ||
+                   lowerName.contains("challenge scroll (" + tierLower + ")");
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     public static int getTierBonus(int itemId, Client client) {
@@ -499,6 +639,7 @@ public class ScrollBoxCounterUtils {
         return client.getItemContainer(InventoryID.BANK) != null;
     }
 }
+
 package com.scrollboxcounter;
 
 import net.runelite.client.RuneLite;
