@@ -9,11 +9,47 @@ public class DropItem
 {
     private int itemId;
     private String name;
+    private String rarity;
 
-    public DropItem(int itemId, String name)
+    public DropItem(int itemId, String name, String rarity)
     {
         this.itemId = itemId;
         this.name = name;
+        this.rarity = rarity;
+    }
+
+    /**
+     * Convert a raw rarity string like "2/128" to a simplified
+     * one-over form, e.g. "1/64". If no fraction is detected,
+     * return the original string.
+     */
+    public String getOneOverRarity()
+    {
+        if (rarity == null)
+        {
+            return "";
+        }
+
+        java.util.regex.Matcher m = java.util.regex.Pattern
+                .compile("(\\d+(?:\\.\\d+)?)\\s*/\\s*(\\d+(?:\\.\\d+)?)")
+                .matcher(rarity);
+
+        if (m.find())
+        {
+            double a = Double.parseDouble(m.group(1));
+            double b = Double.parseDouble(m.group(2));
+            if (a != 0)
+            {
+                double val = b / a;
+                if (Math.abs(val - Math.round(val)) < 0.01)
+                {
+                    return "1/" + Math.round(val);
+                }
+                return String.format("1/%.2f", val);
+            }
+        }
+
+        return rarity;
     }
 }
 package com.chanceman.drops;
@@ -49,7 +85,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.concurrent.CompletableFuture;
+import java.util.stream.Stream;
 
 @Slf4j
 @Singleton
@@ -58,6 +97,7 @@ public class DropCache
     private final Gson gson;
     private final AccountManager accountManager;
     private final DropFetcher dropFetcher;
+    private static final Duration MAX_AGE = Duration.ofDays(7);
 
     @Inject
     public DropCache(Gson gson, AccountManager accountManager, DropFetcher dropFetcher)
@@ -160,6 +200,53 @@ public class DropCache
         String fn = npcId + "_" + safeName + "_" + level + ".json";
         return dir.resolve(fn);
     }
+
+    /**
+     * Deletes cached drop table files older than {@link #MAX_AGE}.
+     */
+    public void pruneOldCaches()
+    {
+        String player = accountManager.getPlayerName();
+        if (player == null)
+        {
+            return;
+        }
+
+        Path dir = RUNELITE_DIR.toPath()
+                .resolve("chanceman")
+                .resolve(player)
+                .resolve("drops");
+
+        if (!Files.exists(dir))
+        {
+            return;
+        }
+
+        Instant cutoff = Instant.now().minus(MAX_AGE);
+        try (Stream<Path> files = Files.list(dir))
+        {
+            files.filter(Files::isRegularFile)
+                    .forEach(p ->
+                    {
+                        try
+                        {
+                            Instant mod = Files.getLastModifiedTime(p).toInstant();
+                            if (mod.isBefore(cutoff))
+                            {
+                                Files.deleteIfExists(p);
+                            }
+                        }
+                        catch (IOException ex)
+                        {
+                            log.debug("Failed to delete old drop cache {}", p, ex);
+                        }
+                    });
+        }
+        catch (IOException ex)
+        {
+            log.debug("Error pruning drop cache directory {}", dir, ex);
+        }
+    }
 }
 
 package com.chanceman.drops;
@@ -195,7 +282,7 @@ public class DropFetcher
     private final OkHttpClient httpClient;
     private final ItemManager itemManager;
     private final ClientThread clientThread;
-    private final ExecutorService fetchExecutor;
+    private ExecutorService fetchExecutor;
 
     @Inject
     public DropFetcher(OkHttpClient httpClient, ItemManager itemManager, ClientThread clientThread)
@@ -203,10 +290,7 @@ public class DropFetcher
         this.httpClient = httpClient;
         this.itemManager  = itemManager;
         this.clientThread = clientThread;
-        this.fetchExecutor = Executors.newFixedThreadPool(
-                2,
-                new ThreadFactoryBuilder().setNameFormat("dropfetch-%d").build()
-        );
+        startUp();
     }
 
     /**
@@ -286,7 +370,10 @@ public class DropFetcher
             List<DropItem> items = table.select("tbody tr").stream()
                     .map(row -> row.select("td"))
                     .filter(td -> td.size() >= 6)
-                    .map(td -> new DropItem(0, td.get(1).text().replace("(m)", "").trim()))
+                    .map(td -> new DropItem(
+                            0,
+                            td.get(1).text().replace("(m)", "").trim(),
+                            td.get(3).text().trim()))
                     .collect(Collectors.toList());
 
             if (!items.isEmpty())
@@ -311,7 +398,7 @@ public class DropFetcher
     {
         Request req = new Request.Builder()
                 .url(url)
-                .header("User-Agent", "RuneLite-ChanceMan/2.3.4")
+                .header("User-Agent", "RuneLite-ChanceMan/2.4.0")
                 .build();
         try (Response res = httpClient.newCall(req).execute())
         {
@@ -326,11 +413,29 @@ public class DropFetcher
     }
 
     /**
+     * Creates the fetch executor if it is missing or has been shut down.
+     */
+    public void startUp()
+    {
+        if (fetchExecutor == null || fetchExecutor.isShutdown() || fetchExecutor.isTerminated())
+        {
+            fetchExecutor = Executors.newFixedThreadPool(
+                    2,
+                    new ThreadFactoryBuilder().setNameFormat("dropfetch-%d").build()
+            );
+        }
+    }
+
+    /**
      *  shut down the executor
      */
     public void shutdown()
     {
-        fetchExecutor.shutdownNow();
+        if (fetchExecutor != null)
+        {
+            fetchExecutor.shutdownNow();
+            fetchExecutor = null;
+        }
     }
 }
 
@@ -920,6 +1025,7 @@ package com.chanceman;
 import com.chanceman.account.AccountChanged;
 import com.chanceman.account.AccountManager;
 import com.chanceman.drops.DropFetcher;
+import com.chanceman.drops.DropCache;
 import com.chanceman.filters.EnsouledHeadMapping;
 import com.chanceman.menus.ActionHandler;
 import com.chanceman.filters.ItemsFilter;
@@ -997,6 +1103,7 @@ public class ChanceManPlugin extends Plugin
     private ItemsFilter itemsFilter;
     @Inject private DropsTabUI dropsTabUI;
     @Inject private DropFetcher dropFetcher;
+    @Inject private DropCache dropCache;
     @Inject private MusicWidgetController musicWidgetController;
 
     private ChanceManPanel chanceManPanel;
@@ -1033,6 +1140,7 @@ public class ChanceManPlugin extends Plugin
         featuresActive = true;
 
         getInjector().getInstance(ActionHandler.class).startUp();
+        dropFetcher.startUp();
         eventBus.register(accountManager);
         overlayManager.add(chanceManOverlay);
         overlayManager.add(dropsTooltipOverlay);
@@ -1073,7 +1181,7 @@ public class ChanceManPlugin extends Plugin
         dropsTabUI.shutDown();
         eventBus.unregister(accountManager);
         getInjector().getInstance(ActionHandler.class).shutDown();
-        musicWidgetController.restore();
+        clientThread.invokeLater(musicWidgetController::restore);
 
         if (clientToolbar != null && navButton != null)
         {
@@ -1159,6 +1267,7 @@ public class ChanceManPlugin extends Plugin
     private void onAccountChanged(AccountChanged event)
     {
         if (!featuresActive) return;
+        dropCache.pruneOldCaches();
         unlockedItemsManager.loadUnlockedItems();
         rolledItemsManager.loadRolledItems();
         if (chanceManPanel != null)
@@ -1413,7 +1522,7 @@ public class MusicWidgetController
     private List<Widget> backupScrollStaticKids = null;
     private List<Widget> backupScrollDynamicKids = null;
     private String originalTitleText = null;
-    @Getter private final Map<Widget, Integer> iconItemMap = new HashMap<>();
+    @Getter private final Map<Widget, DropItem> iconItemMap = new HashMap<>();
     @Getter private boolean overrideActive = false;
 
     @Inject
@@ -1638,7 +1747,7 @@ public class MusicWidgetController
             icon.setOpacity(rolledIds.contains(itemId) ? 0 : 150);
             icon.revalidate();
 
-            iconItemMap.put(icon, itemId);
+            iconItemMap.put(icon, d);
 
             displayIndex++;
         }
@@ -2005,10 +2114,11 @@ import java.util.Map;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 
+import com.chanceman.drops.DropItem;
+
 import net.runelite.api.Client;
 import net.runelite.api.Point;
 import net.runelite.api.widgets.Widget;
-import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
@@ -2021,18 +2131,15 @@ import net.runelite.client.ui.overlay.OverlayPosition;
 public class DropsTooltipOverlay extends Overlay
 {
     private final Client client;
-    private final ItemManager itemManager;
     private final MusicWidgetController widgetController;
 
     @Inject
     public DropsTooltipOverlay(
             Client client,
-            ItemManager itemManager,
             MusicWidgetController widgetController
     )
     {
         this.client = client;
-        this.itemManager = itemManager;
         this.widgetController = widgetController;
         setPosition(OverlayPosition.DYNAMIC);
         setLayer(OverlayLayer.ABOVE_WIDGETS);
@@ -2044,52 +2151,71 @@ public class DropsTooltipOverlay extends Overlay
         if (!widgetController.isOverrideActive()) {return null;}
 
         Point mouse = client.getMouseCanvasPosition();
-        for (Map.Entry<Widget, Integer> entry : widgetController.getIconItemMap().entrySet())
+        for (Map.Entry<Widget, DropItem> entry : widgetController.getIconItemMap().entrySet())
         {
             Widget w = entry.getKey();
             if (w == null || w.isHidden()) {continue;}
             Rectangle bounds = w.getBounds();
             if (bounds.contains(mouse.getX(), mouse.getY()))
             {
-                String name = itemManager
-                        .getItemComposition(entry.getValue())
-                        .getName();
-                drawTooltip(graphics, name, mouse);
+                DropItem drop = entry.getValue();
+                drawTooltip(graphics, drop.getName(), drop.getOneOverRarity(), mouse);
                 break;
             }
         }
         return null;
     }
 
-    private void drawTooltip(Graphics2D g, String text, Point mouse)
+    private void drawTooltip(Graphics2D g, String name, String rarity, Point mouse)
     {
         FontMetrics fm = g.getFontMetrics();
         int padding = 4;
-        int textW   = fm.stringWidth(text);
-        int textH   = fm.getHeight();
+        int gap = 2;
+        int lineH  = fm.getHeight();
 
-        int boxW = textW + padding * 2;
-        int boxH = textH + padding * 2;
+        String rateText = "Rate: " + rarity;
+
+        int nameW = fm.stringWidth(name);
+        int rateW = fm.stringWidth(rateText);
+
+        int nameBoxW = nameW + padding * 2;
+        int rateBoxW = rateW + padding * 2;
+        int boxH     = lineH + padding * 2;
+        int totalH   = boxH * 2 + gap;
+        int clampW   = Math.max(nameBoxW, rateBoxW);
 
         int x = mouse.getX() + 10;
         int y = mouse.getY() - 10;
 
-        // clamp to game canvas
         Rectangle clip = g.getClipBounds();
-        x = Math.max(clip.x, Math.min(x, clip.x + clip.width  - boxW));
-        y = Math.max(clip.y + boxH, Math.min(y, clip.y + clip.height));
+        x = Math.max(clip.x, Math.min(x, clip.x + clip.width  - clampW));
+        y = Math.max(clip.y + totalH, Math.min(y, clip.y + clip.height));
 
-        // fill background (more transparent)
-        g.setColor(new Color(0, 0, 0, 100));
-        g.fillRect(x, y - boxH, boxW, boxH);
+        int nameTop = y - totalH;
+        drawBox(g, x, nameTop, nameBoxW, boxH);
+        drawBox(g, x, y - boxH, rateBoxW, boxH);
 
-        // draw a slightly darker border
-        g.setColor(new Color(50, 50, 50, 200));
-        g.drawRect(x, y - boxH, boxW, boxH);
-
-        // draw the text
         g.setColor(Color.WHITE);
-        g.drawString(text, x + padding, y - padding);
+        int base = nameTop + padding + fm.getAscent();
+        g.drawString(name, x + padding, base);
+
+        int rateBase = y - boxH + padding + fm.getAscent();
+        String prefix = "Rate: ";
+        int prefixW = fm.stringWidth(prefix);
+
+        g.setColor(Color.WHITE);
+        g.drawString(prefix, x + padding, rateBase);
+
+        g.setColor(Color.ORANGE);
+        g.drawString(rarity, x + padding + prefixW, rateBase);
+    }
+
+    private void drawBox(Graphics2D g, int x, int y, int w, int h)
+    {
+        g.setColor(new Color(0, 0, 0, 100));
+        g.fillRect(x, y, w, h);
+        g.setColor(new Color(50, 50, 50, 200));
+        g.drawRect(x, y, w, h);
     }
 }
 
