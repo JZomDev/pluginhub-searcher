@@ -74,7 +74,7 @@ public class OrderWidgetDecorator {
                 potionOrderWidgets.add(child);
                 log.debug("Extracted codes: {} from widget text: {}", codes, originalText);
             }
-            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "Mastering Mixology", "Found codes: " + String.join(", ", codes), null);
+//            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "Mastering Mixology", "Found codes: " + String.join(", ", codes), null);
 
             if (codes.size() == 3) {
 
