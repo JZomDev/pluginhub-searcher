@@ -1,0 +1,594 @@
+package com.afkcrabhelper;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.InteractingChanged;
+import net.runelite.api.events.NpcDespawned;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+@Slf4j
+@PluginDescriptor(
+    name = "AFK Crab Helper",
+    description = "Provides a distraction-reducing overlay when training on crabs",
+    tags = {"afk", "crab", "training", "overlay", "distraction"}
+)
+public class AfkCrabHelperPlugin extends Plugin
+{
+    @Inject
+    private Client client;
+
+    @Inject
+    private AfkCrabHelperConfig config;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private AfkCrabHelperOverlay overlay;
+
+    private boolean isInteractingWithCrab = false;
+    private long lastCrabInteraction = 0;
+    private long overlayStartTime = 0;
+    
+    // AFK time calculation variables
+    private NPC currentCrab = null;
+    private int lastCrabHp = -1;
+    private long lastHpCheckTime = 0;
+    private double calculatedDps = 0.0;
+    private long dpsCalculationStartTime = 0;
+    private int initialCrabHp = -1;
+    private boolean isCalculatingDps = false;
+    private long afkTimeCalculatedAt = 0;
+    private double baseSecondsRemaining = 0.0;
+
+    @Override
+    protected void startUp() throws Exception
+    {
+        overlayManager.add(overlay);
+        log.info("AFK Crab Helper started!");
+    }
+
+    @Override
+    protected void shutDown() throws Exception
+    {
+        overlayManager.remove(overlay);
+        isInteractingWithCrab = false;
+        log.info("AFK Crab Helper stopped!");
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick gameTick)
+    {
+        if (client.getLocalPlayer() == null)
+        {
+            return;
+        }
+
+        checkCrabInteraction();
+        checkCrabStatus();
+    }
+
+    private void checkCrabInteraction()
+    {
+        Actor target = client.getLocalPlayer().getInteracting();
+        boolean currentlyInteractingWithCrab = false;
+        NPC targetCrab = null;
+
+        if (target instanceof NPC)
+        {
+            NPC npc = (NPC) target;
+            String npcName = npc.getName();
+            
+            if (npcName != null && isCrabNpc(npcName))
+            {
+                currentlyInteractingWithCrab = true;
+                lastCrabInteraction = System.currentTimeMillis();
+                targetCrab = npc;
+                
+                // If this is a new crab or we weren't tracking before, reset tracking
+                if (currentCrab != npc)
+                {
+                    resetAfkCalculation();
+                    currentCrab = npc;
+                    if (isGemstoneCrab(npcName))
+                    {
+                        startAfkCalculation(npc);
+                    }
+                }
+                
+                // Update HP tracking for AFK calculation
+                if (currentCrab != null && isGemstoneCrab(npcName))
+                {
+                    updateAfkCalculation(npc);
+                }
+            }
+        }
+
+        // Check if we recently interacted with a crab (within hide delay period)
+        long timeSinceLastInteraction = System.currentTimeMillis() - lastCrabInteraction;
+        if (timeSinceLastInteraction <= config.hideDelay() * 1000)
+        {
+            currentlyInteractingWithCrab = true;
+        }
+
+        // Handle activation delay for overlay
+        if (currentlyInteractingWithCrab && !isInteractingWithCrab)
+        {
+            // Starting interaction - set overlay start time
+            overlayStartTime = System.currentTimeMillis();
+        }
+        else if (!currentlyInteractingWithCrab && isInteractingWithCrab)
+        {
+            // Stopping interaction - reset crab tracking
+            resetAfkCalculation();
+            currentCrab = null;
+        }
+
+        isInteractingWithCrab = currentlyInteractingWithCrab;
+    }
+    
+    private void checkCrabStatus()
+    {
+        // Check if our tracked crab is still valid
+        if (currentCrab != null)
+        {
+            // Check if crab is no longer valid (burrowed or moved away)
+            if (!client.getNpcs().contains(currentCrab))
+            {
+                // Crab is no longer in the world - likely burrowed
+                if (config.notifyOnCrabBurrow() && isGemstoneCrab(currentCrab.getName()))
+                {
+                    // Send burrow notification
+                    client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", 
+                        "The Gemstone Crab burrows away!", null);
+                }
+                
+                // Reset tracking
+                isInteractingWithCrab = false;
+                currentCrab = null;
+                resetAfkCalculation();
+            }
+        }
+    }
+
+    private boolean isCrabNpc(String npcName)
+    {
+        if (npcName == null) return false;
+        String lowerName = npcName.toLowerCase();
+        return lowerName.equals("sand crab") ||
+               lowerName.equals("rock crab") ||
+               lowerName.equals("ammonite crab") ||
+               lowerName.equals("gemstone crab");
+    }
+    
+    private boolean isGemstoneCrab(String npcName)
+    {
+        return npcName != null && npcName.toLowerCase().equals("gemstone crab");
+    }
+    
+    @Subscribe
+    public void onInteractingChanged(InteractingChanged event)
+    {
+        // Reset AFK calculation when player starts interacting with something new
+        if (event.getSource() == client.getLocalPlayer())
+        {
+            Actor newTarget = event.getTarget();
+            if (newTarget instanceof NPC)
+            {
+                NPC npc = (NPC) newTarget;
+                if (isCrabNpc(npc.getName()))
+                {
+                    // Starting to interact with a crab - reset calculation
+                    resetAfkCalculation();
+                }
+            }
+        }
+    }
+    
+    @Subscribe
+    public void onNpcDespawned(NpcDespawned event)
+    {
+        NPC npc = event.getNpc();
+        
+        // Check if it's our current crab that despawned
+        if (npc == currentCrab)
+        {
+            // Crab despawned - stop overlay immediately
+            isInteractingWithCrab = false;
+            currentCrab = null;
+            resetAfkCalculation();
+        }
+    }
+    
+    @Subscribe
+    public void onChatMessage(ChatMessage chatMessage)
+    {
+        // Listen for the actual game message about crab burrowing
+        if (chatMessage.getType() == ChatMessageType.GAMEMESSAGE)
+        {
+            String message = chatMessage.getMessage();
+            if (message != null && message.contains("burrows") && currentCrab != null && 
+                isGemstoneCrab(currentCrab.getName()) && config.notifyOnCrabBurrow())
+            {
+                // Game already sent the burrow message, but we can add our custom notification
+                client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", 
+                    "AFK Crab Helper: Gemstone Crab has burrowed!", null);
+            }
+        }
+    }
+    
+    private void resetAfkCalculation()
+    {
+        lastCrabHp = -1;
+        lastHpCheckTime = 0;
+        calculatedDps = 0.0;
+        dpsCalculationStartTime = 0;
+        initialCrabHp = -1;
+        isCalculatingDps = false;
+        afkTimeCalculatedAt = 0;
+        baseSecondsRemaining = 0.0;
+    }
+    
+    private void startAfkCalculation(NPC crab)
+    {
+        if (crab.getHealthRatio() != -1)
+        {
+            initialCrabHp = (crab.getHealthRatio() * crab.getHealthScale()) / 30; // Approximate HP
+            lastCrabHp = initialCrabHp;
+            lastHpCheckTime = System.currentTimeMillis();
+            dpsCalculationStartTime = System.currentTimeMillis();
+            isCalculatingDps = true;
+        }
+    }
+    
+    private void updateAfkCalculation(NPC crab)
+    {
+        if (!isCalculatingDps || crab.getHealthRatio() == -1)
+        {
+            return;
+        }
+        
+        long currentTime = System.currentTimeMillis();
+        int currentHp = (crab.getHealthRatio() * crab.getHealthScale()) / 30; // Approximate HP
+        
+        // Check if crab is dead
+        if (currentHp <= 0 || crab.isDead())
+        {
+            // Crab is dead - stop showing overlay
+            isInteractingWithCrab = false;
+            currentCrab = null;
+            resetAfkCalculation();
+            return;
+        }
+        
+        // Only calculate DPS after we have some time elapsed and HP has changed
+        if (currentTime - dpsCalculationStartTime >= 2000 && currentHp != lastCrabHp && lastCrabHp > 0)
+        {
+            long timeElapsed = currentTime - lastHpCheckTime;
+            if (timeElapsed > 1000) // At least 1 second between HP checks
+            {
+                int hpLost = lastCrabHp - currentHp;
+                if (hpLost > 0)
+                {
+                    double dpsThisInterval = (double) hpLost / (timeElapsed / 1000.0);
+                    
+                    // Smooth the DPS calculation using a moving average
+                    if (calculatedDps == 0.0)
+                    {
+                        calculatedDps = dpsThisInterval;
+                    }
+                    else
+                    {
+                        calculatedDps = (calculatedDps * 0.7) + (dpsThisInterval * 0.3);
+                    }
+                }
+                
+                lastCrabHp = currentHp;
+                lastHpCheckTime = currentTime;
+            }
+        }
+    }
+
+    public boolean isShowingOverlay()
+    {
+        if (!isInteractingWithCrab || !config.enableOverlay())
+        {
+            return false;
+        }
+        
+        // Check activation delay
+        long timeSinceOverlayStart = System.currentTimeMillis() - overlayStartTime;
+        return timeSinceOverlayStart >= config.activationDelay() * 1000;
+    }
+    
+    public String getAfkTimeRemaining()
+    {
+        if (currentCrab == null || !config.showAfkTime() || calculatedDps <= 0.0)
+        {
+            return null;
+        }
+        
+        // Check if we're still in calculation period (6 seconds)
+        long timeSinceStart = System.currentTimeMillis() - dpsCalculationStartTime;
+        if (timeSinceStart < 6000) // 6 seconds fixed delay
+        {
+            return "Calculating...";
+        }
+        
+        // Calculate time remaining based on current HP and DPS
+        int currentHp = (currentCrab.getHealthRatio() * currentCrab.getHealthScale()) / 30;
+        if (currentHp <= 0)
+        {
+            return "Crab dead";
+        }
+        
+        // Calculate initial time if not done yet, or if HP has changed significantly
+        if (afkTimeCalculatedAt == 0 || Math.abs(currentHp - lastCrabHp) > 5)
+        {
+            baseSecondsRemaining = currentHp / calculatedDps;
+            afkTimeCalculatedAt = System.currentTimeMillis();
+        }
+        
+        // Calculate countdown based on elapsed time
+        long elapsedSinceCalculation = System.currentTimeMillis() - afkTimeCalculatedAt;
+        double elapsedSeconds = elapsedSinceCalculation / 1000.0;
+        double secondsRemaining = Math.max(0, baseSecondsRemaining - elapsedSeconds);
+        
+        // If countdown reaches 0 but crab still has HP, recalculate
+        if (secondsRemaining <= 0 && currentHp > 0)
+        {
+            baseSecondsRemaining = currentHp / calculatedDps;
+            afkTimeCalculatedAt = System.currentTimeMillis();
+            secondsRemaining = baseSecondsRemaining;
+        }
+        
+        if (secondsRemaining < 60)
+        {
+            return String.format("%.0f seconds", secondsRemaining);
+        }
+        else
+        {
+            int minutes = (int) (secondsRemaining / 60);
+            int seconds = (int) (secondsRemaining % 60);
+            return String.format("%d:%02d remaining", minutes, seconds);
+        }
+    }
+    
+    public NPC getCurrentCrab()
+    {
+        return currentCrab;
+    }
+
+    @Provides
+    AfkCrabHelperConfig provideConfig(ConfigManager configManager)
+    {
+        return configManager.getConfig(AfkCrabHelperConfig.class);
+    }
+}
+package com.afkcrabhelper;
+
+import java.awt.Color;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Range;
+
+@ConfigGroup("afkcrabhelper")
+public interface AfkCrabHelperConfig extends Config
+{
+    @ConfigItem(
+        keyName = "enableOverlay",
+        name = "Enable Overlay",
+        description = "Show distraction-reducing overlay when training on crabs"
+    )
+    default boolean enableOverlay()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "overlayColor",
+        name = "Overlay Color",
+        description = "Color of the distraction overlay"
+    )
+    default Color overlayColor()
+    {
+        return Color.BLACK;
+    }
+
+    @ConfigItem(
+        keyName = "overlayOpacity",
+        name = "Overlay Opacity",
+        description = "Opacity of the distraction overlay (0-255)"
+    )
+    @Range(min = 0, max = 255)
+    default int overlayOpacity()
+    {
+        return 200;
+    }
+
+    @ConfigItem(
+        keyName = "activationDelay",
+        name = "Activation Delay",
+        description = "Seconds to wait before showing overlay after crab interaction starts"
+    )
+    @Range(min = 0, max = 30)
+    default int activationDelay()
+    {
+        return 3;
+    }
+
+    @ConfigItem(
+        keyName = "hideDelay",
+        name = "Hide Delay",
+        description = "Seconds to wait before hiding overlay after crab interaction stops"
+    )
+    @Range(min = 0, max = 30)
+    default int hideDelay()
+    {
+        return 5;
+    }
+
+    @ConfigItem(
+        keyName = "showAfkTime",
+        name = "Show AFK Time Remaining",
+        description = "Calculate and display estimated AFK time remaining (Gemstone Crab only)"
+    )
+    default boolean showAfkTime()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "notifyOnCrabBurrow",
+        name = "Notify When Crab Burrows",
+        description = "Send chat notification when Gemstone Crab burrows away"
+    )
+    default boolean notifyOnCrabBurrow()
+    {
+        return true;
+    }
+}
+package com.afkcrabhelper;
+
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.time.Duration;
+import java.time.Instant;
+import javax.inject.Inject;
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+
+public class AfkCrabHelperOverlay extends Overlay
+{
+    private final Client client;
+    private final AfkCrabHelperPlugin plugin;
+    private final AfkCrabHelperConfig config;
+    private Instant trainingStartTime;
+
+    @Inject
+    public AfkCrabHelperOverlay(Client client, AfkCrabHelperPlugin plugin, AfkCrabHelperConfig config)
+    {
+        this.client = client;
+        this.plugin = plugin;
+        this.config = config;
+        setPosition(OverlayPosition.DETACHED);
+        setLayer(OverlayLayer.ALWAYS_ON_TOP);
+        setPriority(OverlayPriority.HIGH);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        if (!plugin.isShowingOverlay())
+        {
+            trainingStartTime = null;
+            return null;
+        }
+
+        // Initialize training start time
+        if (trainingStartTime == null)
+        {
+            trainingStartTime = Instant.now();
+        }
+
+        // Get the maximum possible size to cover everything
+        Dimension clientSize = new Dimension(2560, 1440); // Large enough for most screens
+        
+        try {
+            // Try to get actual client window size
+            if (client.getCanvas() != null) {
+                java.awt.Component canvas = client.getCanvas();
+                // Try to walk up the component hierarchy to find the main window
+                java.awt.Component parent = canvas;
+                while (parent.getParent() != null) {
+                    parent = parent.getParent();
+                    if (parent instanceof javax.swing.JFrame || parent instanceof java.awt.Window) {
+                        clientSize = parent.getSize();
+                        break;
+                    }
+                }
+            }
+        } catch (Exception e) {
+            // Use fallback size if anything fails
+        }
+        
+        // Create overlay color with configured opacity
+        Color overlayColor = config.overlayColor();
+        Color transparentColor = new Color(
+            overlayColor.getRed(),
+            overlayColor.getGreen(), 
+            overlayColor.getBlue(),
+            config.overlayOpacity()
+        );
+        
+        // Fill the entire client with overlay
+        graphics.setColor(transparentColor);
+        graphics.fillRect(0, 0, clientSize.width, clientSize.height);
+
+        // Render AFK time in center if enabled and available
+        if (config.showAfkTime())
+        {
+            renderAfkTimeCenter(graphics);
+        }
+
+        return clientSize;
+    }
+
+    private void renderAfkTimeCenter(Graphics2D graphics)
+    {
+        String afkTime = plugin.getAfkTimeRemaining();
+        if (afkTime == null)
+        {
+            return;
+        }
+
+        // Enable anti-aliasing for smooth text
+        graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+        graphics.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+
+        // Set large font
+        Font font = new Font(Font.SANS_SERIF, Font.BOLD, 36);
+        graphics.setFont(font);
+        FontMetrics metrics = graphics.getFontMetrics(font);
+
+        // Get the game canvas dimensions for proper centering
+        int canvasWidth = client.getCanvasWidth();
+        int canvasHeight = client.getCanvasHeight();
+        
+        // Calculate center position based on game canvas
+        int textWidth = metrics.stringWidth(afkTime);
+        int x = (canvasWidth - textWidth) / 2;
+        int y = canvasHeight / 2;
+
+        // Draw shadow (slightly offset)
+        graphics.setColor(Color.BLACK);
+        graphics.drawString(afkTime, x + 2, y + 2);
+
+        // Draw main text
+        Color textColor = afkTime.equals("Calculating...") ? Color.YELLOW : Color.WHITE;
+        graphics.setColor(textColor);
+        graphics.drawString(afkTime, x, y);
+    }
+
+}
