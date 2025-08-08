@@ -9,6 +9,7 @@ public interface DoomColorBlindConfig extends Config
 {
 	enum ProjectileTheme
 	{
+		NONE,
 		INFERNO,
 		TOA,
 		OLM,
@@ -24,7 +25,6 @@ public interface DoomColorBlindConfig extends Config
 	{
 		return ProjectileTheme.TOA;
 	}
-
 	@ConfigItem(
 			keyName = "replaceMelee",
 			name = "Replace Melee Projectiles",
