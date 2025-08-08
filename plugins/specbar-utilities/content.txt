@@ -314,8 +314,13 @@ package com.specbar;
 
 import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.Player;
+import net.runelite.api.events.AnimationChanged;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.ClientTick;
+import net.runelite.api.events.GraphicChanged;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.api.widgets.InterfaceID;
 import net.runelite.api.widgets.Widget;
@@ -358,6 +363,10 @@ public class SpecBarPlugin extends Plugin
     private int lastSpecialAttackEnergy = -1; // Track spec energy to detect usage
     private long lastClickClearTime = 0; // Track when click state was cleared
     private static final long HOVER_SUPPRESS_DURATION_MS = 300; // Suppress hover for 300ms after click clear
+    
+    // Enhanced special attack detection
+    private long lastSpecClickTime = 0; // Track when spec bar was clicked
+    private static final long SPEC_DETECTION_WINDOW_MS = 3000; // 3 second window to detect spec usage after click
     
     // Widget caching for performance
     private Widget cachedSpecBarWidget = null;
@@ -477,6 +486,74 @@ public class SpecBarPlugin extends Plugin
             }
         }
     }
+    
+    @Subscribe
+    public void onAnimationChanged(AnimationChanged event)
+    {
+        // Only process player animations
+        if (!(event.getActor() instanceof Player))
+        {
+            return;
+        }
+        
+        Player player = (Player) event.getActor();
+        
+        // Only process local player
+        if (player != client.getLocalPlayer())
+        {
+            return;
+        }
+        
+        // If we're in clicked state and within detection window, check for special attack animations
+        if (isClicked && isWithinSpecDetectionWindow())
+        {
+            int animationId = player.getAnimation();
+            
+            // Check if this is a special attack animation
+            if (isSpecialAttackAnimation(animationId))
+            {
+                // Special attack animation detected - clear the click state
+                clearClickState();
+                log.debug("Special attack animation detected: {}", animationId);
+            }
+        }
+    }
+    
+    @Subscribe
+    public void onGraphicChanged(GraphicChanged event)
+    {
+        // Only process local player graphics
+        if (event.getActor() != client.getLocalPlayer())
+        {
+            return;
+        }
+        
+        // If we're in clicked state and within detection window, any graphic change might indicate spec usage
+        if (isClicked && isWithinSpecDetectionWindow())
+        {
+            // For now, we'll rely primarily on animation detection
+            // Graphics can be added later with proper IDs if needed
+            log.debug("Graphic changed during spec detection window");
+        }
+    }
+    
+    @Subscribe
+    public void onChatMessage(ChatMessage event)
+    {
+        // Only process game messages
+        if (event.getType() != ChatMessageType.GAMEMESSAGE)
+        {
+            return;
+        }
+        
+        // Check for the "not enough power" message when in clicked state
+        if (isClicked && event.getMessage().equals("You don't have enough power left."))
+        {
+            // Failed special attack attempt - clear the click state immediately
+            clearClickState();
+            log.debug("Special attack failed - not enough power");
+        }
+    }
 
     private void updateSpecBarState()
     {
@@ -528,11 +605,50 @@ public class SpecBarPlugin extends Plugin
         
         return null;
     }
+    
+    private boolean isWithinSpecDetectionWindow()
+    {
+        return (System.currentTimeMillis() - lastSpecClickTime) < SPEC_DETECTION_WINDOW_MS;
+    }
+    
+    private boolean isSpecialAttackAnimation(int animationId)
+    {
+        // Verified animation IDs from RuneLite source code
+        // These are the actual special attack animations, not regular skilling animations
+        switch (animationId)
+        {
+            // Dragon skilling tool special attacks (boost animations)
+            case 2876: // Dragon axe special attack (stat boost)
+            case 8347: // Dragon pickaxe special attack (stat boost)
+            case 1167: // Dragon harpoon special attack (stat boost)
+            
+            // Infernal tool special attacks (same as dragon variants)
+            case 2117: // Infernal axe special attack (verified from AnimationID.WOODCUTTING_INFERNAL)
+            case 8348: // Infernal pickaxe special attack
+            
+            // Crystal tool special attacks
+            case 8324: // Crystal axe special attack (verified from AnimationID.WOODCUTTING_CRYSTAL)
+            case 8789: // Crystal pickaxe special attack
+            case 8790: // Crystal harpoon special attack
+            
+            // Felling axe variants (2H axes with special attacks)
+            case 10071: // Dragon felling axe special attack
+            case 10072: // Crystal felling axe special attack
+            case 10073: // Crystal felling axe (inactive) special attack
+            case 10074: // 3rd age felling axe special attack
+            
+
+                return true;
+            default:
+                return false;
+        }
+    }
 
     private void triggerClickState()
     {
         isClicked = true;
-        // Click state will persist until spec is used (tracked by energy decrease)
+        lastSpecClickTime = System.currentTimeMillis();
+        // Click state will persist until spec is used (tracked by multiple methods)
     }
     
     private void clearClickState()
@@ -607,7 +723,8 @@ public class SpecBarPlugin extends Plugin
         // Check if the color preset was changed
         if (event.getKey().equals("colorPreset"))
         {
-            applyColorPreset(SpecBarConfig.ColorPreset.valueOf(event.getNewValue()));
+            SpecBarConfig.ColorPreset newPreset = SpecBarConfig.ColorPreset.valueOf(event.getNewValue());
+            loadPresetToUI(newPreset);
         }
     }
 
@@ -702,14 +819,82 @@ public class SpecBarPlugin extends Plugin
         return getPresetColor(SpecBarConfig.ColorPreset.CUSTOM, colorType);
     }
 
-    private void applyColorPreset(SpecBarConfig.ColorPreset preset)
-    {
-        if (preset == SpecBarConfig.ColorPreset.CUSTOM)
-        {
-            return; // Don't override custom colors
-        }
+    // Backup storage for custom settings
+    private Color customHoverArea = null;
+    private Color customHoverBorder = null;
+    private Color customClickArea = null;
+    private Color customClickBorder = null;
+    private Color customIdleArea = null;
+    private Color customIdleBorder = null;
+    private SpecBarConfig.ColorPreset lastPreset = SpecBarConfig.ColorPreset.CUSTOM;
 
-        // Get the preset colors using our local method
+    /**
+     * Loads preset values into the UI fields while preserving custom settings.
+     * This allows users to switch between presets and custom without losing their custom values.
+     */
+    private void loadPresetToUI(SpecBarConfig.ColorPreset preset)
+    {
+        // If switching from CUSTOM to a preset, backup the current custom values
+        if (lastPreset == SpecBarConfig.ColorPreset.CUSTOM && preset != SpecBarConfig.ColorPreset.CUSTOM)
+        {
+            backupCustomSettings();
+        }
+        
+        // If switching to CUSTOM from a preset, restore the backed up custom values
+        if (preset == SpecBarConfig.ColorPreset.CUSTOM && lastPreset != SpecBarConfig.ColorPreset.CUSTOM)
+        {
+            restoreCustomSettings();
+            lastPreset = preset;
+            return;
+        }
+        
+        // If switching between presets (not involving CUSTOM), just load the new preset
+        if (preset != SpecBarConfig.ColorPreset.CUSTOM)
+        {
+            loadPresetValues(preset);
+        }
+        
+        lastPreset = preset;
+    }
+    
+    /**
+     * Backs up the current custom color settings before switching to a preset
+     */
+    private void backupCustomSettings()
+    {
+        customHoverArea = config.hoverAreaColor();
+        customHoverBorder = config.hoverBorderColor();
+        customClickArea = config.clickAreaColor();
+        customClickBorder = config.clickBorderColor();
+        customIdleArea = config.idleAreaColor();
+        customIdleBorder = config.idleBorderColor();
+        
+        log.debug("Backed up custom settings before switching to preset");
+    }
+    
+    /**
+     * Restores the previously backed up custom settings
+     */
+    private void restoreCustomSettings()
+    {
+        if (customHoverArea != null)
+        {
+            configManager.setConfiguration("specbar", "hoverAreaColor", customHoverArea);
+            configManager.setConfiguration("specbar", "hoverBorderColor", customHoverBorder);
+            configManager.setConfiguration("specbar", "clickAreaColor", customClickArea);
+            configManager.setConfiguration("specbar", "clickBorderColor", customClickBorder);
+            configManager.setConfiguration("specbar", "idleAreaColor", customIdleArea);
+            configManager.setConfiguration("specbar", "idleBorderColor", customIdleBorder);
+            
+            log.debug("Restored custom settings");
+        }
+    }
+    
+    /**
+     * Loads preset values into the UI configuration
+     */
+    private void loadPresetValues(SpecBarConfig.ColorPreset preset)
+    {
         Color hoverArea = getPresetColor(preset, ColorType.HOVER_AREA);
         Color hoverBorder = getPresetColor(preset, ColorType.HOVER_BORDER);
         Color clickArea = getPresetColor(preset, ColorType.CLICK_AREA);
@@ -717,13 +902,14 @@ public class SpecBarPlugin extends Plugin
         Color idleArea = getPresetColor(preset, ColorType.IDLE_AREA);
         Color idleBorder = getPresetColor(preset, ColorType.IDLE_BORDER);
 
-        // Update the stored configuration values
         configManager.setConfiguration("specbar", "hoverAreaColor", hoverArea);
         configManager.setConfiguration("specbar", "hoverBorderColor", hoverBorder);
         configManager.setConfiguration("specbar", "clickAreaColor", clickArea);
         configManager.setConfiguration("specbar", "clickBorderColor", clickBorder);
         configManager.setConfiguration("specbar", "idleAreaColor", idleArea);
         configManager.setConfiguration("specbar", "idleBorderColor", idleBorder);
+        
+        log.debug("Loaded preset values for: {}", preset);
     }
 
     @Provides

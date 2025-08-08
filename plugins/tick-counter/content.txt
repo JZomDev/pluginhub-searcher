@@ -103,6 +103,7 @@ public class TickCounterPlugin extends Plugin
 			case 7618: // Chinchompas
 			case 11057: // Eclipse atlatl
 			case 11060: // Eclipse atlatl spec
+			case 12397: // Eye of Ayak
 				delta = 3;
 				break;
 			case 426: // bow shoot
@@ -277,6 +278,7 @@ public class TickCounterPlugin extends Plugin
 			case 10172: // Soulreaper axe auto
 			case 10173: // Soulreaper axe spec
 			case 11222: // Osmumten's fang Special
+			case 12394: // Eye of Ayak Special
 				delta = 5;
 				break;
 			case 401:

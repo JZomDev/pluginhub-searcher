@@ -28,6 +28,7 @@ public class EmptyHandsIndicatorService {
         this.config = config;
         this.client = client;
         this.partyService = partyService;
+        updateExcludedPlayers();
     }
 
     public void updateExcludedPlayers() {
