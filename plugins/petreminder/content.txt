@@ -4,6 +4,7 @@ import com.google.inject.Provides;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.client.config.ConfigManager;
@@ -33,6 +34,9 @@ public class PetReminderPlugin extends Plugin
     private PetReminderOverlay overlay;
 
     private boolean isPetOut = false;
+    private boolean playerDidDie = false;
+
+    private final int FOLLOWER_VARBIT = 447;
 
     @Override
     protected void startUp() throws Exception
@@ -47,40 +51,57 @@ public class PetReminderPlugin extends Plugin
     }
 
     @Subscribe
-    public void onGameTick(GameTick event)
+    public void onGameTick(GameTick tick)
     {
-        NPC follower = client.getFollower();
-        boolean hasPet = (follower != null);
+        // PATCH:
+        // rewritten to use VarPlayer value instead to track pet disappearing but still following
+        // i.e going in and out of ToA, for example
+        int followerNpcId = client.getVarpValue(FOLLOWER_VARBIT);
+        boolean overlayCache = isPetOut;
 
-        if (hasPet != isPetOut)
-        {
-            isPetOut = hasPet;
+        // You have a pet following
+        isPetOut = followerNpcId != -1;
+
+        // if we are not the same state as last tick, change the overlay
+        if (overlayCache != isPetOut) {
             overlay.setIsPetOut(isPetOut);
         }
     }
 
     @Subscribe
-    public void onActorDeath(ActorDeath actorDeath) {
-        Actor actor = actorDeath.getActor();
-
+    public void onActorDeath(ActorDeath event)
+    {
+        Actor actor = event.getActor();
         if (!(actor instanceof Player)) {
             return;
         }
 
-        // PATCH: Forgot to make sure we have a pet out before we post an onActorDeath message, whoops!
-        if (!isPetOut) {
-            return;
-        }
-
-        Player player = (Player)actor;
-        if (!player.equals(client.getLocalPlayer())) {
-            return;
-        }
-
-        if (config.deathMessageEnabled())
+        if (event.getActor() == client.getLocalPlayer())
         {
-            String chatMsg = "Noooo, you forgot about your pet :(";
-            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMsg, null);
+            playerDidDie = true;
+        }
+    }
+
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged event)
+    {
+        if (event.getGameState() == GameState.LOGGED_IN && playerDidDie)
+        {
+            int followerNpcId = client.getVarpValue(FOLLOWER_VARBIT);
+            if (followerNpcId == -1 && isPetOut)
+            {
+                if (config.deathMessageEnabled())
+                {
+                    String chatMsg = "Noooo, you forgot about your pet :(";
+                    client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", chatMsg, null);
+                }
+
+                // force overwrite the var and overlay as death will guarantee loss
+                // next tick will then start to monitor again for us automatically
+                isPetOut = false;
+                overlay.setIsPetOut(isPetOut);
+            }
+            playerDidDie = false;
         }
     }
 
