@@ -67,6 +67,11 @@ public class PetReminderPlugin extends Plugin
             return;
         }
 
+        // PATCH: Forgot to make sure we have a pet out before we post an onActorDeath message, whoops!
+        if (!isPetOut) {
+            return;
+        }
+
         Player player = (Player)actor;
         if (!player.equals(client.getLocalPlayer())) {
             return;
