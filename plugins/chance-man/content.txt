@@ -167,18 +167,28 @@ import static net.runelite.client.RuneLite.RUNELITE_DIR;
 import com.chanceman.account.AccountManager;
 import com.google.gson.Gson;
 import lombok.extern.slf4j.Slf4j;
+
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+/**
+ * Persistent drop-table cache backed by JSON files in the user's RuneLite
+ * directory. The cache is mirrored in memory to make name-based lookups and
+ * searches effectively instantaneous.
+ */
 @Slf4j
 @Singleton
 public class DropCache
@@ -187,6 +197,10 @@ public class DropCache
     private final AccountManager accountManager;
     private final DropFetcher dropFetcher;
     private static final Duration MAX_AGE = Duration.ofDays(7);
+    private final Map<Path, Object> writeLocks = new ConcurrentHashMap<>();
+    private final Map<Path, NpcDropData> cache = new ConcurrentHashMap<>();
+    private final Map<String, Path> nameIndex = new ConcurrentHashMap<>();
+    private volatile boolean indexLoaded = false;
 
     @Inject
     public DropCache(Gson gson, AccountManager accountManager, DropFetcher dropFetcher)
@@ -197,15 +211,20 @@ public class DropCache
     }
 
     /**
-     * Load from disk if possible; otherwise fetch from the wiki,
-     * write out the JSON, and return the data.
+     * Load from disk if possible; otherwise fetch from the wiki, write the
+     * JSON, and return the data. Results without drop-table sections are
+     * discarded and never cached.
      */
     public CompletableFuture<NpcDropData> get(int npcId, String name, int level)
     {
+        loadIndex();
+        final String safeName = name.replaceAll("[^A-Za-z0-9]", "_");
         final Path file;
         try
         {
-            file = getCacheFile(npcId, name, level);
+            file = npcId == 0
+                    ? findExistingCacheFile(safeName, level)
+                    : getCacheFile(npcId, name, level);
         }
         catch (IOException ex)
         {
@@ -214,84 +233,187 @@ public class DropCache
         }
 
         return CompletableFuture.supplyAsync(() ->
+        {
+            if (file != null)
+            {
+                NpcDropData cached = cache.get(file);
+                if (cached != null && Files.exists(file) && isFresh(file))
                 {
-                    if (Files.exists(file))
+                    return cached;
+                }
+
+                // stale or missing entry, clean up
+                try
+                {
+                    Files.deleteIfExists(file);
+                }
+                catch (IOException ignore) { }
+                removeIndex(file);
+            }
+            return null;
+        }).thenCompose(cached ->
+        {
+            if (cached != null)
+            {
+                return CompletableFuture.completedFuture(cached);
+            }
+
+            return dropFetcher.fetch(npcId, name, level)
+                    .thenApply(data ->
                     {
                         try
                         {
-                            String json = Files.readString(file, StandardCharsets.UTF_8);
-                            return gson.fromJson(json, NpcDropData.class);
+                            if (data == null || data.getDropTableSections().isEmpty())
+                            {
+                                return null;
+                            }
+
+                            Path out = getCacheFile(data.getNpcId(), data.getName(), data.getLevel());
+                            Files.createDirectories(out.getParent());
+                            String json = gson.toJson(data);
+
+                            Object lock = writeLocks.computeIfAbsent(out, p -> new Object());
+                            synchronized (lock)
+                            {
+                                Path tmp = out.resolveSibling(out.getFileName() + ".tmp");
+                                Files.writeString(
+                                        tmp,
+                                        json,
+                                        StandardCharsets.UTF_8,
+                                        StandardOpenOption.CREATE,
+                                        StandardOpenOption.TRUNCATE_EXISTING
+                                );
+                                Files.move(tmp, out, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE);
+                            }
+                            writeLocks.remove(out);
+
+                            cache.put(out, data);
+                            nameIndex.put(buildNameKey(data.getName(), data.getLevel()), out);
+
+                            if (npcId == 0 && data.getNpcId() != 0)
+                            {
+                                // Remove old 0_id placeholder if present
+                                Path old = findExistingCacheFile(safeName, data.getLevel());
+                                if (old != null && !old.equals(out))
+                                {
+                                    Files.deleteIfExists(old);
+                                    removeIndex(old);
+                                }
+                            }
                         }
                         catch (Exception e)
                         {
-                            log.warn("Failed to read cache {}, will re-fetch", file, e);
-                            try
-                            {
-                                Files.deleteIfExists(file);
-                            }
-                            catch (IOException ignored) { }
+                            log.error("Failed to write cache file for {}", name, e);
                         }
-                    }
-                    return null;
-                })
-                // If we had a valid cache, return it; otherwise fetch & write
-                .thenCompose(cached ->
-                {
-                    if (cached != null)
+                        return data;
+                    })
+                    .exceptionally(ex ->
                     {
-                        return CompletableFuture.completedFuture(cached);
-                    }
-
-                    return dropFetcher.fetch(npcId, name, level)
-                            .thenApply(data ->
-                            {
-                                try
-                                {
-                                    String json = gson.toJson(data);
-                                    Files.createDirectories(file.getParent());
-                                    Files.writeString(
-                                            file,
-                                            json,
-                                            StandardCharsets.UTF_8,
-                                            StandardOpenOption.CREATE,
-                                            StandardOpenOption.TRUNCATE_EXISTING
-                                    );
-                                }
-                                catch (Exception e)
-                                {
-                                    log.error("Failed to write cache file: {}", file, e);
-                                }
-                                return data;
-                            })
-                            .exceptionally(ex ->
-                            {
-                                log.error("Error fetching drop data for NPC {}", npcId, ex);
-                                return null;
-                            });
-                });
+                        log.error("Error fetching drop data for NPC {}", npcId, ex);
+                        return null;
+                    });
+        });
     }
 
-    private Path getCacheFile(int npcId, String name, int level) throws IOException
+    /**
+     * @return a collection of all cached NPC drop data in memory
+     */
+    public Collection<NpcDropData> getAllNpcData()
+    {
+        loadIndex();
+        return new ArrayList<>(cache.values());
+    }
+
+    /**
+     * Return a list of NPC names containing the supplied query. Matches from
+     * the local cache are combined with wiki search results to ensure partial
+     * lookups surface all relevant NPCs.
+     */
+    public CompletableFuture<List<String>> searchNpcNames(String query)
+    {
+        return CompletableFuture.supplyAsync(() ->
+        {
+            String lc = query.toLowerCase(Locale.ROOT).trim();
+            loadIndex();
+
+            // Preserve insertion order while de-duplicating names
+            Set<String> names = cache.values().stream()
+                    .map(NpcDropData::getName)
+                    .filter(Objects::nonNull)
+                    .filter(name -> name.toLowerCase(Locale.ROOT).contains(lc))
+                    .collect(Collectors.toCollection(LinkedHashSet::new));
+
+            try
+            {
+                names.addAll(dropFetcher.searchNpcNames(query));
+            }
+            catch (Exception ex)
+            {
+                log.debug("Wiki search failed for {}", query, ex);
+            }
+
+            return new ArrayList<>(names);
+        });
+    }
+
+    private boolean isFresh(Path file)
+    {
+        try
+        {
+            Instant cutoff = Instant.now().minus(MAX_AGE);
+            return Files.getLastModifiedTime(file).toInstant().isAfter(cutoff);
+        }
+        catch (IOException e)
+        {
+            return false;
+        }
+    }
+
+    /**
+     * Locate an existing cache file by name and level regardless of stored ID.
+     */
+    private Path findExistingCacheFile(String safeName, int level) throws IOException
+    {
+        String key = safeName + "_" + level;
+        Path p = nameIndex.get(key);
+        if (p != null && Files.exists(p))
+        {
+            if (isFresh(p))
+            {
+                return p;
+            }
+            Files.deleteIfExists(p);
+            removeIndex(p);
+        }
+        return null;
+    }
+
+    private Path getCacheDir() throws IOException
     {
         String player = accountManager.getPlayerName();
         if (player == null)
         {
             throw new IOException("Player name is not available");
         }
-
-        String safeName = name.replaceAll("[^A-Za-z0-9]", "_");
-        Path dir = RUNELITE_DIR.toPath()
+        return RUNELITE_DIR.toPath()
                 .resolve("chanceman")
                 .resolve(player)
                 .resolve("drops");
-        Files.createDirectories(dir);
+    }
 
+    /** Resolve the on-disk cache path for a specific NPC. */
+    private Path getCacheFile(int npcId, String name, int level) throws IOException
+    {
+        String safeName = name.replaceAll("[^A-Za-z0-9]", "_");
+        Path dir = getCacheDir();
+        Files.createDirectories(dir);
         String fn = npcId + "_" + safeName + "_" + level + ".json";
         return dir.resolve(fn);
     }
 
     /**
-     * Deletes cached drop table files older than {@link #MAX_AGE}.
+     * Deletes cached drop table files older than {@link #MAX_AGE} and purges
+     * them from the in-memory index.
      */
     public void pruneOldCaches()
     {
@@ -323,6 +445,7 @@ public class DropCache
                             if (mod.isBefore(cutoff))
                             {
                                 Files.deleteIfExists(p);
+                                removeIndex(p);
                             }
                         }
                         catch (IOException ex)
@@ -338,7 +461,8 @@ public class DropCache
     }
 
     /**
-     * Deletes all cached drop table files for the current player.
+     * Deletes all cached drop table files for the current player and clears the
+     * in-memory index.
      */
     public void clearAllCaches()
     {
@@ -350,33 +474,113 @@ public class DropCache
                 .resolve(player)
                 .resolve("drops");
 
-        if (!Files.exists(dir)) return;
-
-        try (Stream<Path> files = Files.list(dir))
+        if (Files.exists(dir))
         {
-            files.filter(Files::isRegularFile)
-                    .forEach(p ->
-                    {
-                        try
+            try (Stream<Path> files = Files.list(dir))
+            {
+                files.filter(Files::isRegularFile)
+                        .forEach(p ->
                         {
-                            Files.deleteIfExists(p);
-                        }
-                        catch (IOException ex)
-                        {
-                            log.debug("Failed to delete drop cache {}", p, ex);
-                        }
-                    });
+                            try
+                            {
+                                Files.deleteIfExists(p);
+                            }
+                            catch (IOException ex)
+                            {
+                                log.debug("Failed to delete drop cache {}", p, ex);
+                            }
+                        });
+            }
+            catch (IOException ex)
+            {
+                log.debug("Error clearing drop cache directory {}", dir, ex);
+            }
         }
-        catch (IOException ex)
+
+        cache.clear();
+        nameIndex.clear();
+        indexLoaded = true;
+    }
+
+    /** Remove the given file from the in-memory indices. */
+    private void removeIndex(Path p)
+    {
+        NpcDropData data = cache.remove(p);
+        if (data != null)
         {
-            log.debug("Error clearing drop cache directory {}", dir, ex);
+            nameIndex.remove(buildNameKey(data.getName(), data.getLevel()));
         }
     }
-}
 
+    /** Lazily populate the in-memory indices from existing cache files. */
+    private void loadIndex()
+    {
+        if (indexLoaded)
+        {
+            return;
+        }
+        synchronized (this)
+        {
+            if (indexLoaded)
+            {
+                return;
+            }
+            try
+            {
+                Path dir = getCacheDir();
+                if (Files.exists(dir))
+                {
+                    try (Stream<Path> files = Files.list(dir))
+                    {
+                        for (Path p : files.filter(Files::isRegularFile).collect(Collectors.toList()))
+                        {
+                            if (!isFresh(p))
+                            {
+                                Files.deleteIfExists(p);
+                                continue;
+                            }
+                            try
+                            {
+                                String json = Files.readString(p, StandardCharsets.UTF_8);
+                                NpcDropData data = gson.fromJson(json, NpcDropData.class);
+                                if (data != null && data.getDropTableSections() != null && !data.getDropTableSections().isEmpty())
+                                {
+                                    cache.put(p, data);
+                                    nameIndex.put(buildNameKey(data.getName(), data.getLevel()), p);
+                                }
+                                else
+                                {
+                                    Files.deleteIfExists(p);
+                                }
+                            }
+                            catch (Exception e)
+                            {
+                                log.warn("Skipping bad cache file {}", p, e);
+                                Files.deleteIfExists(p);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (IOException e)
+            {
+                log.debug("Error loading cache index", e);
+            }
+            indexLoaded = true;
+        }
+    }
+
+    private String buildNameKey(String name, int level)
+    {
+        return name.replaceAll("[^A-Za-z0-9]", "_") + "_" + level;
+    }
+}
 package com.chanceman.drops;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonParser;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ItemComposition;
 import net.runelite.client.callback.ClientThread;
@@ -394,12 +598,17 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.stream.Collectors;
 
+/**
+ * Retrieves NPC drop information from the wiki and
+ * resolves item and NPC IDs.
+ */
 @Slf4j
 @Singleton
 public class DropFetcher
@@ -419,32 +628,40 @@ public class DropFetcher
     }
 
     /**
-     * Asynchronously fetches an NPC’s drop tables via the OldSchool RuneScape Wiki’s
-     * Special:Lookup endpoint.
-     *
-     * <p>The lookup URL is constructed as
-     * `/w/Special:Lookup?type=npc&amp;id={npcId}&amp;name={fallback}#Drops`,
-     * which forces an ID‐first redirect to the exact NPC page (infobox match), and
-     * only falls back to the provided name (or a search) if no ID match is found.
-     *
-     * @param npcId  the numeric NPC ID to look up in the wiki infobox
-     * @param name   the NPC name (used as a fallback if the ID lookup fails)
-     * @param level  the NPC’s combat level (carried through into the returned data)
-     * @return a CompletableFuture that, when complete, yields an NpcDropData
-     *         containing the raw HTML‐parsed drop sections and resolved item IDs
+     * Asynchronously fetch an NPC's drop table from the wiki.
+     * The lookup first attempts an ID-based redirect and falls back to the given
+     * name if necessary.
      */
     public CompletableFuture<NpcDropData> fetch(int npcId, String name, int level)
     {
-        return CompletableFuture.supplyAsync(() -> {
+        return CompletableFuture.supplyAsync(() ->
+                {
                     String url = buildWikiUrl(npcId, name);
                     String html = fetchHtml(url);
-                    List<DropTableSection> sections = parseSections(html);
-                    return new NpcDropData(npcId, name, level, sections);
+                    Document doc = Jsoup.parse(html);
+                    String actualName = Optional
+                            .ofNullable(doc.selectFirst("h1#firstHeading"))
+                            .map(Element::text)
+                            .orElse(name);
+                    int resolvedLevel = level > 0 ? level : parseCombatLevel(doc);
+                    int actualId = resolveNpcId(doc);
+                    List<DropTableSection> sections = parseSections(doc);
+                    if (sections.isEmpty())
+                    {
+                        return null; // skip NPCs without drop tables
+                    }
+                    return new NpcDropData(actualId, actualName, resolvedLevel, sections);
                 }, fetchExecutor)
 
-                .thenCompose(data -> {
+                .thenCompose(data ->
+                {
+                    if (data == null)
+                    {
+                        return CompletableFuture.completedFuture(null);
+                    }
                     CompletableFuture<NpcDropData> resolved = new CompletableFuture<>();
-                    clientThread.invoke(() -> {
+                    clientThread.invoke(() ->
+                    {
                         for (DropTableSection sec : data.getDropTableSections())
                         {
                             for (DropItem d : sec.getItems())
@@ -452,10 +669,10 @@ public class DropFetcher
                                 String itemName = d.getName();
                                 int resolvedId = itemManager.search(itemName).stream()
                                         .map(ItemPrice::getId)
-                                        .filter(id -> {
+                                        .filter(id ->
+                                        {
                                             ItemComposition comp = itemManager.getItemComposition(id);
-                                            return comp != null
-                                                    && comp.getName().equalsIgnoreCase(itemName);
+                                            return comp != null && comp.getName().equalsIgnoreCase(itemName);
                                         })
                                         .findFirst()
                                         .orElse(0);
@@ -469,11 +686,10 @@ public class DropFetcher
     }
 
     /**
-     * Extract drop table sections from HTML.
+     * Extract drop table sections from the provided document.
      */
-    private List<DropTableSection> parseSections(String html)
+    private List<DropTableSection> parseSections(Document doc)
     {
-        Document doc = Jsoup.parse(html);
         Elements tables = doc.select("table.item-drops");
 
         List<DropTableSection> sections = new ArrayList<>();
@@ -506,29 +722,167 @@ public class DropFetcher
                 sections.add(new DropTableSection(header, items));
             }
         }
+
         return sections;
+    }
+
+    /**
+     * Attempt to parse the combat level from the NPC infobox.
+     */
+    private int parseCombatLevel(Document doc)
+    {
+        Element infobox = doc.selectFirst("table.infobox");
+        if (infobox == null)
+        {
+            return 0;
+        }
+        Elements rows = infobox.select("tr");
+        for (Element row : rows)
+        {
+            Element th = row.selectFirst("th");
+            Element td = row.selectFirst("td");
+            if (th != null && td != null && th.text().toLowerCase(Locale.ROOT).contains("combat level"))
+            {
+                String txt = td.text();
+                for (String part : txt.split("[^0-9]+"))
+                {
+                    if (!part.isEmpty())
+                    {
+                        try
+                        {
+                            return Integer.parseInt(part);
+                        }
+                        catch (NumberFormatException ignore)
+                        {
+                        }
+                    }
+                }
+            }
+        }
+        return 0;
+    }
+
+    /**
+     * Resolve the canonical wiki page ID for the provided document.
+     *
+     * @param doc parsed wiki HTML
+     * @return numeric page ID, or {@code 0} if it could not be determined
+     */
+    private int resolveNpcId(Document doc)
+    {
+        Element link = doc.selectFirst("link[rel=canonical]");
+        if (link == null)
+        {
+            return 0;
+        }
+
+        String href = link.attr("href");
+        String title = href.substring(href.lastIndexOf('/') + 1);
+        // Canonical links may already be URL-encoded; decode first then re-encode
+        title = URLDecoder.decode(title, StandardCharsets.UTF_8);
+        title = title.replace(' ', '_');
+        String apiUrl = "https://oldschool.runescape.wiki/api.php?action=query&format=json&prop=info&titles="
+                + URLEncoder.encode(title, StandardCharsets.UTF_8);
+
+        Request req = new Request.Builder()
+                .url(apiUrl)
+                .header("User-Agent", "RuneLite-ChanceMan/2.6.0")
+                .build();
+
+        try (Response res = httpClient.newCall(req).execute())
+        {
+            if (!res.isSuccessful())
+            {
+                log.warn("Failed to resolve NPC ID for {}: HTTP {}", title, res.code());
+                return 0;
+            }
+
+            String body = res.body().string();
+            JsonElement root = new JsonParser().parse(body);
+            JsonElement pages = root.getAsJsonObject()
+                    .getAsJsonObject("query")
+                    .getAsJsonObject("pages");
+
+            for (Map.Entry<String, JsonElement> entry : pages.getAsJsonObject().entrySet())
+            {
+                JsonElement page = entry.getValue();
+                if (page.getAsJsonObject().has("pageid"))
+                {
+                    return page.getAsJsonObject().get("pageid").getAsInt();
+                }
+            }
+
+            log.warn("No page ID found for title {}", title);
+        }
+        catch (IOException ex)
+        {
+            log.warn("Error resolving NPC ID for {}", title, ex);
+        }
+
+        return 0;
+    }
+
+    /**
+     * Query the wiki's search API for NPC names matching the provided text.
+     */
+    public List<String> searchNpcNames(String query)
+    {
+        String url = "https://oldschool.runescape.wiki/api.php?action=opensearch&format=json&limit=20&namespace=0&search="
+                + URLEncoder.encode(query, StandardCharsets.UTF_8);
+        Request req = new Request.Builder()
+                .url(url)
+                .header("User-Agent", "RuneLite-ChanceMan/2.6.0")
+                .build();
+        try (Response res = httpClient.newCall(req).execute())
+        {
+            if (!res.isSuccessful())
+            {
+                throw new IOException("HTTP " + res.code());
+            }
+            String body = res.body().string();
+            JsonArray arr = new JsonParser().parse(body).getAsJsonArray();
+            JsonArray titles = arr.get(1).getAsJsonArray();
+            List<String> names = new ArrayList<>();
+            for (JsonElement el : titles)
+            {
+                names.add(el.getAsString());
+            }
+            return names;
+        }
+        catch (IOException ex)
+        {
+            throw new UncheckedIOException(ex);
+        }
     }
 
     private String buildWikiUrl(int npcId, String name)
     {
         String fallback = URLEncoder.encode(name.replace(' ', '_'), StandardCharsets.UTF_8);
-        return "https://oldschool.runescape.wiki/w/Special:Lookup"
-                + "?type=npc"
-                + "&id="   + npcId
-                + "&name=" + fallback
-                + "#Drops";
+        StringBuilder url = new StringBuilder("https://oldschool.runescape.wiki/w/Special:Lookup?type=npc");
+
+        if (npcId > 0)
+        {
+            url.append("&id=").append(npcId);
+        }
+
+        if (!fallback.isEmpty())
+        {
+            url.append("&name=").append(fallback);
+        }
+
+        url.append("#Drops");
+        return url.toString();
     }
 
     private String fetchHtml(String url)
     {
         Request req = new Request.Builder()
                 .url(url)
-                .header("User-Agent", "RuneLite-ChanceMan/2.5.0")
+                .header("User-Agent", "RuneLite-ChanceMan/2.6.0")
                 .build();
         try (Response res = httpClient.newCall(req).execute())
         {
-            if (!res.isSuccessful())
-                throw new IOException("HTTP " + res.code());
+            if (!res.isSuccessful()) throw new IOException("HTTP " + res.code());
             return res.body().string();
         }
         catch (IOException ex)
@@ -545,14 +899,14 @@ public class DropFetcher
         if (fetchExecutor == null || fetchExecutor.isShutdown() || fetchExecutor.isTerminated())
         {
             fetchExecutor = Executors.newFixedThreadPool(
-                    2,
+                    4,
                     new ThreadFactoryBuilder().setNameFormat("dropfetch-%d").build()
             );
         }
     }
 
     /**
-     *  shut down the executor
+     * Shut down the executor service.
      */
     public void shutdown()
     {
@@ -563,7 +917,6 @@ public class DropFetcher
         }
     }
 }
-
 package com.chanceman.drops;
 
 import lombok.Getter;
@@ -1161,6 +1514,7 @@ import com.chanceman.filters.ItemsFilter;
 import com.chanceman.ui.DropsTabUI;
 import com.chanceman.ui.DropsTooltipOverlay;
 import com.chanceman.ui.MusicWidgetController;
+import com.chanceman.ui.NpcSearchService;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 import lombok.Getter;
@@ -1234,6 +1588,7 @@ public class ChanceManPlugin extends Plugin
     @Inject private DropFetcher dropFetcher;
     @Inject private DropCache dropCache;
     @Inject private MusicWidgetController musicWidgetController;
+    @Inject private NpcSearchService npcSearchService;
 
     private ChanceManPanel chanceManPanel;
     private NavigationButton navButton;
@@ -1301,6 +1656,7 @@ public class ChanceManPlugin extends Plugin
         clientToolbar.addNavigation(navButton);
 
         accountManager.init();
+        dropCache.getAllNpcData();
     }
 
     private void disableFeatures()
@@ -1674,33 +2030,49 @@ public interface ChanceManConfig extends Config
 
 package com.chanceman.ui;
 
-import com.chanceman.drops.NpcDropData;
-import com.chanceman.drops.DropItem;
-import com.chanceman.managers.RolledItemsManager;
 import com.chanceman.ChanceManConfig;
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
-import javax.inject.Inject;
-import javax.inject.Singleton;
+import com.chanceman.drops.DropItem;
+import com.chanceman.drops.NpcDropData;
+import com.chanceman.managers.RolledItemsManager;
+
 import java.util.*;
 import java.util.stream.Collectors;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.swing.*;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.client.callback.ClientThread;
+import net.runelite.api.ScriptEvent;
+import net.runelite.api.widgets.ItemQuantityMode;
+import net.runelite.api.widgets.JavaScriptCallback;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetType;
-import net.runelite.api.widgets.ItemQuantityMode;
+import net.runelite.client.callback.ClientThread;
 
 @Slf4j
 @Singleton
 public class MusicWidgetController
 {
     private static final int MUSIC_GROUP = 239;
+    private static final int ICON_SIZE = 32;
+    private static final int PADDING = 4;
+    private static final int COLUMNS = 4;
+    private static final int MARGIN_X = 8;
+    private static final int MARGIN_Y = 8;
+    private static final int BAR_HEIGHT = 15;
+    private static final float WIDTH_RATIO = 0.7f;
+    private static final int EYE_SIZE = 20;
+    private static final int SEARCH_SPRITE = 1113;
+
     private final Client client;
     private final ClientThread clientThread;
     private final RolledItemsManager rolledItemsManager;
     private final SpriteOverrideManager spriteOverrideManager;
     private final ItemSpriteCache itemSpriteCache;
     private final ChanceManConfig config;
+    private final NpcSearchService searchService;
 
     private NpcDropData currentDrops = null;
     private List<Widget> backupJukeboxStaticKids = null;
@@ -1708,8 +2080,9 @@ public class MusicWidgetController
     private List<Widget> backupScrollStaticKids = null;
     private List<Widget> backupScrollDynamicKids = null;
     private String originalTitleText = null;
-    @Getter private final Map<Widget, DropItem> iconItemMap = new HashMap<>();
+    @Getter private final Map<Widget, DropItem> iconItemMap = new LinkedHashMap<>();
     @Getter private boolean overrideActive = false;
+    private boolean hideRolledItems = false;
 
     @Inject
     public MusicWidgetController(
@@ -1718,8 +2091,8 @@ public class MusicWidgetController
             RolledItemsManager rolledItemsManager,
             SpriteOverrideManager spriteOverrideManager,
             ItemSpriteCache itemSpriteCache,
-            ChanceManConfig config
-    )
+            ChanceManConfig config,
+            NpcSearchService searchService)
     {
         this.client = client;
         this.clientThread = clientThread;
@@ -1727,6 +2100,7 @@ public class MusicWidgetController
         this.spriteOverrideManager = spriteOverrideManager;
         this.itemSpriteCache = itemSpriteCache;
         this.config = config;
+        this.searchService = searchService;
     }
 
     public boolean hasData()
@@ -1739,21 +2113,383 @@ public class MusicWidgetController
         return currentDrops;
     }
 
+    /**
+     * Replace the music widget with a drop table view for the given NPC.
+     * If an override is already active, it will be updated
+     */
     public void override(NpcDropData dropData)
     {
-        if (dropData == null) return;
-        this.currentDrops = dropData;
-        this.overrideActive = true;
-        applyOverride(dropData);
-        spriteOverrideManager.register();
+        if (dropData == null)
+        {
+            return;
+        }
+        currentDrops = dropData;
+        hideRolledItems = false;
+        if (!overrideActive)
+        {
+            overrideActive = true;
+            clientThread.invokeLater(() ->
+            {
+                applyOverride(dropData);
+                spriteOverrideManager.register();
+            });
+        }
+        else
+        {
+            clientThread.invokeLater(() -> applyOverride(dropData));
+        }
     }
 
+    /**
+     * Remove the drop table overlay and restore the original music widget.
+     */
     public void restore()
     {
-        if (!overrideActive) return;
+        if (!overrideActive)
+        {
+            return;
+        }
         spriteOverrideManager.unregister();
         itemSpriteCache.clear();
-        revertOverride();
+        hideRolledItems = false;
+        clientThread.invokeLater(this::revertOverride);
+    }
+
+    private void updateIconsVisibilityAndLayout()
+    {
+        Set<Integer> rolledIds = rolledItemsManager.getRolledItems();
+        Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
+        Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
+
+        int displayIndex = 0;
+
+        for (Map.Entry<Widget, DropItem> e : iconItemMap.entrySet())
+        {
+            Widget icon = e.getKey();
+            DropItem d = e.getValue();
+            boolean rolled = rolledIds.contains(d.getItemId());
+
+            if (hideRolledItems && rolled)
+            {
+                icon.setHidden(true);
+            }
+            else
+            {
+                icon.setHidden(false);
+                int col = displayIndex % COLUMNS;
+                int row = displayIndex / COLUMNS;
+                int x = MARGIN_X + col * (ICON_SIZE + PADDING);
+                int y = MARGIN_Y + row * (ICON_SIZE + PADDING);
+                icon.setOriginalX(x);
+                icon.setOriginalY(y);
+                icon.revalidate();
+                displayIndex++;
+            }
+        }
+
+        int rows = (displayIndex + COLUMNS - 1) / COLUMNS;
+        if (scrollable != null)
+        {
+            scrollable.setScrollHeight(MARGIN_Y * 2 + rows * (ICON_SIZE + PADDING));
+            scrollable.revalidate();
+        }
+        if (scrollbar != null)
+        {
+            scrollbar.revalidateScroll();
+        }
+    }
+
+    private static List<Widget> copyChildren(Widget parent, boolean dynamic)
+    {
+        if (parent == null)
+        {
+            return new ArrayList<>();
+        }
+        Widget[] kids = dynamic ? parent.getDynamicChildren() : parent.getChildren();
+        return kids != null ? new ArrayList<>(Arrays.asList(kids)) : new ArrayList<>();
+    }
+
+    private static void restoreChildren(Widget parent, List<Widget> staticKids, List<Widget> dynamicKids)
+    {
+        if (parent == null)
+        {
+            return;
+        }
+
+        Widget[] currentStatic = parent.getChildren();
+        if (currentStatic != null)
+        {
+            for (Widget w : currentStatic)
+            {
+                w.setHidden(true);
+            }
+        }
+
+        Widget[] currentDyn = parent.getDynamicChildren();
+        if (currentDyn != null)
+        {
+            for (Widget w : currentDyn)
+            {
+                w.setHidden(true);
+            }
+        }
+
+        if (staticKids != null)
+        {
+            for (Widget w : staticKids)
+            {
+                w.setHidden(false);
+            }
+        }
+        if (dynamicKids != null)
+        {
+            for (Widget w : dynamicKids)
+            {
+                w.setHidden(false);
+            }
+        }
+
+        parent.revalidate();
+    }
+
+    private Widget updateTitle(NpcDropData dropData)
+    {
+        Widget title = client.getWidget(MUSIC_GROUP, 8);
+        if (title != null)
+        {
+            if (originalTitleText == null)
+            {
+                originalTitleText = title.getText();
+            }
+            title.setText(dropData.getName());
+            title.revalidate();
+        }
+        return title;
+    }
+
+    private void drawProgressBarAndToggle(Widget root, Widget title, NpcDropData dropData, int rolledCount, int totalDrops)
+    {
+        int fontId = title != null ? title.getFontId() : 0;
+        boolean shadowed = title != null && title.getTextShadowed();
+
+        int lvlX = Objects.requireNonNull(title).getOriginalX() + title.getOriginalWidth() + 83;
+        int lvlY = title.getOriginalY();
+
+        Widget lvl = root.createChild(-1);
+        lvl.setHidden(false);
+        lvl.setType(WidgetType.TEXT);
+        lvl.setText(String.format("Lvl %d", dropData.getLevel()));
+        lvl.setFontId(fontId);
+        lvl.setTextShadowed(shadowed);
+        lvl.setTextColor(0x00b33c);
+        lvl.setOriginalX(lvlX);
+        lvl.setOriginalY(lvlY);
+        lvl.setOriginalWidth(title.getOriginalWidth());
+        lvl.setOriginalHeight(title.getOriginalHeight());
+        lvl.revalidate();
+
+        Widget oldBar = client.getWidget(MUSIC_GROUP, 9);
+        if (oldBar == null)
+        {
+            return;
+        }
+        int xOld = oldBar.getOriginalX();
+        int yOld = oldBar.getOriginalY();
+        int wOld = oldBar.getOriginalWidth();
+        int hOld = oldBar.getOriginalHeight();
+
+        int newW = Math.round(wOld * WIDTH_RATIO);
+        int newY = yOld + (hOld - BAR_HEIGHT) / 2;
+
+        Widget bg = root.createChild(-1);
+        bg.setHidden(false);
+        bg.setType(WidgetType.RECTANGLE);
+        bg.setOriginalX(xOld);
+        bg.setOriginalY(newY);
+        bg.setOriginalWidth(newW);
+        bg.setOriginalHeight(BAR_HEIGHT);
+        bg.setFilled(true);
+        bg.setTextColor(0x000000);
+        bg.revalidate();
+
+        final int border = 1;
+        int innerWidth = newW - border * 2;
+        int fillW = Math.round(innerWidth * (float) rolledCount / totalDrops);
+
+        Widget fill = root.createChild(-1);
+        fill.setHidden(false);
+        fill.setType(WidgetType.RECTANGLE);
+        fill.setOriginalX(xOld + border);
+        fill.setOriginalY(newY + border);
+        fill.setOriginalWidth(fillW);
+        fill.setOriginalHeight(BAR_HEIGHT - border * 2);
+        fill.setFilled(true);
+        fill.setTextColor(0x00b33c);
+        fill.revalidate();
+
+        String txt = String.format("%d/%d", rolledCount, totalDrops);
+        Widget label = root.createChild(-1);
+        label.setHidden(false);
+        label.setType(WidgetType.TEXT);
+        label.setText(txt);
+        label.setTextColor(0xFFFFFF);
+        label.setFontId(fontId);
+        label.setTextShadowed(shadowed);
+        label.setOriginalWidth(newW);
+        label.setOriginalHeight(BAR_HEIGHT);
+        label.setOriginalX(xOld + (newW / 2) - (txt.length() * 4));
+        label.setOriginalY(newY + (BAR_HEIGHT / 2) - 6);
+        label.revalidate();
+
+        int eyeX = xOld + newW + 4;
+        int eyeY = newY + (BAR_HEIGHT / 2) - (EYE_SIZE / 2);
+
+        Widget eye = root.createChild(-1);
+        eye.setHidden(false);
+        eye.setType(WidgetType.GRAPHIC);
+        eye.setOriginalX(eyeX);
+        eye.setOriginalY(eyeY);
+        eye.setOriginalWidth(EYE_SIZE);
+        eye.setOriginalHeight(EYE_SIZE);
+        eye.setSpriteId(hideRolledItems ? 2222 : 2221);
+        eye.revalidate();
+        eye.setAction(0, "Toggle rolled items");
+
+        eye.setOnOpListener((JavaScriptCallback) (ScriptEvent ev) ->
+        {
+            hideRolledItems = !hideRolledItems;
+            updateIconsVisibilityAndLayout();
+            eye.setSpriteId(hideRolledItems ? 2222 : 2221);
+            eye.revalidate();
+        });
+        eye.setHasListener(true);
+
+        int searchX = eyeX + EYE_SIZE + PADDING;
+        int searchY = eyeY;
+
+        Widget search = root.createChild(-1);
+        search.setHidden(false);
+        search.setType(WidgetType.GRAPHIC);
+        search.setOriginalX(searchX);
+        search.setOriginalY(searchY);
+        search.setOriginalWidth(EYE_SIZE);
+        search.setOriginalHeight(EYE_SIZE);
+        search.setSpriteId(SEARCH_SPRITE);
+        search.revalidate();
+        search.setAction(0, "Search Drops");
+
+        search.setOnOpListener((JavaScriptCallback) ev -> showSearchDialog());
+        search.setHasListener(true);
+
+        root.revalidate();
+    }
+
+    /**
+     * Display a Swing dialog prompting the user for an NPC name or ID. The
+     * potentially long running search executes on a background thread so the
+     * UI remains responsive. Selecting a result will override the widget with
+     * the chosen drop table.
+     */
+    private void showSearchDialog()
+    {
+        SwingUtilities.invokeLater(() ->
+        {
+            String query = JOptionPane.showInputDialog(
+                    null,
+                    "Enter NPC name or ID:",
+                    "Search NPC",
+                    JOptionPane.PLAIN_MESSAGE
+            );
+            if (query == null || query.trim().isEmpty())
+            {
+                return;
+            }
+
+            new Thread(() -> {
+                List<NpcDropData> results = searchService.search(query.trim());
+
+                SwingUtilities.invokeLater(() -> {
+                    if (results.isEmpty())
+                    {
+                        JOptionPane.showMessageDialog(
+                                null,
+                                "No NPCs found for: " + query,
+                                "Search NPC",
+                                JOptionPane.INFORMATION_MESSAGE
+                        );
+                        return;
+                    }
+
+                    List<NpcDropData> limited = results.stream().limit(5).collect(Collectors.toList());
+                    String[] choices = limited.stream()
+                            .map(n -> String.format("%s (ID %d, Lvl %d)", n.getName(), n.getNpcId(), n.getLevel()))
+                            .toArray(String[]::new);
+                    int idx = JOptionPane.showOptionDialog(
+                            null,
+                            "Select NPC:",
+                            "Search Results",
+                            JOptionPane.DEFAULT_OPTION,
+                            JOptionPane.PLAIN_MESSAGE,
+                            null,
+                            choices,
+                            choices[0]
+                    );
+                    if (idx >= 0 && idx < limited.size())
+                    {
+                        override(limited.get(idx));
+                    }
+                });
+            }).start();
+        });
+    }
+
+    private void drawDropIcons(Widget scrollable, Widget scrollbar, Widget jukebox, List<DropItem> drops, Set<Integer> rolledIds)
+    {
+        if (scrollable == null || scrollbar == null)
+        {
+            return;
+        }
+
+        if (backupJukeboxStaticKids == null && jukebox != null)
+        {
+            backupJukeboxStaticKids = copyChildren(jukebox, false);
+        }
+        if (backupJukeboxDynamicKids == null && jukebox != null)
+        {
+            backupJukeboxDynamicKids = copyChildren(jukebox, true);
+        }
+        if (backupScrollStaticKids == null)
+        {
+            backupScrollStaticKids = copyChildren(scrollable, false);
+        }
+        if (backupScrollDynamicKids == null)
+        {
+            backupScrollDynamicKids = copyChildren(scrollable, true);
+        }
+
+        WidgetUtils.hideAllChildrenSafely(jukebox);
+        WidgetUtils.hideAllChildrenSafely(scrollable);
+
+        for (DropItem d : drops)
+        {
+            int itemId = d.getItemId();
+            Widget icon = scrollable.createChild(-1);
+            icon.setHidden(false);
+            icon.setType(WidgetType.GRAPHIC);
+            int spriteId = itemSpriteCache.getSpriteId(itemId);
+            icon.setSpriteId(spriteId);
+            icon.setItemQuantityMode(ItemQuantityMode.NEVER);
+            icon.setOriginalX(MARGIN_X);
+            icon.setOriginalY(MARGIN_Y);
+            icon.setOriginalWidth(ICON_SIZE);
+            icon.setOriginalHeight(ICON_SIZE);
+            icon.setOpacity(rolledIds.contains(itemId) ? 0 : 150);
+            icon.revalidate();
+
+            iconItemMap.put(icon, d);
+        }
+
+        updateIconsVisibilityAndLayout();
     }
 
     private void applyOverride(NpcDropData dropData)
@@ -1763,24 +2499,33 @@ public class MusicWidgetController
         for (int childId : toHide)
         {
             Widget w = client.getWidget(MUSIC_GROUP, childId);
-            if (w != null) w.setHidden(true);
+            if (w != null)
+            {
+                w.setHidden(true);
+            }
         }
 
         List<DropItem> drops = dropData.getDropTableSections().stream()
-                .filter(sec -> {
+                .filter(sec ->
+                {
                     String h = sec.getHeader();
-                    if (h == null) return true;
+                    if (h == null)
+                    {
+                        return true;
+                    }
                     String lower = h.toLowerCase();
-
-                    //wiki may combine these sections under "Rare and Gem drop table"
                     if (lower.contains("rare and gem drop table"))
                     {
                         return config.showRareDropTable() && config.showGemDropTable();
                     }
-
-                    if (!config.showRareDropTable() && lower.contains("rare drop table")) return false;
-                    if (!config.showGemDropTable() && lower.contains("gem drop table")) return false;
-
+                    if (!config.showRareDropTable() && lower.contains("rare drop table"))
+                    {
+                        return false;
+                    }
+                    if (!config.showGemDropTable() && lower.contains("gem drop table"))
+                    {
+                        return false;
+                    }
                     return true;
                 })
                 .flatMap(sec -> sec.getItems().stream())
@@ -1794,171 +2539,27 @@ public class MusicWidgetController
                 .count();
 
         Widget root = client.getWidget(MUSIC_GROUP, 0);
+        Widget title = updateTitle(dropData);
+
         if (root != null)
         {
-            Widget title = client.getWidget(MUSIC_GROUP, 8);
-            if (title != null && originalTitleText == null) originalTitleText = title.getText();
-
-            if (title != null && dropData != null)
-            {
-                title.setText(dropData.getName());
-                title.revalidate();
-            }
-
-            int fontId = title != null ? title.getFontId() : 0;
-            boolean shadowed = title != null && title.getTextShadowed();
             root.setHidden(false);
             root.setType(WidgetType.LAYER);
-            root.revalidate();
-
             WidgetUtils.hideAllChildrenSafely(root);
 
-            int lvlX = Objects.requireNonNull(title).getOriginalX() + title.getOriginalWidth() + 83;
-            int lvlY = title.getOriginalY();
+            drawProgressBarAndToggle(root, title, dropData, rolledCount, totalDrops);
+        }
 
-            Widget lvl = root.createChild(-1);
-            lvl.setHidden(false);
-            lvl.setType(WidgetType.TEXT);
-            lvl.setText(String.format("Lvl %d", dropData.getLevel()));
-            lvl.setFontId(fontId);
-            lvl.setTextShadowed(shadowed);
-            lvl.setTextColor(0x00b33c);
-            lvl.setOriginalX(lvlX);
-            lvl.setOriginalY(lvlY);
-            lvl.setOriginalWidth(title.getOriginalWidth());
-            lvl.setOriginalHeight(title.getOriginalHeight());
-            lvl.revalidate();
+        Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
+        Widget jukebox = client.getWidget(MUSIC_GROUP, 6);
+        Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
 
-            Widget oldBar = client.getWidget(MUSIC_GROUP, 9);
-            if (oldBar == null) return;
-            int xOld = oldBar.getOriginalX();
-            int yOld = oldBar.getOriginalY();
-            int wOld = oldBar.getOriginalWidth();
-            int hOld = oldBar.getOriginalHeight();
+        drawDropIcons(scrollable, scrollbar, jukebox, drops, rolledIds);
 
-            final int BAR_HEIGHT    = 15;
-            final float WIDTH_RATIO = 0.7f;
-            int newW  = Math.round(wOld * WIDTH_RATIO);
-
-            int newY  = yOld + (hOld - BAR_HEIGHT) / 2;
-
-            Widget bg = root.createChild(-1);
-            bg.setHidden(false);
-            bg.setType(WidgetType.RECTANGLE);
-            bg.setOriginalX(xOld);
-            bg.setOriginalY(newY);
-            bg.setOriginalWidth(newW);
-            bg.setOriginalHeight(BAR_HEIGHT);
-            bg.setFilled(true);
-            bg.setTextColor(0x000000);
-            bg.revalidate();
-
-            final int BORDER = 1;
-            int innerWidth = newW - BORDER * 2;
-            int fillW = Math.round(innerWidth * (float) rolledCount / totalDrops);
-
-            Widget fill = root.createChild(-1);
-            fill.setHidden(false);
-            fill.setType(WidgetType.RECTANGLE);
-            fill.setOriginalX(xOld + BORDER);
-            fill.setOriginalY(newY + BORDER);
-            fill.setOriginalWidth(fillW);
-            fill.setOriginalHeight(BAR_HEIGHT - BORDER * 2);
-            fill.setFilled(true);
-            fill.setTextColor(0x00b33c);
-            fill.revalidate();
-
-            String txt = String.format("%d/%d", rolledCount, totalDrops);
-            Widget label = root.createChild(-1);
-            label.setHidden(false);
-            label.setType(WidgetType.TEXT);
-            label.setText(txt);
-            label.setTextColor(0xFFFFFF);
-            label.setFontId(title.getFontId());
-            label.setTextShadowed(title.getTextShadowed());
-            label.setOriginalWidth(newW);
-            label.setOriginalHeight(BAR_HEIGHT);
-            label.setOriginalX(xOld + (newW / 2) - (txt.length() * 4));
-            label.setOriginalY(newY + (BAR_HEIGHT / 2) - 6);
-            label.revalidate();
-
+        if (root != null)
+        {
             root.revalidate();
         }
-
-        final int ICON_SIZE = 32, PADDING = 4, COLUMNS = 4, MARGIN_X = 8, MARGIN_Y = 8;
-        Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
-        Widget jukebox    = client.getWidget(MUSIC_GROUP, 6);
-        Widget overlay    = client.getWidget(MUSIC_GROUP, 5);
-        Widget scrollbar  = client.getWidget(MUSIC_GROUP, 7);
-
-        if (backupJukeboxStaticKids == null && jukebox != null)
-        {
-            Widget[] kids = jukebox.getChildren();
-            backupJukeboxStaticKids = (kids != null)
-                    ? new ArrayList<>(Arrays.asList(kids))
-                    : new ArrayList<>();
-        }
-
-        // backup dynamic children of jukebox
-        if (backupJukeboxDynamicKids == null && jukebox != null)
-        {
-            Widget[] kids = jukebox.getDynamicChildren();
-            backupJukeboxDynamicKids = (kids != null)
-                    ? new ArrayList<>(Arrays.asList(kids))
-                    : new ArrayList<>();
-        }
-
-        // backup static children of scrollable
-        if (backupScrollStaticKids == null && scrollable != null)
-        {
-            Widget[] kids = scrollable.getChildren();
-            backupScrollStaticKids = (kids != null)
-                    ? new ArrayList<>(Arrays.asList(kids))
-                    : new ArrayList<>();
-        }
-
-        // backup dynamic children of scrollable
-        if (backupScrollDynamicKids == null && scrollable != null)
-        {
-            Widget[] kids = scrollable.getDynamicChildren();
-            backupScrollDynamicKids = (kids != null)
-                    ? new ArrayList<>(Arrays.asList(kids))
-                    : new ArrayList<>();
-        }
-
-        WidgetUtils.hideAllChildrenSafely(jukebox);
-        WidgetUtils.hideAllChildrenSafely(scrollable);
-
-        int displayIndex = 0;
-        for (DropItem d : drops)
-        {
-            int itemId = d.getItemId();
-            int col    = displayIndex % COLUMNS;
-            int row    = displayIndex / COLUMNS;
-            int x      = MARGIN_X + col * (ICON_SIZE + PADDING);
-            int y      = MARGIN_Y + row * (ICON_SIZE + PADDING);
-
-            Widget icon = Objects.requireNonNull(scrollable).createChild(-1);
-            icon.setHidden(false);
-            icon.setType(WidgetType.GRAPHIC);
-            int spriteId = itemSpriteCache.getSpriteId(itemId);
-            icon.setSpriteId(spriteId);
-            icon.setItemQuantityMode(ItemQuantityMode.NEVER);
-            icon.setOriginalX(x);
-            icon.setOriginalY(y);
-            icon.setOriginalWidth(ICON_SIZE);
-            icon.setOriginalHeight(ICON_SIZE);
-            icon.setOpacity(rolledIds.contains(itemId) ? 0 : 150);
-            icon.revalidate();
-
-            iconItemMap.put(icon, d);
-
-            displayIndex++;
-        }
-
-        int rows = (displayIndex + COLUMNS - 1) / COLUMNS;
-        Objects.requireNonNull(scrollable).setScrollHeight(MARGIN_Y * 2 + rows * (ICON_SIZE + PADDING));
-        Objects.requireNonNull(scrollbar).revalidateScroll();
     }
 
     private void revertOverride()
@@ -1968,11 +2569,10 @@ public class MusicWidgetController
             return;
         }
 
-        Widget root       = client.getWidget(MUSIC_GROUP, 0);
+        Widget root = client.getWidget(MUSIC_GROUP, 0);
         Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
-        Widget jukebox    = client.getWidget(MUSIC_GROUP, 6);
+        Widget jukebox = client.getWidget(MUSIC_GROUP, 6);
 
-        // 1) Hide any dynamic widgets under the root (lvl text, bar, counter)
         if (root != null)
         {
             Widget[] dynRoot = root.getDynamicChildren();
@@ -1986,35 +2586,13 @@ public class MusicWidgetController
             }
         }
 
-        // 2) Hide injected drop icons under scrollable
-        if (scrollable != null && backupScrollStaticKids != null && backupScrollDynamicKids != null)
-        {
-            Widget[] staticKids = scrollable.getChildren();
-            if (staticKids != null) {for (Widget w : staticKids) {w.setHidden(true);}}
+        restoreChildren(scrollable, backupScrollStaticKids, backupScrollDynamicKids);
+        restoreChildren(jukebox, backupJukeboxStaticKids, backupJukeboxDynamicKids);
 
-            Widget[] dynamicKids = scrollable.getDynamicChildren();
-            if (dynamicKids != null) {for (Widget w : dynamicKids) {w.setHidden(true);}}
-            for (Widget w : backupScrollStaticKids) {w.setHidden(false);}
-            for (Widget w : backupScrollDynamicKids) {w.setHidden(false);}
-            scrollable.revalidate();
-        }
-
-        if (jukebox != null && backupJukeboxStaticKids != null && backupJukeboxDynamicKids != null)
-        {
-            Widget[] jbStaticKids = jukebox.getChildren();
-            if (jbStaticKids != null) {for (Widget w : jbStaticKids) {w.setHidden(true);}}
-
-            Widget[] jbDynamicKids = jukebox.getDynamicChildren();
-            if (jbDynamicKids != null) {for (Widget w : jbDynamicKids) {w.setHidden(true);}}
-            for (Widget w : backupJukeboxStaticKids) {w.setHidden(false);}
-            for (Widget w : backupJukeboxDynamicKids) {w.setHidden(false);}
-            jukebox.revalidate();
-        }
-
-        Widget title     = client.getWidget(MUSIC_GROUP, 8);
-        Widget overlay   = client.getWidget(MUSIC_GROUP, 5);
+        Widget title = client.getWidget(MUSIC_GROUP, 8);
+        Widget overlay = client.getWidget(MUSIC_GROUP, 5);
         Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
-        Widget progress  = client.getWidget(MUSIC_GROUP, 9);
+        Widget progress = client.getWidget(MUSIC_GROUP, 9);
 
         if (title != null && originalTitleText != null)
         {
@@ -2077,11 +2655,11 @@ public class MusicWidgetController
         }
 
         originalTitleText = null;
-        currentDrops      = null;
-        overrideActive    = false;
+        currentDrops = null;
+        overrideActive = false;
         backupJukeboxStaticKids = null;
         backupJukeboxDynamicKids = null;
-        backupScrollStaticKids  = null;
+        backupScrollStaticKids = null;
         backupScrollDynamicKids = null;
         iconItemMap.clear();
     }
@@ -2519,6 +3097,198 @@ public final class WidgetUtils
     }
 }
 
+package com.chanceman.ui;
+
+import com.chanceman.drops.DropCache;
+import com.chanceman.drops.NpcDropData;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Provides fuzzy search over available NPC drop data. The cache is consulted
+ * first and any misses fall back to a wiki lookup. Results without drop tables
+ * are discarded and lookups for multiple candidates are performed in parallel
+ * to keep searches snappy.
+ */
+@Singleton
+public class NpcSearchService
+{
+    private static final Pattern ID_LEVEL_PATTERN = Pattern.compile("^(\\d+)\\s+(?:lvl|level)?\\s*(\\d+)$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern NAME_LVL_PATTERN = Pattern.compile("^(.*)\\s+(?:lvl|level)\\s*(\\d+)$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern LVL_NAME_PATTERN = Pattern.compile("^(?:lvl|level)\\s*(\\d+)\\s+(.*)$", Pattern.CASE_INSENSITIVE);
+    private static final Pattern NAME_NUM_PATTERN = Pattern.compile("^(.*\\D)\\s+(\\d+)$");
+    private static final Pattern NUM_NAME_PATTERN = Pattern.compile("^(\\d+)\\s+(\\D.*)$");
+
+    private final DropCache dropCache;
+
+    @Inject
+    public NpcSearchService(DropCache dropCache)
+    {
+        this.dropCache = dropCache;
+    }
+
+    private static class ParsedQuery
+    {
+        Integer npcId;
+        Integer level;
+        String  name;
+    }
+
+    private static ParsedQuery parse(String q)
+    {
+        if (q == null) return null;
+        String lower = q.trim().toLowerCase(Locale.ROOT);
+        if (lower.isEmpty()) return null;
+
+        ParsedQuery pq = new ParsedQuery();
+        Matcher m;
+
+        // pure ID
+        if (lower.matches("\\d+"))
+        {
+            pq.npcId = Integer.valueOf(lower);
+            return pq;
+        }
+        // ID + level
+        if ((m = ID_LEVEL_PATTERN.matcher(lower)).matches())
+        {
+            pq.npcId = Integer.valueOf(m.group(1));
+            pq.level = Integer.valueOf(m.group(2));
+            return pq;
+        }
+        // name + level
+        if ((m = NAME_LVL_PATTERN.matcher(lower)).matches())
+        {
+            pq.name  = m.group(1).trim();
+            pq.level = Integer.valueOf(m.group(2));
+            return pq;
+        }
+        // level + name
+        if ((m = LVL_NAME_PATTERN.matcher(lower)).matches())
+        {
+            pq.level = Integer.valueOf(m.group(1));
+            pq.name  = m.group(2).trim();
+            return pq;
+        }
+        // trailing number = level
+        if ((m = NAME_NUM_PATTERN.matcher(lower)).matches())
+        {
+            pq.name  = m.group(1).trim();
+            pq.level = Integer.valueOf(m.group(2));
+            return pq;
+        }
+        // leading number = level
+        if ((m = NUM_NAME_PATTERN.matcher(lower)).matches())
+        {
+            pq.level = Integer.valueOf(m.group(1));
+            pq.name  = m.group(2).trim();
+            return pq;
+        }
+
+        // fallback to pure name
+        pq.name = lower;
+        return pq;
+    }
+
+    /**
+     * Search by partial name, level, or ID. Results are limited and ordered by
+     * Levenshtein distance when appropriate.
+     */
+    public List<NpcDropData> search(String query)
+    {
+        ParsedQuery pq = parse(query);
+        if (pq == null)
+        {
+            return Collections.emptyList();
+        }
+
+        // 1) name only → fetch all candidates by name
+        if (pq.npcId == null && pq.level == null && pq.name != null)
+        {
+            List<String> names = dropCache.searchNpcNames(pq.name).join();
+            List<NpcDropData> fetched = fetchAll(names.stream().limit(10).collect(Collectors.toList()), 0);
+            return fetched.stream()
+                    .sorted(Comparator.comparingInt(d ->
+                            levenshtein(d.getName().toLowerCase(Locale.ROOT), pq.name)))
+                    .collect(Collectors.toList());
+        }
+
+        // 2) ID only → fetch by ID
+        if (pq.npcId != null && pq.name == null)
+        {
+            int lvl = (pq.level != null ? pq.level : 0);
+            NpcDropData d = dropCache.get(pq.npcId, "", lvl).join();
+            if (d == null || d.getDropTableSections().isEmpty())
+            {
+                return Collections.emptyList();
+            }
+            return Collections.singletonList(d);
+        }
+
+        // 3) mixed or partial → fuzzy search
+        String nameFilter = (pq.name != null ? pq.name : "");
+        int lvlFilter = (pq.level != null ? pq.level : -1);
+
+        List<String> candidates = dropCache.searchNpcNames(nameFilter).join();
+        List<NpcDropData> all = fetchAll(candidates.stream().limit(10).collect(Collectors.toList()),
+                lvlFilter > -1 ? lvlFilter : 0);
+
+        // if ID also provided, filter it
+        if (pq.npcId != null)
+        {
+            all = all.stream()
+                    .filter(d -> d.getNpcId() == pq.npcId)
+                    .collect(Collectors.toList());
+        }
+
+        // filter by level + sort by name distance
+        final int lvl = lvlFilter;
+        return all.stream()
+                .filter(d -> lvl < 0 || d.getLevel() == lvl)
+                .sorted(Comparator.comparingInt(d ->
+                        levenshtein(d.getName().toLowerCase(Locale.ROOT), nameFilter)))
+                .collect(Collectors.toList());
+    }
+
+    /**
+     * Fetch drop data for a list of names concurrently.
+     */
+    private List<NpcDropData> fetchAll(List<String> names, int level)
+    {
+        List<CompletableFuture<NpcDropData>> futures = names.stream()
+                .map(n -> dropCache.get(0, n, level))
+                .collect(Collectors.toList());
+
+        CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
+
+        return futures.stream()
+                .map(CompletableFuture::join)
+                .filter(Objects::nonNull)
+                .filter(d -> !d.getDropTableSections().isEmpty())
+                .collect(Collectors.toList());
+    }
+
+    // simple DP Levenshtein
+    private static int levenshtein(String a, String b)
+    {
+        int[][] dp = new int[a.length()+1][b.length()+1];
+        for (int i = 0; i <= a.length(); i++) dp[i][0] = i;
+        for (int j = 0; j <= b.length(); j++) dp[0][j] = j;
+        for (int i = 1; i <= a.length(); i++)
+            for (int j = 1; j <= b.length(); j++)
+                dp[i][j] = Math.min(
+                        Math.min(dp[i-1][j] + 1, dp[i][j-1] + 1),
+                        dp[i-1][j-1] + (a.charAt(i-1)==b.charAt(j-1) ? 0 : 1)
+                );
+        return dp[a.length()][b.length()];
+    }
+}
 package com.chanceman.ui;
 
 import javax.inject.Inject;

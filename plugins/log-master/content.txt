@@ -6,6 +6,7 @@ import com.logmaster.domain.TaskTier;
 import com.logmaster.synchronization.clog.CollectionLogService;
 import com.logmaster.task.TaskService;
 import com.logmaster.ui.InterfaceManager;
+import com.logmaster.ui.TaskmanCommandManager;
 import com.logmaster.ui.component.TaskOverlay;
 import com.logmaster.util.GsonOverride;
 import lombok.Getter;
@@ -53,6 +54,9 @@ public class LogMasterPlugin extends Plugin {
 	@Inject
 	public TaskService taskService;
 
+	@Inject
+	public TaskmanCommandManager taskmanCommand;
+
 	@Getter
 	@Setter
 	// TODO: this is UI state, move it somewhere else
@@ -64,6 +68,7 @@ public class LogMasterPlugin extends Plugin {
 		collectionLogService.startUp();
 		pluginUpdateNotifier.startUp();
 		interfaceManager.startUp();
+		taskmanCommand.startUp();
 		this.taskOverlay.setResizable(true);
 		this.overlayManager.add(this.taskOverlay);
 	}
@@ -74,6 +79,7 @@ public class LogMasterPlugin extends Plugin {
 		collectionLogService.shutDown();
 		pluginUpdateNotifier.shutDown();
 		interfaceManager.shutDown();
+		taskmanCommand.shutDown();
 		this.overlayManager.remove(this.taskOverlay);
 	}
 
@@ -98,7 +104,7 @@ public class LogMasterPlugin extends Plugin {
 
 		taskService.toggleComplete(taskId);
 		if (taskService.getActiveTask() == null) {
-			interfaceManager.clearCurrentTask();
+			interfaceManager.taskDashboard.clearTask();
 		}
 
 		interfaceManager.completeTask();
@@ -228,6 +234,112 @@ public class SimpleDebouncer {
         }
 
         future = executorService.schedule(cb::call, MS_DELAY, TimeUnit.MILLISECONDS);
+    }
+}
+
+package com.logmaster.util;
+
+import com.logmaster.PluginUpdateNotifier;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLiteProperties;
+import okhttp3.*;
+
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import java.io.IOException;
+import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
+
+import static com.logmaster.util.GsonOverride.GSON;
+
+@Slf4j
+public class HttpClient {
+    private static final MediaType JSON_MEDIA_TYPE = Objects.requireNonNull(MediaType.parse("application/json; charset=utf-8"));
+
+    @Inject
+    private OkHttpClient okHttpClient;
+
+    private final String userAgent;
+
+    @Inject
+    public HttpClient() {
+        String runeliteVersion = RuneLiteProperties.getVersion();
+        String pluginVersion = PluginUpdateNotifier.getPluginVersion();
+        userAgent = "RuneLite:" + runeliteVersion + "," + "CLogMaster:" + pluginVersion;
+    }
+
+    private Request.Builder buildRequest(String url, Consumer<Request.Builder> methodSetter) {
+        Request.Builder builder = new Request.Builder()
+                .url(url)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", userAgent);
+        methodSetter.accept(builder);
+        return builder;
+    }
+
+    private CompletableFuture<Response> executeHttpRequestAsync(Request request) {
+        log.debug("Sending {} request to {}; data = {}", request.method(), request.url(), request.body());
+
+        CompletableFuture<Response> future = new CompletableFuture<>();
+        okHttpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(@NonNull Call call, @NonNull IOException e) {
+                log.warn("Async request failed.", e);
+                future.completeExceptionally(e);
+            }
+
+            @Override
+            public void onResponse(@NonNull Call call, @NonNull Response response) {
+                future.complete(response);
+            }
+        });
+        return future;
+    }
+
+    public <T> CompletableFuture<T> postHttpRequestAsync(String url, String data, @Nullable Class<T> clazz) {
+        RequestBody body = RequestBody.create(JSON_MEDIA_TYPE, data);
+        Request request = buildRequest(url, builder -> builder.post(body)).build();
+        return executeHttpRequestAsync(request)
+                .thenApply((response) -> handleResponse(response, clazz));
+    }
+
+    public <T> CompletableFuture<T> putHttpRequestAsync(String url, String data, @Nullable Class<T> clazz) {
+        RequestBody body = RequestBody.create(JSON_MEDIA_TYPE, data);
+        Request request = buildRequest(url, builder -> builder.put(body)).build();
+        return executeHttpRequestAsync(request)
+                .thenApply((response) -> handleResponse(response, clazz));
+    }
+
+    public <T> CompletableFuture<T> getHttpRequestAsync(String url, @Nullable Class<T> clazz) {
+        Request request = buildRequest(url, Request.Builder::get)
+                .build();
+        return executeHttpRequestAsync(request)
+                .thenApply((response) -> handleResponse(response, clazz));
+    }
+
+    private <T> T handleResponse(Response response, @Nullable Class<T> clazz) {
+        try (Response res = response) {
+            ResponseBody body = res.body();
+
+            if (body == null) {
+                throw new RuntimeException("Response body is null");
+            }
+
+            String bodyString = body.string();
+            if (!response.isSuccessful()) {
+                throw new RuntimeException("Response unsuccessful: " + bodyString);
+            }
+
+            if (clazz == null) {
+                return null;
+            }
+
+            return GSON.fromJson(bodyString, clazz);
+        } catch (IOException e) {
+            throw new RuntimeException("Error reading response body");
+        }
     }
 }
 
@@ -674,9 +786,10 @@ import static com.logmaster.LogMasterConfig.PLUGIN_VERSION_KEY;
 public class PluginUpdateNotifier extends EventBusSubscriber {
     private static final String[] UPDATE_MESSAGES = {
             "<colHIGHLIGHT>Collection Log Master updated to v" + getPluginVersion(),
-            "<colHIGHLIGHT>- Deprecated checkbox to open the dashboard; use the hamburger menu now",
-            "<colHIGHLIGHT>- Major performance improvements",
-            "<colHIGHLIGHT>- Fixed conflict with RuneProfile",
+            "<colHIGHLIGHT>- Added task info panel; check detailed task requirements in there!",
+            "<colHIGHLIGHT>- Added support for !taskman command; enable in the plugin config",
+            "<colHIGHLIGHT>- Fixed an issue with the conversion of old save data",
+            "<colHIGHLIGHT>- Other minor fixes and improvements",
     };
 
     @Inject
@@ -685,7 +798,7 @@ public class PluginUpdateNotifier extends EventBusSubscriber {
     @Inject
     ChatMessageManager chatMessageManager;
 
-    private static String getPluginVersion() {
+    public static String getPluginVersion() {
         try (InputStream is = LogMasterPlugin.class.getResourceAsStream("version")) {
             assert is != null;
             return new String(is.readAllBytes(), StandardCharsets.UTF_8)
@@ -731,6 +844,7 @@ public class PluginUpdateNotifier extends EventBusSubscriber {
 
 package com.logmaster.ui.generic;
 
+import net.runelite.api.widgets.ItemQuantityMode;
 import net.runelite.api.widgets.Widget;
 
 /**
@@ -764,6 +878,8 @@ public class UIGraphic extends UIComponent
 	 */
 	public void setItem(int itemID)
 	{
+		this.getWidget().setItemQuantity(100);
+		this.getWidget().setItemQuantityMode(ItemQuantityMode.NEVER);
 		this.getWidget().setItemId(itemID);
 	}
 }
@@ -1852,6 +1968,8 @@ public class TaskDashboard extends UIPage {
     private final SyncService syncService;
     private final TaskService taskService;
     private final Client client;
+    private final TaskInfo taskInfo;
+
 
     private UILabel title;
     private UILabel taskLabel;
@@ -1865,13 +1983,14 @@ public class TaskDashboard extends UIPage {
     private UIButton faqBtn;
     private UIButton syncBtn;
 
-    public TaskDashboard(LogMasterPlugin plugin, LogMasterConfig config, Widget window, SyncService syncService, TaskService taskService, Client client) {
+    public TaskDashboard(LogMasterPlugin plugin, LogMasterConfig config, Widget window, SyncService syncService, TaskService taskService, Client client, TaskInfo taskInfo) {
         this.window = window;
         this.plugin = plugin;
         this.config = config;
         this.syncService = syncService;
         this.taskService = taskService;
         this.client = client;
+        this.taskInfo = taskInfo;
 
         createTaskDetails();
 
@@ -1925,6 +2044,19 @@ public class TaskDashboard extends UIPage {
         this.add(syncBtn);
     }
 
+    @Override
+    public void setVisibility(boolean visible) {
+        super.setVisibility(visible);
+        if (visible) {
+            if (taskService.getActiveTask() == null) {
+                clearTask();
+            } else {
+                Task activeTask = taskService.getActiveTask();
+                setTask(activeTask, null);
+            }
+        }
+    }
+
     private void createTaskDetails() {
         final int POS_X = getCenterX(window, DEFAULT_TASK_DETAILS_WIDTH);
         final int POS_Y = getCenterY(window, DEFAULT_TASK_DETAILS_HEIGHT)-3;
@@ -1947,12 +2079,23 @@ public class TaskDashboard extends UIPage {
         Widget taskImageWidget = window.createChild(-1, WidgetType.GRAPHIC);
         this.taskImage = new UIGraphic(taskImageWidget);
         this.taskImage.setPosition(POS_X+12, POS_Y+21);
-        this.taskImage.getWidget().setItemQuantityMode(ItemQuantityMode.NEVER);
         this.taskImage.setSize(42, 36);
         this.taskImage.getWidget().setBorderType(1);
     }
 
-    public void setTask(String desc, int taskItemID, List<Task> cyclingTasks) {
+    public void clearTask() {
+        this.taskBg.getWidget().clearActions();
+        this.taskBg.clearActions();
+        this.taskLabel.setText("No active task.");
+        this.taskImage.setItem(7542);
+        this.disableCompleteTask();
+        this.enableGenerateTask();
+        this.enableFaqButton();
+    }
+
+    public void setTask(Task task, List<Task> cyclingTasks) {
+        this.disableGenerateTask();
+
         if (cyclingTasks != null) {
             for (int i = 0; i < 250; i++) {
                 Task displayTask = cyclingTasks.get((int) Math.floor(Math.random() * cyclingTasks.size()));
@@ -1968,20 +2111,19 @@ public class TaskDashboard extends UIPage {
                 fakeTaskTimer.start();
             }
             Timer realTaskTimer = new Timer(config.rollTime(), ae -> {
-                this.taskLabel.setText(desc);
-                this.taskImage.setItem(taskItemID);
-                this.enableCompleteTask();
-                this.enableFaqButton();
+                setTask(task, null);
             });
             realTaskTimer.setRepeats(false);
             realTaskTimer.setCoalesce(true);
             realTaskTimer.start();
-        } else {
-            this.taskLabel.setText(desc);
-            this.taskImage.setItem(taskItemID);
-            this.enableCompleteTask();
-            this.enableFaqButton();
+            return;
         }
+
+        this.taskLabel.setText(task.getName());
+        this.taskImage.setItem(task.getDisplayItemId());
+        this.taskBg.addAction("View task info", () -> taskInfo.showTask(task.getId()));
+        this.enableCompleteTask();
+        this.enableFaqButton();
     }
 
 	private void generateTask() {
@@ -1989,8 +2131,8 @@ public class TaskDashboard extends UIPage {
 		Task generatedTask = taskService.generate();
 
 		List<Task> rollTaskList = config.rollPastCompleted() ? taskService.getTierTasks() : taskService.getIncompleteTierTasks();
-		setTask(generatedTask.getName(), generatedTask.getDisplayItemId(), rollTaskList);
-        disableGenerateTask(false);
+		setTask(generatedTask, rollTaskList);
+        disableGenerateTask();
         updatePercentages();
 	}
 
@@ -2028,20 +2170,12 @@ public class TaskDashboard extends UIPage {
         }
     }
 
-    public void disableGenerateTask() {
-        disableGenerateTask(true);
-    }
 
-    public void disableGenerateTask(boolean enableComplete) {
+    public void disableGenerateTask() {
         this.generateTaskBtn.setSprites(GENERATE_TASK_DISABLED_SPRITE_ID);
         this.generateTaskBtn.clearActions();
 
         this.generateTaskBtn.addAction("Disabled", this::playFailSound);
-
-        if (enableComplete) {
-            this.enableCompleteTask();
-            this.enableFaqButton();
-        }
     }
 
     public void enableGenerateTask() {
@@ -2078,10 +2212,6 @@ public class TaskDashboard extends UIPage {
     }
 
     public void updateBounds() {
-        if (!this.isVisible()) {
-            return;
-        }
-
         int windowWidth = window.getWidth();
 
         // Update title position - force widget position update
@@ -2192,6 +2322,10 @@ public class TabManager {
     private TaskList taskList;
     private UIGraphic divider;
 
+    private int TAB_HEIGHT = 21;
+    private int TAB_WIDTH = 66;
+    private int DASHBOARD_TAB_WIDTH = 95;
+
     public TabManager(Widget window, LogMasterConfig config, LogMasterPlugin plugin) {
         this.window = window;
         this.config = config;
@@ -2223,7 +2357,7 @@ public class TabManager {
         Widget dashboardTabWidget = window.createChild(-1, WidgetType.GRAPHIC);
         taskDashboardTab = new UIButton(dashboardTabWidget);
         taskDashboardTab.setSprites(DASHBOARD_TAB_SPRITE_ID, DASHBOARD_TAB_HOVER_SPRITE_ID);
-        taskDashboardTab.setSize(95, 21);
+        taskDashboardTab.setSize(DASHBOARD_TAB_WIDTH, TAB_HEIGHT);
         taskDashboardTab.setPosition(10, 0);
         taskDashboardTab.addAction("View <col=ff9040>Dashboard</col>", this::activateTaskDashboard);
         taskDashboardTab.setVisibility(false);
@@ -2231,7 +2365,7 @@ public class TabManager {
         for (TaskTier tier : TaskTier.values()) {
             Widget tabWidget = window.createChild(-1, WidgetType.GRAPHIC);
             UIButton tab = new UIButton(tabWidget);
-            tab.setSize(66, 21);
+            tab.setSize(TAB_WIDTH, TAB_HEIGHT);
             tab.setVisibility(false);
             tabs.add(tab);
         }
@@ -2241,22 +2375,16 @@ public class TabManager {
         Widget dividerWidget = window.createChild(-1, WidgetType.GRAPHIC);
         divider = new UIGraphic(dividerWidget);
         divider.setSprite(DIVIDER_SPRITE_ID);
-        divider.setSize(window.getWidth() - 20, 1); // Full width minus margins
-        divider.setPosition(10, 20);
+        divider.setSize(window.getWidth(), 1); // Full width minus margins
+        divider.setPosition(0, 20);
+        divider.revalidate();
     }
 
     public void updateBounds() {
         // Update divider width to match window width
         int windowWidth = window.getWidth();
-        divider.setSize(windowWidth - 20, 1);
-        divider.getWidget().setSize(windowWidth - 20, 1);
-        divider.getWidget().revalidate();
-        
-        // Force widget position updates for all tabs
-        taskDashboardTab.getWidget().revalidate();
-        for (UIButton tab : tabs) {
-            tab.getWidget().revalidate();
-        }
+        divider.setSize(windowWidth, 1);
+        divider.revalidate();
 
         // Update tab positions
         updateTabPositions();
@@ -2264,9 +2392,6 @@ public class TabManager {
 
     private void updateTabPositions() {
         int windowWidth = window.getWidth();
-        int availableWidth = windowWidth - 20; // 10px margin on each side
-        int dashboardTabWidth = 95;
-        int regularTabWidth = 66;
         int minSpacing = -30; // Allow up to 30px overlap
         // Count only visible tabs
         int visibleTierTabs = 0;
@@ -2275,61 +2400,53 @@ public class TabManager {
                 visibleTierTabs++;
             }
         }
-        int totalTabsWidth = dashboardTabWidth + (visibleTierTabs * regularTabWidth);
-        int spacing = (availableWidth - totalTabsWidth) / (visibleTierTabs + 2);
+        int totalTabsWidth = DASHBOARD_TAB_WIDTH + (visibleTierTabs * TAB_WIDTH);
+        int spacing = (windowWidth - totalTabsWidth) / (visibleTierTabs + 2);
         // Allow negative spacing for overlap, but not less than minSpacing
         spacing = Math.max(minSpacing, Math.min(10, spacing));
-        int dashboardX = 10 + spacing;
-        taskDashboardTab.setSize(dashboardTabWidth, 21);
+        int dashboardX = spacing;
         taskDashboardTab.setPosition(dashboardX, 0);
-        taskDashboardTab.getWidget().setSize(dashboardTabWidth, 21);
         taskDashboardTab.getWidget().setPos(dashboardX, 0);
-        int currentX = dashboardX + dashboardTabWidth + spacing;
+        int currentX = dashboardX + DASHBOARD_TAB_WIDTH + spacing;
         int tabIndex = 0;
         for (TaskTier tier : TaskTier.values()) {
+            UIButton tab = tabs.get(tabIndex);
             if (tier.ordinal() >= config.hideBelow().ordinal()) {
-                UIButton tab = tabs.get(tabIndex);
-                tab.setSize(regularTabWidth, 21);
+                if (plugin.getSelectedTier() == tier && !this.taskDashboard.isVisible()) {
+                    tab.setSprites(tier.tabSpriteHoverId);
+                } else {
+                    tab.setSprites(tier.tabSpriteId, tier.tabSpriteHoverId);
+                }
                 tab.setPosition(currentX, 0);
-                tab.getWidget().setSize(regularTabWidth, 21);
                 tab.getWidget().setPos(currentX, 0);
-                currentX += regularTabWidth + spacing;
+                tab.setVisibility(true);
+                tab.getWidget().setHidden(false);
+                int finalTabIndex = tabIndex;
+                tab.clearActions();
+                tab.addAction(String.format("View <col=ff9040>%s Task List</col>", tier.displayName), () -> activateTaskListForTier(tier, finalTabIndex));
+                currentX += TAB_WIDTH + spacing;
+            } else {
+                // Move out of view if not visible
+                tab.setPosition(-1000, -1000);
+                tab.getWidget().setPos(-1000, -1000);
+                tab.setVisibility(false);
+                tab.getWidget().setHidden(true);
             }
-            tabIndex++;
-        }
-        // Revalidate all tabs
-        for (UIButton tab : tabs) {
             tab.revalidate();
             tab.getWidget().revalidate();
+            tabIndex++;
+        }
+        if (!this.taskDashboard.isVisible() && !this.taskList.isVisible()) {
+            hideTabs();
         }
     }
 
     public void updateTabs() {
         hideTabs();
         if (tabs == null) return;
+        if (!taskDashboard.isVisible() && !taskList.isVisible()) return;
 
-        int tabIndex = 0;
-        for (TaskTier tier : TaskTier.values()) {
-            if (tier.ordinal() >= config.hideBelow().ordinal()) {
-                UIButton tab = tabs.get(tabIndex);
-
-                if (plugin.getSelectedTier() == tier && !this.taskDashboard.isVisible()) {
-                    tab.setSprites(tier.tabSpriteHoverId);
-                } else {
-                    tab.setSprites(tier.tabSpriteId, tier.tabSpriteHoverId);
-                }
-
-                tab.setSize(66, 21);
-
-                int finalTabIndex = tabIndex;
-                String actionLabel = String.format("View <col=ff9040>%s Task List</col>", tier.displayName);
-                tab.clearActions();
-                tab.addAction(actionLabel, () -> activateTaskListForTier(tier, finalTabIndex));
-            }
-
-            tabIndex++;
-        }
-
+        updateTabPositions();
         showTabs();
     }
 
@@ -2386,10 +2503,444 @@ public class TabManager {
         }
         updateTabPositions();
     }
+}
 
-    public void onConfigChanged() {
-        createTabs();
-        updateTabs();
+package com.logmaster.ui.component;
+
+import com.logmaster.LogMasterConfig;
+import com.logmaster.LogMasterPlugin;
+import com.logmaster.domain.DynamicTaskImages;
+import com.logmaster.domain.Task;
+import com.logmaster.domain.TaskTier;
+import com.logmaster.domain.verification.clog.CollectionLogVerification;
+import com.logmaster.synchronization.clog.CollectionLogService;
+import com.logmaster.task.TaskService;
+import com.logmaster.ui.generic.UIButton;
+import com.logmaster.ui.generic.UIGraphic;
+import com.logmaster.ui.generic.UILabel;
+import com.logmaster.ui.generic.UIPage;
+import com.logmaster.ui.component.TaskList;
+import com.logmaster.ui.component.TabManager;
+import com.logmaster.ui.component.TaskDashboard;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.FontID;
+import net.runelite.api.widgets.ItemQuantityMode;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetType;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.util.LinkBrowser;
+
+import java.awt.*;
+import java.awt.event.MouseWheelEvent;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.List;
+
+import static com.logmaster.ui.InterfaceConstants.*;
+
+@Slf4j
+public class TaskInfo extends UIPage {
+    private final static int OFFSET_X = 0;
+    private final static int OFFSET_Y = 21;
+    
+
+    private final Widget window;
+    private final LogMasterPlugin plugin;
+    private final ClientThread clientThread;
+    private final CollectionLogService collectionLogService;
+    private final TaskService taskService;
+
+    private final static int BUTTON_HEIGHT = 30;
+    private final static int BUTTON_WIDTH = 68;
+    private final static int LARGE_BUTTON_WIDTH = 140;
+    private final static int BACK_BUTTON_SPRITE_ID = -20037;
+    private final static int BACK_BUTTON_HOVER_SPRITE_ID = -20038;
+    private final static int WIKI_BUTTON_SPRITE_ID = -20039;
+    private final static int WIKI_BUTTON_HOVER_SPRITE_ID = -20040;
+    private final static int COMPLETE_TASK_SPRITE_ID = -20000;
+    private final static int COMPLETE_TASK_HOVER_SPRITE_ID = -20002;
+    private final static int INCOMPLETE_TASK_SPRITE_ID = -20041;
+    private final static int INCOMPLETE_TASK_HOVER_SPRITE_ID = -20042;
+
+    private TaskDashboard taskDashboard;
+    private TaskList taskList;
+    private TabManager tabManager;
+    private UIPage previousVisiblePage = null;
+    private Task currentTask = null;
+
+    private Rectangle bounds = new Rectangle();
+    private int windowWidth = 480;
+    private int windowHeight = 252;
+    private int wrapperX = 0;
+    private int wrapperY = 0;
+    private int wrapperHeight = 231;
+    private int windowX = 0;
+    private int windowY = 0;
+
+    private final LogMasterConfig config;
+
+    public TaskInfo(Widget window, LogMasterPlugin plugin, ClientThread clientThread, LogMasterConfig config, CollectionLogService collectionLogService, TaskService taskService) {
+        this.window = window;
+        this.plugin = plugin;
+        this.clientThread = clientThread;
+        this.config = config;
+        this.collectionLogService = collectionLogService;
+        this.taskService = taskService;
+
+        updateBounds();
+    }
+
+    public void setComponents(TaskDashboard taskDashboard, TaskList taskList, TabManager tabManager) {
+        this.taskDashboard = taskDashboard;
+        this.taskList = taskList;
+        this.tabManager = tabManager;
+    }
+
+    @Override
+    public void setVisibility(boolean visible) {
+        super.setVisibility(visible);
+        if (visible) {
+            this.previousVisiblePage = this.taskDashboard.isVisible() ? this.taskDashboard : this.taskList;
+            this.previousVisiblePage.setVisibility(false);
+            this.tabManager.hideTabs();
+        } else if (this.previousVisiblePage != null) {
+            this.previousVisiblePage.setVisibility(true);
+            if (this.taskList.isVisible()) {
+                this.taskList.updateBounds();
+            }
+            this.tabManager.showTabs();
+            this.tabManager.updateTabs();
+            previousVisiblePage = null;
+        }
+    }
+
+    private UILabel titleLabel;
+    private UILabel tipLabel;
+    private UIButton wikiBtn;
+    private UIButton closeBtn;
+    private UIButton completeBtn;
+    private UILabel progressLabel;
+    private UIGraphic progressBarBg;
+    private UIGraphic progressBarFill;
+    private List<UIGraphic> taskIcons = new ArrayList<>();
+    private UILabel extraItemsLabel;
+
+    public void showTask(String taskId) {
+        currentTask = taskService.getTaskById(taskId);
+
+        // Show the task title
+        if (titleLabel == null) {
+            titleLabel = new UILabel(window.createChild(-1, WidgetType.TEXT));
+        }
+        titleLabel.setFont(FontID.BOLD_12);
+        titleLabel.setText(currentTask.getName());
+        titleLabel.getWidget().setHidden(false);
+        titleLabel.getWidget().setTextColor(Color.WHITE.getRGB());
+        titleLabel.getWidget().setTextShadowed(true);
+        titleLabel.getWidget().setName(currentTask.getName());
+        this.add(titleLabel);
+
+        // Show the task tip
+        if (tipLabel == null) {
+            tipLabel = new UILabel(window.createChild(-1, WidgetType.TEXT));
+            this.add(tipLabel);
+        }
+        tipLabel.setFont(FontID.PLAIN_12);
+        tipLabel.setText(currentTask.getTip());
+        tipLabel.getWidget().setHidden(false);
+        tipLabel.getWidget().setTextColor(Color.WHITE.getRGB());
+        tipLabel.getWidget().setTextShadowed(true);
+        tipLabel.getWidget().setName(currentTask.getName());
+
+        int itemIndex = 0;
+        if (currentTask.getVerification() instanceof CollectionLogVerification) {
+            CollectionLogVerification verification = (CollectionLogVerification) currentTask.getVerification();
+            int[] itemIds = verification.getItemIds();
+
+            // Create or reuse a UIGraphic for the progress bar background
+            if (progressBarBg == null) {
+                progressBarBg = new UIGraphic(window.createChild(-1, WidgetType.RECTANGLE));
+                this.add(progressBarBg);
+            }
+            progressBarBg.getWidget().setFilled(true);
+            progressBarBg.getWidget().setOpacity(100);
+            progressBarBg.getWidget().setTextColor(new Color(40, 40, 40).getRGB()); // dark background
+            progressBarBg.getWidget().setBorderType(1);
+
+            // Create or reuse a UIGraphic for the progress bar fill
+            if (progressBarFill == null) {
+                progressBarFill = new UIGraphic(window.createChild(-1, WidgetType.RECTANGLE));
+                this.add(progressBarFill);
+            }
+            progressBarFill.getWidget().setFilled(true);
+            progressBarFill.getWidget().setOpacity(100);
+            progressBarFill.getWidget().setTextColor(new Color(60, 180, 75).getRGB()); // green fill
+            progressBarFill.getWidget().setBorderType(0);
+
+            // Progress label on top of the bar
+            if (progressLabel == null) {
+                progressLabel = new UILabel(window.createChild(-1, WidgetType.TEXT));
+                this.add(progressLabel);
+            }
+            progressLabel.setFont(FontID.PLAIN_12);
+            progressLabel.getWidget().setTextColor(Color.WHITE.getRGB());
+            progressLabel.getWidget().setTextShadowed(true);
+            progressLabel.getWidget().setName(currentTask.getName());
+
+            if (itemIds != null && itemIds.length > 0) {
+                int itemSize = 32;
+                for (int itemId : itemIds) {
+                    UIGraphic itemImage = itemIndex < taskIcons.size() ? taskIcons.get(itemIndex) : null;
+                    if (itemImage == null) {
+                        itemImage = new UIGraphic(window.createChild(-1, WidgetType.GRAPHIC));
+                        taskIcons.add(itemImage);
+                        this.add(itemImage);
+                    }
+                    itemImage.getWidget().setHidden(false);
+                    itemImage.getWidget().setBorderType(1);
+                    itemImage.setSize(itemSize, itemSize);
+                    itemImage.setItem(itemId);
+                    boolean isObtained = collectionLogService.isItemObtained(itemId);
+                    itemImage.setOpacity(isObtained ? 1 : 0.3f);
+                    String itemName = plugin.itemManager.getItemComposition(itemId).getName();
+                    itemImage.getWidget().clearActions();
+                    itemImage.clearActions();
+                    itemImage.addAction(itemName, () -> {});
+                    itemIndex++;
+                }
+            }
+        }
+        // Extra items label if needed
+        if (extraItemsLabel == null) {
+            extraItemsLabel = new UILabel(window.createChild(-1, WidgetType.TEXT));
+            this.add(extraItemsLabel);
+        }
+        extraItemsLabel.setFont(FontID.PLAIN_11);
+        extraItemsLabel.setText("");
+        extraItemsLabel.getWidget().setTextColor(Color.WHITE.getRGB());
+        extraItemsLabel.getWidget().setTextShadowed(true);
+        extraItemsLabel.getWidget().setName(currentTask.getName());
+
+        if (wikiBtn == null) {
+            wikiBtn = new UIButton(window.createChild(-1, WidgetType.GRAPHIC));
+            this.add(wikiBtn);
+        }
+        wikiBtn.setSize(BUTTON_WIDTH, BUTTON_HEIGHT);
+        wikiBtn.setSprites(WIKI_BUTTON_SPRITE_ID, WIKI_BUTTON_HOVER_SPRITE_ID);
+        wikiBtn.getWidget().clearActions();
+        wikiBtn.clearActions();
+        wikiBtn.addAction("View wiki", () -> {
+            LinkBrowser.browse(currentTask.getWikiLink());
+        });
+
+        if (closeBtn == null) {
+            closeBtn = new UIButton(window.createChild(-1, WidgetType.GRAPHIC));
+            closeBtn.addAction("Close Task Info", this::closeTask);
+            this.add(closeBtn);
+        }
+        closeBtn.setSize(BUTTON_WIDTH, BUTTON_HEIGHT);
+        closeBtn.setSprites(BACK_BUTTON_SPRITE_ID, BACK_BUTTON_HOVER_SPRITE_ID);
+
+        if (completeBtn == null) {
+            completeBtn = new UIButton(window.createChild(-1, WidgetType.GRAPHIC));
+            this.add(completeBtn);
+        }
+        completeBtn.setSize(LARGE_BUTTON_WIDTH, BUTTON_HEIGHT);
+        completeBtn.getWidget().clearActions();
+        completeBtn.clearActions();
+        if (taskService.isComplete(taskId)) {
+            completeBtn.setSprites(INCOMPLETE_TASK_SPRITE_ID, INCOMPLETE_TASK_HOVER_SPRITE_ID);
+            completeBtn.addAction("Mark as <col=c0392b>incomplete</col>", () -> toggleTask(taskId));
+        } else {
+            completeBtn.setSprites(COMPLETE_TASK_SPRITE_ID, COMPLETE_TASK_HOVER_SPRITE_ID);
+            completeBtn.addAction("Mark as <col=27ae60>complete</col>", () -> toggleTask(taskId));
+        }
+
+        // Hide task list/dashboard/tabs, show task info
+        this.setVisibility(true);
+        this.setPositions();
+    }
+
+    private void toggleTask(String taskId) {
+        completeBtn.getWidget().clearActions();
+        completeBtn.clearActions();
+        if (taskService.isComplete(taskId)) {
+            taskService.uncomplete(taskId);
+            completeBtn.setSprites(COMPLETE_TASK_SPRITE_ID, COMPLETE_TASK_HOVER_SPRITE_ID);
+            completeBtn.addAction("Mark as <col=27ae60>complete</col>", () -> toggleTask(taskId));
+        } else {
+            taskService.complete(taskId);
+            completeBtn.setSprites(INCOMPLETE_TASK_SPRITE_ID, INCOMPLETE_TASK_HOVER_SPRITE_ID);
+            completeBtn.addAction("Mark as <col=c0392b>incomplete</col>", () -> toggleTask(taskId));
+        }
+        completeBtn.revalidate();
+    }
+
+    private void setPositions() {
+        int offset_y = 0;
+        titleLabel.setPosition(0, offset_y);
+        titleLabel.setSize(windowWidth, 20);
+        offset_y += 30;
+        tipLabel.setPosition(10, offset_y);
+        Dimension descBounds = getTextDimension(tipLabel.getWidget(), tipLabel.getWidget().getText(), windowWidth - 40);
+        tipLabel.setSize(windowWidth - 20, descBounds.height);
+        offset_y += descBounds.height + 8;
+        int progressBarX = 10;
+        int progressBarY = offset_y;
+        
+        int itemIndex = 0;
+        if (currentTask.getVerification() instanceof CollectionLogVerification) {
+            CollectionLogVerification verification = (CollectionLogVerification) currentTask.getVerification();
+            int[] itemIds = verification.getItemIds();
+
+            int obtainedCount = 0;
+            int requiredCount = verification.getCount();
+            for (int id : itemIds) {
+                if (collectionLogService.isItemObtained(id)) {
+                    obtainedCount++;
+                }
+            }
+            int progressBarWidth = windowWidth - 20;
+            int progressBarHeight = 18;
+            int fillWidth = Math.min((int) ((obtainedCount / (float) requiredCount) * progressBarWidth), progressBarWidth);
+            
+            progressBarBg.setPosition(progressBarX, progressBarY);
+            progressBarBg.setSize(progressBarWidth, progressBarHeight);
+            progressBarFill.setPosition(progressBarX, progressBarY);
+            progressBarFill.setSize(fillWidth, progressBarHeight);
+            progressLabel.setPosition(progressBarX, progressBarY);
+            progressLabel.setSize(progressBarWidth, progressBarHeight);
+            progressLabel.setText("Obtained " + obtainedCount + "/" + requiredCount + " required items");
+            offset_y += 18;
+
+            if (itemIds != null && itemIds.length > 0) {
+                int itemSize = 32;
+                int spacing = 8;
+                int itemsPerRow = Math.max(1, (windowWidth - 20) / (itemSize + spacing));
+                int numRows = (int) Math.ceil((double) itemIds.length / itemsPerRow);
+                int startY = offset_y + 8;
+                int y = startY;
+                for (int row = 0; row < numRows; row++) {
+                    int itemsInThisRow = Math.min(itemsPerRow, itemIds.length - itemIndex);
+                    int totalRowWidth = itemsInThisRow * itemSize + (itemsInThisRow - 1) * spacing;
+                    int startX = (windowWidth - totalRowWidth) / 2;
+                    int x = startX;
+                    // Check if this row would be too close to the bottom edge
+                    if (y + itemSize > windowHeight - BUTTON_HEIGHT - 20) {
+                        break;
+                    }
+                    for (int col = 0; col < itemsInThisRow; col++) {
+                        UIGraphic itemImage = itemIndex < taskIcons.size() ? taskIcons.get(itemIndex) : null;
+                        itemImage.setPosition(x, y);
+                        x += itemSize + spacing;
+                        itemImage.revalidate();
+                        itemIndex++;
+                    }
+                    y += itemSize + spacing;
+                }
+                offset_y = y;
+                if (itemIndex < itemIds.length) {
+                    extraItemsLabel.setText((itemIds.length - itemIndex) + " more items...");
+                    extraItemsLabel.setPosition(10, offset_y);
+                    extraItemsLabel.setSize(windowWidth, 12);
+                    extraItemsLabel.revalidate();
+                } else {
+                    extraItemsLabel.setText("");
+                    extraItemsLabel.setPosition(-100, -100);
+                }
+                for (int i = itemIndex; i < taskIcons.size(); i++) {
+                    UIGraphic itemImage = taskIcons.get(i);
+                    if (itemImage != null) {
+                        itemImage.setPosition(-100, -100);
+                        itemImage.revalidate();
+                    }
+                }
+            }
+        } else {
+            progressBarBg.setPosition(-100, -100);
+            progressBarFill.setPosition(-100, -100);
+            progressLabel.setPosition(-100, -100);
+        }
+        offset_y += 16;
+        wikiBtn.setPosition(10, windowHeight - 10 - BUTTON_HEIGHT);
+        completeBtn.setPosition((windowWidth / 2) - (LARGE_BUTTON_WIDTH / 2), windowHeight - 10 - BUTTON_HEIGHT);
+        closeBtn.setPosition(windowWidth - 10 - BUTTON_WIDTH, windowHeight - 10 - BUTTON_HEIGHT);
+
+        titleLabel.revalidate();
+        tipLabel.revalidate();
+        wikiBtn.revalidate();
+        closeBtn.revalidate();
+        completeBtn.revalidate();
+        progressBarBg.revalidate();
+        progressBarFill.revalidate();
+        progressLabel.revalidate();
+    }
+
+    private Dimension getTextDimension(Widget widget, String text, int maxWidth) {
+        if (text == null || text.isEmpty()) {
+            return new Dimension(0, 0);
+        }
+        String[] words = text.split(" ");
+        StringBuilder line = new StringBuilder();
+        int lineCount = 1;
+        int maxLineWidth = 0;
+        for (int i = 0; i < words.length; i++) {
+            String testLine = line.length() == 0 ? words[i] : line + " " + words[i];
+            int testWidth = widget.getFont().getTextWidth(testLine);
+            if (line.toString().contains("<br>") || testWidth > maxWidth && line.length() > 0) {
+                // Start new line
+                maxLineWidth = Math.max(maxLineWidth, widget.getFont().getTextWidth(line.toString()));
+                line = new StringBuilder(words[i]);
+                lineCount++;
+            } else {
+                if (line.length() > 0) {
+                    line.append(" ");
+                }
+                line.append(words[i]);
+            }
+        }
+        // Check last line
+        if (line.length() > 0) {
+            maxLineWidth = Math.max(maxLineWidth, widget.getFont().getTextWidth(line.toString()));
+        }
+        int lineHeight = widget.getFont().getBaseline();
+        return new Dimension(maxLineWidth, lineCount * lineHeight);
+    }
+
+    public void closeTask() {
+        // TODO: Implement closing the task info
+        this.setVisibility(false);
+    }
+
+    public void updateBounds()
+    {
+        Widget wrapper = window.getParent();
+        wrapperX = wrapper.getRelativeX();
+        wrapperY = wrapper.getRelativeY();
+        wrapperHeight = window.getHeight() - OFFSET_Y;
+        windowX = window.getRelativeX();
+        windowY = window.getRelativeY();
+        windowWidth = window.getWidth();
+        windowHeight = window.getHeight();
+
+        bounds.setLocation(wrapperX + windowX + OFFSET_X, wrapperY + windowY + OFFSET_Y);
+        bounds.setSize(windowWidth - OFFSET_X, wrapperHeight);
+
+        if (!this.isVisible()) {
+            return;
+        }
+
+        this.setPositions();
+    }
+
+    private void forceWidgetPositionUpdate(Widget button, int x, int y) {
+        button.setPos(x, y);
+        button.revalidate();
+    }
+
+    private void forceWidgetUpdate(Widget widget, int width, int height) {
+        widget.setSize(width, height);
+        widget.revalidate();
     }
 }
 
@@ -2407,6 +2958,7 @@ import com.logmaster.ui.generic.UIButton;
 import com.logmaster.ui.generic.UIGraphic;
 import com.logmaster.ui.generic.UILabel;
 import com.logmaster.ui.generic.UIPage;
+import com.logmaster.ui.component.TaskInfo;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.widgets.ItemQuantityMode;
 import net.runelite.api.widgets.Widget;
@@ -2448,6 +3000,7 @@ public class TaskList extends UIPage {
     private final ClientThread clientThread;
     private final CollectionLogService collectionLogService;
     private final TaskService taskService;
+    private final TaskInfo taskInfo;
 
     private Rectangle bounds = new Rectangle();
 
@@ -2480,13 +3033,14 @@ public class TaskList extends UIPage {
 
     private final LogMasterConfig config;
 
-    public TaskList(Widget window, LogMasterPlugin plugin, ClientThread clientThread, LogMasterConfig config, CollectionLogService collectionLogService, TaskService taskService) {
+    public TaskList(Widget window, LogMasterPlugin plugin, ClientThread clientThread, LogMasterConfig config, CollectionLogService collectionLogService, TaskService taskService, TaskInfo taskInfo) {
         this.window = window;
         this.plugin = plugin;
         this.clientThread = clientThread;
         this.config = config;
         this.collectionLogService = collectionLogService;
         this.taskService = taskService;
+        this.taskInfo = taskInfo;
 
         updateBounds();
 
@@ -2643,12 +3197,11 @@ public class TaskList extends UIPage {
                 taskImage.getWidget().setHidden(false);
                 taskImage.setPosition(taskX + 12, taskY + 6);
                 taskImage.getWidget().setBorderType(1);
-                taskImage.getWidget().setItemQuantityMode(ItemQuantityMode.NEVER);
                 taskImage.setSize(TASK_ITEM_WIDTH, TASK_ITEM_HEIGHT);
                 taskImage.setItem(task.getDisplayItemId());
 
                 // Add our right click actions
-                taskBg.addAction("Mark as " + (taskCompleted ? "<col=c0392b>incomplete" : "<col=27ae60>completed") + "</col>", () -> plugin.completeTask(task.getId()));
+                taskBg.addAction("Show task info", () -> taskInfo.showTask(task.getId()));
 
                 if (task.getVerification() instanceof CollectionLogVerification) {
                     CollectionLogVerification verif = (CollectionLogVerification) task.getVerification();
@@ -2769,19 +3322,17 @@ public class TaskList extends UIPage {
 
     public void updateBounds()
     {
-        if (!this.isVisible()) {
-            return;
-        }
-
-        Widget collectionLogWrapper = window.getParent();
-        wrapperX = collectionLogWrapper.getRelativeX();
-        wrapperY = collectionLogWrapper.getRelativeY();
+        Widget wrapper = window.getParent();
+        wrapperX = wrapper.getRelativeX();
+        wrapperY = wrapper.getRelativeY();
         wrapperHeight = window.getHeight() - OFFSET_Y;
         windowX = window.getRelativeX();
         windowY = window.getRelativeY();
         windowWidth = window.getWidth();
         windowHeight = window.getHeight();
 
+        bounds.setLocation(wrapperX + windowX + OFFSET_X, wrapperY + windowY + OFFSET_Y);
+        bounds.setSize(windowWidth - OFFSET_X, wrapperHeight);
         // Recalculate how many tasks can be displayed
         int newTasksPerPage = Math.max(1, wrapperHeight / TASK_HEIGHT);
         columns = Math.max(1, (windowWidth - SCROLLBAR_WIDTH - 40) / (TASK_WIDTH + COLUMN_SPACING));
@@ -2795,12 +3346,13 @@ public class TaskList extends UIPage {
             int maxTopIndex = Math.max(0, taskService.getTierTasks(relevantTier).size() - tasksPerPage);
             topTaskIndex = Math.min(topTaskIndex, maxTopIndex);
         }
+
+        if (!this.isVisible()) {
+            return;
+        }
         updateArrowPositions();
         updateScrollbar();
         refreshTasks(0);
-
-        bounds.setLocation(wrapperX + windowX + OFFSET_X, wrapperY + windowY + OFFSET_Y);
-        bounds.setSize(windowWidth - OFFSET_X, wrapperHeight);
     }
 
     private void updateArrowPositions() {
@@ -2982,6 +3534,198 @@ public class SpriteDefinition implements SpriteOverride
 package com.logmaster.ui;
 
 import com.logmaster.LogMasterConfig;
+import com.logmaster.domain.Task;
+import com.logmaster.domain.TaskTier;
+import com.logmaster.domain.command.CommandRequest;
+import com.logmaster.domain.command.CommandResponse;
+import com.logmaster.task.TaskService;
+import com.logmaster.util.EventBusSubscriber;
+import com.logmaster.util.HttpClient;
+import com.logmaster.util.SimpleDebouncer;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.MessageNode;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatCommandManager;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.util.Text;
+import okhttp3.HttpUrl;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.time.Instant;
+
+import static com.logmaster.util.GsonOverride.GSON;
+
+@Slf4j
+@Singleton
+public class TaskmanCommandManager extends EventBusSubscriber {
+    @Inject
+    private Client client;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private ChatCommandManager chatCommandManager;
+
+    @Inject
+    private LogMasterConfig config;
+
+    @Inject
+    private HttpClient httpClient;
+
+    @Inject
+    private TaskService taskService;
+
+    @Inject
+    private SimpleDebouncer updateDebouncer;
+
+    private final HttpUrl baseApiUrl = new HttpUrl.Builder()
+            .scheme("https")
+            .host("taskman.up.railway.app")
+            .addPathSegment("task")
+            .addPathSegment("command")
+            .build();
+
+    private final String COLLECTION_LOG_COMMAND = "!taskman";
+
+    public void startUp() {
+        super.startUp();
+
+        if (config.isCommandEnabled()) {
+            chatCommandManager.registerCommand(COLLECTION_LOG_COMMAND, this::executeCommand);
+        }
+    }
+
+    public void shutDown() {
+        super.shutDown();
+
+        if (config.isCommandEnabled()) {
+            chatCommandManager.unregisterCommand(COLLECTION_LOG_COMMAND);
+        }
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if (!event.getGroup().equals(LogMasterConfig.CONFIG_GROUP)) return;
+        if (!event.getKey().equals(LogMasterConfig.IS_COMMAND_ENABLED_KEY)) return;
+
+        if (config.isCommandEnabled()) {
+            chatCommandManager.registerCommand(COLLECTION_LOG_COMMAND, this::executeCommand);
+            updateServerImmediately(true);
+        } else {
+            chatCommandManager.unregisterCommand(COLLECTION_LOG_COMMAND);
+        }
+    }
+
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged e) {
+        if (e.getGameState() != GameState.LOGGED_IN) return;
+
+        clientThread.invokeAtTickEnd(this::updateServer);
+    }
+
+    public void updateServer() {
+        updateServer(false);
+    }
+
+    public void updateServer(boolean skipReminder) {
+        log.debug("Scheduling command update; {}", Instant.now());
+        updateDebouncer.debounce(() -> updateServerImmediately(skipReminder));
+    }
+
+    public void updateServerImmediately(boolean skipReminder) {
+        if (!config.isCommandEnabled()) {
+            if (!skipReminder) {
+                remind();
+            }
+
+            return;
+        }
+
+        log.debug("Executing command update; {}", Instant.now());
+
+        String rsn = client.getLocalPlayer().getName();
+        if (rsn == null) return;
+
+        HttpUrl url = baseApiUrl.newBuilder().addPathSegment(rsn).build();
+
+        String taskId = "complete";
+        Task currentTask = taskService.getActiveTask();
+        if (currentTask != null) {
+            taskId = currentTask.getId();
+        }
+
+        TaskTier currentTier = taskService.getCurrentTier();
+        float currentProgress = taskService.getProgress().get(currentTier);
+
+        CommandRequest data = new CommandRequest(taskId, taskService.getCurrentTier().displayName, (int) currentProgress);
+        httpClient.putHttpRequestAsync(url.toString(), GSON.toJson(data), null);
+    }
+
+    private void executeCommand(ChatMessage chatMessage, String message) {
+        log.debug("Executing taskman command: {}", message);
+
+        String senderName = chatMessage.getType().equals(ChatMessageType.PRIVATECHATOUT)
+                ? client.getLocalPlayer().getName()
+                : Text.sanitize(chatMessage.getName());
+
+        if (senderName == null) {
+            log.debug("Couldn't identify message sender");
+            return;
+        }
+
+        HttpUrl url = baseApiUrl.newBuilder().addPathSegment(senderName).build();
+        httpClient.getHttpRequestAsync(url.toString(), CommandResponse.class)
+                .thenAccept(res -> {
+                    clientThread.invokeLater(() -> replaceChatMessage(chatMessage, res));
+                });
+    }
+
+    private void replaceChatMessage(ChatMessage chatMessage, CommandResponse res) {
+        if (res == null) return;
+
+        final String msg = new ChatMessageBuilder()
+                .append(ChatColorType.NORMAL)
+                .append("Progress: ")
+                .append(ChatColorType.HIGHLIGHT)
+                .append(res.getProgressPercentage() + "% " + res.getTier())
+                .append(ChatColorType.NORMAL)
+                .append(" Current task: ")
+                .append(ChatColorType.HIGHLIGHT)
+                .append(res.getTask().getName())
+                .build();
+
+        final MessageNode messageNode = chatMessage.getMessageNode();
+        messageNode.setRuneLiteFormatMessage(msg);
+        client.refreshChat();
+    }
+
+    private void remind() {
+        if (!config.isCommandReminderEnabled()) {
+            return;
+        }
+
+        clientThread.invoke(() -> {
+            String msg = "<col=ff392b>[Collection Log Master] Your data hasn't been synchronized with the command server because this feature is disabled."
+                    + " You can enable it in the plugin config; you can also disable this reminder in the plugin config.";
+            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", msg, "");
+            client.playSoundEffect(2277);
+        });
+    }
+}
+
+package com.logmaster.ui;
+
+import com.logmaster.LogMasterConfig;
 import com.logmaster.LogMasterPlugin;
 import com.logmaster.domain.Task;
 import com.logmaster.domain.TaskTier;
@@ -2991,6 +3735,7 @@ import com.logmaster.task.TaskService;
 import com.logmaster.ui.component.BurgerMenuManager;
 import com.logmaster.ui.component.TabManager;
 import com.logmaster.ui.component.TaskDashboard;
+import com.logmaster.ui.component.TaskInfo;
 import com.logmaster.ui.component.TaskList;
 import com.logmaster.ui.generic.UICheckBox;
 import com.logmaster.util.EventBusSubscriber;
@@ -3014,6 +3759,8 @@ import net.runelite.client.input.MouseWheelListener;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
+
+import java.awt.Rectangle;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseWheelEvent;
 import java.util.List;
@@ -3056,6 +3803,8 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
     public TaskDashboard taskDashboard;
     private TaskList taskList;
     private TabManager tabManager;
+    private TaskInfo taskInfo;
+
     private UICheckBox taskDashboardCheckbox;
 
     private boolean checkboxDeprecationWarned = false;
@@ -3085,23 +3834,20 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
 			return;
 		}
 
-        if (this.taskDashboard == null || !isTaskDashboardEnabled()) {
+        if (!isTaskDashboardEnabled() || this.taskDashboard == null || this.tabManager == null) {
             return;
         }
 
-        if (tabManager != null) {
-            tabManager.updateTabs();
-
-            List<TaskTier> visibleTiers = taskService.getVisibleTiers();
-            TaskTier activeTier = plugin.getSelectedTier();
-            if (activeTier != null && visibleTiers.contains(activeTier)) {
-                tabManager.activateTaskDashboard();
-            }
-        }
-
         taskDashboard.updatePercentages();
-        tabManager.onConfigChanged();
-	}
+
+        clientThread.invoke(tabManager::updateTabs);
+
+        List<TaskTier> visibleTiers = taskService.getVisibleTiers();
+        TaskTier activeTier = plugin.getSelectedTier();
+        if (activeTier != null && !visibleTiers.contains(activeTier)) {
+            clientThread.invoke(tabManager::activateTaskDashboard);
+        }
+    }
 
 	@Subscribe
 	public void onWidgetLoaded(WidgetLoaded e) {
@@ -3111,10 +3857,13 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
 
         Widget window = client.getWidget(InterfaceID.Collection.CONTENT);
 
+        createTaskInfo(window);
         createTaskDashboard(window);
         createTaskList(window);
         createTabManager(window);
         createTaskCheckbox();
+        this.tabManager.setComponents(taskDashboard, taskList);
+        this.taskInfo.setComponents(taskDashboard, taskList, tabManager);
 
         this.tabManager.updateTabs();
         this.taskDashboard.setVisibility(false);
@@ -3130,9 +3879,23 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
         this.taskList.setVisibility(false);
         tabManager.hideTabs();
 	}
+    
+    Rectangle oldBounds;
 
 	@Subscribe
 	public void onGameTick(GameTick e) {
+        Widget window = client.getWidget(621, 88);
+        if (window == null) {
+            oldBounds = null;
+            return;
+        }
+        // Check if the window bounds have changed
+        Rectangle newBounds = window.getBounds();
+        if (oldBounds != null && oldBounds.equals(newBounds)) {
+            return;
+        }
+        oldBounds = newBounds;
+
         if (this.taskList != null) {
             taskList.updateBounds();
         }
@@ -3142,11 +3905,11 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
         if (this.tabManager != null) {
             tabManager.updateBounds();
         }
+        if (this.taskInfo != null) {
+            taskInfo.updateBounds();
+        }
         if (this.taskDashboardCheckbox != null) {
-            Widget window = client.getWidget(621, 88);
-            if (window != null) {
-                taskDashboardCheckbox.alignToRightEdge(window, 35, 10);
-            }
+            taskDashboardCheckbox.alignToRightEdge(window, 35, 10);
         }
 	}
 
@@ -3224,17 +3987,20 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
 
     private void createTabManager(Widget window) {
         this.tabManager = new TabManager(window, config, plugin);
-        this.tabManager.setComponents(taskDashboard, taskList);
     }
 
     private void createTaskDashboard(Widget window) {
-        this.taskDashboard = new TaskDashboard(plugin, config, window, syncService, taskService, client);
+        this.taskDashboard = new TaskDashboard(plugin, config, window, syncService, taskService, client, taskInfo);
         this.taskDashboard.setVisibility(false);
     }
 
     private void createTaskList(Widget window) {
-        this.taskList = new TaskList(window, plugin, clientThread, config, collectionLogService, taskService);
+        this.taskList = new TaskList(window, plugin, clientThread, config, collectionLogService, taskService, taskInfo);
         this.taskList.setVisibility(false);
+    }
+
+    private void createTaskInfo(Widget window) {
+        this.taskInfo = new TaskInfo(window, plugin, clientThread, config, collectionLogService, taskService);
     }
 
     private void createTaskCheckbox() {
@@ -3272,10 +4038,9 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
 
         Task activeTask = taskService.getActiveTask();
         if (activeTask != null) {
-            this.taskDashboard.setTask(activeTask.getName(), activeTask.getDisplayItemId(), null);
-            this.taskDashboard.disableGenerateTask();
+            this.taskDashboard.setTask(activeTask, null);
         } else {
-            clearCurrentTask();
+            this.taskDashboard.clearTask();
         }
 
         boolean enabled = isTaskDashboardEnabled();
@@ -3296,6 +4061,7 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
         if (enabled) {
             this.tabManager.activateTaskDashboard();
         } else {
+            this.taskInfo.setVisibility(false);
             this.taskDashboard.setVisibility(false);
             this.taskList.setVisibility(false);
             this.tabManager.hideTabs();
@@ -3317,12 +4083,6 @@ public class InterfaceManager extends EventBusSubscriber implements MouseListene
         this.taskDashboard.setVisibility(wasDashboardVisible);
         this.taskList.setVisibility(!wasDashboardVisible);
         this.tabManager.showTabs();
-    }
-
-    public void clearCurrentTask() {
-        this.taskDashboard.setTask("No task.", -1, null);
-        this.taskDashboard.enableGenerateTask();
-        this.taskDashboard.enableFaqButton();
     }
 }
 
@@ -3351,8 +4111,44 @@ public class Task {
     private String id;
     private String name;
     private int displayItemId;
+    private String tip;
+    private String wikiLink;
     
     private @Nullable Verification verification;
+}
+
+package com.logmaster.domain.command;
+
+import lombok.Data;
+
+@Data
+public class CommandResponse {
+    private CommandTask task;
+    private String tier;
+    private int progressPercentage;
+}
+
+package com.logmaster.domain.command;
+
+import lombok.Data;
+
+@Data
+public class CommandTask {
+    private String name;
+    private String imageUrl;
+}
+
+package com.logmaster.domain.command;
+
+import lombok.Data;
+import lombok.RequiredArgsConstructor;
+
+@Data
+@RequiredArgsConstructor
+public class CommandRequest {
+    private final String taskId;
+    private final String tier;
+    private final int progressPercentage;
 }
 
 package com.logmaster.domain.verification.diary;
@@ -3632,6 +4428,7 @@ import com.logmaster.domain.savedata.v0.V0TaskPointer;
 import com.logmaster.domain.savedata.v1.V1SaveData;
 import com.logmaster.domain.savedata.v1.V1TaskPointer;
 import com.logmaster.task.SaveDataStorage;
+import com.logmaster.task.TaskService;
 import com.logmaster.util.FileUtils;
 import lombok.extern.slf4j.Slf4j;
 
@@ -3651,23 +4448,49 @@ public class SaveDataUpdater {
     @Inject
     private SaveDataStorage saveDataStorage;
 
+    @Inject
+    private TaskService taskService;
+
     public SaveData update(String json) {
         BaseSaveData base = GSON.fromJson(json, BaseSaveData.class);
         if (base == null) {
             return new SaveData();
         }
 
+        SaveData save = new SaveData();
         if (base.getVersion() == V0SaveData.VERSION) {
             V0SaveData v0Save = GSON.fromJson(json, V0SaveData.class);
-            return update(update(v0Save));
+            save = update(update(v0Save));
         }
 
         if (base.getVersion() == V1SaveData.VERSION) {
             V1SaveData v1Save = GSON.fromJson(json, V1SaveData.class);
-            return update(v1Save);
+            save = update(v1Save);
         }
 
-        return GSON.fromJson(json, SaveData.class);
+        if (base.getVersion() == SaveData.VERSION) {
+            save = GSON.fromJson(json, SaveData.class);
+        }
+
+        // fix issue with save data conversion by clearing active task if it failed
+        Task activeTask = save.getActiveTask();
+        if (activeTask != null) {
+            if (
+                    activeTask.getId() == null
+                    || activeTask.getName() == null
+                    || activeTask.getTip() == null
+                    || activeTask.getWikiLink() == null
+            ) {
+                if (activeTask.getId() == null) {
+                    save.setActiveTask(null);
+                } else {
+                    Task updatedTask = taskService.getTaskById(activeTask.getId());
+                    save.setActiveTask(updatedTask);
+                }
+            }
+        }
+
+        return save;
     }
 
     private SaveData update(V1SaveData v1Save) {
@@ -3716,8 +4539,12 @@ public class SaveDataUpdater {
         if (v0TaskPointer != null) {
             V0Task v0Task = v0TaskPointer.getTask();
             String newTaskId = v0MigrationData.get(v0TaskPointer.getTaskTier()).get(v0Task.getId());
-            Task newTask = new Task(newTaskId, v0Task.getDescription(), v0Task.getItemID(), null);
-            newSave.setActiveTaskPointer(new V1TaskPointer(v0TaskPointer.getTaskTier(), newTask));
+            Task newTask = taskService.getTaskById(newTaskId);
+
+            // if we can't find the task, don't set it to avoid problems
+            if (newTask != null) {
+                newSave.setActiveTaskPointer(new V1TaskPointer(v0TaskPointer.getTaskTier(), newTask));
+            }
         }
 
         return newSave;
@@ -3750,16 +4577,17 @@ package com.logmaster.domain;
 
 import lombok.Data;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 @Data
 public class TieredTaskList {
-    private List<Task> easy;
-    private List<Task> medium;
-    private List<Task> hard;
-    private List<Task> elite;
-    private List<Task> master;
+    private List<Task> easy = new ArrayList<>();
+    private List<Task> medium = new ArrayList<>();
+    private List<Task> hard = new ArrayList<>();
+    private List<Task> elite = new ArrayList<>();
+    private List<Task> master = new ArrayList<>();
 
     public List<Task> getForTier(TaskTier tier) {
         switch (tier) {
@@ -3851,16 +4679,14 @@ package com.logmaster.task;
 
 import com.logmaster.domain.TieredTaskList;
 import com.logmaster.util.FileUtils;
+import com.logmaster.util.HttpClient;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
-import okhttp3.*;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
-import java.io.IOException;
 import java.util.concurrent.CompletableFuture;
 
-import static com.logmaster.util.GsonOverride.GSON;
 
 @Slf4j
 @Singleton
@@ -3869,19 +4695,17 @@ public class TaskListStorage {
 
     private static final String REMOTE_TASK_LIST_URL = "https://raw.githubusercontent.com/OSRS-Taskman/generate-task/refs/heads/main/src/main/resources/com/logmaster/domain/task-list.json";
 
+    private final HttpClient httpClient;
+
+    private @NonNull TieredTaskList taskList = new TieredTaskList();
+
     @Inject
-    private OkHttpClient client;
-
-    private TieredTaskList taskList;
-
-    @Inject
-    public TaskListStorage(OkHttpClient client) {
-        this.client = client;
-
+    public TaskListStorage(HttpClient httpClient) {
+        this.httpClient = httpClient;
         loadAsync();
     }
 
-    public TieredTaskList get() {
+    public @NonNull TieredTaskList get() {
         return taskList;
     }
 
@@ -3891,46 +4715,12 @@ public class TaskListStorage {
                 .thenAccept(taskList -> this.taskList = taskList);
     }
 
-    private static TieredTaskList fetchLocal() {
+    private @NonNull TieredTaskList fetchLocal() {
         return FileUtils.loadDefinitionResource(TieredTaskList.class, LOCAL_TASK_LIST_FILE);
     }
 
     private CompletableFuture<TieredTaskList> fetchRemoteAsync() {
-        return requestRemote().thenApply(response -> {
-            try (Response res = response) {
-                ResponseBody body = res.body();
-                if (body == null) {
-                    throw new RuntimeException("Response body is null");
-                }
-
-                return GSON.fromJson(body.string(), TieredTaskList.class);
-            } catch (Exception e) {
-                log.error("Error!", e);
-                return null;
-            }
-        });
-    }
-
-    private CompletableFuture<Response> requestRemote() {
-        Request request = new Request.Builder()
-                .url(REMOTE_TASK_LIST_URL)
-                .header("Content-Type", "application/json")
-                .build();
-
-        CompletableFuture<Response> future = new CompletableFuture<>();
-        client.newCall(request).enqueue(new Callback() {
-            @Override
-            public void onFailure(@NonNull Call call, @NonNull IOException e) {
-                log.error("Failed requesting remote task list", e);
-                future.completeExceptionally(e);
-            }
-
-            @Override
-            public void onResponse(@NonNull Call call, @NonNull Response response) {
-                future.complete(response);
-            }
-        });
-        return future;
+        return httpClient.getHttpRequestAsync(REMOTE_TASK_LIST_URL, TieredTaskList.class);
     }
 }
 
@@ -3942,6 +4732,7 @@ import com.logmaster.domain.TaskTier;
 import com.logmaster.domain.TieredTaskList;
 import com.logmaster.domain.savedata.SaveData;
 import com.logmaster.domain.verification.clog.CollectionLogVerification;
+import com.logmaster.ui.TaskmanCommandManager;
 import com.logmaster.util.EventBusSubscriber;
 import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
@@ -3964,6 +4755,9 @@ public class TaskService extends EventBusSubscriber {
     @Inject
     private TaskListStorage taskListStorage;
 
+    @Inject
+    private TaskmanCommandManager taskmanCommandManager;
+
     @Override
     public void startUp() {
         super.startUp();
@@ -3978,6 +4772,18 @@ public class TaskService extends EventBusSubscriber {
 
     public Task getActiveTask() {
         return saveDataStorage.get().getActiveTask();
+    }
+
+    public Task getTaskById(String taskId) {
+        for (TaskTier t : TaskTier.values()) {
+            List<Task> tasks = getTierTasks(t);
+            for (Task task : tasks) {
+                if (task.getId().equals(taskId)) {
+                    return task;
+                }
+            }
+        }
+        return null;
     }
 
     public @NonNull TaskTier getCurrentTier() {
@@ -4060,6 +4866,7 @@ public class TaskService extends EventBusSubscriber {
 
         data.setActiveTask(generatedTask);
         saveDataStorage.save();
+        taskmanCommandManager.updateServer();
 
         return generatedTask;
     }
@@ -4084,6 +4891,7 @@ public class TaskService extends EventBusSubscriber {
         }
 
         saveDataStorage.save();
+        taskmanCommandManager.updateServer();
     }
 
     public void uncomplete(String taskId) {
@@ -4091,6 +4899,7 @@ public class TaskService extends EventBusSubscriber {
         completedTasks.remove(taskId);
 
         saveDataStorage.save();
+        taskmanCommandManager.updateServer();
     }
 
     public void toggleComplete(String taskId) {
@@ -4247,6 +5056,7 @@ public interface LogMasterConfig extends Config
     String CONFIG_GROUP = "log-master";
 
     String PLUGIN_VERSION_KEY = "plugin-version";
+    String IS_COMMAND_ENABLED_KEY = "isCommandEnabled";
 
     @Range(
             min = 1000,
@@ -4287,17 +5097,6 @@ public interface LogMasterConfig extends Config
     }
 
     @ConfigItem(
-            keyName = "loadRemoteTaskList",
-            name = "Load remote task list",
-            description = "Load the latest version of the tasklist, this will be updated more frequently than the default list bundled with the plugin",
-            position = 4
-    )
-    default boolean loadRemoteTaskList()
-    {
-        return true;
-    }
-
-    @ConfigItem(
             keyName = "displayCurrentTaskOverlay",
             name = "Display current task overlay",
             description = "Enable an overlay showing the currently assigned task (when one exists)",
@@ -4316,7 +5115,39 @@ public interface LogMasterConfig extends Config
     )
     default DynamicTaskImages dynamicTaskImages()
     {
-        return DynamicTaskImages.NONE;
+        return DynamicTaskImages.COMPLETE;
+    }
+
+    @ConfigSection(
+            name = "!taskman Command",
+            description = "Configuration options for the !taskman command",
+            position = 7
+    )
+    String command = "command";
+
+    @ConfigItem(
+            keyName = IS_COMMAND_ENABLED_KEY,
+            name = "Enable command",
+            description = "When you or others type !taskman in the chat, it will be replaced by your current task status",
+            warning = "Enabling this feature submits your IP address to a server not controlled or verified by the RuneLite developers.",
+            section = command,
+            position = 0
+    )
+    default boolean isCommandEnabled()
+    {
+        return false;
+    }
+
+    @ConfigItem(
+            keyName = "isCommandReminderEnabled",
+            name = "Enable reminder",
+            description = "Reminds you to enable commands in case you forgot",
+            section = command,
+            position = 1
+    )
+    default boolean isCommandReminderEnabled()
+    {
+        return true;
     }
 }
 

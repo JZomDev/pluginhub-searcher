@@ -1,61 +1,82 @@
 package net.runelite.client.plugins.burneralarm;
 
-import com.google.common.collect.ImmutableSet;
 import com.google.inject.Provides;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
-import javax.inject.Inject;
-import lombok.RequiredArgsConstructor;
+import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.api.GameObject;
-import net.runelite.api.GameState;
-import net.runelite.api.Skill;
-import net.runelite.api.events.GameObjectDespawned;
-import net.runelite.api.events.GameObjectSpawned;
-import net.runelite.api.events.GameTick;
-import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.api.gameval.InventoryID;
 import net.runelite.client.Notifier;
 import net.runelite.client.audio.AudioPlayer;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.Notification;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.ColorUtil;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.text.NumberFormat;
+import java.util.HashMap;
+import java.util.Locale;
+import java.util.Map;
+import java.util.regex.Matcher;
 
 @Slf4j
 @PluginDescriptor(
-        // Synced name, description, and tags with runelite-plugin.properties
-        name = "Burner Alarm",
-        description = "Sends a notification and plays a really annoying sound when your poh burners are about to go out",
-        tags = {"poh", "player owned house", "prayer", "altar", "burner", "incense", "notification", "alarm"}
+        name = "House Hosting",
+        description = "Tools to assist players hosting their player owned house to guests.",
+        tags = {"poh", "player owned house", "house", "host", "hosting", "altar", "gilded", "gilded altar", "burner", "burners", "tip", "jar", "tip jar", "notification", "alarm"}
 )
 public class BurnerAlarmPlugin extends Plugin {
-    private static final Set<Integer> LIT_BURNER_IDS = ImmutableSet.of(13211, 13213);
-    private static final int NOTIFICATION_COOLDOWN_TICKS = 25; // Prevents notification spam
 
-    @RequiredArgsConstructor
     private static class BurnerState {
         final int startTick;
         boolean preNotificationSent = false;
-        boolean soundNotificationSent = false;
-    }
+        boolean finalAlarmSent = false;
 
-    private final Map<GameObject, BurnerState> litBurners = new HashMap<>();
-    private int lastTextAlertTick = 0; // Cooldown for text notifications
-    private int lastSoundAlertTick = 0; // Cooldown for sound notifications
+        BurnerState(int startTick) {
+            this.startTick = startTick;
+        }
+    }
 
     @Inject
     private Client client;
 
     @Inject
-    private Notifier notifier;
-
-    @Inject
     private BurnerAlarmConfig config;
 
     @Inject
+    private Notifier notifier;
+
+    @Inject
     private AudioPlayer audioPlayer;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private BurnerAlarmOverlay burnerAlarmOverlay;
+
+    @Getter
+    private int guestCount = -1;
+
+    private final Map<GameObject, BurnerState> litBurners = new HashMap<>();
+    @Getter
+    private final Map<GameObject, Boolean> unlitBurners = new HashMap<>();
+
+    private int lastPreWarningTick = 0;
+    private int lastFinalAlarmTick = 0;
+    private int unnotedMarrentillCount = -1;
+    private boolean notifiedLowStock = false;
+
+    private final Map<String, Integer> playerCombatLevels = new HashMap<>();
+    // This flag tracks if the next Level 99 graphic for a player should be suppressed,
+    // specifically when a Combat Level 126 achievement has just occurred.
+    private final Map<String, Boolean> playerSuppressNext99GraphicFor126 = new HashMap<>();
+
 
     @Provides
     BurnerAlarmConfig provideConfig(ConfigManager configManager) {
@@ -64,158 +85,746 @@ public class BurnerAlarmPlugin extends Plugin {
 
     @Override
     protected void startUp() {
+        overlayManager.add(burnerAlarmOverlay);
+        log.debug("POH Assistant plugin started.");
     }
 
     @Override
     protected void shutDown() {
         litBurners.clear();
+        unlitBurners.clear();
+        unnotedMarrentillCount = -1;
+        notifiedLowStock = false;
+        guestCount = -1;
+        playerCombatLevels.clear();
+        playerSuppressNext99GraphicFor126.clear();
+        overlayManager.remove(burnerAlarmOverlay);
+        log.debug("POH Assistant plugin shut down.");
     }
 
     @Subscribe
     public void onGameObjectSpawned(GameObjectSpawned event) {
         final GameObject gameObject = event.getGameObject();
-        if (LIT_BURNER_IDS.contains(gameObject.getId())) {
+        if (BurnerAlarmConstants.LIT_BURNER_IDS.contains(gameObject.getId())) {
             litBurners.put(gameObject, new BurnerState(client.getTickCount()));
+            unlitBurners.remove(gameObject);
+        } else if (BurnerAlarmConstants.UNLIT_BURNER_IDS.contains(gameObject.getId())) {
+            unlitBurners.put(gameObject, true);
         }
     }
 
     @Subscribe
     public void onGameObjectDespawned(GameObjectDespawned event) {
         litBurners.remove(event.getGameObject());
+        unlitBurners.remove(event.getGameObject());
     }
 
     @Subscribe
     public void onGameStateChanged(GameStateChanged event) {
-        // Clears burners when game state transitions to LOGGED_IN (e.g., after loading a new area like POH exit/entry)
-        // or during other critical state changes (logout, disconnect).
-        if (event.getGameState() == GameState.LOGGED_IN ||
-                event.getGameState() == GameState.LOGIN_SCREEN ||
-                event.getGameState() == GameState.HOPPING ||
-                event.getGameState() == GameState.CONNECTION_LOST ||
-                event.getGameState() == GameState.STARTING ||
-                event.getGameState() == GameState.UNKNOWN)
-        {
-            if (!litBurners.isEmpty()) {
-                log.debug("Cleared lit burners due to game state change: {}", event.getGameState());
-                litBurners.clear();
+        if (event.getGameState() != GameState.LOGGED_IN) {
+            litBurners.clear();
+            unlitBurners.clear();
+            unnotedMarrentillCount = -1;
+            notifiedLowStock = false;
+            guestCount = -1;
+            playerCombatLevels.clear();
+            playerSuppressNext99GraphicFor126.clear();
+            log.debug("POH Assistant: Game state changed to non-logged in. All trackers reset.");
+        }
+        if (event.getGameState() == GameState.LOGGED_IN) {
+            updateUnnotedMarrentillCount();
+            if (isInPOH()) {
+                playerCombatLevels.clear();
+                playerSuppressNext99GraphicFor126.clear();
+                for (Player player : client.getTopLevelWorldView().players()) {
+                    if (player != null && !player.equals(client.getLocalPlayer())) {
+                        playerCombatLevels.put(player.getName(), player.getCombatLevel());
+                        log.debug("POH Assistant: On login, tracked player: {} - Combat Level: {}", player.getName(), player.getCombatLevel());
+                    }
+                }
             }
+            log.debug("POH Assistant: Game state changed to LOGGED_IN. Marrentill and initial player levels updated.");
         }
     }
 
     @Subscribe
-    public void onGameTick(GameTick event) {
-        // Only process if client is logged in and there are burners to track
-        if (client.getGameState() != GameState.LOGGED_IN || client.getLocalPlayer() == null || litBurners.isEmpty()) {
-            return;
-        }
-
-        final int currentTick = client.getTickCount();
-        final int fmLevel = client.getRealSkillLevel(Skill.FIREMAKING);
-        final int certainDurationTicks = 200 + fmLevel;
-        final int preNotificationTriggerTicks = certainDurationTicks - config.preNotificationLeadTimeTicks();
-
-        boolean triggerTextNotificationThisTick = false;
-        boolean triggerSoundNotificationThisTick = false;
-
-        for (BurnerState burnerState : litBurners.values()) {
-            final int ticksSinceLit = currentTick - burnerState.startTick;
-
-            // Trigger pre-notification if conditions met and not already sent for this burner
-            if (!burnerState.preNotificationSent && ticksSinceLit >= preNotificationTriggerTicks) {
-                triggerTextNotificationThisTick = true;
-                burnerState.preNotificationSent = true; // Mark as sent for this specific burner
-            }
-
-            // Trigger sound notification if conditions met and not already sent for this burner
-            if (!burnerState.soundNotificationSent && ticksSinceLit >= certainDurationTicks) {
-                triggerSoundNotificationThisTick = true;
-                burnerState.soundNotificationSent = true; // Mark as sent for this specific burner
-            }
-        }
-
-        // Apply global cooldowns and send notifications (once per tick per type)
-        if (triggerTextNotificationThisTick && config.sendNotification() && currentTick >= lastTextAlertTick + NOTIFICATION_COOLDOWN_TICKS) {
-            notifier.notify("A gilded altar burner will enter its random burnout phase soon!");
-            lastTextAlertTick = currentTick;
-        }
-
-        if (triggerSoundNotificationThisTick) {
-            if (config.playAlertSound() && currentTick >= lastSoundAlertTick + NOTIFICATION_COOLDOWN_TICKS) {
-                playSound();
-                lastSoundAlertTick = currentTick;
-            }
+    public void onPlayerSpawned(PlayerSpawned event) {
+        final Player player = event.getPlayer();
+        if (player != null && !player.equals(client.getLocalPlayer()) && isInPOH()) {
+            playerCombatLevels.put(player.getName(), player.getCombatLevel());
+            log.debug("POH Assistant: Player spawned: {} - Combat Level: {}", player.getName(), player.getCombatLevel());
         }
     }
 
-    private void playSound() {
+    @Subscribe
+    public void onPlayerDespawned(PlayerDespawned event) {
+        if (!isInPOH()) {
+            return;
+        }
+
+        final Player player = event.getPlayer();
+        if (player != null) {
+            Integer removedLevel = playerCombatLevels.remove(player.getName());
+            playerSuppressNext99GraphicFor126.remove(player.getName());
+            log.debug("POH Assistant: Player despawned: {} - Last known Combat Level: {}", player.getName(), removedLevel);
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick tick) {
+        // --- Burner Alarm Logic ---
+        if (client.getGameState() == GameState.LOGGED_IN && !litBurners.isEmpty()) {
+            final int currentTick = client.getTickCount();
+            final int firemakingLevel = client.getRealSkillLevel(Skill.FIREMAKING);
+            final int certainDurationTicks = 200 + firemakingLevel;
+            final int preNotificationTriggerTicks = certainDurationTicks - config.burnerLeadTime();
+
+            boolean triggerPreWarningThisTick = false;
+            boolean triggerFinalAlarmThisTick = false;
+
+            for (BurnerState burnerState : litBurners.values()) {
+                final int ticksSinceLit = currentTick - burnerState.startTick;
+
+                if (!burnerState.preNotificationSent && ticksSinceLit >= preNotificationTriggerTicks) {
+                    burnerState.preNotificationSent = true;
+                    triggerPreWarningThisTick = true;
+                }
+
+                if (!burnerState.finalAlarmSent && ticksSinceLit >= certainDurationTicks) {
+                    burnerState.finalAlarmSent = true;
+                    triggerFinalAlarmThisTick = true;
+                }
+            }
+
+            if (triggerPreWarningThisTick) {
+                if (currentTick >= lastPreWarningTick + BurnerAlarmConstants.NOTIFICATION_COOLDOWN_TICKS) {
+                    Notification preWarningNotification = config.burnerPreWarningNotification();
+                    String notificationMessage = "A burner will enter its random burnout phase soon!";
+
+                    if (preWarningNotification.isEnabled()) {
+                        notifier.notify(preWarningNotification, BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage);
+                    }
+
+                    if (config.burnerPreWarningGameMessage()) {
+                        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "",
+                                ColorUtil.wrapWithColorTag(BurnerAlarmConstants.PLUGIN_PREFIX + "A burner will enter its random burnout phase soon!", config.burnerPreWarningColor()), null);
+                    }
+
+                    lastPreWarningTick = currentTick;
+                    log.debug("POH Assistant: Burner pre-warning triggered.");
+                }
+            }
+
+            if (triggerFinalAlarmThisTick && config.playFinalAlarm()) {
+                if (currentTick >= lastFinalAlarmTick + BurnerAlarmConstants.NOTIFICATION_COOLDOWN_TICKS) {
+                    playFinalAlarmSound();
+                    lastFinalAlarmTick = currentTick;
+                    log.debug("POH Assistant: Final burner alarm triggered.");
+                }
+            }
+        }
+
+        // --- Guest Counter Logic ---
+        if (config.pohGuestTrackerEnabled() && client.getGameState() == GameState.LOGGED_IN) {
+            updateGuestCount();
+        } else {
+            guestCount = -1;
+        }
+    }
+
+    @Subscribe
+    public void onItemContainerChanged(ItemContainerChanged event) {
+        if (event.getItemContainer().getId() == InventoryID.INV) {
+            updateUnnotedMarrentillCount();
+        }
+    }
+
+
+    @Subscribe
+    public void onChatMessage(ChatMessage event) {
+        if (event.getType() != ChatMessageType.PLAYERRELATED) {
+            return;
+        }
+
+        Matcher matcher = BurnerAlarmConstants.TIP_JAR_PATTERN.matcher(event.getMessage());
+        if (!matcher.matches()) {
+            return;
+        }
+
+        String playerName = matcher.group(1);
+        String amountString = matcher.group(2).replace(",", "");
+
         try {
-            audioPlayer.play(getClass(), "alarm.wav", config.soundVolume());
+            long amount = Long.parseLong(amountString);
+            String formattedAmount = NumberFormat.getInstance(Locale.US).format(amount);
+            String notificationMessage = playerName + " tipped " + formattedAmount + " coins!";
+
+            Notification notification = null;
+            Color color = null;
+
+            if (amount >= config.tipJarTier1Threshold()) {
+                notification = config.tipJarTier1Notification();
+                color = config.tipJarTier1Color();
+            } else if (amount >= config.tipJarTier2Threshold()) {
+                notification = config.tipJarTier2Notification();
+                color = config.tipJarTier2Color();
+            } else if (amount >= config.tipJarTier3Threshold()) {
+                notification = config.tipJarTier3Notification();
+                color = config.tipJarTier3Color();
+            }
+
+            if (notification != null && notification.isEnabled()) {
+                notifier.notify(notification, BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage);
+                log.info("POH Assistant: Tip jar notification for {} tipped {} coins.", playerName, formattedAmount);
+            }
+
+            if (config.tipJarRecolorChatMessage() && color != null) {
+                final MessageNode messageNode = event.getMessageNode();
+                messageNode.setValue(ColorUtil.wrapWithColorTag(messageNode.getValue(), color));
+                client.refreshChat();
+            }
+        } catch (NumberFormatException e) {
+            log.warn("Failed to parse tip jar amount: {}", amountString, e);
+        }
+    }
+
+    @Subscribe
+    public void onGraphicChanged(GraphicChanged event) {
+        final Actor actor = event.getActor();
+        if (!(actor instanceof Player)) {
+            return;
+        }
+
+        final Player player = (Player) actor;
+        if (player.equals(client.getLocalPlayer())) {
+            return;
+        }
+
+        if (client.getGameState() != GameState.LOGGED_IN) {
+            return;
+        }
+
+        if (!isInPOH()) {
+            return;
+        }
+
+        final boolean isGenericLevelUpGraphic = player.hasSpotAnim(BurnerAlarmConstants.GENERIC_LEVEL_UP_GRAPHIC_ID);
+        final boolean isLevel99Graphic = player.hasSpotAnim(BurnerAlarmConstants.LEVEL_99_GRAPHIC_ID);
+
+        log.debug("POH Assistant: GraphicChanged for {}. Has 99 graphic: {}. Has Generic graphic: {}. Current Game State: {}.",
+                player.getName(), isLevel99Graphic, isGenericLevelUpGraphic, client.getGameState());
+
+        if (!isGenericLevelUpGraphic && !isLevel99Graphic) {
+            log.debug("POH Assistant: GraphicChanged for {} is not a recognized level-up graphic. Skipping further processing.", player.getName());
+            return;
+        }
+
+        Integer previousCombatLevel = playerCombatLevels.get(player.getName());
+        int currentCombatLevel = player.getCombatLevel();
+
+        log.debug("POH Assistant: Level-up Graphic for {}. Previous Combat Level (from map): {}. Current Combat Level (now): {}.",
+                player.getName(), previousCombatLevel, currentCombatLevel);
+
+        // Combat Level 126 Detection (Highest Priority when combat changes from 125 to 126)
+        if (previousCombatLevel != null && previousCombatLevel == 125 && currentCombatLevel == 126) {
+            String notificationMessage = player.getName() + " has achieved Combat Level 126!";
+            Notification notificationConfig = config.level126CombatNotification();
+            Color messageColor = config.level126CombatColor();
+            boolean sendGameMessage = config.level126CombatGameMessage();
+            log.info("POH Assistant: Detected Combat Level 126 for {} (graphic: {}).", player.getName(), (isLevel99Graphic ? "99 graphic" : "generic graphic"));
+
+            if (notificationConfig.isEnabled()) {
+                notifier.notify(notificationConfig, BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage);
+            }
+            if (sendGameMessage && messageColor != null) {
+                client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", ColorUtil.wrapWithColorTag(BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage, messageColor), null);
+            }
+            // If Combat Level 126 was just achieved, the next 99/126 graphic is likely for this achievement, so suppress it.
+            playerSuppressNext99GraphicFor126.put(player.getName(), true);
+        }
+
+        // Handle Generic Level Up Graphic
+        if (isGenericLevelUpGraphic) {
+            String notificationMessage = player.getName() + " has leveled up!";
+            Notification notificationConfig = config.levelUpNotification();
+            Color messageColor = config.levelUpColor();
+            boolean sendGameMessage = config.levelUpGameMessage();
+            log.info("POH Assistant: Detected Generic Level-Up for {}", player.getName());
+
+            if (notificationConfig.isEnabled()) {
+                notifier.notify(notificationConfig, BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage);
+            }
+            if (sendGameMessage && messageColor != null) {
+                client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", ColorUtil.wrapWithColorTag(BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage, messageColor), null);
+            }
+        }
+        // Level 99 Skill Detection (from LEVEL_99_GRAPHIC_ID)
+        else if (isLevel99Graphic) {
+            // Check if this 99 graphic should be suppressed because it's the expected 126 combat animation.
+            boolean shouldSuppressThis99Graphic = playerSuppressNext99GraphicFor126.getOrDefault(player.getName(), false);
+
+            if (shouldSuppressThis99Graphic) {
+                log.debug("POH Assistant: Level 99 graphic for {} suppressed (it's the expected 126 combat animation).", player.getName());
+                // Reset the flag immediately after suppressing, so any subsequent 99/126 graphics can be real 99s.
+                playerSuppressNext99GraphicFor126.put(player.getName(), false);
+            } else {
+                // If not suppressed, it's a genuine Level 99 skill.
+                String notificationMessage = player.getName() + " has achieved level 99!";
+                Notification notificationConfig = config.level99Notification();
+                Color messageColor = config.level99Color();
+                boolean sendGameMessage = config.level99GameMessage();
+                log.info("POH Assistant: Detected Level 99 for {}", player.getName());
+
+                if (notificationConfig.isEnabled()) {
+                    notifier.notify(notificationConfig, BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage);
+                }
+                if (sendGameMessage && messageColor != null) {
+                    client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", ColorUtil.wrapWithColorTag(BurnerAlarmConstants.PLUGIN_PREFIX + notificationMessage, messageColor), null);
+                }
+            }
+        }
+
+        // Update the combat level in the map if it has changed.
+        if (previousCombatLevel == null || previousCombatLevel != currentCombatLevel) {
+            playerCombatLevels.put(player.getName(), currentCombatLevel);
+            log.debug("POH Assistant: Final update for {}'s combat level in map to {}.", player.getName(), currentCombatLevel);
+        }
+    }
+
+    /**
+     * Checks if a Gilded Altar or Exit Portal is present in the current scene.
+     * This method is used for POH detection.
+     *
+     * @return true if a Gilded Altar or Exit Portal is found, false otherwise.
+     */
+    private boolean isGildedAltarOrExitPortalPresent() {
+        for (int x = 0; x < BurnerAlarmConstants.SCENE_SIZE; x++) {
+            for (int y = 0; y < BurnerAlarmConstants.SCENE_SIZE; y++) {
+                for (int plane = 0; plane < BurnerAlarmConstants.MAX_PLANE; plane++) {
+                    Tile tile = client.getTopLevelWorldView().getScene().getTiles()[plane][x][y];
+                    if (tile == null) {
+                        continue;
+                    }
+
+                    for (GameObject gameObject : tile.getGameObjects()) {
+                        if (gameObject != null && (BurnerAlarmConstants.GILDED_ALTAR_IDS.contains(gameObject.getId()) || gameObject.getId() == BurnerAlarmConstants.EXIT_PORTAL_ID)) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Updates the count of players in the POH, excluding the local player.
+     * This method uses `isInPOH()` for POH detection.
+     */
+    private void updateGuestCount() {
+        if (isInPOH()) {
+            int currentGuestCount = 0;
+            Player localPlayer = client.getLocalPlayer();
+            if (localPlayer != null) {
+                for (Player player : client.getTopLevelWorldView().players()) {
+                    if (player != null && !player.equals(localPlayer)) {
+                        currentGuestCount++;
+                    }
+                }
+            }
+            this.guestCount = currentGuestCount;
+        } else {
+            this.guestCount = -1;
+        }
+    }
+
+    /**
+     * Checks if the player is currently inside their Player-Owned House (by checking for Gilded Altar or Exit Portal).
+     * Used by the HouseHostingOverlay to determine visibility and by other plugin logic.
+     * @return true if in a POH with a Gilded Altar or Exit Portal, false otherwise.
+     */
+    public boolean isInPOH() {
+        return isGildedAltarOrExitPortalPresent();
+    }
+
+    private void playFinalAlarmSound() {
+        try {
+            audioPlayer.play(getClass(), BurnerAlarmConstants.FINAL_ALARM_SOUND_FILE, config.finalAlarmVolume());
         } catch (Exception e) {
-            log.warn("Failed to play Burner Alarm sound", e);
+            log.warn("Failed to play POH Assistant final alarm sound", e);
+        }
+    }
+
+    /**
+     * Checks the player's inventory for unnoted Clean Marrentills (ID 251)
+     * and updates the count. This method also triggers the notification logic.
+     */
+    private void updateUnnotedMarrentillCount() {
+        if (client.getGameState() != GameState.LOGGED_IN || !isInPOH()) {
+            if (unnotedMarrentillCount != -1)
+            {
+                unnotedMarrentillCount = -1;
+                log.debug("POH Assistant: Not in POH or not logged in. Marrentill count tracking paused (-1).");
+            }
+            return;
+        }
+
+        ItemContainer inventory = client.getItemContainer(InventoryID.INV);
+        int count = 0;
+        if (inventory != null) {
+            for (Item item : inventory.getItems()) {
+                if (item != null && item.getId() == BurnerAlarmConstants.CLEAN_MARRENTILL_ID && client.getItemDefinition(item.getId()).getNote() == -1) {
+                    count += item.getQuantity();
+                }
+            }
+        }
+
+        int previousCount = this.unnotedMarrentillCount;
+        this.unnotedMarrentillCount = count;
+
+        log.debug("POH Assistant: Marrentill count updated. Previous: {}, Current: {}. NotifiedLowStock: {}",
+                previousCount, count, notifiedLowStock);
+
+        if (config.marrentillNotification().isEnabled() || config.marrentillGameMessage()) {
+            if (count <= 1 && !notifiedLowStock && previousCount > 1) {
+                String message;
+                if (count == 0) {
+                    message = "You're out of unnoted Marrentills!";
+                } else {
+                    message = "You're almost out of unnoted Marrentills!";
+                }
+
+                if (config.marrentillNotification().isEnabled()) {
+                    notifier.notify(config.marrentillNotification(), BurnerAlarmConstants.PLUGIN_PREFIX + message);
+                }
+
+                if (config.marrentillGameMessage()) {
+                    client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", ColorUtil.wrapWithColorTag(BurnerAlarmConstants.PLUGIN_PREFIX + message, config.marrentillGameMessageColor()), null);
+                }
+                notifiedLowStock = true;
+                log.info("POH Assistant: Notified - Low Marrentill stock (Current: {}).", count);
+            }
+            else if (count > 1) {
+                notifiedLowStock = false;
+                log.debug("POH Assistant: Marrentill stock sufficient (Current: {}). Resetting notification flag.", count);
+            }
+        }
+        else {
+            notifiedLowStock = false;
+            log.debug("POH Assistant: Marrentill notification disabled. Resetting flags.");
         }
     }
 }
 package net.runelite.client.plugins.burneralarm;
 
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-import net.runelite.client.config.Range;
-import net.runelite.client.config.Units;
+import net.runelite.client.config.*;
+
+import java.awt.*;
 
 @ConfigGroup("burneralarm")
-public interface BurnerAlarmConfig extends Config
-{
-    @ConfigItem(
-            keyName = "sendNotification",
-            name = "Send Notification",
-            description = "Toggle the notification pre-warning.",
-            position = 1
-    )
-    default boolean sendNotification()
-    {
+public interface BurnerAlarmConfig extends Config {
+
+    // --- Burner Alarm Section ---
+    @ConfigSection(name = "Burner Alarm", description = "Settings for the two-stage incense burner alarm.", position = 0, closedByDefault = false)
+    String burnerAlarmSection = "burnerAlarmSection";
+
+    @ConfigItem(keyName = "sendNotification", name = "Pre-warning Notification", description = "Configure the notification that fires shortly before burners can go out.", position = 1, section = burnerAlarmSection)
+    default Notification burnerPreWarningNotification() {
+        return Notification.ON;
+    }
+
+    @ConfigItem(keyName = "burnerPreWarningColor", name = "Message Color", description = "Color of the burner pre-warning message in chat.", position = 2, section = burnerAlarmSection)
+    default Color burnerPreWarningColor() {
+        return new Color(185, 65, 0);
+    }
+
+    @ConfigItem(keyName = "burnerPreWarningGameMessage", name = "Chat Message", description = "Toggle custom chat message for burner pre-warning.", position = 2, section = burnerAlarmSection)
+    default boolean burnerPreWarningGameMessage() {
         return true;
     }
 
-    @ConfigItem(
-            keyName = "playAlertSound",
-            name = "Play Alert Sound",
-            description = "Toggle the main audible alarm. Volume is controlled by the 'Sound Volume' setting below.",
-            position = 2
-    )
-    default boolean playAlertSound()
-    {
+    @ConfigItem(keyName = "playAlertSound", name = "Play Final Alarm", description = "Toggle the main audible alarm that plays the moment burners can extinguish.", position = 3, section = burnerAlarmSection)
+    default boolean playFinalAlarm() {
         return true;
     }
 
-    @Range(
-            min = -40,
-            max = 6
-    )
-    @ConfigItem(
-            keyName = "soundVolume",
-            name = "Sound Volume (dB)",
-            description = "Adjust the volume of the alarm sound in decibels (dB) from -40 for quiet to 6 for loud.",
-            position = 3
-    )
-    default int soundVolume()
-    {
-        return -20;
+    @Range(min = -40, max = 6)
+    @ConfigItem(keyName = "soundVolume", name = "Final Alarm Volume (dB)", description = "Adjust the volume of the 'Final Alarm' sound (-40 to +6).", position = 4, section = burnerAlarmSection)
+    default int finalAlarmVolume() {
+        return -30;
     }
 
-    @Range(
-            min = 0,
-            max = 50
-    )
+    @Range(min = 0, max = 50)
     @Units(Units.TICKS)
-    @ConfigItem(
-            keyName = "leadTime",
-            name = "Pre-warning Lead Time",
-            description = "How many ticks before the alarm to send the notification pre-warning (0.6 seconds per tick).",
-            position = 4
-    )
-    default int preNotificationLeadTimeTicks()
-    {
-        return 17;
+    @ConfigItem(keyName = "leadTime", name = "Pre-warning Lead Time", description = "How many ticks before the final alarm to send the pre-warning notification.", position = 5, section = burnerAlarmSection)
+    default int burnerLeadTime() {
+        return 25;
     }
+
+    // --- Unlit Burner Highlight Section ---
+    @ConfigSection(name = "Unlit Burner Highlight", description = "Settings for highlighting unlit incense burners.", position = 7, closedByDefault = false)
+    String unlitBurnerHighlightSection = "unlitBurnerHighlightSection";
+
+    @ConfigItem(keyName = "enableUnlitBurnerOutline", name = "Draw Outline", description = "Draws a smooth outline around the burner model.", position = 1, section = unlitBurnerHighlightSection)
+    default boolean enableUnlitBurnerOutline() {
+        return true;
+    }
+
+    @ConfigItem(keyName = "unlitBurnerHighlightColor", name = "Highlight Color", description = "Color of the unlit burner highlight.", position = 2, section = unlitBurnerHighlightSection)
+    default Color unlitBurnerHighlightColor() {
+        return Color.RED;
+    }
+
+    @Range(min = 1, max = 5)
+    @ConfigItem(keyName = "unlitBurnerBorderWidth", name = "Border Width", description = "Width of the highlight border for unlit burners.", position = 3, section = unlitBurnerHighlightSection)
+    default int unlitBurnerBorderWidth() {
+        return 2;
+    }
+
+    @Range(min = 0, max = 4)
+    @ConfigItem(keyName = "unlitBurnerOutlineFeather", name = "Outline Feather", description = "How much to feather the outline.", position = 4, section = unlitBurnerHighlightSection)
+    default int unlitBurnerOutlineFeather() {
+        return 0;
+    }
+
+
+    // --- Tip Jar Section ---
+    @ConfigSection(name = "Tip Jar Notifications", description = "Settings for tip jar notifications and chat recoloring.", position = 10, closedByDefault = false)
+    String tipJarSection = "tipJarSection";
+
+    @ConfigItem(keyName = "tipJarRecolorChatMessage", name = "Recolor Tip Jar Chat", description = "Recolor the in-game tip jar message.", position = 11, section = tipJarSection)
+    default boolean tipJarRecolorChatMessage() {
+        return true;
+    }
+
+    // Tier 3
+    @ConfigItem(keyName = "tipJarTier3Notification", name = "Tier 3 Notification", description = "Notification for the lowest tier of tips.", position = 12, section = tipJarSection)
+    default Notification tipJarTier3Notification() {
+        return Notification.ON;
+    }
+
+    @Units(" gp")
+    @ConfigItem(keyName = "tipJarTier3Threshold", name = "Tier 3 Threshold", description = "Minimum tip amount to trigger the Tier 3 notification.", position = 13, section = tipJarSection)
+    default int tipJarTier3Threshold() {
+        return 100_000;
+    }
+
+    @ConfigItem(keyName = "tipJarTier3Color", name = "Tier 3 Color", description = "Color of the Tier 3 tip message in chat.", position = 14, section = tipJarSection)
+    default Color tipJarTier3Color() {
+        return new Color(0, 115, 0);
+    }
+
+    // Tier 2
+    @ConfigItem(keyName = "tipJarTier2Notification", name = "Tier 2 Notification", description = "Notification for the middle tier of tips.", position = 15, section = tipJarSection)
+    default Notification tipJarTier2Notification() {
+        return Notification.ON;
+    }
+
+    @Units(" gp")
+    @ConfigItem(keyName = "tipJarTier2Threshold", name = "Tier 2 Threshold", description = "Minimum tip amount to trigger the Tier 2 notification.", position = 16, section = tipJarSection)
+    default int tipJarTier2Threshold() {
+        return 1_000_000;
+    }
+
+    @ConfigItem(keyName = "tipJarTier2Color", name = "Tier 2 Color", description = "Color of the Tier 2 tip message in chat.", position = 17, section = tipJarSection)
+    default Color tipJarTier2Color() {
+        return new Color(100, 100, 255);
+    }
+
+    // Tier 1
+    @ConfigItem(keyName = "tipJarTier1Notification", name = "Tier 1 Notification", description = "Notification for the highest tier of tips.", position = 18, section = tipJarSection)
+    default Notification tipJarTier1Notification() {
+        return Notification.ON;
+    }
+
+    @Units(" gp")
+    @ConfigItem(keyName = "tipJarTier1Threshold", name = "Tier 1 Threshold", description = "Minimum tip amount to trigger the Tier 1 notification.", position = 19, section = tipJarSection)
+    default int tipJarTier1Threshold() {
+        return 10_000_000;
+    }
+
+    @ConfigItem(keyName = "tipJarTier1Color", name = "Tier 1 Color", description = "Color of the Tier 1 tip message in chat.", position = 20, section = tipJarSection)
+    default Color tipJarTier1Color() {
+        return new Color(220, 0, 220);
+    }
+
+    // --- Player Level-Up Notifications Section ---
+    @ConfigSection(name = "Player Level-Up Notifications", description = "Settings for notifications when other players level up in your POH.", position = 20, closedByDefault = false)
+    String levelUpSection = "levelUpSection";
+
+    @ConfigItem(keyName = "levelUpNotification", name = "Generic Level-Up Notification", description = "Configure the notification for a generic level-up by another player.", position = 21, section = levelUpSection)
+    default Notification levelUpNotification() {
+        return Notification.OFF;
+    }
+
+    @ConfigItem(keyName = "levelUpColor", name = "Message Color", description = "Color of the Generic Level-Up message in chat.", position = 22, section = levelUpSection)
+    default Color levelUpColor() {
+        return new Color(0, 145, 140);
+    }
+
+    @ConfigItem(keyName = "levelUpGameMessage", name = "Chat Message", description = "Toggle custom chat message for generic level-ups.", position = 22, section = levelUpSection)
+    default boolean levelUpGameMessage() {
+        return false;
+    }
+
+    @ConfigItem(keyName = "level99Notification", name = "Level 99 Notification", description = "Configure the notification for a level 99 achievement by another player (non-combat).", position = 23, section = levelUpSection)
+    default Notification level99Notification() {
+        return Notification.ON;
+    }
+
+    @ConfigItem(keyName = "level99Color", name = "Message Color", description = "Color of the Level 99 achievement message in chat (non-combat).", position = 24, section = levelUpSection)
+    default Color level99Color() {
+        return new Color(90, 0, 180);
+    }
+
+    @ConfigItem(keyName = "level99GameMessage", name = "Chat Message", description = "Toggle custom chat message for level 99 achievements (non-combat).", position = 24, section = levelUpSection)
+    default boolean level99GameMessage() {
+        return true;
+    }
+
+    // --- Combat Level 126 Notification ---
+    @ConfigItem(keyName = "level126CombatNotification", name = "Combat Level 126 Notification", description = "Configure the notification for a Combat Level 126 achievement by another player.", position = 25, section = levelUpSection)
+    default Notification level126CombatNotification() {
+        return Notification.ON;
+    }
+
+    @ConfigItem(keyName = "level126CombatGameMessage", name = "Chat Message", description = "Toggle custom chat message for Combat Level 126 achievements.", position = 26, section = levelUpSection)
+    default boolean level126CombatGameMessage() {
+        return true;
+    }
+
+    @ConfigItem(keyName = "level126CombatColor", name = "Message Color", description = "Color of the Combat Level 126 achievement message in chat.", position = 27, section = levelUpSection)
+    default Color level126CombatColor() {
+        return new Color(120, 0, 135);
+    }
+
+
+    // --- Marrentill Tracker Section ---
+    @ConfigSection(name = "Marrentill Tracker", description = "Settings for tracking unnoted Clean Marrentills.", position = 40, closedByDefault = false)
+    String marrentillTrackerSection = "marrentillTrackerSection";
+
+    @ConfigItem(keyName = "marrentillNotification", name = "Out of Marrentills Notification", description = "Configure notification when you run out of unnoted Clean Marrentills.", position = 41, section = marrentillTrackerSection)
+    default Notification marrentillNotification() {
+        return Notification.ON;
+    }
+
+    @ConfigItem(keyName = "marrentillGameMessageColor", name = "Chat Message Color", description = "Color of the 'Out of Marrentills' chat message.", position = 42, section = marrentillTrackerSection)
+    default Color marrentillGameMessageColor() {
+        return new Color(0, 105, 70);
+    }
+
+    @ConfigItem(keyName = "marrentillGameMessage", name = "Chat Message", description = "Toggle custom chat message for low marrentill stock.", position = 43, section = marrentillTrackerSection)
+    default boolean marrentillGameMessage() {
+        return true;
+    }
+
+    // --- POH Guest Tracker Section ---
+    @ConfigSection(name = "POH Guest Tracker", description = "Settings for the overlay displaying the number of guests in your POH.", position = 30, closedByDefault = false)
+    String guestTrackerSection = "guestTrackerSection";
+
+    @ConfigItem(keyName = "pohGuestTrackerEnabled", name = "Enable Guest Tracker", description = "Toggle the display of the POH guest counter overlay.", position = 31, section = guestTrackerSection)
+    default boolean pohGuestTrackerEnabled() {
+        return true;
+    }
+}
+package net.runelite.client.plugins.burneralarm;
+
+import net.runelite.api.GameObject;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+import net.runelite.client.ui.overlay.outline.ModelOutlineRenderer;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+/**
+ * HouseHostingOverlay displays the current number of guests in the player's POH
+ * and draws outlines around unlit burners.
+ */
+public class BurnerAlarmOverlay extends Overlay {
+    private final BurnerAlarmPlugin plugin;
+    private final BurnerAlarmConfig config;
+    private final PanelComponent panelComponent = new PanelComponent();
+    private final ModelOutlineRenderer modelOutlineRenderer;
+
+    @Inject
+    public BurnerAlarmOverlay(BurnerAlarmPlugin plugin, BurnerAlarmConfig config,
+                              ModelOutlineRenderer modelOutlineRenderer) {
+        this.plugin = plugin;
+        this.config = config;
+        this.modelOutlineRenderer = modelOutlineRenderer;
+        setPosition(OverlayPosition.TOP_LEFT);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        // Render POH Guests counter
+        if (config.pohGuestTrackerEnabled() && plugin.isInPOH() && plugin.getGuestCount() >= 0) {
+            panelComponent.getChildren().clear();
+
+            panelComponent.getChildren().add(TitleComponent.builder()
+                    .text("POH Guests")
+                    .build());
+
+            panelComponent.getChildren().add(TitleComponent.builder()
+                    .text(String.valueOf(plugin.getGuestCount()))
+                    .build());
+
+            panelComponent.render(graphics);
+        }
+
+        // Draw outlines around unlit burners
+        if (config.enableUnlitBurnerOutline()) {
+            Color highlightColor = config.unlitBurnerHighlightColor();
+            int borderWidth = config.unlitBurnerBorderWidth();
+            int outlineFeather = config.unlitBurnerOutlineFeather();
+
+            for (GameObject unlitBurner : plugin.getUnlitBurners().keySet()) {
+                modelOutlineRenderer.drawOutline(unlitBurner, borderWidth, highlightColor, outlineFeather);
+            }
+        }
+
+        return null;
+    }
+}
+package net.runelite.client.plugins.burneralarm;
+
+import com.google.common.collect.ImmutableSet;
+
+import java.util.Set;
+import java.util.regex.Pattern;
+
+final class BurnerAlarmConstants {
+    private BurnerAlarmConstants() {}
+
+    // Plugin Name Prefix for chat messages
+    static final String PLUGIN_PREFIX = "[House Hosting] ";
+
+    // Game Object IDs for various POH elements
+    static final Set<Integer> LIT_BURNER_IDS = ImmutableSet.of(13211, 13213);
+    static final Set<Integer> UNLIT_BURNER_IDS = ImmutableSet.of(13210, 13212);
+    static final Set<Integer> GILDED_ALTAR_IDS = ImmutableSet.of(13197, 13198, 13199);
+    static final int EXIT_PORTAL_ID = 4525;
+
+    // Item IDs
+    static final int CLEAN_MARRENTILL_ID = 251;
+
+    // Graphic/SpotAnim IDs for level-up animations
+    static final int GENERIC_LEVEL_UP_GRAPHIC_ID = 199;
+    static final int LEVEL_99_GRAPHIC_ID = 1388;
+
+    // Sound file names
+    static final String FINAL_ALARM_SOUND_FILE = "alarm.wav";
+
+    // Cooldown periods for notifications in game ticks
+    static final int NOTIFICATION_COOLDOWN_TICKS = 25;
+
+    // Regex pattern for parsing tip jar messages
+    static final Pattern TIP_JAR_PATTERN = Pattern.compile("(.+) has left you a tip: Coins x ((?:\\d{1,3},)*\\d+)");
+
+    // Constants related to the game scene
+    static final int SCENE_SIZE = 104;
+    static final int MAX_PLANE = 4;
 }
