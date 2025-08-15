@@ -22,7 +22,6 @@ import xyz.oelderoth.runelite.forestry.service.WoodcuttingService;
 @Singleton
 public class ForceSpawnOverlay extends Overlay
 {
-
 	@Inject
 	private Client client;
 
@@ -49,8 +48,11 @@ public class ForceSpawnOverlay extends Overlay
 	public Dimension render(Graphics2D graphics)
 	{
 		var wcState = woodcuttingService.getWoodcuttingState();
-		if (wcState != null && config.drawOutlineInProgressTree())
-		{
+		if (wcState != null
+			&& config.drawOutlineInProgressTree()
+			&& wcState.isForestryEligible()
+			&& forceSpawnService.isTreeTypeEnabled(wcState.getTreeType())
+		) {
 			if (client.getTickCount() - wcState.getStartTick() > ForceSpawnService.MIN_TICK_COUNT)
 			{
 				renderHighlight(graphics,
@@ -763,7 +765,11 @@ public class CurrentTreePanel extends JPanel
 				.findAny();
 			if (existingTimerOpt.isEmpty())
 			{
-				if (wcStatus.isForestryEligible()) {
+				if (!forceSpawnService.isTreeTypeEnabled(wcStatus.getTreeType())) {
+					hintLabel.setText("Tracking disabled in settings");
+					hintLabel.setForeground(PluginScheme.HINT_COLOR);
+				}
+				else if (wcStatus.isForestryEligible()) {
 					var ticks = client.getTickCount() - wcStatus.getStartTick();
 					var remaining = ForceSpawnService.MIN_TICK_COUNT - ticks;
 
@@ -1935,7 +1941,9 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import javax.annotation.Nullable;
@@ -1958,6 +1966,7 @@ import net.runelite.api.events.GameObjectDespawned;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.ScriptPreFired;
+import net.runelite.api.gameval.ObjectID;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import xyz.oelderoth.runelite.forestry.domain.TreeCutDownListener;
@@ -1987,6 +1996,30 @@ public class WoodcuttingService
 	private final List<WoodcuttingStateListener> stateChangeListeners = new ArrayList<>();
 	private final List<TreeCutDownListener> treeCutDownListeners = new ArrayList<>();
 	private final HashMap<Integer, GameObject> objectCache = new HashMap<>();
+
+	private final Map<String, TreeType> treeTypeByNameCache = new HashMap<>();
+	private final Map<Integer, TreeType> treeTypeByIdCache = new HashMap<>();
+	private final Set<Integer> checkedObjectIdCache = new HashSet<>();
+	private final Set<Integer> excludedTreeIds = new HashSet<>();
+
+	public WoodcuttingService() {
+		for (var type : TreeType.values()) {
+			treeTypeByNameCache.put(type.getObjectName().toLowerCase(), type);
+		}
+		excludedTreeIds.addAll(Arrays.asList(
+			ObjectID.FARMING_TREE_PATCH_1,
+			ObjectID.FARMING_TREE_PATCH_2,
+			ObjectID.FARMING_TREE_PATCH_3,
+			ObjectID.FARMING_TREE_PATCH_4,
+			ObjectID.FARMING_TREE_PATCH_5,
+			ObjectID.FARMING_TREE_PATCH_6,
+			56953, // Auburnvale Tree Patch,
+			ObjectID.FARMING_HARDWOOD_TREE_PATCH_1,
+			ObjectID.FARMING_HARDWOOD_TREE_PATCH_2,
+			ObjectID.FARMING_HARDWOOD_TREE_PATCH_3,
+			ObjectID.FARMING_HARDWOOD_TREE_PATCH_4
+		));
+	}
 
 	public void enable()
 	{
@@ -2087,7 +2120,7 @@ public class WoodcuttingService
 
 	@Subscribe
 	private void onGameObjectDespawned(GameObjectDespawned e) {
-		if (TreeType.isTree(e.getGameObject())) {
+		if (getTreeType(e.getGameObject()).isPresent()) {
 			var p = new ObjectPosition(e.getGameObject());
 			objectCache.remove(p.hashCode());
 		}
@@ -2112,11 +2145,10 @@ public class WoodcuttingService
 				.getTiles()[worldPoint.getPlane()][localPoint.getSceneX()][localPoint.getSceneY()])
 			.map(Tile::getGameObjects)
 			.flatMap(objects -> Arrays.stream(objects)
-				.filter(it -> TreeType.getTreeType(it)
+				.filter(it -> getTreeType(it)
 					.isPresent())
 				.findFirst());
 	}
-
 
 	private Optional<GameObject> getFacingTree(Player player)
 	{
@@ -2145,13 +2177,48 @@ public class WoodcuttingService
 
 	private void onStartCutTree(GameObject gameObject)
 	{
-		TreeType.getTreeType(gameObject)
+		getTreeType(gameObject)
 			.ifPresent(type -> {
 				woodcuttingState = new WoodcuttingState(gameObject, type, client.getTickCount(), Instant.now()
 					.toEpochMilli());
 
 				stateChangeListeners.forEach(handler -> handler.onWoodcuttingStateChanged(woodcuttingState));
 			});
+	}
+
+	private Optional<TreeType> getTreeType(GameObject gameObject) {
+		if (gameObject == null) return Optional.empty();
+
+		var objectId = gameObject.getId();
+		if (excludedTreeIds.contains(objectId)) return Optional.empty();
+
+		var cachedType = treeTypeByIdCache.get(objectId);
+		if (cachedType != null) return Optional.of(cachedType);
+
+		// If we don't have a cached match, and we haven't already tried to check if this object is a known tree type,
+		// attempt to populate the cache by looking at the name of the object composition (and impostors if present)
+		if (checkedObjectIdCache.contains(objectId)) return Optional.empty();
+		var composition = client.getObjectDefinition(objectId);
+		if (composition != null) {
+			var type = treeTypeByNameCache.get(composition.getName().toLowerCase());
+			if (type != null) {
+				treeTypeByIdCache.put(objectId, type);
+			} else {
+				var impostorIds = composition.getImpostorIds();
+				if (impostorIds != null && impostorIds.length > 0) {
+					var impostor = composition.getImpostor();
+					var impostorType = treeTypeByNameCache.get(impostor.getName().toLowerCase());
+					if (impostorType != null) {
+						treeTypeByIdCache.put(objectId, impostorType);
+					}
+				}
+			}
+		}
+
+		// Cache the objectId so we don't have to look it up again next time if it wasn't a tree
+		checkedObjectIdCache.add(objectId);
+
+		return Optional.ofNullable(treeTypeByIdCache.get(objectId));
 	}
 }
 
@@ -2225,7 +2292,7 @@ public class ForceSpawnService
 
 		var wcState = woodcuttingService.getWoodcuttingState();
 
-		if (wcState == null || !wcState.isForestryEligible())
+		if (wcState == null || !wcState.isForestryEligible() || !isTreeTypeEnabled(wcState.getTreeType()))
 			return;
 		if (e.getGameState() != GameState.HOPPING && e.getGameState() != GameState.LOGIN_SCREEN)
 			return;
@@ -2246,7 +2313,7 @@ public class ForceSpawnService
 		}
 	}
 
-	private boolean isTreeTypeEnabled(TreeType treeType) {
+	public boolean isTreeTypeEnabled(TreeType treeType) {
 		switch (treeType) {
 			case Oak:
 				return config.trackOakTree();
@@ -2433,57 +2500,28 @@ public class ObjectPosition
 
 package xyz.oelderoth.runelite.forestry.domain;
 
-import com.google.common.collect.Sets;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
 import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.GameObject;
 import net.runelite.api.ItemID;
-import static net.runelite.api.ObjectID.*;
 
 @Getter
 @Slf4j
 @AllArgsConstructor
 public enum TreeType
 {
-	Oak(27000, ItemID.OAK_LOGS, Sets.newHashSet(OAK_TREE_4540, OAK_TREE_8462, OAK_TREE_8463, OAK_TREE_8464, OAK_TREE_8465, OAK_TREE_8466, OAK_TREE_8467, OAK_TREE_9734, OAK_TREE_10820, OAK_TREE_20806, OAK_TREE_37969, OAK_TREE_37970, OAK_TREE_42395, OAK_TREE_42831, OAK_TREE_51772, OAK_TREE_55913)),
-	Willow(30000, ItemID.WILLOW_LOGS, Sets.newHashSet(WILLOW_TREE_4541, WILLOW_TREE_8481, WILLOW_TREE_8482, WILLOW_TREE_8483, WILLOW_TREE_8484, WILLOW_TREE_8485, WILLOW_TREE_8486, WILLOW_TREE_8487, WILLOW_TREE_8488, WILLOW_TREE_10819, WILLOW_TREE_10829, WILLOW_TREE_10831, WILLOW_TREE_10833)),
-	Teak(30000, ItemID.TEAK_LOGS, Sets.newHashSet(TEAK_TREE_15062, TEAK_TREE_30437, TEAK_TREE_30438, TEAK_TREE_30439, TEAK_TREE_30440, TEAK_TREE_30441, TEAK_TREE_30442, TEAK_TREE_30443, TEAK_TREE_30444, TEAK_TREE_30445, TEAK_TREE_36686, TEAK_TREE_40758)),
-	Maple(60000, ItemID.MAPLE_LOGS, Sets.newHashSet(MAPLE_TREE_4674, MAPLE_TREE_5126, MAPLE_TREE_8435, MAPLE_TREE_8436, MAPLE_TREE_8437, MAPLE_TREE_8438, MAPLE_TREE_8439, MAPLE_TREE_8440, MAPLE_TREE_8441, MAPLE_TREE_8442, MAPLE_TREE_8443, MAPLE_TREE_8444, MAPLE_TREE_10832, MAPLE_TREE_36681, MAPLE_TREE_36682, MAPLE_TREE_40754, MAPLE_TREE_40755)),
-	ArcticPine(114000, ItemID.ARCTIC_PINE_LOGS, Sets.newHashSet(ARCTIC_PINE_TREE)),
-	Mahogany(60000, ItemID.MAHOGANY_LOGS, Sets.newHashSet(MAHOGANY_TREE_30407, MAHOGANY_TREE_30408, MAHOGANY_TREE_30409, MAHOGANY_TREE_30410, MAHOGANY_TREE_30411, MAHOGANY_TREE_30412, MAHOGANY_TREE_30413, MAHOGANY_TREE_30414, MAHOGANY_TREE_30415, MAHOGANY_TREE_30416, MAHOGANY_TREE_30417, MAHOGANY_TREE_36688, MAHOGANY_TREE_40760)),
-	Yew(114000, ItemID.YEW_LOGS, Sets.newHashSet(YEW_TREE_5121, YEW_TREE_8503, YEW_TREE_8504, YEW_TREE_8505, YEW_TREE_8506, YEW_TREE_8507, YEW_TREE_8508, YEW_TREE_8509, YEW_TREE_8510, YEW_TREE_8511, YEW_TREE_8512, YEW_TREE_8513, YEW_TREE_10822, 10823, YEW_TREE_36683, YEW_TREE_40756, YEW_TREE_42391, YEW_TREE_42427)),
-	Magic(234000, ItemID.MAGIC_LOGS, Sets.newHashSet(MAGIC_TREE_5127, MAGIC_TREE_8396, MAGIC_TREE_8397, MAGIC_TREE_8398, MAGIC_TREE_8399, MAGIC_TREE_8400, MAGIC_TREE_8401, MAGIC_TREE_8402, MAGIC_TREE_8403, MAGIC_TREE_8404, MAGIC_TREE_8405, MAGIC_TREE_8406, MAGIC_TREE_8407, MAGIC_TREE_8408, MAGIC_TREE_8409, MAGIC_TREE_10834, MAGIC_TREE_36685));
+	Oak(27000, ItemID.OAK_LOGS, "Oak Tree"),
+	Willow(30000, ItemID.WILLOW_LOGS, "Willow Tree"),
+	Teak(30000, ItemID.TEAK_LOGS, "Teak Tree"),
+	Maple(60000, ItemID.MAPLE_LOGS, "Maple Tree"),
+	ArcticPine(114000, ItemID.ARCTIC_PINE_LOGS, "Arctic Pine Tree"),
+	Mahogany(60000, ItemID.MAHOGANY_LOGS, "Mahogany Tree"),
+	Yew(114000, ItemID.YEW_LOGS, "Yew Tree"),
+	Magic(234000, ItemID.MAGIC_LOGS, "Magic Tree");
 
 	private final int despawnDurationMs;
 	private final int itemId;
-	private final Set<Integer> objectIDs;
-
-	private final static Map<Integer, TreeType> treeTypeById = new HashMap<>();
-
-	public static Optional<TreeType> getTreeType(int objectId) {
-		return Optional.ofNullable(treeTypeById.get(objectId));
-	}
-
-	public static Optional<TreeType> getTreeType(GameObject object) {
-		return Optional.ofNullable(object).map(GameObject::getId).flatMap(TreeType::getTreeType);
-	}
-
-	public static boolean isTree(GameObject object) {
-		return treeTypeById.containsKey(object.getId());
-	}
-
-	static {
-		for (var type : TreeType.values()) {
-			for (var id: type.objectIDs) {
-				treeTypeById.put(id, type);
-			}
-		}
-	}
+	private final String objectName;
 }
 package xyz.oelderoth.runelite.forestry.domain;
 
