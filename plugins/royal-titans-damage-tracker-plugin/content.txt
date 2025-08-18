@@ -33,8 +33,8 @@ import java.util.concurrent.TimeUnit;
 public class RoyalTitansPlugin extends Plugin {
 
 	// NPC IDs
-	private static final int BRANDA_ID = NpcID.RT_FIRE_QUEEN; //12596;
-	private static final int ELDRIC_ID = NpcID.RT_ICE_KING; //14147;
+	private static final int BRANDA_ID = NpcID.RT_FIRE_QUEEN;
+	private static final int ELDRIC_ID = NpcID.RT_ICE_KING;
 
 	private static final int COMBINED_HP = 1200;
 	private static final double BASE_DROP_RATE = 75.0;
@@ -60,6 +60,7 @@ public class RoyalTitansPlugin extends Plugin {
 	private NPC branda = null;
 	private NPC eldric = null;
 	private ScheduledFuture<?> resetCounterDelay = null;
+	private boolean resetScheduled = false;
 
 	@Override
 	protected void startUp() throws Exception {
@@ -158,7 +159,7 @@ public class RoyalTitansPlugin extends Plugin {
 
 	private void checkAreaExit() {
 		// if encounter was active but both NPCs are now gone, player likely left the area
-		if (encounterActive && branda == null && eldric == null) {
+		if (encounterActive && branda == null && eldric == null && !resetScheduled) {
 			// Check if there are any Royal Titan NPCs in the current world view
 			boolean anyTitansPresent = false;
 			WorldView worldView = client.getTopLevelWorldView();
@@ -205,6 +206,9 @@ public class RoyalTitansPlugin extends Plugin {
 		// Cancel any existing reset delay
 		cancelResetCounterDelay();
 
+		// Set the flag to indicate a reset is scheduled
+		resetScheduled = true;
+
 		// Get delay from config and clamp between 0-18 seconds
 		int delaySeconds = Math.max(0, Math.min(18, config.resetDelay()));
 
@@ -224,8 +228,9 @@ public class RoyalTitansPlugin extends Plugin {
 	private void cancelResetCounterDelay() {
 		if (resetCounterDelay != null && !resetCounterDelay.isDone()) {
 			resetCounterDelay.cancel(false);
-			resetCounterDelay = null;
 		}
+		resetCounterDelay = null;
+		resetScheduled = false; // Clear the flag when canceling
 	}
 
 	private void checkEncounterStart() {
