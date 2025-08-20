@@ -32,7 +32,6 @@ import java.util.concurrent.TimeUnit;
 )
 public class RoyalTitansPlugin extends Plugin {
 
-	// NPC IDs
 	private static final int BRANDA_ID = NpcID.RT_FIRE_QUEEN;
 	private static final int ELDRIC_ID = NpcID.RT_ICE_KING;
 
@@ -61,6 +60,8 @@ public class RoyalTitansPlugin extends Plugin {
 	private NPC eldric = null;
 	private ScheduledFuture<?> resetCounterDelay = null;
 	private boolean resetScheduled = false;
+	private boolean titansDefeated = false;
+	private int ticksSinceLastTitanSeen = 0;
 
 	@Override
 	protected void startUp() throws Exception {
@@ -79,7 +80,7 @@ public class RoyalTitansPlugin extends Plugin {
 	public void onChatMessage(ChatMessage event) {
 		String message = event.getMessage();
 
-		// Reset damage tracker when titans respawn
+		// Reset damage tracker when titans respawn (this is the looting message)
 		if (message.contains("The Royal Titans will reinvigorate themselves in 18 seconds.")) {
 			scheduleReset();
 		}
@@ -91,9 +92,22 @@ public class RoyalTitansPlugin extends Plugin {
 
 		if (npc.getId() == BRANDA_ID) {
 			branda = npc;
+			// If we have damage tracked and titans were defeated, but now fresh titans spawned,
+			// this means player left and returned to new spawns - reset the tracker
+			if (getTotalDamage() > 0 && titansDefeated && !resetScheduled) {
+				resetDamageCounters();
+			}
+			titansDefeated = false;
+			ticksSinceLastTitanSeen = 0;
 			checkEncounterStart();
 		} else if (npc.getId() == ELDRIC_ID) {
 			eldric = npc;
+			// Same check for Eldric
+			if (getTotalDamage() > 0 && titansDefeated && !resetScheduled) {
+				resetDamageCounters();
+			}
+			titansDefeated = false;
+			ticksSinceLastTitanSeen = 0;
 			checkEncounterStart();
 		}
 	}
@@ -106,6 +120,11 @@ public class RoyalTitansPlugin extends Plugin {
 			branda = null;
 		} else if (npc.getId() == ELDRIC_ID) {
 			eldric = null;
+		}
+
+		// If both titans are gone and player did damage, they were likely defeated
+		if (branda == null && eldric == null && getTotalDamage() > 0) {
+			titansDefeated = true;
 		}
 	}
 
@@ -146,38 +165,46 @@ public class RoyalTitansPlugin extends Plugin {
 	}
 
 	private void validateNpcReferences() {
-		// Branda reference became invalid, cleaning up
+		// Clean up invalid NPC references
 		if (branda != null && !isNpcValid(branda)) {
 			branda = null;
 		}
 
-		// Eldric reference became invalid, cleaning up
 		if (eldric != null && !isNpcValid(eldric)) {
 			eldric = null;
 		}
 	}
 
 	private void checkAreaExit() {
-		// if encounter was active but both NPCs are now gone, player likely left the area
-		if (encounterActive && branda == null && eldric == null && !resetScheduled) {
-			// Check if there are any Royal Titan NPCs in the current world view
-			boolean anyTitansPresent = false;
-			WorldView worldView = client.getTopLevelWorldView();
+		// Check if there are any Royal Titan NPCs in the current world view
+		boolean anyTitansPresent = false;
+		WorldView worldView = client.getTopLevelWorldView();
 
-			if (worldView != null) {
-				for (NPC npc : worldView.npcs()) {
-					if (npc.getId() == BRANDA_ID || npc.getId() == ELDRIC_ID) {
-						anyTitansPresent = true;
-						break;
-					}
+		if (worldView != null) {
+			for (NPC npc : worldView.npcs()) {
+				if (npc.getId() == BRANDA_ID || npc.getId() == ELDRIC_ID) {
+					anyTitansPresent = true;
+					break;
 				}
 			}
-
-			// If no Royal Titans found, player has left the area - reset counters
-			if (!anyTitansPresent) {
-				resetDamageCounters();
-			}
 		}
+
+		if (anyTitansPresent) {
+			// Titans are present, reset the exit counter
+			ticksSinceLastTitanSeen = 0;
+		} else if (encounterActive || getTotalDamage() > 0) {
+			// No titans present but we have an active encounter or damage tracked
+			ticksSinceLastTitanSeen++;
+		}
+
+		// Only reset if:
+		// 1. No royal titans have been seen for 10 ticks (6 seconds) - player left the area
+		// 2. No reset is already scheduled
+		// 3. Titans were not defeated (player left during active fight)
+		if (ticksSinceLastTitanSeen >= 10 && !resetScheduled && !titansDefeated) {
+			resetDamageCounters();
+		}
+		
 	}
 
 	private boolean isNpcValid(NPC npc) {
@@ -198,7 +225,6 @@ public class RoyalTitansPlugin extends Plugin {
 			}
 		}
 
-		// Titan NPCs not found in the current world view, cleanup NPC reference
 		return false;
 	}
 
@@ -230,7 +256,7 @@ public class RoyalTitansPlugin extends Plugin {
 			resetCounterDelay.cancel(false);
 		}
 		resetCounterDelay = null;
-		resetScheduled = false; // Clear the flag when canceling
+		resetScheduled = false;
 	}
 
 	private void checkEncounterStart() {
@@ -238,6 +264,8 @@ public class RoyalTitansPlugin extends Plugin {
 			// Cancel any existing reset delay since a new encounter is starting
 			cancelResetCounterDelay();
 			encounterActive = true;
+			titansDefeated = false;
+			ticksSinceLastTitanSeen = 0;
 		}
 	}
 
@@ -247,7 +275,9 @@ public class RoyalTitansPlugin extends Plugin {
 		encounterActive = false;
 		branda = null;
 		eldric = null;
-		cancelResetCounterDelay(); // Ensure no pending reset task
+		titansDefeated = false;
+		ticksSinceLastTitanSeen = 0;
+		cancelResetCounterDelay();
 	}
 
 	// Getters for overlay
