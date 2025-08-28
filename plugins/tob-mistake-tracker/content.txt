@@ -1,44 +1,292 @@
 package com.tobmistaketracker;
 
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
+import lombok.Getter;
+import lombok.NonNull;
+import net.runelite.client.util.ImageUtil;
 
-public class TobMistakeTrackerPluginTest {
+import java.awt.image.BufferedImage;
+import java.util.EnumSet;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
 
-    public static void main(String[] args) throws Exception {
-        ExternalPluginManager.loadBuiltin(TobMistakeTrackerPlugin.class);
-        RuneLite.main(args);
+public enum TobMistake {
+    // All death chat messages will be handled by the corresponding specific DEATH enum
+    DEATH("Death", "death.png", ""),
+    DEATH_MAIDEN("Maiden Death", "death_maiden.png", "I'm planking!"),
+    DEATH_BLOAT("Bloat Death", "death_bloat.png", "I'm planking!"),
+    DEATH_NYLOCAS("Nylocas Death", "death_nylo.png", "I'm planking!"),
+    DEATH_SOTETSEG("Sotetseg Death", "death_sot.png", "I'm planking!"),
+    DEATH_XARPUS("Xarpus Death", "death_xarpus.png", "I'm planking!"),
+    DEATH_VERZIK("Verzik Death", "death_verzik.png", "I'm planking!"),
+    MAIDEN_BLOOD("Maiden Blood", "maiden_blood.png", "I'm drowning in Maiden's blood!"),
+    MAIDEN_BLOOD_SPAWN("Maiden Blood (Tomato)", "maiden_blood_orb.png", "I'm gonna catch this tomato!"),
+    BLOAT_HAND("Bloat Hand", "bloat_hand.png", "I'm stunned!"),
+    VERZIK_P2_BOUNCE("Verzik P2 Bounce", "verzik_p2_bounce.png", "Bye!"),
+    VERZIK_P2_BOMB("Verzik P2 Bomb", "verzik_p2_bomb.png", "I'm eating cabbages!"),
+    VERZIK_P2_ACID("Verzik P2 Acid", "verzik_p2_acid.png", "I can't count to four!"),
+    VERZIK_P3_MELEE_TANKED("Verzik P3 Melee", "verzik_p3_melee.png", "I'm PKing my team!"),
+    VERZIK_P3_MELEE_CHANCED("Verzik P3 Melee", "verzik_p3_melee.png", "Was I lucky?"),
+    VERZIK_P3_WEB("Verzik P3 Web", "verzik_p3_web.png", "I was stuck in a web!"),
+    VERZIK_P3_PURPLE("Verzik P3 Purple Tornado", "verzik_p3_purple.png", "I'm healing Verzik!");
+
+
+    private static final Set<TobMistake> ROOM_DEATH_ENUMS = EnumSet.of(
+            DEATH_MAIDEN, DEATH_BLOAT, DEATH_NYLOCAS, DEATH_SOTETSEG, DEATH_XARPUS, DEATH_VERZIK);
+
+    /**
+     * Mistakes that should actually be tracked as another mistake, but only defined above for their own chat messages
+     * For example, VERZIK_P3_MELEE_CHANCED is tracked as VERZIK_P3_MELEE_TANKED, but we want to show the chat message
+     * for both of them depending on the contextual situation determined by the detector.
+     * <p>
+     * It's a bit hacky, but meh.
+     */
+    private static final Map<TobMistake, TobMistake> REFERENCE_MISTAKES = new HashMap<TobMistake, TobMistake>() {
+        {
+            put(VERZIK_P3_MELEE_CHANCED, VERZIK_P3_MELEE_TANKED);
+        }
+    };
+
+    @Getter
+    @NonNull
+    private final String mistakeName;
+
+    @Getter
+    @NonNull
+    // TODO: Maybe have a list of messages to say after reaching a certain amount of mistakes
+    // TODO: Maybe have these be configurable for each mistake in the config?
+    private final String chatMessage;
+
+    @Getter
+    @NonNull
+    private final BufferedImage mistakeImage;
+
+    TobMistake(@NonNull String mistakeName, @NonNull String mistakeImagePath, @NonNull String chatMessage) {
+        this.mistakeName = mistakeName;
+        this.chatMessage = chatMessage;
+
+        this.mistakeImage = ImageUtil.loadImageResource(getClass(), mistakeImagePath);
+    }
+
+    public static boolean isRoomDeath(TobMistake mistake) {
+        return ROOM_DEATH_ENUMS.contains(mistake);
+    }
+
+    public static TobMistake getMistakeForTracking(TobMistake mistake) {
+        return REFERENCE_MISTAKES.getOrDefault(mistake, mistake);
     }
 }
-package com.tobmistaketracker;
 
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
+package com.tobmistaketracker.detector;
 
-@ConfigGroup(TobMistakeTrackerPlugin.CONFIG_GROUP)
-public interface TobMistakeTrackerConfig extends Config {
+import com.google.common.annotations.VisibleForTesting;
+import com.tobmistaketracker.TobBossNames;
+import com.tobmistaketracker.TobMistake;
+import com.tobmistaketracker.TobRaider;
+import lombok.NonNull;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.Constants;
+import net.runelite.api.GameObject;
+import net.runelite.api.NPC;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ActorDeath;
+import net.runelite.api.events.GameObjectDespawned;
+import net.runelite.api.events.GameObjectSpawned;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.NpcSpawned;
+import net.runelite.api.events.ProjectileMoved;
+import net.runelite.client.eventbus.Subscribe;
 
-    @ConfigItem(
-            keyName = "showMistakesInChat",
-            name = "Show Mistakes In Chat",
-            description = "When a player makes a mistake in ToB, whether or not to put it in public chat for other " +
-                    "raiders who have the plugin to see.",
-            position = 1
-    )
-    default boolean showMistakesInChat() {
-        return true;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * When Maiden throws her blood at players, she always throws 1 to where each player is currently standing, and 2 extra
+ * to the furthest player. The remainingCycles on the blood Projectile depends on how far the player is from her
+ * actual hitbox (not what's shown in-game, NE is closer). 1 tile away takes 65 cycles, incrementing by 15 for every
+ * extra tile away from her hitbox (80, 95, 110, etc.). The extra two bloods thrown at the furthest player are *always*
+ * +25 cycles from that player's blood spot (65 -> 90, 80 -> 105, 95 -> 120, etc.), which guarantees that they will
+ * activate one tick later than the main blood spot.
+ * <p>
+ * Since there are 30 cycles per GameTick (a cycle happens once every 20ms), we can do some basic math to figure out
+ * when the projectile is supposed to land on the tile and start becoming an active blood spot.
+ * The math is: gameTicksToActivate = floor(remainingCycles / CYCLES_PER_GAME_TICK).
+ * <p>
+ * Once the blood spot is active, it *always* last for exactly 11 GameTicks.
+ * <p>
+ * Additionally, I was going to add splashing on a nylo as a mistake, but there were too many edge cases that couldn't
+ * be resolved guaranteed, so I ended up scrapping it for now. I might revisit it in the future. In case I do, this
+ * is how it works:
+ * <p>
+ * A player will freeze on tick 1, which is also when the Projectile is created and the graphic
+ * on the npc is changed. By tick 2, the npc is actually frozen (if it caught), but the rest of the projectile
+ * could take several more ticks to finish (up to 5 total?) -- We should add a delay on when to show the mistake
+ * so it can't be used for decision-making.
+ */
+@Slf4j
+@Singleton
+public class MaidenMistakeDetector extends BaseTobMistakeDetector {
+
+    private static final int BLOOD_SPAWN_BLOOD_GAME_OBJECT_ID = 32984;
+    private static final int MAIDEN_BLOOD_PROJECTILE_ID = 1578;
+
+    private static final int CYCLES_PER_GAME_TICK = Constants.GAME_TICK_LENGTH / Constants.CLIENT_TICK_LENGTH;
+
+    // Each blood tile from maiden lasts exactly 11 ticks
+    private static final int MAIDEN_BLOOD_GAME_TICK_LENGTH = 11;
+
+    // It's easier to track these separately and check if a player is in either of them, since they (maybe?) can overlap
+    // and we don't need to worry about removing one accidentally when the other despawns.
+    private final Set<WorldPoint> bloodSpawnBloodTiles;
+    private final Set<WorldPoint> maidenBloodTiles;
+
+    private final Map<Integer, List<WorldPoint>> maidenBloodTilesToActivate; // Key is activationTick
+    private final Map<Integer, List<WorldPoint>> activeMaidenBloodTiles; // Key is deactivationTick
+
+    // From what I can tell, we need to remove the blood spawn tiles *after* we detect for that tick, so aggregate here
+    private final Set<WorldPoint> bloodSpawnBloodTilesToRemove;
+
+    @Inject
+    public MaidenMistakeDetector() {
+        bloodSpawnBloodTiles = new HashSet<>();
+        bloodSpawnBloodTilesToRemove = new HashSet<>();
+        maidenBloodTiles = new HashSet<>();
+        maidenBloodTilesToActivate = new HashMap<>();
+        activeMaidenBloodTiles = new HashMap<>();
     }
 
-    @ConfigItem(
-            keyName = "showMistakesOnOverheadText",
-            name = "Show Mistakes On Overhead Text",
-            description = "When a player makes a mistake in ToB, whether or not to show the overhead text for other " +
-                    "raiders who have the plugin to see.",
-            position = 2
-    )
-    default boolean showMistakesOnOverheadText() {
-        return true;
+    @Override
+    public void shutdown() {
+        super.shutdown();
+        bloodSpawnBloodTiles.clear();
+        bloodSpawnBloodTilesToRemove.clear();
+        maidenBloodTiles.clear();
+        maidenBloodTilesToActivate.clear();
+        activeMaidenBloodTiles.clear();
+    }
+
+    @Override
+    protected void computeDetectingMistakes() {
+        if (!detectingMistakes && isAlreadySpawned()) {
+            detectingMistakes = true;
+        }
+    }
+
+    @Override
+    public List<TobMistake> detectMistakes(@NonNull TobRaider raider) {
+        WorldPoint previousLocation = raider.getPreviousWorldLocation();
+        if (!raider.isDead() && isOnBloodTile(previousLocation)) {
+            return isSpawnedBlood(previousLocation) ? Collections.singletonList(TobMistake.MAIDEN_BLOOD) : Collections.singletonList(TobMistake.MAIDEN_BLOOD_SPAWN);
+        }
+
+        return Collections.emptyList();
+    }
+
+    @Override
+    public void afterDetect() {
+        // Remove the blood spawn blood tiles *after* detecting this tick, so that it's still around for detection.
+        bloodSpawnBloodTiles.removeAll(bloodSpawnBloodTilesToRemove);
+        bloodSpawnBloodTilesToRemove.clear();
+    }
+
+    private boolean isSpawnedBlood(WorldPoint worldPoint) {
+        return maidenBloodTiles.contains(worldPoint);
+    }
+
+    private boolean isOnBloodTile(WorldPoint worldPoint) {
+        return bloodSpawnBloodTiles.contains(worldPoint) || maidenBloodTiles.contains(worldPoint);
+    }
+
+    @Subscribe
+    public void onProjectileMoved(ProjectileMoved event) {
+        if (event.getProjectile().getId() == MAIDEN_BLOOD_PROJECTILE_ID) {
+            int gameTicksToActivate =
+                    (int) Math.floor((double) event.getProjectile().getRemainingCycles() / CYCLES_PER_GAME_TICK);
+            int activationTick = client.getTickCount() + gameTicksToActivate;
+            WorldPoint worldPoint = WorldPoint.fromLocal(client, event.getPosition());
+
+            maidenBloodTilesToActivate.computeIfAbsent(activationTick, k -> new ArrayList<>()).add(worldPoint);
+        }
+    }
+
+    @Subscribe
+    public void onGameObjectSpawned(GameObjectSpawned event) {
+        GameObject go = event.getGameObject();
+        if (go.getId() == BLOOD_SPAWN_BLOOD_GAME_OBJECT_ID) {
+            // TODO: These are missing if the plugin is turned on during the wave, after some have spawned. We could
+            // TODO: aggregate all of them on startup too, to catch whatever's already been spawned. Pretty minor though
+            bloodSpawnBloodTiles.add(go.getWorldLocation());
+        }
+    }
+
+    @Subscribe
+    public void onGameObjectDespawned(GameObjectDespawned event) {
+        GameObject go = event.getGameObject();
+        if (go.getId() == BLOOD_SPAWN_BLOOD_GAME_OBJECT_ID) {
+            // Remove these *after* detecting this tick, since they were still present in the previous player location.
+            bloodSpawnBloodTilesToRemove.add(go.getWorldLocation());
+        }
+    }
+
+    @Subscribe
+    public void onNpcSpawned(NpcSpawned event) {
+        if (!detectingMistakes && TobBossNames.MAIDEN.equals(event.getActor().getName())) {
+            detectingMistakes = true;
+        }
+    }
+
+    @Subscribe
+    public void onActorDeath(ActorDeath event) {
+        Actor actor = event.getActor();
+        if (actor instanceof NPC) {
+            if (TobBossNames.MAIDEN.equals(event.getActor().getName())) {
+                shutdown();
+            }
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick event) {
+        int currentGameTick = client.getTickCount();
+
+        // Find all blood tiles to activate this Game Tick
+        if (maidenBloodTilesToActivate.containsKey(currentGameTick)) {
+            int deactivationTick = currentGameTick + MAIDEN_BLOOD_GAME_TICK_LENGTH;
+            for (WorldPoint worldPoint : maidenBloodTilesToActivate.remove(currentGameTick)) {
+                activeMaidenBloodTiles.computeIfAbsent(deactivationTick, k -> new ArrayList<>()).add(worldPoint);
+                // Also add to maiden blood tiles Set for fast detection
+                maidenBloodTiles.add(worldPoint);
+            }
+        }
+
+        // Remove all blood tiles that should deactivate this Game Tick
+        if (activeMaidenBloodTiles.containsKey(currentGameTick)) {
+            for (WorldPoint worldPoint : activeMaidenBloodTiles.remove(currentGameTick)) {
+                maidenBloodTiles.remove(worldPoint);
+            }
+        }
+    }
+
+    private boolean isAlreadySpawned() {
+        return client.getNpcs().stream().anyMatch(npc -> TobBossNames.MAIDEN.equals(npc.getName()));
+    }
+
+    @VisibleForTesting
+    public Set<WorldPoint> getBloodSpawnBloodTiles() {
+        return Collections.unmodifiableSet(bloodSpawnBloodTiles);
+    }
+
+    @VisibleForTesting
+    public Set<WorldPoint> getMaidenBloodTiles() {
+        return Collections.unmodifiableSet(maidenBloodTiles);
     }
 }
 
@@ -542,214 +790,6 @@ public class MistakeDetectorManager {
 
 package com.tobmistaketracker.detector;
 
-import com.google.common.annotations.VisibleForTesting;
-import com.tobmistaketracker.TobBossNames;
-import com.tobmistaketracker.TobMistake;
-import com.tobmistaketracker.TobRaider;
-import lombok.NonNull;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Actor;
-import net.runelite.api.Constants;
-import net.runelite.api.GameObject;
-import net.runelite.api.NPC;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.ActorDeath;
-import net.runelite.api.events.GameObjectDespawned;
-import net.runelite.api.events.GameObjectSpawned;
-import net.runelite.api.events.GameTick;
-import net.runelite.api.events.NpcSpawned;
-import net.runelite.api.events.ProjectileMoved;
-import net.runelite.client.eventbus.Subscribe;
-
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-
-/**
- * When Maiden throws her blood at players, she always throws 1 to where each player is currently standing, and 2 extra
- * to the furthest player. The remainingCycles on the blood Projectile depends on how far the player is from her
- * actual hitbox (not what's shown in-game, NE is closer). 1 tile away takes 65 cycles, incrementing by 15 for every
- * extra tile away from her hitbox (80, 95, 110, etc.). The extra two bloods thrown at the furthest player are *always*
- * +25 cycles from that player's blood spot (65 -> 90, 80 -> 105, 95 -> 120, etc.), which guarantees that they will
- * activate one tick later than the main blood spot.
- * <p>
- * Since there are 30 cycles per GameTick (a cycle happens once every 20ms), we can do some basic math to figure out
- * when the projectile is supposed to land on the tile and start becoming an active blood spot.
- * The math is: gameTicksToActivate = floor(remainingCycles / CYCLES_PER_GAME_TICK).
- * <p>
- * Once the blood spot is active, it *always* last for exactly 11 GameTicks.
- * <p>
- * Additionally, I was going to add splashing on a nylo as a mistake, but there were too many edge cases that couldn't
- * be resolved guaranteed, so I ended up scrapping it for now. I might revisit it in the future. In case I do, this
- * is how it works:
- * <p>
- * A player will freeze on tick 1, which is also when the Projectile is created and the graphic
- * on the npc is changed. By tick 2, the npc is actually frozen (if it caught), but the rest of the projectile
- * could take several more ticks to finish (up to 5 total?) -- We should add a delay on when to show the mistake
- * so it can't be used for decision-making.
- */
-@Slf4j
-@Singleton
-public class MaidenMistakeDetector extends BaseTobMistakeDetector {
-
-    private static final int BLOOD_SPAWN_BLOOD_GAME_OBJECT_ID = 32984;
-    private static final int MAIDEN_BLOOD_PROJECTILE_ID = 1578;
-
-    private static final int CYCLES_PER_GAME_TICK = Constants.GAME_TICK_LENGTH / Constants.CLIENT_TICK_LENGTH;
-
-    // Each blood tile from maiden lasts exactly 11 ticks
-    private static final int MAIDEN_BLOOD_GAME_TICK_LENGTH = 11;
-
-    // It's easier to track these separately and check if a player is in either of them, since they (maybe?) can overlap
-    // and we don't need to worry about removing one accidentally when the other despawns.
-    private final Set<WorldPoint> bloodSpawnBloodTiles;
-    private final Set<WorldPoint> maidenBloodTiles;
-
-    private final Map<Integer, List<WorldPoint>> maidenBloodTilesToActivate; // Key is activationTick
-    private final Map<Integer, List<WorldPoint>> activeMaidenBloodTiles; // Key is deactivationTick
-
-    // From what I can tell, we need to remove the blood spawn tiles *after* we detect for that tick, so aggregate here
-    private final Set<WorldPoint> bloodSpawnBloodTilesToRemove;
-
-    @Inject
-    public MaidenMistakeDetector() {
-        bloodSpawnBloodTiles = new HashSet<>();
-        bloodSpawnBloodTilesToRemove = new HashSet<>();
-        maidenBloodTiles = new HashSet<>();
-        maidenBloodTilesToActivate = new HashMap<>();
-        activeMaidenBloodTiles = new HashMap<>();
-    }
-
-    @Override
-    public void shutdown() {
-        super.shutdown();
-        bloodSpawnBloodTiles.clear();
-        bloodSpawnBloodTilesToRemove.clear();
-        maidenBloodTiles.clear();
-        maidenBloodTilesToActivate.clear();
-        activeMaidenBloodTiles.clear();
-    }
-
-    @Override
-    protected void computeDetectingMistakes() {
-        if (!detectingMistakes && isAlreadySpawned()) {
-            detectingMistakes = true;
-        }
-    }
-
-    @Override
-    public List<TobMistake> detectMistakes(@NonNull TobRaider raider) {
-        if (!raider.isDead() && isOnBloodTile(raider.getPreviousWorldLocation())) {
-            return Collections.singletonList(TobMistake.MAIDEN_BLOOD);
-        }
-
-        return Collections.emptyList();
-    }
-
-    @Override
-    public void afterDetect() {
-        // Remove the blood spawn blood tiles *after* detecting this tick, so that it's still around for detection.
-        bloodSpawnBloodTiles.removeAll(bloodSpawnBloodTilesToRemove);
-        bloodSpawnBloodTilesToRemove.clear();
-    }
-
-    private boolean isOnBloodTile(WorldPoint worldPoint) {
-        return bloodSpawnBloodTiles.contains(worldPoint) || maidenBloodTiles.contains(worldPoint);
-    }
-
-    @Subscribe
-    public void onProjectileMoved(ProjectileMoved event) {
-        if (event.getProjectile().getId() == MAIDEN_BLOOD_PROJECTILE_ID) {
-            int gameTicksToActivate =
-                    (int) Math.floor((double) event.getProjectile().getRemainingCycles() / CYCLES_PER_GAME_TICK);
-            int activationTick = client.getTickCount() + gameTicksToActivate;
-            WorldPoint worldPoint = WorldPoint.fromLocal(client, event.getPosition());
-
-            maidenBloodTilesToActivate.computeIfAbsent(activationTick, k -> new ArrayList<>()).add(worldPoint);
-        }
-    }
-
-    @Subscribe
-    public void onGameObjectSpawned(GameObjectSpawned event) {
-        GameObject go = event.getGameObject();
-        if (go.getId() == BLOOD_SPAWN_BLOOD_GAME_OBJECT_ID) {
-            // TODO: These are missing if the plugin is turned on during the wave, after some have spawned. We could
-            // TODO: aggregate all of them on startup too, to catch whatever's already been spawned. Pretty minor though
-            bloodSpawnBloodTiles.add(go.getWorldLocation());
-        }
-    }
-
-    @Subscribe
-    public void onGameObjectDespawned(GameObjectDespawned event) {
-        GameObject go = event.getGameObject();
-        if (go.getId() == BLOOD_SPAWN_BLOOD_GAME_OBJECT_ID) {
-            // Remove these *after* detecting this tick, since they were still present in the previous player location.
-            bloodSpawnBloodTilesToRemove.add(go.getWorldLocation());
-        }
-    }
-
-    @Subscribe
-    public void onNpcSpawned(NpcSpawned event) {
-        if (!detectingMistakes && TobBossNames.MAIDEN.equals(event.getActor().getName())) {
-            detectingMistakes = true;
-        }
-    }
-
-    @Subscribe
-    public void onActorDeath(ActorDeath event) {
-        Actor actor = event.getActor();
-        if (actor instanceof NPC) {
-            if (TobBossNames.MAIDEN.equals(event.getActor().getName())) {
-                shutdown();
-            }
-        }
-    }
-
-    @Subscribe
-    public void onGameTick(GameTick event) {
-        int currentGameTick = client.getTickCount();
-
-        // Find all blood tiles to activate this Game Tick
-        if (maidenBloodTilesToActivate.containsKey(currentGameTick)) {
-            int deactivationTick = currentGameTick + MAIDEN_BLOOD_GAME_TICK_LENGTH;
-            for (WorldPoint worldPoint : maidenBloodTilesToActivate.remove(currentGameTick)) {
-                activeMaidenBloodTiles.computeIfAbsent(deactivationTick, k -> new ArrayList<>()).add(worldPoint);
-                // Also add to maiden blood tiles Set for fast detection
-                maidenBloodTiles.add(worldPoint);
-            }
-        }
-
-        // Remove all blood tiles that should deactivate this Game Tick
-        if (activeMaidenBloodTiles.containsKey(currentGameTick)) {
-            for (WorldPoint worldPoint : activeMaidenBloodTiles.remove(currentGameTick)) {
-                maidenBloodTiles.remove(worldPoint);
-            }
-        }
-    }
-
-    private boolean isAlreadySpawned() {
-        return client.getNpcs().stream().anyMatch(npc -> TobBossNames.MAIDEN.equals(npc.getName()));
-    }
-
-    @VisibleForTesting
-    public Set<WorldPoint> getBloodSpawnBloodTiles() {
-        return Collections.unmodifiableSet(bloodSpawnBloodTiles);
-    }
-
-    @VisibleForTesting
-    public Set<WorldPoint> getMaidenBloodTiles() {
-        return Collections.unmodifiableSet(maidenBloodTiles);
-    }
-}
-
-package com.tobmistaketracker.detector;
-
 import com.tobmistaketracker.TobMistake;
 import com.tobmistaketracker.TobMistakeTrackerPlugin;
 import com.tobmistaketracker.TobRaider;
@@ -823,169 +863,6 @@ public abstract class BaseTobMistakeDetector {
      * for this {@link net.runelite.api.events.GameTick}.
      */
     public void afterDetect() {
-    }
-}
-
-package com.tobmistaketracker.detector;
-
-import com.google.common.annotations.VisibleForTesting;
-import com.tobmistaketracker.TobBossNames;
-import com.tobmistaketracker.TobMistake;
-import com.tobmistaketracker.TobRaider;
-import lombok.NonNull;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.NPC;
-import net.runelite.api.Player;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.ActorDeath;
-import net.runelite.api.events.GameObjectDespawned;
-import net.runelite.api.events.GameObjectSpawned;
-import net.runelite.api.events.GraphicChanged;
-import net.runelite.api.events.NpcChanged;
-import net.runelite.api.events.NpcSpawned;
-import net.runelite.client.eventbus.Subscribe;
-
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Set;
-
-/**
- * Verzik P3 is also pretty straightforward -- detect for webs/purples and show them.
- *
- * We are intentionally waiting until the web has *despawned* and checking if a player was standing on it in order
- * to combat any form of "cheating" where the mistake detection can be seen as a communication mechanic.
- *
- * In the future, this will also add verzik melee for the player tanking, but we currently can't easily
- * detect when verzik is meleeing, unless the dev team unmask certain animations/graphics for P3.
- */
-@Slf4j
-@Singleton
-public class VerzikP3MistakeDetector extends BaseTobMistakeDetector {
-
-    private static final Set<Integer> VERZIK_P3_IDS = Set.of(
-            10835, // Entry
-            8374, // Normal
-            10852 // Hard
-    );
-
-    private static final int VERZIK_WEB_GAME_OBJECT_ID = 32734;
-    private static final int PLAYER_PURPLE_GRAPHIC_ID = 1602;
-
-    private final Set<WorldPoint> activeWebTiles;
-    private final Set<WorldPoint> webTilesToRemove;
-
-    private final Set<String> playerNamesPurpled;
-
-    @Inject
-    public VerzikP3MistakeDetector() {
-        activeWebTiles = new HashSet<>();
-        webTilesToRemove = new HashSet<>();
-        playerNamesPurpled = new HashSet<>();
-    }
-
-    @Override
-    public void shutdown() {
-        super.shutdown();
-        activeWebTiles.clear();
-        webTilesToRemove.clear();
-        playerNamesPurpled.clear();
-    }
-
-    @Override
-    protected void computeDetectingMistakes() {
-        if (!detectingMistakes && isAlreadySpawned()) {
-            detectingMistakes = true;
-        }
-    }
-
-    @Override
-    public List<TobMistake> detectMistakes(@NonNull TobRaider raider) {
-        List<TobMistake> mistakes = new ArrayList<>();
-
-        if (raider.isDead()) {
-            return mistakes;
-        }
-
-        // If this web just despawned, we can track this mistake
-        // Note: We are intentionally delaying detecting this, so as to avoid cheating
-        if (webTilesToRemove.contains(raider.getPreviousWorldLocation())) {
-            mistakes.add(TobMistake.VERZIK_P3_WEB);
-        }
-
-        if (playerNamesPurpled.contains(raider.getName())) {
-            mistakes.add(TobMistake.VERZIK_P3_PURPLE);
-        }
-
-        // TODO: Verzik melee if the animations become unmasked
-
-        return mistakes;
-    }
-
-    @Override
-    public void afterDetect() {
-        activeWebTiles.removeAll(webTilesToRemove);
-        webTilesToRemove.clear();
-        playerNamesPurpled.clear();
-    }
-
-    @Subscribe
-    public void onGraphicChanged(GraphicChanged event) {
-        if (event.getActor() instanceof Player && event.getActor().getGraphic() == PLAYER_PURPLE_GRAPHIC_ID) {
-            playerNamesPurpled.add(event.getActor().getName());
-        }
-    }
-
-    @Subscribe
-    public void onNpcSpawned(NpcSpawned event) {
-        if (!detectingMistakes && isVerzikP3(event.getNpc())) {
-            detectingMistakes = true;
-        }
-    }
-
-    @Subscribe
-    public void onGameObjectSpawned(GameObjectSpawned event) {
-        if (event.getGameObject().getId() == VERZIK_WEB_GAME_OBJECT_ID) {
-            activeWebTiles.add(event.getGameObject().getWorldLocation());
-        }
-    }
-
-    @Subscribe
-    public void onGameObjectDespawned(GameObjectDespawned event) {
-        if (event.getGameObject().getId() == VERZIK_WEB_GAME_OBJECT_ID) {
-            // Remove these *after* detecting this tick, since they were still present in the previous player location.
-            webTilesToRemove.add(event.getGameObject().getWorldLocation());
-        }
-    }
-
-    @Subscribe
-    public void onNpcChanged(NpcChanged event) {
-        if (!detectingMistakes && isVerzikP3(event.getNpc())) {
-            detectingMistakes = true;
-        }
-    }
-
-    @Subscribe
-    public void onActorDeath(ActorDeath event) {
-        if (event.getActor() instanceof NPC && isVerzikP3((NPC) event.getActor())) {
-            shutdown();
-        }
-    }
-
-    private boolean isAlreadySpawned() {
-        return client.getNpcs().stream().anyMatch(VerzikP3MistakeDetector::isVerzikP3);
-    }
-
-    private static boolean isVerzikP3(NPC npc) {
-        return TobBossNames.VERZIK.equals(npc.getName()) && VERZIK_P3_IDS.contains(npc.getId());
-    }
-
-    @VisibleForTesting
-    public Set<WorldPoint> getVerzikP3WebTiles() {
-        return Collections.unmodifiableSet(activeWebTiles);
     }
 }
 
@@ -1100,46 +977,663 @@ public class BloatMistakeDetector extends BaseTobMistakeDetector {
     }
 }
 
-package com.tobmistaketracker;
+package com.tobmistaketracker.detector;
 
-import lombok.AccessLevel;
-import lombok.Getter;
+import com.google.common.annotations.VisibleForTesting;
+import com.tobmistaketracker.TobBossNames;
+import com.tobmistaketracker.TobMistake;
+import com.tobmistaketracker.TobRaider;
+import com.tobmistaketracker.detector.MistakeDetectors.VerzikMeleeChancedTracker;
+import com.tobmistaketracker.detector.MistakeDetectors.VerzikMeleeChancedTracker.MeleeChanceData;
 import lombok.NonNull;
-import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.NPC;
 import net.runelite.api.Player;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ActorDeath;
+import net.runelite.api.events.AnimationChanged;
+import net.runelite.api.events.GameObjectDespawned;
+import net.runelite.api.events.GameObjectSpawned;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.GraphicChanged;
+import net.runelite.api.events.NpcChanged;
+import net.runelite.api.events.NpcSpawned;
+import net.runelite.client.eventbus.Subscribe;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 
 /**
- * Encapsulating class for a {@link Player} and other relevant metadata in a Tob raid.
+ * Verzik P3 is also pretty straightforward -- detect for webs/purples and show them.
+ * <p>
+ * We are intentionally waiting until the web has *despawned* and checking if a player was standing on it in order
+ * to combat any form of "cheating" where the mistake detection can be seen as a communication mechanic.
+ * <p>
+ * In the future, this will also add verzik melee for the player tanking, but we currently can't easily
+ * detect when verzik is meleeing, unless the dev team unmask certain animations/graphics for P3.
  */
-public class TobRaider {
+@Slf4j
+@Singleton
+public class VerzikP3MistakeDetector extends BaseTobMistakeDetector {
+    private VerzikMeleeChancedTracker verzikMeleeChancedTracker = new VerzikMeleeChancedTracker();
+
+    private static final Set<Integer> VERZIK_P3_IDS = Set.of(
+            10835, // Entry
+            8374, // Normal
+            10852 // Hard
+    );
+
+    private static final int VERZIK_WEB_GAME_OBJECT_ID = 32734;
+    private static final int PLAYER_PURPLE_GRAPHIC_ID = 1602;
+
+    private final Set<WorldPoint> activeWebTiles;
+    private final Set<WorldPoint> webTilesToRemove;
+
+    private final Set<String> playerNamesPurpled;
+    private NPC verzikP3NPC;
+
+    @Inject
+    public VerzikP3MistakeDetector() {
+        activeWebTiles = new HashSet<>();
+        webTilesToRemove = new HashSet<>();
+        playerNamesPurpled = new HashSet<>();
+    }
+
+    @Override
+    public void shutdown() {
+        super.shutdown();
+        activeWebTiles.clear();
+        webTilesToRemove.clear();
+        playerNamesPurpled.clear();
+        verzikMeleeChancedTracker.dispose();
+
+        verzikP3NPC = null;
+    }
+
+    @Override
+    protected void computeDetectingMistakes() {
+        if (!detectingMistakes && isAlreadySpawned()) {
+            enableDetectingMistakes();
+        }
+    }
+
+    @Override
+    public List<TobMistake> detectMistakes(@NonNull TobRaider raider) {
+        List<TobMistake> mistakes = new ArrayList<>();
+
+        if (raider.isDead()) {
+            return mistakes;
+        }
+
+        // If this web just despawned, we can track this mistake
+        // Note: We are intentionally delaying detecting this, so as to avoid cheating
+        if (webTilesToRemove.contains(raider.getPreviousWorldLocation())) {
+            mistakes.add(TobMistake.VERZIK_P3_WEB);
+        }
+
+        if (playerNamesPurpled.contains(raider.getName())) {
+            mistakes.add(TobMistake.VERZIK_P3_PURPLE);
+        }
+
+        MeleeChanceData chancedMeleePlayer = verzikMeleeChancedTracker.getMeleeChanceData();
+        if (chancedMeleePlayer != null && chancedMeleePlayer.getPlayerName().equals(raider.getName())) {
+            TobMistake mistake = chancedMeleePlayer.isWasMelee() ?
+                    TobMistake.VERZIK_P3_MELEE_TANKED :
+                    TobMistake.VERZIK_P3_MELEE_CHANCED;
+            mistakes.add(mistake);
+        }
+
+        return mistakes;
+    }
+
+    @Override
+    public void afterDetect() {
+        activeWebTiles.removeAll(webTilesToRemove);
+        webTilesToRemove.clear();
+        playerNamesPurpled.clear();
+        verzikMeleeChancedTracker.setMeleeChanceData(null);
+    }
+
+    @Subscribe
+    public void onGraphicChanged(GraphicChanged event) {
+        if (event.getActor() instanceof Player && event.getActor().getGraphic() == PLAYER_PURPLE_GRAPHIC_ID) {
+            playerNamesPurpled.add(event.getActor().getName());
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick tick) {
+        if (verzikP3NPC != null) {
+            verzikMeleeChancedTracker.setVerzikAttackInfo(verzikP3NPC);
+        }
+    }
+
+    @Subscribe
+    public void onAnimationChanged(AnimationChanged event) {
+        if (event.getActor() instanceof NPC) {
+            verzikMeleeChancedTracker.checkPlayerWronglyTanked(event);
+        }
+    }
+
+    @Subscribe
+    public void onNpcSpawned(NpcSpawned event) {
+        if (!detectingMistakes && isVerzikP3(event.getNpc())) {
+            enableDetectingMistakes();
+        }
+    }
+
+    @Subscribe
+    public void onGameObjectSpawned(GameObjectSpawned event) {
+        if (event.getGameObject().getId() == VERZIK_WEB_GAME_OBJECT_ID) {
+            activeWebTiles.add(event.getGameObject().getWorldLocation());
+        }
+    }
+
+    @Subscribe
+    public void onGameObjectDespawned(GameObjectDespawned event) {
+        if (event.getGameObject().getId() == VERZIK_WEB_GAME_OBJECT_ID) {
+            // Remove these *after* detecting this tick, since they were still present in the previous player location.
+            webTilesToRemove.add(event.getGameObject().getWorldLocation());
+        }
+    }
+
+    @Subscribe
+    public void onNpcChanged(NpcChanged event) {
+        if (!detectingMistakes && isVerzikP3(event.getNpc())) {
+            enableDetectingMistakes();
+        }
+    }
+
+    @Subscribe
+    public void onActorDeath(ActorDeath event) {
+        if (event.getActor() instanceof NPC && isVerzikP3((NPC) event.getActor())) {
+            shutdown();
+        }
+    }
+
+    private boolean isAlreadySpawned() {
+        return client.getNpcs().stream().anyMatch(VerzikP3MistakeDetector::isVerzikP3);
+    }
+
+    private static boolean isVerzikP3(NPC npc) {
+        return TobBossNames.VERZIK.equals(npc.getName()) && VERZIK_P3_IDS.contains(npc.getId());
+    }
+
+    private void enableDetectingMistakes() {
+        detectingMistakes = true;
+
+        verzikP3NPC = client.getNpcs().stream()
+                .filter(VerzikP3MistakeDetector::isVerzikP3)
+                .findFirst()
+                .orElse(null);
+    }
+
+    @VisibleForTesting
+    public Set<WorldPoint> getVerzikP3WebTiles() {
+        return Collections.unmodifiableSet(activeWebTiles);
+    }
+}
+
+package com.tobmistaketracker.detector.MistakeDetectors;
+
+import lombok.Getter;
+import lombok.Setter;
+import lombok.Value;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldArea;
+import net.runelite.api.events.AnimationChanged;
+import net.runelite.api.gameval.AnimationID;
+
+import java.util.Set;
+
+@Slf4j
+public class VerzikMeleeChancedTracker {
+
+    @Value
+    public static class MeleeChanceData {
+
+        String playerName;
+        boolean wasMelee;
+    }
 
     @Getter
+    @Setter
+    private MeleeChanceData meleeChanceData;
+
+    private String lastTickTarget;
+    private WorldArea lastTickTargetArea;
+    private WorldArea lastTickVerzikArea;
+
+    private static final Set<Integer> VERZIK_ATTACK_ANIMATIONS = Set.of(
+            AnimationID.VERZIK_PHASE3_ATTACK_MELEE,
+            AnimationID.VERZIK_PHASE3_ATTACK_MAGIC,
+            AnimationID.VERZIK_PHASE3_ATTACK_RANGED
+    );
+
+    public void setVerzikAttackInfo(NPC verzik) {
+        if (verzik == null) {
+            emptyTickData();
+        } else {
+            Actor target = verzik.getInteracting();
+            if (target instanceof Player) {
+                lastTickTarget = target.getName();
+                lastTickTargetArea = target.getWorldArea();
+                lastTickVerzikArea = verzik.getWorldArea();
+            } else {
+                emptyTickData();
+            }
+        }
+    }
+
+    public void checkPlayerWronglyTanked(AnimationChanged event) {
+        int animationId = event.getActor().getAnimation();
+
+        if (VERZIK_ATTACK_ANIMATIONS.contains(animationId)) {
+            if (lastTickTarget != null && lastTickTargetArea != null && lastTickVerzikArea != null) {
+                if (isWronglyTanked(lastTickVerzikArea, lastTickTargetArea)) {
+                    boolean wasMelee = AnimationID.VERZIK_PHASE3_ATTACK_MELEE == animationId;
+                    meleeChanceData = new MeleeChanceData(lastTickTarget, wasMelee);
+                }
+            }
+        }
+    }
+
+    public void dispose(){
+        emptyTickData();
+    }
+
+    private boolean isWronglyTanked(WorldArea verzikArea, WorldArea tankArea) {
+        return !verzikArea.intersectsWith(tankArea) && verzikArea.distanceTo(tankArea) == 1;
+    }
+
+    private void emptyTickData() {
+        lastTickTarget = null;
+        lastTickTargetArea = null;
+        lastTickVerzikArea = null;
+    }
+}
+
+package com.tobmistaketracker.state;
+
+import com.tobmistaketracker.TobMistake;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Singleton;
+import java.util.Set;
+
+/**
+ * In charge of the different MistakeManagers, and knowing which one is the currently viewed one.
+ * <p>
+ * For now, these are very small and writes are relatively infrequent, so let's write to disk for every write API.
+ */
+@Slf4j
+@Singleton
+public class MistakeStateManager {
+
+    private final MistakeManager currentRaidMistakeManager;
+    private final MistakeManager allRaidsMistakeManager;
+
+    private transient boolean isAll;
+    @Setter
+    private transient MistakeStateWriter mistakeStateWriter;
+
+    public MistakeStateManager(MistakeStateWriter mistakeStateWriter) {
+        this.currentRaidMistakeManager = new MistakeManager();
+        this.allRaidsMistakeManager = new MistakeManager();
+        this.mistakeStateWriter = mistakeStateWriter;
+
+        this.isAll = false;
+    }
+
+    public void addMistakeForPlayer(String playerName, TobMistake mistake) {
+        // Always add to both
+        currentRaidMistakeManager.addMistakeForPlayer(playerName, mistake);
+        allRaidsMistakeManager.addMistakeForPlayer(playerName, mistake);
+
+        mistakeStateWriter.write(this);
+    }
+
+    public void removeAllMistakesForPlayer(String playerName) {
+        // Always remove from both
+        currentRaidMistakeManager.removeAllMistakesForPlayer(playerName);
+        allRaidsMistakeManager.removeAllMistakesForPlayer(playerName);
+
+        mistakeStateWriter.write(this);
+    }
+
+    public void resetAll() {
+        // Always clear from both
+        currentRaidMistakeManager.clearAllMistakes();
+        allRaidsMistakeManager.clearAllMistakes();
+
+        mistakeStateWriter.write(this);
+    }
+
+    public void newRaid(Set<String> playerNames) {
+        // Clear just the current mistakes
+        currentRaidMistakeManager.clearAllMistakes();
+
+        // Denote to the manager that there's a new raid, incrementing the raid count for all players in this raid
+        // Raid count for current raid isn't valid, so only do for all raids
+        allRaidsMistakeManager.newRaid(playerNames);
+
+        mistakeStateWriter.write(this);
+    }
+
+    public Set<String> getPlayersWithMistakes() {
+        return isAll ?
+                allRaidsMistakeManager.getPlayersWithMistakes() :
+                currentRaidMistakeManager.getPlayersWithMistakes();
+    }
+
+    public int getMistakeCountForPlayer(String playerName, TobMistake mistake) {
+        return isAll ?
+                allRaidsMistakeManager.getMistakeCountForPlayer(playerName, mistake) :
+                currentRaidMistakeManager.getMistakeCountForPlayer(playerName, mistake);
+    }
+
+    public int getTotalMistakeCountForAllPlayers() {
+        return isAll ?
+                allRaidsMistakeManager.getTotalMistakeCountForAllPlayers() :
+                currentRaidMistakeManager.getTotalMistakeCountForAllPlayers();
+    }
+
+    public int getRaidCountForPlayer(String playerName) {
+        return isAll ? allRaidsMistakeManager.getRaidCountForPlayer(playerName) :
+                0; // Raid count for current raid isn't valid, so return 0
+    }
+
+    public int getTrackedRaids() {
+        return isAll ? allRaidsMistakeManager.getTrackedRaids() :
+                1; // Tracked raids for current raid is always just the 1 raid
+    }
+
+    public void switchMistakes() {
+        isAll = !isAll;
+    }
+}
+package com.tobmistaketracker.state;
+
+import com.google.gson.Gson;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.http.api.RuneLiteAPI;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import java.io.BufferedWriter;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static com.tobmistaketracker.state.MistakeStateUtil.getMistakeStateDir;
+import static com.tobmistaketracker.state.MistakeStateUtil.getMistakeStateFilePath;
+
+/**
+ * Writes MistakeState to disk
+ */
+@Slf4j
+@Singleton
+public class MistakeStateWriter {
+
+    private static final Gson GSON = RuneLiteAPI.GSON;
+
+    private final Path mistakeStateDir;
+    private final Path mistakeStateFilePath;
+
+    @Inject
+    public MistakeStateWriter(@Named("developerMode") boolean developerMode) {
+        this.mistakeStateDir = getMistakeStateDir();
+        this.mistakeStateFilePath = getMistakeStateFilePath(developerMode);
+    }
+
+    public void write(MistakeStateManager mistakeStateManager) {
+        try {
+            Files.createDirectories(mistakeStateDir);
+        } catch (IOException e) {
+            log.error("Unable to create directories " + mistakeStateDir, e);
+            return;
+        }
+
+        final Path filepath = mistakeStateFilePath;
+        try (BufferedWriter writer = Files.newBufferedWriter(filepath)) {
+            writer.write(GSON.toJson(mistakeStateManager));
+        } catch (IOException e) {
+            log.error("Unable to write mistake state to " + filepath, e);
+        }
+    }
+}
+package com.tobmistaketracker.state;
+
+import com.tobmistaketracker.TobMistake;
+import lombok.Getter;
+import lombok.NonNull;
+
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Encapsulating class for relevant tracking information for a player, including mistakes.
+ */
+public class PlayerTrackingInfo {
+
     @NonNull
-    private final Player player;
-
     @Getter
-    @Setter(AccessLevel.PACKAGE)
-    private WorldPoint previousWorldLocation;
-
+    private final String playerName;
+    @NonNull
     @Getter
-    @Setter(AccessLevel.PACKAGE)
-    private WorldPoint previousWorldLocationForOverlay;
-
+    private final Map<TobMistake, Integer> mistakes;
     @Getter
-    @Setter(AccessLevel.PACKAGE)
-    private boolean isDead;
+    private int raidCount;
 
-    TobRaider(@NonNull Player player) {
-        this.player = player;
+    public PlayerTrackingInfo(@NonNull final String playerName) {
+        this.playerName = playerName;
+        this.mistakes = new HashMap<>();
+        this.raidCount = 1; // Default raid count is 1 since just by creating this object it's assumed there's a raid
     }
 
-    public String getName() {
-        return player.getName();
+    public void incrementMistake(TobMistake mistake) {
+        mistakes.compute(mistake, PlayerTrackingInfo::increment);
     }
 
-    public WorldPoint getCurrentWorldLocation() {
-        return player.getWorldLocation();
+    public void incrementRaidCount() {
+        raidCount++;
+    }
+
+    public boolean hasMistakes() {
+        return !mistakes.isEmpty();
+    }
+
+    private static <T> Integer increment(T key, Integer oldValue) {
+        return oldValue == null ? 1 : oldValue + 1;
+    }
+}
+
+package com.tobmistaketracker.state;
+
+import java.nio.file.Path;
+
+import static net.runelite.client.RuneLite.RUNELITE_DIR;
+
+public class MistakeStateUtil {
+
+    private static final Path MISTAKE_STATE_DIR = RUNELITE_DIR.toPath().resolve("tob-mistake-tracker");
+
+    // Use the same mistake state file regardless of user
+    private static final String MISTAKE_STATE_FILE_NAME = "mistake-state.txt";
+
+    private static final String DEVELOPER_MODE_PREFIX = "dev-";
+
+    static Path getMistakeStateDir() {
+        return MISTAKE_STATE_DIR;
+    }
+
+    static Path getMistakeStateFilePath(boolean developerMode) {
+        final String filename;
+        if (developerMode) {
+            filename = DEVELOPER_MODE_PREFIX + MISTAKE_STATE_FILE_NAME;
+        } else {
+            filename = MISTAKE_STATE_FILE_NAME;
+        }
+
+        return getMistakeStateDir().resolve(filename);
+    }
+}
+
+package com.tobmistaketracker.state;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonSyntaxException;
+import com.google.gson.stream.JsonReader;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.http.api.RuneLiteAPI;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+
+import static com.tobmistaketracker.state.MistakeStateUtil.getMistakeStateFilePath;
+
+/**
+ * Reads MistakeState from disk
+ */
+@Slf4j
+@Singleton
+public class MistakeStateReader {
+
+    private static final Gson GSON = RuneLiteAPI.GSON;
+
+    private final MistakeStateWriter mistakeStateWriter;
+    private final Path mistakeStateFilePath;
+
+    @Inject
+    public MistakeStateReader(MistakeStateWriter mistakeStateWriter, @Named("developerMode") boolean developerMode) {
+        this.mistakeStateWriter = mistakeStateWriter;
+        this.mistakeStateFilePath = getMistakeStateFilePath(developerMode);
+    }
+
+    public MistakeStateManager read() {
+        if (Files.exists(mistakeStateFilePath)) {
+            try (BufferedReader reader = Files.newBufferedReader(mistakeStateFilePath);
+                 JsonReader jsonReader = new JsonReader(reader)) {
+                MistakeStateManager mistakeStateManager = GSON.fromJson(jsonReader, MistakeStateManager.class);
+                if (mistakeStateManager == null) {
+                    return new MistakeStateManager(mistakeStateWriter);
+                }
+                mistakeStateManager.setMistakeStateWriter(mistakeStateWriter);
+                return mistakeStateManager;
+            } catch (IOException | JsonSyntaxException e) {
+                log.error("Unable to read mistake state from " + mistakeStateFilePath, e);
+            }
+        }
+
+        return new MistakeStateManager(mistakeStateWriter);
+    }
+}
+package com.tobmistaketracker.state;
+
+import com.tobmistaketracker.TobMistake;
+
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+/**
+ * Keeps track of mistakes for players
+ */
+class MistakeManager {
+
+    private final Map<String, PlayerTrackingInfo> trackingInfo;
+    private int trackedRaids;
+
+    MistakeManager() {
+        trackingInfo = new HashMap<>();
+        trackedRaids = 0;
+    }
+
+    public void clearAllMistakes() {
+        trackingInfo.clear();
+        trackedRaids = 0;
+    }
+
+    public void addMistakeForPlayer(String playerName, TobMistake mistake) {
+        PlayerTrackingInfo playerInfo = trackingInfo.computeIfAbsent(playerName,
+                k -> new PlayerTrackingInfo(playerName));
+        playerInfo.incrementMistake(mistake);
+    }
+
+    public void newRaid(Set<String> playerNames) {
+        trackedRaids++;
+
+        for (String playerName : playerNames) {
+            PlayerTrackingInfo playerInfo = trackingInfo.get(playerName);
+            if (playerInfo != null) {
+                playerInfo.incrementRaidCount();
+            } else {
+                trackingInfo.put(playerName, new PlayerTrackingInfo(playerName));
+            }
+        }
+    }
+
+    public void removeAllMistakesForPlayer(String playerName) {
+        trackingInfo.remove(playerName);
+    }
+
+    public Set<String> getPlayersWithMistakes() {
+        return trackingInfo.values().stream()
+                .filter(PlayerTrackingInfo::hasMistakes)
+                .map(PlayerTrackingInfo::getPlayerName)
+                .collect(Collectors.toSet());
+    }
+
+    public int getMistakeCountForPlayer(String playerName, TobMistake mistake) {
+        PlayerTrackingInfo playerInfo = trackingInfo.get(playerName);
+        if (playerInfo != null) {
+            Integer count = playerInfo.getMistakes().get(mistake);
+            if (count != null) {
+                return count;
+            }
+        }
+
+        return 0;
+    }
+
+    public int getTotalMistakeCountForAllPlayers() {
+        int totalMistakes = 0;
+        for (PlayerTrackingInfo playerInfo : trackingInfo.values()) {
+            for (int mistakes : playerInfo.getMistakes().values()) {
+                totalMistakes += mistakes;
+            }
+        }
+
+        return totalMistakes;
+    }
+
+    public int getRaidCountForPlayer(String playerName) {
+        PlayerTrackingInfo playerInfo = trackingInfo.get(playerName);
+        if (playerInfo != null) {
+            return playerInfo.getRaidCount();
+        }
+
+        return 0;
+    }
+
+    public int getTrackedRaids() {
+        return trackedRaids;
     }
 }
 
@@ -1158,58 +1652,206 @@ public class TobBossNames {
 
 package com.tobmistaketracker;
 
-import lombok.Getter;
-import lombok.NonNull;
-import net.runelite.client.util.ImageUtil;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
 
-import java.awt.image.BufferedImage;
-import java.util.EnumSet;
-import java.util.Set;
+@ConfigGroup(TobMistakeTrackerPlugin.CONFIG_GROUP)
+public interface TobMistakeTrackerConfig extends Config {
 
-public enum TobMistake {
-    // All death chat messages will be handled by the corresponding specific DEATH enum
-    DEATH("Death", "death.png", ""),
-    DEATH_MAIDEN("Maiden Death", "death_maiden.png", "I'm planking!"),
-    DEATH_BLOAT("Bloat Death", "death_bloat.png", "I'm planking!"),
-    DEATH_NYLOCAS("Nylocas Death", "death_nylo.png", "I'm planking!"),
-    DEATH_SOTETSEG("Sotetseg Death", "death_sot.png", "I'm planking!"),
-    DEATH_XARPUS("Xarpus Death", "death_xarpus.png", "I'm planking!"),
-    DEATH_VERZIK("Verzik Death", "death_verzik.png", "I'm planking!"),
-    MAIDEN_BLOOD("Maiden Blood", "maiden_blood.png", "I'm drowning in Maiden's blood!"),
-    BLOAT_HAND("Bloat Hand", "bloat_hand.png", "I'm stunned!"),
-    VERZIK_P2_BOUNCE("Verzik P2 Bounce", "verzik_p2_bounce.png", "Bye!"),
-    VERZIK_P2_BOMB("Verzik P2 Bomb", "verzik_p2_bomb.png", "I'm eating cabbages!"),
-    VERZIK_P2_ACID("Verzik P2 Acid", "verzik_p2_acid.png", "I can't count to four!"),
-    VERZIK_P3_MELEE("Verzik P3 Melee", "verzik_p3_melee.png", "I'm PKing my team!"),
-    VERZIK_P3_WEB("Verzik P3 Web", "verzik_p3_web.png", "I was stuck in a web!"),
-    VERZIK_P3_PURPLE("Verzik P3 Purple Tornado", "verzik_p3_purple.png", "I'm healing Verzik!");
-
-    private static final Set<TobMistake> ROOM_DEATH_ENUMS = EnumSet.of(
-            DEATH_MAIDEN, DEATH_BLOAT, DEATH_NYLOCAS, DEATH_SOTETSEG, DEATH_XARPUS, DEATH_VERZIK);
-
-    @Getter
-    @NonNull
-    private final String mistakeName;
-
-    @Getter
-    @NonNull
-    // TODO: Maybe have a list of messages to say after reaching a certain amount of mistakes
-    // TODO: Maybe have these be configurable for each mistake in the config?
-    private final String chatMessage;
-
-    @Getter
-    @NonNull
-    private final BufferedImage mistakeImage;
-
-    TobMistake(@NonNull String mistakeName, @NonNull String mistakeImagePath, @NonNull String chatMessage) {
-        this.mistakeName = mistakeName;
-        this.chatMessage = chatMessage;
-
-        this.mistakeImage = ImageUtil.loadImageResource(getClass(), mistakeImagePath);
+    @ConfigItem(
+            keyName = "showMistakesInChat",
+            name = "Show Mistakes In Chat",
+            description = "When a player makes a mistake in ToB, whether or not to put it in public chat for other " +
+                    "raiders who have the plugin to see.",
+            position = 1
+    )
+    default boolean showMistakesInChat() {
+        return true;
     }
 
-    public static boolean isRoomDeath(TobMistake mistake) {
-        return ROOM_DEATH_ENUMS.contains(mistake);
+    @ConfigItem(
+            keyName = "showMistakesOnOverheadText",
+            name = "Show Mistakes On Overhead Text",
+            description = "When a player makes a mistake in ToB, whether or not to show the overhead text for other " +
+                    "raiders who have the plugin to see.",
+            position = 2
+    )
+    default boolean showMistakesOnOverheadText() {
+        return true;
+    }
+}
+
+package com.tobmistaketracker.panel;
+
+import com.tobmistaketracker.TobMistake;
+import com.tobmistaketracker.state.MistakeStateManager;
+import lombok.Getter;
+import lombok.NonNull;
+import lombok.Value;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
+
+import javax.swing.ImageIcon;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.JPopupMenu;
+import javax.swing.SwingConstants;
+import javax.swing.border.EmptyBorder;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.GridLayout;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.List;
+
+public class PlayerMistakesBox extends JPanel {
+
+    private static final int ITEMS_PER_ROW = 5;
+
+    private final MistakeStateManager mistakeStateManager;
+
+    @NonNull
+    @Getter
+    private final String playerName;
+    private int totalMistakes;
+
+    private final JPanel mistakesContainer = new JPanel();
+    private final JLabel raidCountLabel;
+    private final JLabel mistakeCountLabel;
+
+    protected PlayerMistakesBox(MistakeStateManager mistakeStateManager, @NonNull String playerName) {
+        this.mistakeStateManager = mistakeStateManager;
+        this.playerName = playerName;
+
+        setLayout(new BorderLayout(0, 1));
+        setBorder(new EmptyBorder(5, 0, 0, 0));
+
+        final JPanel playerMistakesTitle = new JPanel(new BorderLayout(5, 0));
+        playerMistakesTitle.setBorder(new EmptyBorder(7, 7, 7, 7));
+        playerMistakesTitle.setBackground(ColorScheme.DARKER_GRAY_COLOR.darker());
+
+        final JLabel playerNameLabel = new JLabel(playerName); // e.g. Questing Pet
+        playerNameLabel.setFont(FontManager.getRunescapeSmallFont());
+        playerNameLabel.setForeground(Color.WHITE);
+        playerMistakesTitle.add(playerNameLabel, BorderLayout.WEST);
+
+        mistakeCountLabel = new JLabel(); // e.g. 78 Mistakes
+        mistakeCountLabel.setFont(FontManager.getRunescapeSmallFont());
+        mistakeCountLabel.setForeground(Color.LIGHT_GRAY);
+        mistakeCountLabel.setHorizontalAlignment(SwingConstants.RIGHT);
+        playerMistakesTitle.add(mistakeCountLabel, BorderLayout.CENTER);
+
+        raidCountLabel = new JLabel(); // e.g. (53 Raids)
+        raidCountLabel.setFont(FontManager.getRunescapeSmallFont());
+        raidCountLabel.setForeground(Color.GRAY);
+        playerMistakesTitle.add(raidCountLabel, BorderLayout.EAST);
+
+        add(playerMistakesTitle, BorderLayout.NORTH);
+        add(mistakesContainer, BorderLayout.CENTER);
+
+        // Create popup menu for resetting the player's mistakes
+        final JPopupMenu popupMenu = new JPopupMenu();
+        popupMenu.setBorder(new EmptyBorder(5, 5, 5, 5));
+        setComponentPopupMenu(popupMenu);
+    }
+
+    void rebuildAllMistakes(boolean isRaidDeaths) {
+        buildMistakes(isRaidDeaths);
+
+        final String mistakeString = totalMistakes == 1 ? "Mistake" : "Mistakes";
+        mistakeCountLabel.setText(String.format("%s %s", totalMistakes, mistakeString));
+
+        final int totalRaids = mistakeStateManager.getRaidCountForPlayer(playerName);
+        if (totalRaids > 0) {
+            final String raidString = totalRaids == 1 ? "Raid" : "Raids";
+            raidCountLabel.setText(String.format("(%s %s)", totalRaids, raidString));
+        }
+
+        validate();
+        repaint();
+    }
+
+    private void buildMistakes(boolean isRaidDeaths) {
+        totalMistakes = 0;
+        setVisible(true);
+
+        List<TobMistakeCount> mistakeCountsForPlayer = new ArrayList<>();
+        for (TobMistake mistake : TobMistake.values()) {
+            if (isRaidDeaths && TobMistake.isRoomDeath(mistake)) {
+                continue;
+            } else if (!isRaidDeaths && mistake == TobMistake.DEATH) {
+                continue;
+            }
+
+            int mistakeCount = mistakeStateManager.getMistakeCountForPlayer(playerName, mistake);
+            if (mistakeCount > 0) {
+                totalMistakes += mistakeCount;
+                mistakeCountsForPlayer.add(new TobMistakeCount(mistake, mistakeCount));
+            }
+        }
+
+        int numRows = calculateNumRows(mistakeCountsForPlayer.size());
+
+        mistakesContainer.removeAll();
+        mistakesContainer.setLayout(new GridLayout(numRows, ITEMS_PER_ROW, 1, 1));
+
+        for (int i = 0; i < numRows * ITEMS_PER_ROW; i++) {
+            // Create the panel for this mistake
+            final JPanel mistakeContainer = new JPanel(new BorderLayout(0, 0));
+            mistakeContainer.setMaximumSize(new Dimension(36, 32));
+            mistakeContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+            // If we still have mistakes to show for this row
+            if (i < mistakeCountsForPlayer.size()) {
+                TobMistakeCount mistakeCount = mistakeCountsForPlayer.get(i);
+
+                // Create the image label
+                final JLabel imageLabel = new JLabel();
+                imageLabel.setLayout(new BorderLayout(0, 0));
+                imageLabel.setToolTipText(mistakeCount.getTooltipText());
+                imageLabel.setVerticalAlignment(SwingConstants.CENTER);
+                imageLabel.setHorizontalAlignment(SwingConstants.CENTER);
+
+                BufferedImage mistakeImage = mistakeCount.getMistake().getMistakeImage();
+                imageLabel.setIcon(new ImageIcon(mistakeImage));
+
+                // Create the quantity label
+                final JLabel quantityLabel = new JLabel();
+                quantityLabel.setText(String.valueOf(mistakeCount.getCount()));
+                quantityLabel.setFont(FontManager.getRunescapeSmallFont());
+                quantityLabel.setForeground(Color.YELLOW);
+                quantityLabel.setVerticalAlignment(SwingConstants.BOTTOM);
+                quantityLabel.setHorizontalAlignment(SwingConstants.LEFT);
+
+                // Add them to the panel
+                imageLabel.add(quantityLabel, BorderLayout.NORTH); // Add the quantity to the image so it's on top of it
+                mistakeContainer.add(imageLabel);
+
+            }
+            mistakesContainer.add(mistakeContainer);
+        }
+
+        mistakesContainer.repaint();
+    }
+
+    private static int calculateNumRows(int numItems) {
+        return (int) Math.ceil((double) numItems / ITEMS_PER_ROW);
+    }
+
+    @Value
+    private static class TobMistakeCount {
+
+        TobMistake mistake;
+        int count;
+        String tooltipText;
+
+        TobMistakeCount(TobMistake mistake, int count) {
+            this.mistake = mistake;
+            this.count = count;
+            this.tooltipText = String.format("%s x %s", mistake.getMistakeName(), count);
+        }
     }
 }
 
@@ -1359,9 +2001,8 @@ public class TobMistakeTrackerPanel extends PluginPanel {
         leftTitleContainer.add(currentViewTitle, BorderLayout.WEST);
 
         // Create the switch view button
-        SwingUtil.removeButtonDecorations(switchMistakesViewBtn);
         switchMistakesViewBtn.setText(getSwitchMistakesViewButtonText());
-        switchMistakesViewBtn.setBackground(Color.WHITE);
+        switchMistakesViewBtn.setBackground(Color.DARK_GRAY);
         switchMistakesViewBtn.setBorder(new EmptyBorder(10, 10, 10, 10));
         switchMistakesViewBtn.setBorderPainted(true);
         switchMistakesViewBtn.setPreferredSize(new Dimension(100, 10));
@@ -1370,13 +2011,11 @@ public class TobMistakeTrackerPanel extends PluginPanel {
         switchMistakesViewBtn.addActionListener(e -> switchMistakesView());
         switchMistakesViewBtn.addMouseListener(new MouseAdapter() {
             public void mouseEntered(MouseEvent e) {
-                switchMistakesViewBtn.setForeground(Color.LIGHT_GRAY);
-                switchMistakesViewBtn.setBackground(Color.LIGHT_GRAY);
+                switchMistakesViewBtn.setBackground(Color.GRAY);
             }
 
             public void mouseExited(MouseEvent e) {
-                switchMistakesViewBtn.setForeground(Color.WHITE);
-                switchMistakesViewBtn.setBackground(Color.WHITE);
+                switchMistakesViewBtn.setBackground(Color.DARK_GRAY);
             }
         });
 
@@ -1700,176 +2339,46 @@ public class TobMistakeTrackerPanel extends PluginPanel {
     }
 }
 
-package com.tobmistaketracker.panel;
+package com.tobmistaketracker;
 
-import com.tobmistaketracker.TobMistake;
-import com.tobmistaketracker.state.MistakeStateManager;
+import lombok.AccessLevel;
 import lombok.Getter;
 import lombok.NonNull;
-import lombok.Value;
-import net.runelite.client.ui.ColorScheme;
-import net.runelite.client.ui.FontManager;
+import lombok.Setter;
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldPoint;
 
-import javax.swing.ImageIcon;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.JPopupMenu;
-import javax.swing.SwingConstants;
-import javax.swing.border.EmptyBorder;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.GridLayout;
-import java.awt.image.BufferedImage;
-import java.util.ArrayList;
-import java.util.List;
+/**
+ * Encapsulating class for a {@link Player} and other relevant metadata in a Tob raid.
+ */
+public class TobRaider {
 
-public class PlayerMistakesBox extends JPanel {
-
-    private static final int ITEMS_PER_ROW = 5;
-
-    private final MistakeStateManager mistakeStateManager;
-
-    @NonNull
     @Getter
-    private final String playerName;
-    private int totalMistakes;
+    @NonNull
+    private final Player player;
 
-    private final JPanel mistakesContainer = new JPanel();
-    private final JLabel raidCountLabel;
-    private final JLabel mistakeCountLabel;
+    @Getter
+    @Setter(AccessLevel.PACKAGE)
+    private WorldPoint previousWorldLocation;
 
-    protected PlayerMistakesBox(MistakeStateManager mistakeStateManager, @NonNull String playerName) {
-        this.mistakeStateManager = mistakeStateManager;
-        this.playerName = playerName;
+    @Getter
+    @Setter(AccessLevel.PACKAGE)
+    private WorldPoint previousWorldLocationForOverlay;
 
-        setLayout(new BorderLayout(0, 1));
-        setBorder(new EmptyBorder(5, 0, 0, 0));
+    @Getter
+    @Setter(AccessLevel.PACKAGE)
+    private boolean isDead;
 
-        final JPanel playerMistakesTitle = new JPanel(new BorderLayout(5, 0));
-        playerMistakesTitle.setBorder(new EmptyBorder(7, 7, 7, 7));
-        playerMistakesTitle.setBackground(ColorScheme.DARKER_GRAY_COLOR.darker());
-
-        final JLabel playerNameLabel = new JLabel(playerName); // e.g. Questing Pet
-        playerNameLabel.setFont(FontManager.getRunescapeSmallFont());
-        playerNameLabel.setForeground(Color.WHITE);
-        playerMistakesTitle.add(playerNameLabel, BorderLayout.WEST);
-
-        mistakeCountLabel = new JLabel(); // e.g. 78 Mistakes
-        mistakeCountLabel.setFont(FontManager.getRunescapeSmallFont());
-        mistakeCountLabel.setForeground(Color.LIGHT_GRAY);
-        mistakeCountLabel.setHorizontalAlignment(SwingConstants.RIGHT);
-        playerMistakesTitle.add(mistakeCountLabel, BorderLayout.CENTER);
-
-        raidCountLabel = new JLabel(); // e.g. (53 Raids)
-        raidCountLabel.setFont(FontManager.getRunescapeSmallFont());
-        raidCountLabel.setForeground(Color.GRAY);
-        playerMistakesTitle.add(raidCountLabel, BorderLayout.EAST);
-
-        add(playerMistakesTitle, BorderLayout.NORTH);
-        add(mistakesContainer, BorderLayout.CENTER);
-
-        // Create popup menu for resetting the player's mistakes
-        final JPopupMenu popupMenu = new JPopupMenu();
-        popupMenu.setBorder(new EmptyBorder(5, 5, 5, 5));
-        setComponentPopupMenu(popupMenu);
+    TobRaider(@NonNull Player player) {
+        this.player = player;
     }
 
-    void rebuildAllMistakes(boolean isRaidDeaths) {
-        buildMistakes(isRaidDeaths);
-
-        final String mistakeString = totalMistakes == 1 ? "Mistake" : "Mistakes";
-        mistakeCountLabel.setText(String.format("%s %s", totalMistakes, mistakeString));
-
-        final int totalRaids = mistakeStateManager.getRaidCountForPlayer(playerName);
-        if (totalRaids > 0) {
-            final String raidString = totalRaids == 1 ? "Raid" : "Raids";
-            raidCountLabel.setText(String.format("(%s %s)", totalRaids, raidString));
-        }
-
-        validate();
-        repaint();
+    public String getName() {
+        return player.getName();
     }
 
-    private void buildMistakes(boolean isRaidDeaths) {
-        totalMistakes = 0;
-        setVisible(true);
-
-        List<TobMistakeCount> mistakeCountsForPlayer = new ArrayList<>();
-        for (TobMistake mistake : TobMistake.values()) {
-            if (isRaidDeaths && TobMistake.isRoomDeath(mistake)) {
-                continue;
-            } else if (!isRaidDeaths && mistake == TobMistake.DEATH) {
-                continue;
-            }
-
-            int mistakeCount = mistakeStateManager.getMistakeCountForPlayer(playerName, mistake);
-            if (mistakeCount > 0) {
-                totalMistakes += mistakeCount;
-                mistakeCountsForPlayer.add(new TobMistakeCount(mistake, mistakeCount));
-            }
-        }
-
-        int numRows = calculateNumRows(mistakeCountsForPlayer.size());
-
-        mistakesContainer.removeAll();
-        mistakesContainer.setLayout(new GridLayout(numRows, ITEMS_PER_ROW, 1, 1));
-
-        for (int i = 0; i < numRows * ITEMS_PER_ROW; i++) {
-            // Create the panel for this mistake
-            final JPanel mistakeContainer = new JPanel(new BorderLayout(0, 0));
-            mistakeContainer.setMaximumSize(new Dimension(36, 32));
-            mistakeContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-
-            // If we still have mistakes to show for this row
-            if (i < mistakeCountsForPlayer.size()) {
-                TobMistakeCount mistakeCount = mistakeCountsForPlayer.get(i);
-
-                // Create the image label
-                final JLabel imageLabel = new JLabel();
-                imageLabel.setLayout(new BorderLayout(0, 0));
-                imageLabel.setToolTipText(mistakeCount.getTooltipText());
-                imageLabel.setVerticalAlignment(SwingConstants.CENTER);
-                imageLabel.setHorizontalAlignment(SwingConstants.CENTER);
-
-                BufferedImage mistakeImage = mistakeCount.getMistake().getMistakeImage();
-                imageLabel.setIcon(new ImageIcon(mistakeImage));
-
-                // Create the quantity label
-                final JLabel quantityLabel = new JLabel();
-                quantityLabel.setText(String.valueOf(mistakeCount.getCount()));
-                quantityLabel.setFont(FontManager.getRunescapeSmallFont());
-                quantityLabel.setForeground(Color.YELLOW);
-                quantityLabel.setVerticalAlignment(SwingConstants.BOTTOM);
-                quantityLabel.setHorizontalAlignment(SwingConstants.LEFT);
-
-                // Add them to the panel
-                imageLabel.add(quantityLabel, BorderLayout.NORTH); // Add the quantity to the image so it's on top of it
-                mistakeContainer.add(imageLabel);
-
-            }
-            mistakesContainer.add(mistakeContainer);
-        }
-
-        mistakesContainer.repaint();
-    }
-
-    private static int calculateNumRows(int numItems) {
-        return (int) Math.ceil((double) numItems / ITEMS_PER_ROW);
-    }
-
-    @Value
-    private static class TobMistakeCount {
-
-        TobMistake mistake;
-        int count;
-        String tooltipText;
-
-        TobMistakeCount(TobMistake mistake, int count) {
-            this.mistake = mistake;
-            this.count = count;
-            this.tooltipText = String.format("%s x %s", mistake.getMistakeName(), count);
-        }
+    public WorldPoint getCurrentWorldLocation() {
+        return player.getWorldLocation();
     }
 }
 
@@ -1922,7 +2431,7 @@ import java.util.Set;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
-import static net.runelite.api.widgets.WidgetID.TOB_GROUP_ID;
+import static net.runelite.api.widgets.InterfaceID.TOB;
 
 @Singleton
 @Slf4j
@@ -2078,7 +2587,8 @@ public class TobMistakeTrackerPlugin extends Plugin {
                     raider.setDead(true);
                 }
 
-                addMistakeForPlayer(raider.getName(), mistake);
+                TobMistake mistakeForTracking = TobMistake.getMistakeForTracking(mistake);
+                addMistakeForPlayer(raider.getName(), mistakeForTracking);
                 addChatMessageForPlayerMistake(raider.getPlayer(), mistake);
             }
         }
@@ -2261,7 +2771,7 @@ public class TobMistakeTrackerPlugin extends Plugin {
      * @return The text shown on the screen from the tob widget when entering a new room, or empty string if none
      */
     public static String getTobRoomEnterText(final Client client) {
-        Widget widget = client.getWidget(TOB_GROUP_ID, TOB_BOSS_INTERFACE_ID);
+        Widget widget = client.getWidget(TOB, TOB_BOSS_INTERFACE_ID);
         if (widget != null && widget.getChild(TOB_BOSS_INTERFACE_TEXT_ID) != null) {
             Widget childWidget = widget.getChild(TOB_BOSS_INTERFACE_TEXT_ID);
             return childWidget.getText();
@@ -2276,379 +2786,15 @@ public class TobMistakeTrackerPlugin extends Plugin {
     }
 }
 
-package com.tobmistaketracker.state;
+package com.tobmistaketracker;
 
-import com.tobmistaketracker.TobMistake;
-import lombok.Getter;
-import lombok.NonNull;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
 
-import java.util.HashMap;
-import java.util.Map;
+public class TobMistakeTrackerPluginTest {
 
-/**
- * Encapsulating class for relevant tracking information for a player, including mistakes.
- */
-public class PlayerTrackingInfo {
-
-    @NonNull
-    @Getter
-    private final String playerName;
-    @NonNull
-    @Getter
-    private final Map<TobMistake, Integer> mistakes;
-    @Getter
-    private int raidCount;
-
-    public PlayerTrackingInfo(@NonNull final String playerName) {
-        this.playerName = playerName;
-        this.mistakes = new HashMap<>();
-        this.raidCount = 1; // Default raid count is 1 since just by creating this object it's assumed there's a raid
-    }
-
-    public void incrementMistake(TobMistake mistake) {
-        mistakes.compute(mistake, PlayerTrackingInfo::increment);
-    }
-
-    public void incrementRaidCount() {
-        raidCount++;
-    }
-
-    public boolean hasMistakes() {
-        return !mistakes.isEmpty();
-    }
-
-    private static <T> Integer increment(T key, Integer oldValue) {
-        return oldValue == null ? 1 : oldValue + 1;
-    }
-}
-
-package com.tobmistaketracker.state;
-
-import com.google.gson.Gson;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.http.api.RuneLiteAPI;
-
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import java.io.BufferedWriter;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-
-import static com.tobmistaketracker.state.MistakeStateUtil.getMistakeStateDir;
-import static com.tobmistaketracker.state.MistakeStateUtil.getMistakeStateFilePath;
-
-/**
- * Writes MistakeState to disk
- */
-@Slf4j
-@Singleton
-public class MistakeStateWriter {
-
-    private static final Gson GSON = RuneLiteAPI.GSON;
-
-    private final Path mistakeStateDir;
-    private final Path mistakeStateFilePath;
-
-    @Inject
-    public MistakeStateWriter(@Named("developerMode") boolean developerMode) {
-        this.mistakeStateDir = getMistakeStateDir();
-        this.mistakeStateFilePath = getMistakeStateFilePath(developerMode);
-    }
-
-    public void write(MistakeStateManager mistakeStateManager) {
-        try {
-            Files.createDirectories(mistakeStateDir);
-        } catch (IOException e) {
-            log.error("Unable to create directories " + mistakeStateDir, e);
-            return;
-        }
-
-        final Path filepath = mistakeStateFilePath;
-        try (BufferedWriter writer = Files.newBufferedWriter(filepath)) {
-            writer.write(GSON.toJson(mistakeStateManager));
-        } catch (IOException e) {
-            log.error("Unable to write mistake state to " + filepath, e);
-        }
-    }
-}
-package com.tobmistaketracker.state;
-
-import com.tobmistaketracker.TobMistake;
-
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Set;
-import java.util.stream.Collectors;
-
-/**
- * Keeps track of mistakes for players
- */
-class MistakeManager {
-
-    private final Map<String, PlayerTrackingInfo> trackingInfo;
-    private int trackedRaids;
-
-    MistakeManager() {
-        trackingInfo = new HashMap<>();
-        trackedRaids = 0;
-    }
-
-    public void clearAllMistakes() {
-        trackingInfo.clear();
-        trackedRaids = 0;
-    }
-
-    public void addMistakeForPlayer(String playerName, TobMistake mistake) {
-        PlayerTrackingInfo playerInfo = trackingInfo.computeIfAbsent(playerName,
-                k -> new PlayerTrackingInfo(playerName));
-        playerInfo.incrementMistake(mistake);
-    }
-
-    public void newRaid(Set<String> playerNames) {
-        trackedRaids++;
-
-        for (String playerName : playerNames) {
-            PlayerTrackingInfo playerInfo = trackingInfo.get(playerName);
-            if (playerInfo != null) {
-                playerInfo.incrementRaidCount();
-            } else {
-                trackingInfo.put(playerName, new PlayerTrackingInfo(playerName));
-            }
-        }
-    }
-
-    public void removeAllMistakesForPlayer(String playerName) {
-        trackingInfo.remove(playerName);
-    }
-
-    public Set<String> getPlayersWithMistakes() {
-        return trackingInfo.values().stream()
-                .filter(PlayerTrackingInfo::hasMistakes)
-                .map(PlayerTrackingInfo::getPlayerName)
-                .collect(Collectors.toSet());
-    }
-
-    public int getMistakeCountForPlayer(String playerName, TobMistake mistake) {
-        PlayerTrackingInfo playerInfo = trackingInfo.get(playerName);
-        if (playerInfo != null) {
-            Integer count = playerInfo.getMistakes().get(mistake);
-            if (count != null) {
-                return count;
-            }
-        }
-
-        return 0;
-    }
-
-    public int getTotalMistakeCountForAllPlayers() {
-        int totalMistakes = 0;
-        for (PlayerTrackingInfo playerInfo : trackingInfo.values()) {
-            for (int mistakes : playerInfo.getMistakes().values()) {
-                totalMistakes += mistakes;
-            }
-        }
-
-        return totalMistakes;
-    }
-
-    public int getRaidCountForPlayer(String playerName) {
-        PlayerTrackingInfo playerInfo = trackingInfo.get(playerName);
-        if (playerInfo != null) {
-            return playerInfo.getRaidCount();
-        }
-
-        return 0;
-    }
-
-    public int getTrackedRaids() {
-        return trackedRaids;
-    }
-}
-
-package com.tobmistaketracker.state;
-
-import com.tobmistaketracker.TobMistake;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-
-import javax.inject.Singleton;
-import java.util.Set;
-
-/**
- * In charge of the different MistakeManagers, and knowing which one is the currently viewed one.
- * <p>
- * For now, these are very small and writes are relatively infrequent, so let's write to disk for every write API.
- */
-@Slf4j
-@Singleton
-public class MistakeStateManager {
-
-    private final MistakeManager currentRaidMistakeManager;
-    private final MistakeManager allRaidsMistakeManager;
-
-    private transient boolean isAll;
-    @Setter
-    private transient MistakeStateWriter mistakeStateWriter;
-
-    public MistakeStateManager(MistakeStateWriter mistakeStateWriter) {
-        this.currentRaidMistakeManager = new MistakeManager();
-        this.allRaidsMistakeManager = new MistakeManager();
-        this.mistakeStateWriter = mistakeStateWriter;
-
-        this.isAll = false;
-    }
-
-    public void addMistakeForPlayer(String playerName, TobMistake mistake) {
-        // Always add to both
-        currentRaidMistakeManager.addMistakeForPlayer(playerName, mistake);
-        allRaidsMistakeManager.addMistakeForPlayer(playerName, mistake);
-
-        mistakeStateWriter.write(this);
-    }
-
-    public void removeAllMistakesForPlayer(String playerName) {
-        // Always remove from both
-        currentRaidMistakeManager.removeAllMistakesForPlayer(playerName);
-        allRaidsMistakeManager.removeAllMistakesForPlayer(playerName);
-
-        mistakeStateWriter.write(this);
-    }
-
-    public void resetAll() {
-        // Always clear from both
-        currentRaidMistakeManager.clearAllMistakes();
-        allRaidsMistakeManager.clearAllMistakes();
-
-        mistakeStateWriter.write(this);
-    }
-
-    public void newRaid(Set<String> playerNames) {
-        // Clear just the current mistakes
-        currentRaidMistakeManager.clearAllMistakes();
-
-        // Denote to the manager that there's a new raid, incrementing the raid count for all players in this raid
-        // Raid count for current raid isn't valid, so only do for all raids
-        allRaidsMistakeManager.newRaid(playerNames);
-
-        mistakeStateWriter.write(this);
-    }
-
-    public Set<String> getPlayersWithMistakes() {
-        return isAll ?
-                allRaidsMistakeManager.getPlayersWithMistakes() :
-                currentRaidMistakeManager.getPlayersWithMistakes();
-    }
-
-    public int getMistakeCountForPlayer(String playerName, TobMistake mistake) {
-        return isAll ?
-                allRaidsMistakeManager.getMistakeCountForPlayer(playerName, mistake) :
-                currentRaidMistakeManager.getMistakeCountForPlayer(playerName, mistake);
-    }
-
-    public int getTotalMistakeCountForAllPlayers() {
-        return isAll ?
-                allRaidsMistakeManager.getTotalMistakeCountForAllPlayers() :
-                currentRaidMistakeManager.getTotalMistakeCountForAllPlayers();
-    }
-
-    public int getRaidCountForPlayer(String playerName) {
-        return isAll ? allRaidsMistakeManager.getRaidCountForPlayer(playerName) :
-                0; // Raid count for current raid isn't valid, so return 0
-    }
-
-    public int getTrackedRaids() {
-        return isAll ? allRaidsMistakeManager.getTrackedRaids() :
-                1; // Tracked raids for current raid is always just the 1 raid
-    }
-
-    public void switchMistakes() {
-        isAll = !isAll;
-    }
-}
-package com.tobmistaketracker.state;
-
-import java.nio.file.Path;
-
-import static net.runelite.client.RuneLite.RUNELITE_DIR;
-
-public class MistakeStateUtil {
-
-    private static final Path MISTAKE_STATE_DIR = RUNELITE_DIR.toPath().resolve("tob-mistake-tracker");
-
-    // Use the same mistake state file regardless of user
-    private static final String MISTAKE_STATE_FILE_NAME = "mistake-state.txt";
-
-    private static final String DEVELOPER_MODE_PREFIX = "dev-";
-
-    static Path getMistakeStateDir() {
-        return MISTAKE_STATE_DIR;
-    }
-
-    static Path getMistakeStateFilePath(boolean developerMode) {
-        final String filename;
-        if (developerMode) {
-            filename = DEVELOPER_MODE_PREFIX + MISTAKE_STATE_FILE_NAME;
-        } else {
-            filename = MISTAKE_STATE_FILE_NAME;
-        }
-
-        return getMistakeStateDir().resolve(filename);
-    }
-}
-
-package com.tobmistaketracker.state;
-
-import com.google.gson.Gson;
-import com.google.gson.JsonSyntaxException;
-import com.google.gson.stream.JsonReader;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.http.api.RuneLiteAPI;
-
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import java.io.BufferedReader;
-import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Path;
-
-import static com.tobmistaketracker.state.MistakeStateUtil.getMistakeStateFilePath;
-
-/**
- * Reads MistakeState from disk
- */
-@Slf4j
-@Singleton
-public class MistakeStateReader {
-
-    private static final Gson GSON = RuneLiteAPI.GSON;
-
-    private final MistakeStateWriter mistakeStateWriter;
-    private final Path mistakeStateFilePath;
-
-    @Inject
-    public MistakeStateReader(MistakeStateWriter mistakeStateWriter, @Named("developerMode") boolean developerMode) {
-        this.mistakeStateWriter = mistakeStateWriter;
-        this.mistakeStateFilePath = getMistakeStateFilePath(developerMode);
-    }
-
-    public MistakeStateManager read() {
-        if (Files.exists(mistakeStateFilePath)) {
-            try (BufferedReader reader = Files.newBufferedReader(mistakeStateFilePath);
-                 JsonReader jsonReader = new JsonReader(reader)) {
-                MistakeStateManager mistakeStateManager = GSON.fromJson(jsonReader, MistakeStateManager.class);
-                if (mistakeStateManager == null) {
-                    return new MistakeStateManager(mistakeStateWriter);
-                }
-                mistakeStateManager.setMistakeStateWriter(mistakeStateWriter);
-                return mistakeStateManager;
-            } catch (IOException | JsonSyntaxException e) {
-                log.error("Unable to read mistake state from " + mistakeStateFilePath, e);
-            }
-        }
-
-        return new MistakeStateManager(mistakeStateWriter);
+    public static void main(String[] args) throws Exception {
+        ExternalPluginManager.loadBuiltin(TobMistakeTrackerPlugin.class);
+        RuneLite.main(args);
     }
 }
