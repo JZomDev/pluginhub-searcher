@@ -5,12 +5,15 @@ import com.groupstoragereminder.GroupStorageReminderConfig.IconOptions;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.GameState;
 import net.runelite.api.Item;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.ItemContainer;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
@@ -33,6 +36,7 @@ import net.runelite.api.widgets.WidgetItem;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.MenuEntryAdded;
 import net.runelite.api.MenuAction;
+import net.runelite.api.Player;
 
 import java.awt.Color;
 import java.awt.Dimension;
@@ -166,9 +170,27 @@ public class GroupStorageReminderPlugin extends Plugin
     return false;
   }
 
+  public boolean isGroupIronman = false;
+  public boolean checkedGroupIronman = false;
+
+  @Subscribe
+  public void onGameStateChanged(GameStateChanged gameStateChanged) {
+    GameState gameState = gameStateChanged.getGameState();
+    if (gameState == GameState.LOGGED_IN) {
+      checkedGroupIronman = false;
+    }
+  }
+
   @Subscribe
   public void onWidgetLoaded(WidgetLoaded event)
   {
+    if (!checkedGroupIronman) {
+      int ironmanStatus = client.getVarbitValue(VarbitID.IRONMAN);
+      isGroupIronman = ironmanStatus >= 4 && ironmanStatus <= 6;
+      checkedGroupIronman = true;
+    }
+    if (!isGroupIronman) return;
+
     if (event.getGroupId() == InterfaceID.BANKMAIN)
     {
       bankIsOpen = true;
@@ -190,6 +212,7 @@ public class GroupStorageReminderPlugin extends Plugin
   @Subscribe
   public void onItemContainerChanged(ItemContainerChanged event)
   {
+    if (!isGroupIronman) return;
     if (event.getContainerId() == InventoryID.BANK)
     {
       checkBankContainsItems();
@@ -218,8 +241,7 @@ public class GroupStorageReminderPlugin extends Plugin
   public void onMenuEntryAdded(MenuEntryAdded event)
   {
     // Only add menu entries if group storage is open
-    if (!groupStorageIsOpen)
-      return;
+    if (!isGroupIronman || !groupStorageIsOpen) return;
 
     // Get the item id
     if (event.getItemId() <= 0 || (event.getOption() != null && !event.getOption().equalsIgnoreCase("Examine")))
@@ -357,6 +379,7 @@ public class GroupStorageReminderPlugin extends Plugin
 
   void saveItems()
   {
+    if (!isGroupIronman) return;
     config.setStoredInventory(String.join(",", itemsOnPlayer));
     config.setStoredBank(String.join(",", itemsInBank));
   }
@@ -399,6 +422,8 @@ public class GroupStorageReminderPlugin extends Plugin
     @Override
     public Dimension render(Graphics2D graphics)
     {
+      if (!plugin.isGroupIronman) return null;
+
       if (
         !plugin.logoutSwitcherOpen &&
         !plugin.bankIsOpen &&
@@ -490,6 +515,7 @@ public class GroupStorageReminderPlugin extends Plugin
       @Override
       public void renderItemOverlay(Graphics2D graphics, int itemId, WidgetItem item)
       {
+        if (!plugin.isGroupIronman) return;
         loadIcon();
         if (shouldShowImage(itemId))
         {
