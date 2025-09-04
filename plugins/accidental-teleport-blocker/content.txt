@@ -1,0 +1,583 @@
+package com.AccidentalTeleportBlocker;
+
+import net.runelite.client.config.*;
+
+@ConfigGroup("AccidentalTeleportBlocker")
+public interface AccidentalTeleportBlockerPluginConfig extends Config
+{
+    enum ModifierKey { CTRL, SHIFT }
+
+
+
+    // ─────────────────────── General Settings ───────────────────────
+    @ConfigSection(
+            name = "General settings",
+            description = "General settings",
+            position = 0
+    )
+    String generalSettingsSection = "generalSettings";
+
+    @ConfigItem(
+            keyName = "",
+            name = "<html><div style='width:171px; text-align:center; color: white'>"
+                    + "Use SHIFT + RIGHT-CLICK on any teleport spell in any spellbook to start blocking specific teleports!<br>"
+                    + "</div></html>",
+            description = "",
+            position = 0,
+            section = generalSettingsSection
+    )
+    default void generalExplanationLabel() {
+    }
+
+    @ConfigItem(
+            keyName = "enableModifierKey",
+            name = "Require modifier key",
+            description = "Allow pressing a modifier key to bypass the block",
+            section = generalSettingsSection,
+            position = 1
+    )
+    default boolean enableModifierKey() { return true; }
+
+    @ConfigItem(
+            keyName = "modifierKey",
+            name = "Modifier key",
+            description = "Hold this key while left clicking to teleport",
+            section = generalSettingsSection,
+            position = 2
+    )
+    default ModifierKey modifierKey() { return ModifierKey.CTRL; }
+
+    @ConfigItem(
+            keyName = "allowRightClickWithoutModifier",
+            name = "Allow right-click casting",
+            description = "If enabled, casting from the right-click menu is always allowed",
+            section = generalSettingsSection,
+            position = 3
+    )
+    default boolean allowRightClickWithoutModifier() { return true; }
+
+    // ─────────────────────── Spell activation settings ───────────────────────
+    @ConfigSection(
+            name = "Spell activation settings",
+            description = "Settings to only block teleports after casting certain spells",
+            position = 1
+    )
+    String activationSection = "activationDelay";
+
+    @ConfigItem(
+            keyName = "",
+            name = "<html><div style='width:171px; text-align:center; color: white'>"
+                    + "Use SHIFT + RIGHT-CLICK on any non-teleport spell in any spellbook to add a trigger!<br>"
+                    + "</div></html>",
+            description = "",
+            position = 0,
+            section = activationSection
+    )
+    default void spellActivationExplanationLabel() {
+    }
+
+    @ConfigItem(
+            keyName = "enableSpellTriggerList",
+            name = "Enable spell list",
+            description = "When enabled, teleports are only blocked if you cast any spell from the custom list within the last X seconds.",
+            section = activationSection,
+            position = 1
+    )
+    default boolean enableCustomTriggerSpells() { return false; }
+
+    @ConfigItem(
+            keyName = "customTriggerSpells",
+            name = "Spell list",
+            description = "Comma-separated list of spell names that will trigger the block delay window. Can also be modified through the spellbook shift + right-click menu.",
+            section = activationSection,
+            position = 2
+    )
+    default String customTriggerSpells() { return "high level alchemy, low level alchemy"; }
+
+    @Range(min = 1, max = 600)
+    @Units(Units.SECONDS)
+    @ConfigItem(
+            keyName = "activationDelaySeconds",
+            name = "Unblock delay",
+            description = "How long should teleports be blocked for after a cast?",
+            section = activationSection,
+            position = 3
+    )
+    default int activationDelaySeconds() { return 5; }
+}
+
+package com.AccidentalTeleportBlocker;
+
+import com.google.inject.Provides;
+import net.runelite.api.*;
+import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.StatChanged;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.menus.MenuManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+
+import javax.inject.Inject;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * 30-08-2025 - Nobodycalled - Initial release
+ * 31-08-2025 - Nobodycalled - Added support for custom trigger spells
+ * <p>
+ * RuneLite plugin that prevents accidental teleport usage by requiring a modifier key
+ * or by only blocking teleports for a limited time after casting specific trigger spells.
+ * Features:
+ * - Block teleport spells unless a modifier key (CTRL/SHIFT) is held
+ * - Allow users to manage which teleports are blocked per spellbook
+ * - Optionally only block teleports for X seconds after casting custom trigger spells
+ * - Case-insensitive, comma-separated list of trigger spells configurable by user
+ */
+@PluginDescriptor(
+        name = "Accidental Teleport Blocker"
+)
+public class AccidentalTeleportBlockerPlugin extends Plugin {
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private AccidentalTeleportBlockerPluginConfig config;
+
+    @Inject
+    private ConfigManager configManager;
+
+    @Inject
+    private MenuManager menuManager;
+
+    private volatile Instant lastCustomSpellCastAt = null;
+
+    private volatile String pendingSpellName = null;
+
+    private static final String BLOCKED_TELEPORTS_KEY_PREFIX = "blockedTeleports_";
+
+    private final Map<String, Set<String>> blockedTeleportsPerSpellbook = new HashMap<>();
+    private final Set<String> customTriggerSpells = new HashSet<>();
+
+    private static final String STANDARD_SPELLBOOK = "standard";
+    private static final String ANCIENT_SPELLBOOK = "ancient";
+    private static final String LUNAR_SPELLBOOK = "lunar";
+    private static final String ARCEUUS_SPELLBOOK = "arceuus";
+
+    /**
+     * Maps base teleport names to their alternative names/locations
+     */
+    private static final Map<String, Set<String>> TELEPORT_GROUPS = Map.of(
+            "varrock teleport", Set.of("grand exchange"),
+            "teleport to house", Set.of("outside"),
+            "camelot teleport", Set.of("seers"),
+            "watchtower teleport", Set.of("yanille")
+    );
+
+    private String getBaseTeleportName(String teleportName) {
+        String lower = teleportName.toLowerCase();
+
+        // Check if this teleport name matches any of the alternative names
+        for (Map.Entry<String, Set<String>> entry : TELEPORT_GROUPS.entrySet()) {
+            if (entry.getValue().stream().anyMatch(lower::contains)) {
+                return entry.getKey(); // Return the base name instead of the alternative
+            }
+        }
+
+        return lower; // No grouping needed, return as-is
+    }
+
+    @Override
+    protected void startUp() {
+        loadBlockedTeleports();
+        loadCustomTriggerSpells();
+    }
+
+    @Override
+    protected void shutDown() {
+
+        lastCustomSpellCastAt = null;
+
+        blockedTeleportsPerSpellbook.clear();
+        customTriggerSpells.clear();
+    }
+
+    private void loadBlockedTeleports() {
+        for (String spellbook : new String[]{STANDARD_SPELLBOOK, ANCIENT_SPELLBOOK, LUNAR_SPELLBOOK, ARCEUUS_SPELLBOOK}) {
+            String blocked = configManager.getConfiguration("AccidentalTeleportBlocker", BLOCKED_TELEPORTS_KEY_PREFIX + spellbook);
+            Set<String> blockedSet = new HashSet<>();
+
+            if (blocked != null && !blocked.isEmpty()) {
+                for (String s : blocked.split(",")) {
+                    blockedSet.add(s.trim().toLowerCase());
+                }
+            }
+
+            blockedTeleportsPerSpellbook.put(spellbook, blockedSet);
+        }
+    }
+
+    private void loadCustomTriggerSpells() {
+        customTriggerSpells.clear();
+        String spellList = config.customTriggerSpells();
+
+        if (spellList != null && !spellList.trim().isEmpty()) {
+            String[] spells = spellList.split(",");
+            for (String spell : spells) {
+                customTriggerSpells.add(spell.trim().toLowerCase());
+            }
+        }
+    }
+
+    private void saveBlockedTeleports() {
+        for (Map.Entry<String, Set<String>> entry : blockedTeleportsPerSpellbook.entrySet()) {
+            String spellbook = entry.getKey();
+            Set<String> teleports = entry.getValue();
+
+            configManager.setConfiguration("AccidentalTeleportBlocker", BLOCKED_TELEPORTS_KEY_PREFIX + spellbook, String.join(",", teleports));
+        }
+    }
+
+    @Subscribe
+    public void onMenuEntryAdded(MenuEntryAdded event) {
+        if (!client.isKeyPressed(KeyCode.KC_SHIFT)) return;
+
+        String option = event.getOption();
+        String target = event.getTarget();
+        String spellName = getSpellNameFromTarget(target);
+
+        if (!option.equals("Cast")) {
+            return;
+        }
+
+        if (isTeleportSpellOption(target)) { // Teleport spells
+            String baseTeleport = getBaseTeleportName(spellName);
+            boolean blocked = isBlockedTeleport(baseTeleport);
+
+            String menuText = blocked ? "Disable block" : "Enable block";
+
+            client.getMenu().createMenuEntry(-1)
+                    .setOption(menuText)
+                    .setTarget(target)
+                    .setType(MenuAction.RUNELITE)
+                    .onClick(e -> {
+                        if (blocked) {
+                            unblockTeleport(baseTeleport);
+                        } else {
+                            blockTeleport(baseTeleport);
+                        }
+                        saveBlockedTeleports();
+                    });
+        } else { // All other spells
+            loadCustomTriggerSpells();
+
+            boolean isAlreadyTrigger = customTriggerSpells.contains(spellName);
+            String menuText = isAlreadyTrigger ? "Remove block trigger" : "Add block trigger";
+
+            client.getMenu().createMenuEntry(-1)
+                    .setOption(menuText)
+                    .setTarget(target)
+                    .setType(MenuAction.RUNELITE)
+                    .onClick(e -> {
+                        if (isAlreadyTrigger) {
+                            removeFromCustomTriggerSpells(spellName);
+                        } else {
+                            addToCustomTriggerSpells(spellName);
+                        }
+                    });
+        }
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked event) {
+        String option = event.getMenuOption();
+        String target = event.getMenuTarget();
+
+        if (config.enableCustomTriggerSpells()) {
+            if (option.equals("Cast")) {
+                pendingSpellName = getSpellNameFromTarget(target);
+            } else {
+                pendingSpellName = null;
+            }
+        }
+
+        // Only process teleport-related menu clicks from here
+        if (!isTeleportSpellOption(target)) {
+            return;
+        }
+
+        // Handle our custom "Enable/Disable block" menu options
+        if (option.equals("Enable block") || option.equals("Disable block")) {
+            String teleport = getSpellNameFromTarget(target);
+            String baseTeleport = getBaseTeleportName(teleport);
+
+            if (option.equals("Enable block")) {
+                blockTeleport(baseTeleport);
+            } else {
+                unblockTeleport(baseTeleport);
+            }
+
+            saveBlockedTeleports();
+            event.consume();
+            return;
+        }
+
+        if (event.getMenuAction() != MenuAction.CC_OP && event.getMenuAction() != MenuAction.CC_OP_LOW_PRIORITY) {
+            return;
+        }
+
+        // Don't process un-blocked teleports
+        if (!isBlockedTeleportTarget(target)) {
+            return;
+        }
+
+        // Allow to right-click menu casting if configured
+        if (config.allowRightClickWithoutModifier() && client.isMenuOpen()) {
+            return;
+        }
+
+        boolean shouldBlock = false;
+
+        if (config.enableCustomTriggerSpells()) {
+            if (lastCustomSpellCastAt != null) {
+                long sinceCustomSpell = Duration.between(lastCustomSpellCastAt, Instant.now()).getSeconds();
+                shouldBlock = sinceCustomSpell <= config.activationDelaySeconds();
+            }
+        } else {
+            shouldBlock = true;
+        }
+
+        if (!shouldBlock) {
+            return;
+        }
+
+        // Early return if modifier key bypass is disabled
+        if (!config.enableModifierKey()) {
+            event.consume();
+            String blockedMessage = "ATB: This teleport is being blocked";
+
+            if (config.enableCustomTriggerSpells() && lastCustomSpellCastAt != null) {
+                long sinceCustomSpell = Duration.between(lastCustomSpellCastAt, Instant.now()).getSeconds();
+                long remainingCustomSpell = config.activationDelaySeconds() - sinceCustomSpell;
+
+                if (remainingCustomSpell >= 0) {
+                    blockedMessage += getSecondsMessage((int) remainingCustomSpell, "please wait");
+                }
+            }
+
+            blockedMessage += "!";
+            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", blockedMessage, null);
+
+            return;
+        }
+
+        boolean modifierHeld;
+        String keyName;
+
+        switch (config.modifierKey()) {
+            case SHIFT:
+                modifierHeld = client.isKeyPressed(KeyCode.KC_SHIFT);
+                keyName = "SHIFT";
+                break;
+            case CTRL:
+            default:
+                modifierHeld = client.isKeyPressed(KeyCode.KC_CONTROL);
+                keyName = "CTRL";
+                break;
+        }
+
+        // Block the teleport if modifier key is not held
+        if (!modifierHeld) {
+            event.consume();
+            String blockedMessage = "ATB: Hold " + keyName + " to use this teleport";
+
+            if (config.enableCustomTriggerSpells() && lastCustomSpellCastAt != null) {
+                long sinceCustomSpell = Duration.between(lastCustomSpellCastAt, Instant.now()).getSeconds();
+                long remainingCustomSpell = config.activationDelaySeconds() - sinceCustomSpell;
+
+                if (remainingCustomSpell >= 0) {
+                    blockedMessage += getSecondsMessage((int) remainingCustomSpell, "or wait");
+                }
+            }
+
+            blockedMessage += "!";
+            client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", blockedMessage, null);
+        }
+    }
+
+    @Subscribe
+    public void onStatChanged(StatChanged event) {
+        // Check if a custom trigger spell was just cast and if any magic xp was gained (not 100% accurate but close enough)
+        if (pendingSpellName != null && event.getSkill() == Skill.MAGIC) {
+            if (isCustomTriggerSpell(pendingSpellName)) {
+                lastCustomSpellCastAt = Instant.now();
+            }
+
+            pendingSpellName = null;
+        }
+    }
+
+    private String getSecondsMessage(Integer remaining, String prefix) {
+        String secondsString = " seconds";
+
+        if (remaining <= 0) {
+            remaining = 1;
+        }
+
+        if (remaining == 1) secondsString = " second";
+
+        return " " + prefix + " " + remaining + secondsString;
+    }
+
+    private boolean isTeleportSpellOption(String target) {
+        String tgt = target.toLowerCase().replaceAll("<.*?>", "").replaceAll("[^a-z ]", "").trim();
+
+        return tgt.contains("teleport") || tgt.contains("tele group");
+    }
+
+    private String getSpellNameFromTarget(String target) {
+        return target.toLowerCase().replaceAll("<.*?>", "").replaceAll("[^a-z ]", "").trim();
+    }
+
+    private boolean isCustomTriggerSpell(String spellName) {
+        loadCustomTriggerSpells();
+
+        return customTriggerSpells.stream().anyMatch(triggerSpell ->
+                spellName.contains(triggerSpell) || triggerSpell.contains(spellName)
+        );
+    }
+
+    private String getCurrentSpellbook() {
+        int spellbookVar = client.getVarbitValue(4070); // Spellbook varbit from the game
+
+        switch (spellbookVar) {
+            case 1:
+                return ANCIENT_SPELLBOOK;
+            case 2:
+                return LUNAR_SPELLBOOK;
+            case 3:
+                return ARCEUUS_SPELLBOOK;
+            default:
+                return STANDARD_SPELLBOOK;
+        }
+    }
+
+    private boolean isBlockedTeleport(String baseTeleport) {
+        String currentSpellbook = getCurrentSpellbook();
+        Set<String> spellbookBlockedTeleports = blockedTeleportsPerSpellbook.get(currentSpellbook);
+
+        if (spellbookBlockedTeleports == null) {
+            return false;
+        }
+
+        // Direct match
+        if (spellbookBlockedTeleports.contains(baseTeleport)) {
+            return true;
+        }
+
+        // Grouped teleports
+        return TELEPORT_GROUPS.entrySet().stream()
+                .anyMatch(entry -> {
+                    boolean keyBlocked = spellbookBlockedTeleports.contains(entry.getKey());
+                    boolean containsTarget = entry.getValue().stream().anyMatch(baseTeleport::contains);
+                    return keyBlocked && containsTarget;
+                });
+    }
+
+    private void blockTeleport(String baseTeleport) {
+        String currentSpellbook = getCurrentSpellbook();
+        Set<String> spellbookBlockedTeleports = blockedTeleportsPerSpellbook.get(currentSpellbook);
+
+        if (spellbookBlockedTeleports != null) {
+            spellbookBlockedTeleports.add(baseTeleport);
+        }
+    }
+
+    private void unblockTeleport(String baseTeleport) {
+        String currentSpellbook = getCurrentSpellbook();
+        Set<String> spellbookBlockedTeleports = blockedTeleportsPerSpellbook.get(currentSpellbook);
+
+        if (spellbookBlockedTeleports != null) {
+            spellbookBlockedTeleports.remove(baseTeleport);
+        }
+    }
+
+    private boolean isBlockedTeleportTarget(String target) {
+        String lowerTarget = target.toLowerCase().replaceAll("<.*?>", "").replaceAll("[^a-z ]", "").trim();
+        String baseTeleport = getBaseTeleportName(lowerTarget);
+        String currentSpellbook = getCurrentSpellbook();
+        Set<String> spellbookBlockedTeleports = blockedTeleportsPerSpellbook.get(currentSpellbook);
+
+        if (spellbookBlockedTeleports == null) {
+            return false;
+        }
+
+        // Check direct match
+        if (spellbookBlockedTeleports.contains(baseTeleport)) {
+            return true;
+        }
+
+        // Check grouped teleports
+        return TELEPORT_GROUPS.entrySet().stream()
+                .anyMatch(entry -> {
+                    boolean keyBlocked = spellbookBlockedTeleports.contains(entry.getKey());
+                    boolean containsTarget = entry.getValue().stream().anyMatch(lowerTarget::contains);
+                    return keyBlocked && containsTarget;
+                });
+    }
+
+    @Provides
+    AccidentalTeleportBlockerPluginConfig provideConfig(ConfigManager configManager) {
+        return configManager.getConfig(AccidentalTeleportBlockerPluginConfig.class);
+    }
+
+    private void addToCustomTriggerSpells(String spellName) {
+        // Ignore empty or duplicate entries
+        if (spellName == null || spellName.trim().isEmpty() || customTriggerSpells.contains(spellName)) {
+            return;
+        }
+
+        customTriggerSpells.add(spellName.trim().toLowerCase());
+
+        // Sort the spells alphabetically and update the configuration
+        String updatedSpellList = customTriggerSpells.stream()
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(", "));
+        configManager.setConfiguration("AccidentalTeleportBlocker", "customTriggerSpells", updatedSpellList);
+    }
+
+    private void removeFromCustomTriggerSpells(String spellName) {
+        // Ignore empty entries
+        if (spellName == null || spellName.trim().isEmpty()) {
+            return;
+        }
+
+        customTriggerSpells.remove(spellName.trim().toLowerCase());
+
+        // Sort the spells alphabetically and update the configuration
+        String updatedSpellList = customTriggerSpells.stream()
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(", "));
+        configManager.setConfiguration("AccidentalTeleportBlocker", "customTriggerSpells", updatedSpellList);
+    }
+}
+
+package com.AccidentalTeleportBlocker;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class AccidentalTeleportBlockerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(AccidentalTeleportBlockerPlugin.class);
+		RuneLite.main(args);
+	}
+}
