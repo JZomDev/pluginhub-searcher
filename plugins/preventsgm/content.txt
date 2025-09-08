@@ -204,7 +204,10 @@ public class PreventSGMPlugin extends Plugin {
                 amountOfSeaweed = 0;
                 break;
             case SUPERGLASS_MAKE:
-                if (!checkSeaweedAndSand()) {
+                if (checkSeaweedAndSand()) {
+                    amountOfSand = 0;
+                    amountOfSeaweed = 0;
+                } else {
                     event.consume();
                     client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "[Prevent Misclicks] Superglass make spell disabled", null);
                 }
