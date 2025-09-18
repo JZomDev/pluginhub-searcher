@@ -13,7 +13,7 @@ public interface TreeCountConfig extends Config
 	@ConfigItem(
 		keyName = "renderTreeHull",
 		name = "Draw Tree Hull",
-		description = "Configures whether to draw the hull the hull of the tree with the same color as the text."
+		description = "Configures whether to draw the hull of the tree with the same color as the text."
 	)
 	default boolean renderTreeHull()
 	{
