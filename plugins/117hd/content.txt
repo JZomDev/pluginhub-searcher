@@ -8287,9 +8287,11 @@ public class LightGizmoOverlay extends Overlay implements MouseListener, KeyList
 package rs117.hd.overlays;
 
 import com.google.inject.Singleton;
+import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import rs117.hd.HdPluginConfig;
 
 import static org.lwjgl.opengl.GL33C.*;
 import static rs117.hd.HdPluginConfig.*;
@@ -8298,6 +8300,9 @@ import static rs117.hd.utils.MathUtils.*;
 @Slf4j
 @Singleton
 public class GammaCalibrationOverlay extends ShaderOverlay<GammaCalibrationOverlay.Shader> {
+	@Inject
+	private HdPluginConfig config;
+
 	static class Shader extends ShaderOverlay.Shader {
 		public Uniform1f uniCalibrationTimer = addUniform1f("calibrationTimer");
 
@@ -8323,7 +8328,7 @@ public class GammaCalibrationOverlay extends ShaderOverlay<GammaCalibrationOverl
 
 	@Override
 	public boolean isHidden() {
-		return super.isHidden() || getTimeout() <= 0;
+		return super.isHidden() || getTimeout() <= 0 || config.useLegacyBrightness();
 	}
 
 	@Override
@@ -10791,7 +10796,9 @@ public class LightManager {
 package rs117.hd.scene;
 
 import java.io.IOException;
+import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Objects;
 import javax.annotation.Nonnull;
 import javax.inject.Inject;
@@ -10932,6 +10939,13 @@ public class EnvironmentManager {
 					throw new IOException("Empty or invalid: " + path);
 				log.debug("Loaded {} environments", environments.length);
 
+				if (!config.legacyTobEnvironment()) {
+					var legacyEnvs = List.of("TOB_ROOM_VAULT_LEGACY", "THEATRE_OF_BLOOD_LEGACY");
+					environments = Arrays.stream(environments)
+						.filter(env -> env.key == null || !legacyEnvs.contains(env.key))
+						.toArray(Environment[]::new);
+				}
+
 				HashMap<String, Environment> map = new HashMap<>();
 				for (var env : environments)
 					if (env.key != null)
@@ -10971,7 +10985,9 @@ public class EnvironmentManager {
 		forceNextTransition = false;
 	}
 
-	public void triggerTransition() {
+	public void reload() {
+		shutDown();
+		startUp();
 		forceNextTransition = true;
 	}
 
@@ -18802,13 +18818,42 @@ public class HdPlugin extends Plugin implements DrawCallbacks {
 				}
 			}
 
-			int tiledLayerCount = DynamicLights.MAX_LIGHTS_PER_TILE / 4;
-			for (int layer = 0; layer < tiledLayerCount; layer++) {
-				var shader = new TiledLightingShaderProgram();
-				shader.compile(includes
-					.define("TILED_IMAGE_STORE", false)
-					.define("TILED_LIGHTING_LAYER", layer));
-				tiledLightingShaderPrograms.add(shader);
+			// Compile layered version if the image store version isn't supported or failed to compile
+			if (!tiledLightingImageStoreProgram.isValid()) {
+				try {
+					int tiledLayerCount = DynamicLights.MAX_LIGHTS_PER_TILE / 4;
+					for (int layer = 0; layer < tiledLayerCount; layer++) {
+						var shader = new TiledLightingShaderProgram();
+						shader.compile(includes
+							.define("TILED_IMAGE_STORE", false)
+							.define("TILED_LIGHTING_LAYER", layer));
+						tiledLightingShaderPrograms.add(shader);
+					}
+				} catch (ShaderException ex) {
+					log.warn("Disabling TILED_LIGHTING_LAYERED due to:", ex);
+					// If both tiled lighting implementations fail, fall back to the old lighting, and warn about it
+					if (!Props.DEVELOPMENT) {
+						config.tiledLighting(false);
+						PopupUtils.displayPopupMessage(
+							client, "117 HD Error",
+							"Tiled lighting has been automatically disabled, since it failed to compile on your GPU.<br>" +
+							"<br>GPU name: " + glGetString(GL_RENDERER) + "<br><br>" +
+							"If you want to help us make it work on your system, please join our " +
+							"<a href=\"" + HdPlugin.DISCORD_URL + "\">Discord</a> server, and<br>" +
+							"click the \"Open logs folder\" button below, find the file named \"client\" or \"client.log\",<br>" +
+							"then drag and drop that file into one of our support channels.",
+							new String[] { "Open logs folder", "Ok" },
+							i -> {
+								if (i == 0) {
+									LinkBrowser.open(RuneLite.LOGS_DIR.toString());
+									return false;
+								}
+								return true;
+							}
+						);
+					}
+					configTiledLighting = false;
+				}
 			}
 		}
 
@@ -20624,6 +20669,7 @@ public class HdPlugin extends Plugin implements DrawCallbacks {
 								recreateShadowMapFbo = true;
 								break;
 							case KEY_ATMOSPHERIC_LIGHTING:
+							case KEY_LEGACY_TOB_ENVIRONMENT:
 								reloadEnvironments = true;
 								break;
 							case KEY_SEASONAL_THEME:
@@ -20720,7 +20766,7 @@ public class HdPlugin extends Plugin implements DrawCallbacks {
 					}
 
 					if (reloadEnvironments)
-						environmentManager.triggerTransition();
+						environmentManager.reload();
 				}
 			} catch (Throwable ex) {
 				log.error("Error while changing settings:", ex);
@@ -21141,6 +21187,8 @@ public class HdPlugin extends Plugin implements DrawCallbacks {
 	}
 
 	public float getGammaCorrection() {
+		if (config.useLegacyBrightness())
+			return 1;
 		return 100f / config.brightness();
 	}
 
@@ -23839,6 +23887,8 @@ public interface HdPluginConfig extends Config
 	default boolean tiledLighting() {
 		return true;
 	}
+	@ConfigItem(keyName = KEY_TILED_LIGHTING, hidden = true, name = "", description = "")
+	void tiledLighting(boolean enabled);
 
 	String KEY_PROJECTILE_LIGHTS = "projectileLights";
 	@ConfigItem(
@@ -24399,6 +24449,19 @@ public interface HdPluginConfig extends Config
 		section = miscellaneousSettings
 	)
 	default boolean flatShading() {
+		return false;
+	}
+
+	String KEY_LEGACY_TOB_ENVIRONMENT = "legacyTobEnvironment";
+	@ConfigItem(
+		keyName = KEY_LEGACY_TOB_ENVIRONMENT,
+		name = "Legacy Theatre of Blood",
+		description =
+			"Previously, Theatre of Blood used to look a whole lot more blue, which<br>" +
+			"some people grew really used to. This option brings back that same old look.",
+		section = miscellaneousSettings
+	)
+	default boolean legacyTobEnvironment() {
 		return false;
 	}
 
