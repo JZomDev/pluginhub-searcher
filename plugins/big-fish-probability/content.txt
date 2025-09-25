@@ -5,8 +5,8 @@ import lombok.Getter;
 @Getter
 public enum FishType {
     SHARK("You catch a shark", 5000f),
-    SWORDFISH("You catch a raw bass", 2500f),
-    BASS("You catch a raw swordfish", 1000f);
+    SWORDFISH("You catch a swordfish", 2500f),
+    BASS("You catch a raw bass", 1000f);
 
     private final String catchMessage;
     private final float probability;
