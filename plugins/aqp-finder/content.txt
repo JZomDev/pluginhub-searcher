@@ -7,9 +7,11 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
 import lombok.Getter;
@@ -174,6 +176,9 @@ public class AqpFinderPlugin extends Plugin implements KeyListener {
 				result.put('°',4);
 				result.put('<',4);
 				result.put('>',4);
+                result.put('|',1);
+                result.put('%',9);
+                result.put('_',7);
 //				other
 				result.put('\u00A0',1);//no-break space
 				return Collections.unmodifiableMap(result);
@@ -183,6 +188,18 @@ public class AqpFinderPlugin extends Plugin implements KeyListener {
 	 * An immutable list of characters that end a sentence in player chat.
 	 */
 	private final List<Character> endSentenceCharList = createEndSentenceCharList();
+
+    // Allowed message types for QP processing
+    private static final Set<ChatMessageType> ALLOWED_MESSAGE_TYPES = Collections.unmodifiableSet(
+            new HashSet<>(Arrays.asList(
+                    ChatMessageType.CLAN_CHAT,
+                    ChatMessageType.CLAN_GUEST_CHAT,
+                    ChatMessageType.PUBLICCHAT,
+                    ChatMessageType.PRIVATECHAT,
+                    ChatMessageType.PRIVATECHATOUT,
+                    ChatMessageType.FRIENDSCHAT
+            ))
+    );
 
 	/**
 	 * Creates an immutable list of characters that end a sentence in player chat.
@@ -204,6 +221,7 @@ public class AqpFinderPlugin extends Plugin implements KeyListener {
 	@Getter
 	private boolean lastMessageIncludesQP = false;
 	private boolean lastQPFromPM = false;
+    private ChatMessageType lastQPMessageType = null;
 	private Integer[] lastMessageSegmentIndex = new Integer[0];
 	private String[] lastMessageQPIndex = new String[0];
 	private String chatBoxTypedText = "";
@@ -260,7 +278,13 @@ public class AqpFinderPlugin extends Plugin implements KeyListener {
 		String message = messageNode.getValue();
 		boolean update = false;
 
-		if(lastMessageIncludesQP)
+        // Only process allowed message types
+        if(!ALLOWED_MESSAGE_TYPES.contains(messageNode.getType()))
+        {
+            return;
+        }
+
+        if(lastMessageIncludesQP && messageNode.getType().equals(lastQPMessageType))
 		{
 			lastMessageIncludesQP = false;
 			lastMessageSegmentIndex = null;
@@ -269,6 +293,7 @@ public class AqpFinderPlugin extends Plugin implements KeyListener {
 		if(containsQP(message))
 		{
 			lastMessageIncludesQP = true;
+            lastQPMessageType = messageNode.getType();
 			String originalMessage = message;
 
 			message = preprocessMessage(message);
