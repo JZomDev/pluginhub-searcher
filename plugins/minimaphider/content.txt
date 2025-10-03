@@ -4,7 +4,8 @@ import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 
 import net.runelite.api.Client;
-import net.runelite.api.events.WidgetLoaded;
+import net.runelite.api.ScriptID;
+import net.runelite.api.events.ScriptPostFired;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.eventbus.Subscribe;
@@ -35,9 +36,9 @@ public class MinimapHiderPlugin extends Plugin
     }
 
     @Subscribe
-    public void onWidgetLoaded(WidgetLoaded event)
+    public void onScriptPostFired(ScriptPostFired s)
     {
-        if (event.getGroupId() == InterfaceID.TOPLEVEL_OSRS_STRETCH || event.getGroupId() == InterfaceID.TOPLEVEL_PRE_EOC)
+        if (s.getScriptId() == ScriptID.TOPLEVEL_REDRAW || s.getScriptId() == 903)
         {
             setMapHidden(true);
         }
