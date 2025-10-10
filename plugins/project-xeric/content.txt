@@ -660,7 +660,10 @@ import static io.septem150.xeric.util.RegexUtil.KC_REGEX;
 import static io.septem150.xeric.util.RegexUtil.NAME_GROUP;
 import static io.septem150.xeric.util.RegexUtil.QUEST_REGEX;
 
+import com.google.common.net.HttpHeaders;
 import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
 import com.google.gson.JsonSyntaxException;
 import com.google.gson.reflect.TypeToken;
 import io.septem150.xeric.ProjectXericConfig;
@@ -674,9 +677,8 @@ import io.septem150.xeric.data.player.Level;
 import io.septem150.xeric.data.player.PlayerInfo;
 import io.septem150.xeric.data.player.QuestProgress;
 import io.septem150.xeric.data.task.KCTask;
-import io.septem150.xeric.data.task.LevelTask;
 import io.septem150.xeric.data.task.Task;
-import io.septem150.xeric.data.task.TaskStore;
+import io.septem150.xeric.data.task.TaskType;
 import io.septem150.xeric.panel.ProjectXericPanel;
 import io.septem150.xeric.util.WorldUtil;
 import java.awt.Color;
@@ -688,7 +690,6 @@ import java.util.Arrays;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
-import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -699,7 +700,7 @@ import javax.inject.Inject;
 import javax.inject.Named;
 import javax.inject.Singleton;
 import javax.swing.SwingUtilities;
-import lombok.Getter;
+import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
@@ -727,6 +728,13 @@ import net.runelite.client.hiscore.HiscoreResult;
 import net.runelite.client.hiscore.HiscoreSkill;
 import net.runelite.client.util.ColorUtil;
 import net.runelite.client.util.Text;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
 
 @Slf4j
 @Singleton
@@ -738,23 +746,20 @@ public class ProjectXericManager {
   private final ProjectXericConfig config;
   private final ConfigManager configManager;
   private final ScheduledExecutorService executor;
+  private final OkHttpClient httpClient;
   private final HiscoreManager hiscoreManager;
-  private final TaskStore taskStore;
   private final Gson gson;
+  private final PlayerInfo playerInfo;
 
   private ProjectXericPanel panel;
   private long lastAccountId;
   private Set<Integer> remainingCaStructIds;
-  private Set<Integer> completedTaskIds;
   private Set<ClogItem> allClogItems;
-  private Set<Task> remainingTasks;
-  private Set<Task> levelTasks;
   private boolean clogOpened;
   private int updateGeneral;
   private int updateTasks;
   private int updateLevels;
   private int ticksTilClientReady;
-  @Getter private PlayerInfo playerInfo;
 
   @Inject
   public ProjectXericManager(
@@ -763,36 +768,35 @@ public class ProjectXericManager {
       ProjectXericConfig config,
       ConfigManager configManager,
       ScheduledExecutorService executor,
+      OkHttpClient httpClient,
       HiscoreManager hiscoreManager,
-      TaskStore taskStore,
-      @Named("xericGson") Gson gson) {
+      @Named("xericGson") Gson gson,
+      PlayerInfo playerInfo) {
     this.client = client;
     this.clientThread = clientThread;
     this.config = config;
     this.configManager = configManager;
     this.executor = executor;
+    this.httpClient = httpClient;
     this.hiscoreManager = hiscoreManager;
-    this.taskStore = taskStore;
     this.gson = gson;
+    this.playerInfo = playerInfo;
   }
 
   public void startUp(ProjectXericPanel panel) {
     this.panel = panel;
     lastAccountId = -1L;
     ticksTilClientReady = 2;
-    playerInfo = new PlayerInfo();
-    clientThread.invokeLater(
-        () -> {
-          if (client.getGameState() == GameState.LOGGED_IN && WorldUtil.isValidWorldType(client)) {
-            updateGeneral = 1;
-          }
-        });
-    taskStore
-        .getAllAsync(false)
-        .exceptionally(
-            err -> {
-              throw new RuntimeException(err);
-            });
+    updateTaskCacheAsync()
+        .thenRun(
+            () ->
+                clientThread.invokeLater(
+                    () -> {
+                      if (client.getGameState() == GameState.LOGGED_IN
+                          && WorldUtil.isValidWorldType(client)) {
+                        updateGeneral = 1;
+                      }
+                    }));
   }
 
   public void shutDown() {
@@ -800,69 +804,50 @@ public class ProjectXericManager {
         ProjectXericConfig.GROUP,
         ProjectXericConfig.CLOG_DATA_KEY,
         gson.toJson(playerInfo.getCollectionLog().getItemIds()));
-    configManager.setRSProfileConfiguration(
-        ProjectXericConfig.GROUP,
-        ProjectXericConfig.TASKS_DATA_KEY,
-        gson.toJson(playerInfo.getTasks().stream().map(Task::getId).collect(Collectors.toSet())));
-    playerInfo = null;
+    playerInfo.logout();
+    playerInfo.reset();
     lastAccountId = -1L;
     clogOpened = false;
     remainingCaStructIds = null;
     allClogItems = null;
-    completedTaskIds = null;
-    levelTasks = null;
     updateGeneral = 0;
     updateTasks = 0;
     updateLevels = 0;
-    taskStore.reset();
   }
 
   public void reset(long accountId) {
     if (lastAccountId == accountId) return;
     lastAccountId = accountId;
-    playerInfo = new PlayerInfo();
+    playerInfo.reset();
     updateAccountInfo();
     updateQuests();
     updateDiaries();
     updateCombatAchievements();
     updateCollectionLog();
 
-    // Attempt to load collection log data from RuneLite Profile data first
-    try {
-      Type type = new TypeToken<Set<Integer>>() {}.getType();
-      completedTaskIds =
-          gson.fromJson(
-              configManager.getRSProfileConfiguration(
-                  ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_DATA_KEY),
-              type);
-    } catch (JsonSyntaxException exc) {
-      log.warn("malformed stored tasks data found, will ignore and overwrite.");
-      configManager.unsetRSProfileConfiguration(
-          ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_DATA_KEY);
-    }
-    // Save empty clog to RuneLite Profile if malformed clog data or null key
-    if (completedTaskIds == null) {
-      completedTaskIds = new HashSet<>();
-      configManager.setRSProfileConfiguration(
-          ProjectXericConfig.GROUP,
-          ProjectXericConfig.TASKS_DATA_KEY,
-          gson.toJson(completedTaskIds));
-    }
-
     // Update player tasks and levels in the background, as these are both asynchronous processes
     // that require network calls, and we don't want the panel or task-checking logic running until
     // those calls are complete
-    CompletableFuture.allOf(updatePlayerTasks(), updatePlayerHiscores())
+    CompletableFuture.allOf(updateTaskCacheAsync(), updatePlayerHiscores())
         .thenRun(
-            () -> {
-              updateLevels = 2;
-              updateTasks = 2;
-              clientThread.invoke(
-                  () -> {
-                    panel.startUpChildren();
-                    SwingUtilities.invokeLater(panel::refresh);
-                  });
-            });
+            () ->
+                clientThread.invoke(
+                    () -> {
+                      if (checkForUpdatedTasks()) {
+                        playerInfo.clearCompletedTasks();
+                        playerInfo.setLevels(
+                            Arrays.stream(Skill.values())
+                                .map(skill -> Level.from(client, skill))
+                                .collect(Collectors.toMap(Level::getName, level -> level)));
+                        updateXericTasks(false, false);
+                      } else {
+                        playerInfo.loadTasksFromRSProfile();
+                        updateLevels = 2;
+                        updateTasks = 2;
+                      }
+                      panel.startUpChildren();
+                      SwingUtilities.invokeLater(panel::refresh);
+                    }));
   }
 
   @Subscribe
@@ -871,14 +856,14 @@ public class ProjectXericManager {
       updateGeneral = 1;
     } else if (client.getGameState() == GameState.LOGIN_SCREEN) {
       ticksTilClientReady = 2;
+      // reset whether the clog interface has been opened on logout in case
+      // the player leaves this client open and then obtains an item on another
+      // client before logging in again to this one
       configManager.setRSProfileConfiguration(
           ProjectXericConfig.GROUP,
           ProjectXericConfig.CLOG_DATA_KEY,
           gson.toJson(playerInfo.getCollectionLog().getItemIds()));
-      configManager.setRSProfileConfiguration(
-          ProjectXericConfig.GROUP,
-          ProjectXericConfig.TASKS_DATA_KEY,
-          gson.toJson(playerInfo.getTasks().stream().map(Task::getId).collect(Collectors.toSet())));
+      playerInfo.logout();
       clogOpened = false;
       updateLevels = 2;
     } else if (client.getGameState() == GameState.HOPPING) {
@@ -893,6 +878,7 @@ public class ProjectXericManager {
       if (ticksTilClientReady == 0) {
         checkClogChatMessageEnabled();
       }
+      return;
     }
     if (updateGeneral > 0 && --updateGeneral == 0) {
       reset(client.getAccountHash());
@@ -906,6 +892,7 @@ public class ProjectXericManager {
                 .collect(Collectors.toMap(Level::getName, level -> level)));
       }
       updateXericTasks(true);
+      return;
     }
     if (updateTasks > 0 && --updateTasks == 0) {
       updateXericTasks(false);
@@ -1062,51 +1049,43 @@ public class ProjectXericManager {
     }
   }
 
+  private void updateXericTasks(boolean onlyLevels, boolean showMessage) {
+    Set<Task> remainingTasksToCheck =
+        playerInfo.getRemainingTasks().stream()
+            .filter(task -> !onlyLevels || task.getType() == TaskType.LEVEL)
+            .collect(Collectors.toSet());
+    log.debug("iterating through {} tasks", remainingTasksToCheck.size());
+    boolean updated = false;
+    for (Task task : remainingTasksToCheck) {
+      if (task.checkCompletion(playerInfo)) {
+        updated = true;
+        playerInfo.addCompletedTask(task);
+        if (showMessage) {
+          client.addChatMessage(
+              ChatMessageType.GAMEMESSAGE,
+              "",
+              String.format(
+                  "Xeric task completed for %d point%s: %s.",
+                  task.getTier(),
+                  task.getTier() > 1 ? "s" : "",
+                  ColorUtil.wrapWithColorTag(task.getName(), DARK_GREEN)),
+              null);
+        }
+      }
+    }
+    if (updated) {
+      SwingUtilities.invokeLater(panel::refresh);
+    }
+  }
+
   private void updateXericTasks(boolean onlyLevels) {
-    executor.execute(
-        () -> {
-          log.debug("Called UPDATE TASKS, Only Levels: {}", onlyLevels);
-          boolean refresh = false;
-          Set<Task> completedTasks = new HashSet<>(playerInfo.getTasks());
-          Iterator<Task> iterator = onlyLevels ? levelTasks.iterator() : remainingTasks.iterator();
-          log.debug(
-              "Iterating over {} tasks", onlyLevels ? levelTasks.size() : remainingTasks.size());
-          while (iterator.hasNext()) {
-            Task task = iterator.next();
-            if (task.checkCompletion(playerInfo)) {
-              log.debug("New completed task!\n{}", gson.toJson(task));
-              completedTasks.add(task);
-              iterator.remove();
-              if (onlyLevels) remainingTasks.remove(task);
-              else levelTasks.remove(task);
-              refresh = true;
-              if (config.chatMessages()) {
-                clientThread.invokeLater(
-                    () -> {
-                      int points = config.slayer() ? task.getSlayerPoints() : task.getTier();
-                      client.addChatMessage(
-                          ChatMessageType.GAMEMESSAGE,
-                          ProjectXericConfig.NAME,
-                          String.format(
-                              "Xeric task completed for %d point%s: %s.",
-                              points,
-                              points > 1 ? "s" : "",
-                              ColorUtil.wrapWithColorTag(task.getName(), DARK_GREEN)),
-                          "");
-                    });
-              }
-            }
-          }
-          if (refresh) {
-            playerInfo.setTasks(new ArrayList<>(completedTasks));
-            SwingUtilities.invokeLater(panel::refresh);
-          }
-        });
+    updateXericTasks(onlyLevels, config.chatMessages());
   }
 
   private void updateAccountInfo() {
-    playerInfo.setUsername(client.getLocalPlayer().getName());
-    playerInfo.setAccountType(AccountType.fromVarbValue(client.getVarbitValue(VarbitID.IRONMAN)));
+    playerInfo.login(
+        client.getLocalPlayer().getName(),
+        AccountType.fromVarbValue(client.getVarbitValue(VarbitID.IRONMAN)));
     playerInfo.setSlayerException(config.slayer());
   }
 
@@ -1208,31 +1187,68 @@ public class ProjectXericManager {
     }
   }
 
-  private CompletableFuture<Void> updatePlayerTasks() {
-    return taskStore
-        .getAllAsync()
-        .exceptionally(
-            err -> {
-              throw new RuntimeException(err);
-            })
-        .thenAccept(
-            tasks -> {
-              remainingTasks = new HashSet<>(tasks);
-              List<Task> completedTasks = new ArrayList<>();
-              Iterator<Task> iterator = remainingTasks.iterator();
-              while (iterator.hasNext()) {
-                Task task = iterator.next();
-                if (completedTaskIds.contains(task.getId())) {
-                  iterator.remove();
-                  completedTasks.add(task);
+  private boolean checkForUpdatedTasks() {
+    if (playerInfo.isTaskListUpdated()) {
+      client.addChatMessage(
+          ChatMessageType.GAMEMESSAGE,
+          "",
+          String.format(
+              "[%s] Info: %s",
+              ColorUtil.wrapWithColorTag(ProjectXericConfig.NAME, DARK_GREEN),
+              ColorUtil.wrapWithColorTag(
+                  "Tasks have been updated! Check your tasks in the side panel.", Color.RED)),
+          null);
+      return true;
+    }
+    return false;
+  }
+
+  private CompletableFuture<Void> updateTaskCacheAsync() {
+    CompletableFuture<Void> future = new CompletableFuture<>();
+    HttpUrl url =
+        new HttpUrl.Builder()
+            .scheme("https")
+            .host("api.projectxeric.com")
+            .addPathSegment("v1")
+            .addPathSegment("tasks")
+            .build();
+    Request request =
+        new Request.Builder()
+            .get()
+            .url(url)
+            .addHeader(HttpHeaders.CONTENT_TYPE, "application/json; charset=utf-8")
+            .build();
+    httpClient
+        .newCall(request)
+        .enqueue(
+            new Callback() {
+              @Override
+              public void onFailure(@NonNull Call call, @NonNull IOException err) {
+                log.warn("api call to tasks failed: {}", err.getMessage());
+                future.completeExceptionally(err);
+              }
+
+              @Override
+              public void onResponse(@NonNull Call call, @NonNull Response response) {
+                try (Response res = response) {
+                  ResponseBody body = res.body();
+                  if (body == null) {
+                    throw new IOException("response body empty");
+                  }
+                  String bodyString = body.string();
+                  if (!res.isSuccessful()) {
+                    JsonObject json = gson.fromJson(bodyString, JsonObject.class);
+                    throw new IOException(json.get("error").getAsString());
+                  }
+                  Type type = new TypeToken<Set<Task>>() {}.getType();
+                  playerInfo.setAllTasks(gson.fromJson(bodyString, type));
+                  future.complete(null);
+                } catch (IOException | JsonParseException err) {
+                  onFailure(call, new IOException(err));
                 }
               }
-              playerInfo.setTasks(completedTasks);
-              levelTasks =
-                  remainingTasks.stream()
-                      .filter(LevelTask.class::isInstance)
-                      .collect(Collectors.toSet());
             });
+    return future;
   }
 
   private CompletableFuture<Void> updatePlayerHiscores() {
@@ -1537,34 +1553,90 @@ public enum AccountType {
 
 package io.septem150.xeric.data.player;
 
+import com.google.common.collect.Sets;
+import com.google.gson.Gson;
+import com.google.gson.JsonParseException;
+import com.google.gson.reflect.TypeToken;
+import io.septem150.xeric.ProjectXericConfig;
 import io.septem150.xeric.data.clog.CollectionLog;
 import io.septem150.xeric.data.diary.DiaryProgress;
 import io.septem150.xeric.data.task.Task;
+import java.lang.reflect.Type;
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
-import lombok.Data;
+import java.util.Set;
+import java.util.stream.Collectors;
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import lombok.AccessLevel;
+import lombok.Getter;
 import lombok.NonNull;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneScapeProfile;
 
-@Data
+@Slf4j
+@Singleton
+@Getter
+@Setter
 public class PlayerInfo {
-  private String username;
-  private AccountType accountType;
-  private boolean slayerException;
-  private @NonNull List<QuestProgress> quests = new ArrayList<>();
-  private @NonNull List<DiaryProgress> diaries = new ArrayList<>();
-  private @NonNull Map<String, Level> levels = new HashMap<>();
-  private @NonNull Map<String, KillCount> killCounts = new HashMap<>();
-  private @NonNull List<CombatAchievement> combatAchievements = new ArrayList<>();
-  private @NonNull CollectionLog collectionLog = new CollectionLog();
-  private @NonNull List<Task> tasks = new ArrayList<>();
+  @Getter(AccessLevel.NONE)
+  @Setter(AccessLevel.NONE)
+  @NonNull private final ConfigManager configManager;
 
-  public PlayerInfo() {
-    clear();
+  @Getter(AccessLevel.NONE)
+  @Setter(AccessLevel.NONE)
+  @NonNull private final Gson gson;
+
+  @Setter(AccessLevel.NONE)
+  @Nullable private String username;
+
+  @Setter(AccessLevel.NONE)
+  @Nullable private AccountType accountType;
+
+  private boolean slayerException;
+  @NonNull private List<QuestProgress> quests = new ArrayList<>();
+  @NonNull private List<DiaryProgress> diaries = new ArrayList<>();
+  @NonNull private Map<String, Level> levels = new HashMap<>();
+  @NonNull private Map<String, KillCount> killCounts = new HashMap<>();
+  @NonNull private List<CombatAchievement> combatAchievements = new ArrayList<>();
+  @NonNull private CollectionLog collectionLog = new CollectionLog();
+  @NonNull private Set<Task> allTasks = new HashSet<>();
+  @NonNull private Set<Task> completedTasks = new HashSet<>();
+  @NonNull private Set<Task> remainingTasks = new HashSet<>();
+  @Nullable private String tasksHash;
+
+  @Inject
+  public PlayerInfo(ConfigManager configManager, @Named("xericGson") Gson gson) {
+    this.configManager = configManager;
+    this.gson = gson;
   }
 
-  public void clear() {
+  public void login(String username, AccountType accountType) {
+    this.username = username;
+    this.accountType = accountType;
+  }
+
+  public void logout() {
+    configManager.setRSProfileConfiguration(
+        ProjectXericConfig.GROUP,
+        ProjectXericConfig.TASKS_DATA_KEY,
+        gson.toJson(completedTasks.stream().map(Task::getId).collect(Collectors.toSet())));
+    configManager.setRSProfileConfiguration(
+        ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_HASH_DATA_KEY, tasksHash);
+  }
+
+  public void reset() {
     username = null;
     accountType = null;
     slayerException = false;
@@ -1574,11 +1646,82 @@ public class PlayerInfo {
     killCounts = new HashMap<>();
     combatAchievements = new ArrayList<>();
     collectionLog = new CollectionLog();
-    tasks = new ArrayList<>();
+    allTasks = new HashSet<>();
+    completedTasks = new HashSet<>();
+    remainingTasks = new HashSet<>();
+  }
+
+  public void loadTasksFromRSProfile() {
+    completedTasks.clear();
+    remainingTasks.clear();
+    try {
+      Type type = new TypeToken<Set<Integer>>() {}.getType();
+      Set<Integer> taskIds =
+          gson.fromJson(
+              configManager.getRSProfileConfiguration(
+                  ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_DATA_KEY),
+              type);
+      if (taskIds != null) {
+        completedTasks.addAll(
+            allTasks.stream()
+                .filter(task -> taskIds.contains(task.getId()))
+                .collect(Collectors.toSet()));
+        remainingTasks.addAll(Sets.difference(allTasks, completedTasks));
+      }
+    } catch (JsonParseException err) {
+      log.error("malformed task data in profile");
+      configManager.unsetRSProfileConfiguration(
+          ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_DATA_KEY);
+    }
+  }
+
+  public boolean isTaskListUpdated() {
+    String prevTasksHash =
+        configManager.getRSProfileConfiguration(
+            ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_HASH_DATA_KEY);
+    if (prevTasksHash == null || !prevTasksHash.equals(tasksHash)) {
+      for (RuneScapeProfile rsProfile : configManager.getRSProfiles()) {
+        String profileKey = rsProfile.getKey();
+        configManager.unsetConfiguration(
+            ProjectXericConfig.GROUP, profileKey, ProjectXericConfig.TASKS_DATA_KEY);
+      }
+      configManager.setRSProfileConfiguration(
+          ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_HASH_DATA_KEY, tasksHash);
+
+      return true;
+    }
+    return false;
+  }
+
+  public void clearCompletedTasks() {
+    completedTasks.clear();
+    remainingTasks.clear();
+    remainingTasks.addAll(Sets.difference(allTasks, completedTasks));
+  }
+
+  public void setAllTasks(Set<Task> tasks) {
+    allTasks.clear();
+    allTasks.addAll(tasks);
+    try {
+      tasksHash =
+          String.format(
+              "%032x",
+              new BigInteger(
+                  1,
+                  MessageDigest.getInstance("MD5")
+                      .digest(gson.toJson(allTasks).getBytes(StandardCharsets.UTF_8))));
+    } catch (NoSuchAlgorithmException e) {
+      throw new RuntimeException(e);
+    }
+  }
+
+  public void addCompletedTask(Task task) {
+    completedTasks.add(task);
+    remainingTasks.remove(task);
   }
 
   public int getPoints() {
-    return tasks.stream().mapToInt(Task::getTier).sum();
+    return completedTasks.stream().mapToInt(Task::getTier).sum();
   }
 
   public ClanRank getRank() {
@@ -1802,84 +1945,6 @@ public class LevelTask extends Task {
 
 package io.septem150.xeric.data.task;
 
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
-import io.septem150.xeric.ProjectXericPlugin;
-import java.io.FileNotFoundException;
-import java.io.InputStream;
-import java.io.InputStreamReader;
-import java.lang.reflect.Type;
-import java.nio.charset.StandardCharsets;
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ExecutionException;
-import javax.annotation.Nullable;
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import lombok.NonNull;
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
-@Singleton
-public final class LocalTaskStore implements TaskStore {
-  private static final String TASKS_RES_PATH = "data/rank_tasks.json";
-
-  private final Gson gson;
-
-  private @Nullable List<Task> tasksList;
-  private @Nullable CompletableFuture<List<Task>> future;
-
-  @Inject
-  public LocalTaskStore(@Named("xericGson") Gson gson) {
-    this.gson = gson;
-  }
-
-  @Override
-  public @NonNull List<Task> getAll() {
-    if (tasksList != null) return tasksList;
-    try {
-      return getAllAsync().get();
-    } catch (InterruptedException | ExecutionException err) {
-      throw new RuntimeException(err);
-    }
-  }
-
-  @Override
-  public @NonNull CompletableFuture<List<Task>> getAllAsync() {
-    return getAllAsync(true);
-  }
-
-  @Override
-  public @NonNull CompletableFuture<List<Task>> getAllAsync(boolean cached) {
-    if (!cached || tasksList == null) {
-      if (future == null || future.isDone()) {
-        try (InputStream in = ProjectXericPlugin.class.getResourceAsStream(TASKS_RES_PATH)) {
-          if (in == null) {
-            throw new FileNotFoundException(
-                String.format("Unable to access resource '%s'", TASKS_RES_PATH));
-          }
-          Type type = new TypeToken<List<Task>>() {}.getType();
-          tasksList = gson.fromJson(new InputStreamReader(in, StandardCharsets.UTF_8), type);
-          future = CompletableFuture.completedFuture(tasksList);
-        } catch (Exception err) {
-          future = CompletableFuture.failedFuture(err);
-        }
-      }
-    } else {
-      future = CompletableFuture.completedFuture(tasksList);
-    }
-    return future;
-  }
-
-  @Override
-  public void reset() {
-    tasksList = null;
-  }
-}
-
-package io.septem150.xeric.data.task;
-
 import io.septem150.xeric.data.player.PlayerInfo;
 import java.awt.image.BufferedImage;
 import java.util.Objects;
@@ -1907,22 +1972,6 @@ public class DiaryTask extends Task {
     return ImageUtil.resizeImage(
         Objects.requireNonNull(spriteManager.getSprite(1299, 0)), 20, 20, true);
   }
-}
-
-package io.septem150.xeric.data.task;
-
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-import lombok.NonNull;
-
-public interface TaskStore {
-  @NonNull List<Task> getAll();
-
-  @NonNull CompletableFuture<List<Task>> getAllAsync();
-
-  @NonNull CompletableFuture<List<Task>> getAllAsync(boolean cached);
-
-  void reset();
 }
 
 package io.septem150.xeric.data.task;
@@ -2110,7 +2159,6 @@ public class KCTask extends Task {
 package io.septem150.xeric;
 
 import com.google.gson.Gson;
-import com.google.inject.Binder;
 import com.google.inject.Provides;
 import io.septem150.xeric.data.ProjectXericManager;
 import io.septem150.xeric.data.task.CATask;
@@ -2118,10 +2166,8 @@ import io.septem150.xeric.data.task.CollectTask;
 import io.septem150.xeric.data.task.DiaryTask;
 import io.septem150.xeric.data.task.KCTask;
 import io.septem150.xeric.data.task.LevelTask;
-import io.septem150.xeric.data.task.LocalTaskStore;
 import io.septem150.xeric.data.task.QuestTask;
 import io.septem150.xeric.data.task.Task;
-import io.septem150.xeric.data.task.TaskStore;
 import io.septem150.xeric.data.task.TaskType;
 import io.septem150.xeric.panel.ProjectXericPanel;
 import io.septem150.xeric.util.RuntimeTypeAdapterFactory;
@@ -2177,18 +2223,11 @@ public final class ProjectXericPlugin extends Plugin {
       configManager.unsetRSProfileConfiguration(
           ProjectXericConfig.GROUP, ProjectXericConfig.TASKS_DATA_KEY);
       panel.shutDown();
-      manager.getPlayerInfo().clear();
       manager.shutDown();
       manager.startUp(panel);
       panel.startUp();
       SwingUtilities.invokeLater(panel::refresh);
     }
-  }
-
-  @Override
-  public void configure(Binder binder) {
-    super.configure(binder);
-    binder.bind(TaskStore.class).to(LocalTaskStore.class);
   }
 
   @Provides
@@ -2232,6 +2271,7 @@ public interface ProjectXericConfig extends Config {
   String GROUP = "projectxeric";
   String CLOG_DATA_KEY = "clog";
   String TASKS_DATA_KEY = "tasks";
+  String TASKS_HASH_DATA_KEY = "tasks_hash";
   String SLAYER_CONFIG_KEY = "slayer";
   String CHAT_MESSAGES_CONFIG_KEY = "chat_messages";
 
@@ -2254,9 +2294,8 @@ public interface ProjectXericConfig extends Config {
 
 package io.septem150.xeric.panel.summary;
 
-import io.septem150.xeric.data.ProjectXericManager;
+import io.septem150.xeric.data.player.PlayerInfo;
 import io.septem150.xeric.data.task.Task;
-import io.septem150.xeric.data.task.TaskStore;
 import io.septem150.xeric.data.task.TaskType;
 import java.awt.*;
 import java.util.ArrayList;
@@ -2275,8 +2314,7 @@ public class TaskTierPanel extends JPanel {
   @Getter private final int tier;
   private List<TaskPanel> taskPanels = new ArrayList<>();
 
-  private final transient TaskStore taskStore;
-  private final transient ProjectXericManager manager;
+  private final transient PlayerInfo playerInfo;
   private final transient SpriteManager spriteManager;
 
   private final JLabel tierAndCountLabel = new JLabel();
@@ -2285,13 +2323,9 @@ public class TaskTierPanel extends JPanel {
   private boolean loaded;
 
   public TaskTierPanel(
-      int tier,
-      @NonNull TaskStore taskStore,
-      @NonNull ProjectXericManager manager,
-      @NonNull SpriteManager spriteManager) {
+      int tier, @NonNull PlayerInfo playerInfo, @NonNull SpriteManager spriteManager) {
     this.tier = tier;
-    this.taskStore = taskStore;
-    this.manager = manager;
+    this.playerInfo = playerInfo;
     this.spriteManager = spriteManager;
   }
 
@@ -2323,10 +2357,10 @@ public class TaskTierPanel extends JPanel {
 
   public void startUp() {
     taskPanels =
-        taskStore.getAll().stream()
+        playerInfo.getAllTasks().stream()
             .filter(task -> task.getTier() == tier)
             .sorted(Comparator.comparing(Task::getType).thenComparing(Task::getName))
-            .map(task -> new TaskPanel(task, manager, spriteManager))
+            .map(task -> new TaskPanel(task, playerInfo, spriteManager))
             .collect(Collectors.toList());
     if (!loaded) {
       removeAll();
@@ -2383,7 +2417,7 @@ public class TaskTierPanel extends JPanel {
 
 package io.septem150.xeric.panel.summary;
 
-import io.septem150.xeric.data.ProjectXericManager;
+import io.septem150.xeric.data.player.PlayerInfo;
 import java.awt.BorderLayout;
 import java.awt.CardLayout;
 import javax.inject.Inject;
@@ -2402,14 +2436,13 @@ public class SummaryPanel extends JPanel {
   public static final String TOOLTIP = "Player Summary";
   public static final String TAB_ICON = "summary_tab_icon.png";
 
-  private final ProjectXericManager manager;
+  private final PlayerInfo playerInfo;
   private final TaskListPanel taskListPanel;
   private final IdCard idCardPanel;
 
   @Inject
-  private SummaryPanel(
-      ProjectXericManager manager, TaskListPanel taskListPanel, IdCard idCardPanel) {
-    this.manager = manager;
+  private SummaryPanel(PlayerInfo playerInfo, TaskListPanel taskListPanel, IdCard idCardPanel) {
+    this.playerInfo = playerInfo;
     this.taskListPanel = taskListPanel;
     this.idCardPanel = idCardPanel;
   }
@@ -2473,11 +2506,11 @@ public class SummaryPanel extends JPanel {
   }
 
   public void refresh() {
-    if (manager.getPlayerInfo().getUsername() == null) {
+    if (playerInfo.getUsername() == null) {
       layout.show(this, LOGGED_OUT_CONSTRAINT);
     } else {
       layout.show(this, LOGGED_IN_CONSTRAINT);
-      clogLabel.setVisible(manager.getPlayerInfo().getCollectionLog().getLastOpened() == null);
+      clogLabel.setVisible(playerInfo.getCollectionLog().getLastOpened() == null);
       idCardPanel.reload();
       taskListPanel.reload();
     }
@@ -2487,9 +2520,8 @@ public class SummaryPanel extends JPanel {
 
 package io.septem150.xeric.panel.summary;
 
-import io.septem150.xeric.data.ProjectXericManager;
+import io.septem150.xeric.data.player.PlayerInfo;
 import io.septem150.xeric.data.task.Task;
-import io.septem150.xeric.data.task.TaskStore;
 import io.septem150.xeric.data.task.TaskType;
 import io.septem150.xeric.util.ResourceUtil;
 import java.awt.*;
@@ -2507,8 +2539,7 @@ import net.runelite.client.ui.components.IconTextField;
 
 @Singleton
 public class TaskListPanel extends JPanel {
-  private final TaskStore taskStore;
-  private final ProjectXericManager manager;
+  private final PlayerInfo playerInfo;
   private final SpriteManager spriteManager;
 
   private List<TaskTierPanel> tierPanels = new ArrayList<>();
@@ -2522,10 +2553,8 @@ public class TaskListPanel extends JPanel {
   private boolean loaded;
 
   @Inject
-  public TaskListPanel(
-      TaskStore taskStore, ProjectXericManager manager, SpriteManager spriteManager) {
-    this.taskStore = taskStore;
-    this.manager = manager;
+  public TaskListPanel(PlayerInfo playerInfo, SpriteManager spriteManager) {
+    this.playerInfo = playerInfo;
     this.spriteManager = spriteManager;
   }
 
@@ -2588,11 +2617,11 @@ public class TaskListPanel extends JPanel {
 
   public void startUp() {
     tierPanels =
-        taskStore.getAll().stream()
+        playerInfo.getAllTasks().stream()
             .map(Task::getTier)
             .distinct()
             .sorted()
-            .map(tier -> new TaskTierPanel(tier, taskStore, manager, spriteManager))
+            .map(tier -> new TaskTierPanel(tier, playerInfo, spriteManager))
             .collect(Collectors.toList());
     if (!loaded) {
       removeAll();
@@ -2627,7 +2656,7 @@ public class TaskListPanel extends JPanel {
 
 package io.septem150.xeric.panel.summary;
 
-import io.septem150.xeric.data.ProjectXericManager;
+import io.septem150.xeric.data.player.PlayerInfo;
 import io.septem150.xeric.data.task.Task;
 import java.awt.*;
 import javax.swing.*;
@@ -2638,7 +2667,7 @@ import net.runelite.client.ui.ColorScheme;
 public class TaskPanel extends JPanel {
   private final Task task;
 
-  private final transient ProjectXericManager manager;
+  private final transient PlayerInfo playerInfo;
   private final transient SpriteManager spriteManager;
 
   private final JLabel nameAndIconLabel = new JLabel();
@@ -2647,11 +2676,9 @@ public class TaskPanel extends JPanel {
   private boolean loaded;
 
   public TaskPanel(
-      @NonNull Task task,
-      @NonNull ProjectXericManager manager,
-      @NonNull SpriteManager spriteManager) {
+      @NonNull Task task, @NonNull PlayerInfo playerInfo, @NonNull SpriteManager spriteManager) {
     this.task = task;
-    this.manager = manager;
+    this.playerInfo = playerInfo;
     this.spriteManager = spriteManager;
   }
 
@@ -2665,7 +2692,7 @@ public class TaskPanel extends JPanel {
 
     // set up completed checkbox
     completedCheckbox.setEnabled(false);
-    completedCheckbox.setSelected(manager.getPlayerInfo().getTasks().contains(task));
+    completedCheckbox.setSelected(playerInfo.getCompletedTasks().contains(task));
     completedCheckbox.setBorder(BorderFactory.createEmptyBorder(5, 0, 5, 5));
 
     // setup parent panel and add components to layout
@@ -2686,7 +2713,7 @@ public class TaskPanel extends JPanel {
   }
 
   public void refresh() {
-    completedCheckbox.setSelected(manager.getPlayerInfo().getTasks().contains(task));
+    completedCheckbox.setSelected(playerInfo.getCompletedTasks().contains(task));
     revalidate();
   }
 
@@ -2706,11 +2733,9 @@ public class TaskPanel extends JPanel {
 package io.septem150.xeric.panel.summary;
 
 import com.google.common.collect.Iterables;
-import io.septem150.xeric.data.ProjectXericManager;
 import io.septem150.xeric.data.player.ClanRank;
 import io.septem150.xeric.data.player.PlayerInfo;
 import io.septem150.xeric.data.task.Task;
-import io.septem150.xeric.data.task.TaskStore;
 import io.septem150.xeric.panel.JLabeledValue;
 import io.septem150.xeric.util.ResourceUtil;
 import io.septem150.xeric.util.TransferableBufferedImage;
@@ -2739,14 +2764,12 @@ import org.apache.commons.text.WordUtils;
 
 @Singleton
 public class IdCard extends JPanel {
-  private final ProjectXericManager manager;
-  private final TaskStore taskStore;
+  private final PlayerInfo playerInfo;
   private final SpriteManager spriteManager;
 
   @Inject
-  private IdCard(ProjectXericManager manager, TaskStore taskStore, SpriteManager spriteManager) {
-    this.manager = manager;
-    this.taskStore = taskStore;
+  private IdCard(PlayerInfo playerInfo, SpriteManager spriteManager) {
+    this.playerInfo = playerInfo;
     this.spriteManager = spriteManager;
 
     setBorder(BorderFactory.createEmptyBorder(0, 0, 5, 0));
@@ -2863,7 +2886,6 @@ public class IdCard extends JPanel {
   }
 
   private void makeDynamicData() {
-    PlayerInfo playerInfo = manager.getPlayerInfo();
     int playerPoints = playerInfo.getPoints();
     ClanRank playerRank = playerInfo.getRank();
     playerRank.getImageAsync(spriteManager, image -> rank.setIcon(new ImageIcon(image)));
@@ -2902,7 +2924,7 @@ public class IdCard extends JPanel {
               slayException.setIcon(new ImageIcon(ImageUtil.resizeImage(image, 20, 20, true))));
     }
     slayException.setEnabled(playerInfo.isSlayerException());
-    tasksCompleted.setValue(playerInfo.getTasks().size());
+    tasksCompleted.setValue(playerInfo.getCompletedTasks().size());
     pointsToNextRank.setValue(playerRank.getNextRank().getPointsNeeded() - playerPoints);
     highestTierCompleted.setValue(getHighestTierCompleted());
   }
@@ -2914,17 +2936,20 @@ public class IdCard extends JPanel {
   }
 
   private String getHighestTierCompleted() {
-    List<Task> tasks = taskStore.getAll();
     List<Integer> tiers =
-        tasks.stream().map(Task::getTier).distinct().sorted().collect(Collectors.toList());
+        playerInfo.getAllTasks().stream()
+            .map(Task::getTier)
+            .distinct()
+            .sorted()
+            .collect(Collectors.toList());
     int highestTier = 0;
     int maxTiers = Optional.ofNullable(Iterables.getLast(tiers, 0)).orElse(0);
     for (int tier = 1; tier <= maxTiers; tier++) {
-      if (manager.getPlayerInfo().getTasks().isEmpty()) break;
+      if (playerInfo.getCompletedTasks().isEmpty()) break;
       boolean completed = true;
-      for (Task task : tasks) {
+      for (Task task : playerInfo.getAllTasks()) {
         if (task.getTier() != tier) continue;
-        if (!manager.getPlayerInfo().getTasks().contains(task)) {
+        if (!playerInfo.getCompletedTasks().contains(task)) {
           completed = false;
           break;
         }

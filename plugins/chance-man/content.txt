@@ -226,10 +226,7 @@ public class DropCache
     private volatile boolean indexLoaded = false;
 
     // Dedicated IO executor so we dont block the common ForkJoinPool with file ops
-    private final ExecutorService ioExecutor = Executors.newFixedThreadPool(
-            Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
-            new ThreadFactoryBuilder().setNameFormat("dropcache-io-%d").build()
-    );
+    private ExecutorService ioExecutor;
 
     @Inject
     public DropCache(Gson gson, AccountManager accountManager, DropFetcher dropFetcher)
@@ -242,6 +239,7 @@ public class DropCache
     /** Preload on-disk index and prune stale cache entries. */
     public void startUp()
     {
+        ensureExecutor();
         String player = accountManager.getPlayerName();
         if (player == null || player.isEmpty()) { return; }
         loadIndex();
@@ -270,6 +268,7 @@ public class DropCache
             return CompletableFuture.failedFuture(ex);
         }
 
+        ExecutorService executor = ensureExecutor();
         return CompletableFuture.supplyAsync(() ->
         {
             if (file != null)
@@ -289,7 +288,7 @@ public class DropCache
                 removeIndex(file);
             }
             return null;
-        }, ioExecutor).thenComposeAsync(cached ->
+        }, executor).thenComposeAsync(cached ->
         {
             if (cached != null)
             {
@@ -351,13 +350,13 @@ public class DropCache
                             log.error("Failed to write cache file for {}", name, e);
                         }
                         return data;
-                    }, ioExecutor)
+                    }, executor)
                     .exceptionally(ex ->
                     {
                         log.error("Error fetching drop data for NPC {}", npcId, ex);
                         return null;
                     });
-        }, ioExecutor);
+        }, executor);
     }
 
     /**
@@ -376,6 +375,7 @@ public class DropCache
      */
     public CompletableFuture<List<String>> searchNpcNames(String query)
     {
+        ExecutorService executor = ensureExecutor();
         return CompletableFuture.supplyAsync(() ->
         {
             String lc = query.toLowerCase(Locale.ROOT).trim();
@@ -398,7 +398,7 @@ public class DropCache
             }
 
             return new ArrayList<>(names);
-        }, ioExecutor);
+        }, executor);
     }
 
     private boolean isFresh(Path file)
@@ -616,25 +616,27 @@ public class DropCache
     }
 
     /** Gracefully shutdown IO executor. */
-    public void shutdown()
-    {
-        ioExecutor.shutdown();
-        try
-        {
-            if (!ioExecutor.awaitTermination(3, TimeUnit.SECONDS))
-            {
-                ioExecutor.shutdownNow();
-                if (!ioExecutor.awaitTermination(2, TimeUnit.SECONDS))
-                {
-                    log.warn("dropcache-io executor did not terminate cleanly");
-                }
-            }
+    public void shutdown() {
+        ExecutorService executor = ioExecutor;
+        if (executor == null) {
+            return;
         }
-        catch (InterruptedException ie)
-        {
-            ioExecutor.shutdownNow();
-            Thread.currentThread().interrupt();
+
+        executor.shutdownNow();
+        ioExecutor = null;
+        cache.clear();
+        nameIndex.clear();
+        indexLoaded = false;
+    }
+
+    private synchronized ExecutorService ensureExecutor() {
+        if (ioExecutor == null || ioExecutor.isShutdown() || ioExecutor.isTerminated()) {
+            ioExecutor = Executors.newFixedThreadPool(
+                    Math.max(2, Runtime.getRuntime().availableProcessors() / 2),
+                    new ThreadFactoryBuilder().setNameFormat("dropcache-io-%d").build()
+            );
         }
+        return ioExecutor;
     }
 
     private String buildNameKey(String name, int level)
@@ -679,7 +681,7 @@ import java.util.concurrent.*;
 @Singleton
 public class DropFetcher
 {
-    private static final String USER_AGENT = "RuneLite-ChanceMan/2.7.0";
+    private static final String USER_AGENT = "RuneLite-ChanceMan/2.7.1";
     private final OkHttpClient httpClient;
     private final ItemManager itemManager;
     private final ClientThread clientThread;
@@ -2366,19 +2368,7 @@ public class ChanceManPlugin extends Plugin
         }
         if (fileExecutor != null)
         {
-            fileExecutor.shutdown(); // stop accepting new tasks
-            try
-            {
-                if (!fileExecutor.awaitTermination(1500, java.util.concurrent.TimeUnit.MILLISECONDS))
-                {
-                    fileExecutor.shutdownNow(); // cancel leftovers if they hang
-                }
-            }
-            catch (InterruptedException ie)
-            {
-                fileExecutor.shutdownNow();
-                Thread.currentThread().interrupt();
-            }
+            fileExecutor.shutdownNow();
             fileExecutor = null;
 
             if (unlockedItemsManager != null)
@@ -2541,13 +2531,7 @@ public class ChanceManPlugin extends Plugin
         if (!accountManager.ready()) return;
 
         TileItem tileItem = (TileItem) event.getItem();
-        int itemId = tileItem.getId();
-        ItemComposition comp = itemManager.getItemComposition(itemId);
-        String name = (comp != null && comp.getName() != null) ? comp.getName() : tileItem.toString();
-        if (name.toLowerCase().contains("ensouled")) {
-            int mappedId = ItemsFilter.getEnsouledHeadId(name);
-            if (mappedId != EnsouledHeadMapping.DEFAULT_ENSOULED_HEAD_ID) { itemId = mappedId; }
-        }
+        int itemId = EnsouledHeadMapping.toTradeableId(tileItem.getId());
         int canonicalItemId = itemManager.canonicalize(itemId);
         if (!isTradeable(canonicalItemId) || isNotTracked(canonicalItemId))
         {
@@ -2581,7 +2565,8 @@ public class ChanceManPlugin extends Plugin
             for (net.runelite.api.Item item : event.getItemContainer().getItems())
             {
                 int rawItemId = item.getId();
-                int canonicalId = itemManager.canonicalize(rawItemId);
+                int mapped = EnsouledHeadMapping.toTradeableId(rawItemId);
+                int canonicalId = itemManager.canonicalize(mapped);
                 if (!isTradeable(canonicalId) || isNotTracked(canonicalId))
                 {
                     continue;
@@ -2739,10 +2724,18 @@ public interface ChanceManConfig extends Config
     default boolean showGemDropTable() { return true; }
 
     @ConfigItem(
+            keyName = "deprioritizeLockedOptions",
+            name = "Deprioritize Locked Menu Options",
+            description = "Sorts locked menu options below the Walk Here option.",
+            position = 11
+    )
+    default boolean deprioritizeLockedOptions() { return true; }
+
+    @ConfigItem(
             keyName = "unlockedItemColor",
             name = "Unlocked Item Color",
             description = "Color of the unlocked item name in chat messages.",
-            position = 11
+            position = 12
     )
     default Color unlockedItemColor()
     {
@@ -2753,7 +2746,7 @@ public interface ChanceManConfig extends Config
             keyName = "rolledItemColor",
             name = "Rolled Item Color",
             description = "Color of the item used to unlock another item.",
-            position = 12
+            position = 13
     )
     default Color rolledItemColor()
     {
@@ -2764,7 +2757,7 @@ public interface ChanceManConfig extends Config
             keyName = "dimLockedItemsEnabled",
             name = "Dim locked items",
             description = "Dim any item icons that have not been unlocked.",
-            position = 13
+            position = 14
     )
     default boolean dimLockedItemsEnabled()
     {
@@ -2776,7 +2769,7 @@ public interface ChanceManConfig extends Config
             keyName = "dimLockedItemsOpacity",
             name = "Dim opacity",
             description = "0 = no dim (fully visible), 255 = fully transparent.",
-            position = 14
+            position = 15
     )
     default int dimLockedItemsOpacity()
     {
@@ -2835,6 +2828,11 @@ public class MusicWidgetController
     private List<Widget> backupJukeboxDynamicKids = null;
     private List<Widget> backupScrollStaticKids = null;
     private List<Widget> backupScrollDynamicKids = null;
+    private List<Widget> backupRootStaticKids = null;
+    private List<Widget> backupRootDynamicKids = null;
+    private final List<Widget> overrideRootWidgets = new ArrayList<>();
+    private final List<Widget> overrideScrollWidgets = new ArrayList<>();
+    private Integer originalRootType = null;
     private String originalTitleText = null;
     @Getter private final Map<Widget, DropItem> iconItemMap = new LinkedHashMap<>();
     @Getter private boolean overrideActive = false;
@@ -2964,7 +2962,14 @@ public class MusicWidgetController
             return new ArrayList<>();
         }
         Widget[] kids = dynamic ? parent.getDynamicChildren() : parent.getChildren();
-        return kids != null ? new ArrayList<>(Arrays.asList(kids)) : new ArrayList<>();
+        if (kids == null) {
+            return new ArrayList<>();
+        }
+        List<Widget> out = new ArrayList<>(kids.length);
+        for (Widget k : kids) {
+            if (k != null) out.add(k);
+        }
+        return out;
     }
 
     private static void restoreChildren(Widget parent, List<Widget> staticKids, List<Widget> dynamicKids)
@@ -2979,7 +2984,9 @@ public class MusicWidgetController
         {
             for (Widget w : currentStatic)
             {
-                w.setHidden(true);
+                if (w != null) {
+                    w.setHidden(true);
+                }
             }
         }
 
@@ -2988,7 +2995,9 @@ public class MusicWidgetController
         {
             for (Widget w : currentDyn)
             {
-                w.setHidden(true);
+                if (w != null) {
+                    w.setHidden(true);
+                }
             }
         }
 
@@ -2996,14 +3005,18 @@ public class MusicWidgetController
         {
             for (Widget w : staticKids)
             {
-                w.setHidden(false);
+                if (w != null && w.getType() != 0) {
+                    w.setHidden(false);
+                }
             }
         }
         if (dynamicKids != null)
         {
             for (Widget w : dynamicKids)
             {
-                w.setHidden(false);
+                if (w != null && w.getType() != 0) {
+                    w.setHidden(false);
+                }
             }
         }
 
@@ -3045,6 +3058,7 @@ public class MusicWidgetController
         lvl.setOriginalWidth(title.getOriginalWidth());
         lvl.setOriginalHeight(title.getOriginalHeight());
         lvl.revalidate();
+        overrideRootWidgets.add(lvl);
 
         Widget oldBar = client.getWidget(MUSIC_GROUP, 9);
         if (oldBar == null)
@@ -3069,6 +3083,7 @@ public class MusicWidgetController
         bg.setFilled(true);
         bg.setTextColor(0x000000);
         bg.revalidate();
+        overrideRootWidgets.add(bg);
 
         final int border = 1;
         int innerWidth = newW - border * 2;
@@ -3084,6 +3099,7 @@ public class MusicWidgetController
         fill.setFilled(true);
         fill.setTextColor(0x00b33c);
         fill.revalidate();
+        overrideRootWidgets.add(fill);
 
         String txt = String.format("%d/%d", rolledCount, totalDrops);
         Widget label = root.createChild(-1);
@@ -3098,6 +3114,7 @@ public class MusicWidgetController
         label.setOriginalX(xOld + (newW / 2) - (txt.length() * 4));
         label.setOriginalY(newY + (BAR_HEIGHT / 2) - 6);
         label.revalidate();
+        overrideRootWidgets.add(label);
 
         int eyeX = xOld + newW + 4;
         int eyeY = newY + (BAR_HEIGHT / 2) - (EYE_SIZE / 2);
@@ -3113,6 +3130,7 @@ public class MusicWidgetController
         eye.revalidate();
         eye.setAction(0, "Toggle rolled items");
 
+        overrideRootWidgets.add(eye);
         eye.setOnOpListener((JavaScriptCallback) (ScriptEvent ev) ->
         {
             hideRolledItems = !hideRolledItems;
@@ -3135,6 +3153,7 @@ public class MusicWidgetController
         search.setSpriteId(SEARCH_SPRITE);
         search.revalidate();
         search.setAction(0, "Search Drops");
+        overrideRootWidgets.add(search);
 
         search.setOnOpListener((JavaScriptCallback) ev -> showSearchDialog());
         search.setHasListener(true);
@@ -3250,6 +3269,7 @@ public class MusicWidgetController
             icon.revalidate();
 
             iconItemMap.put(icon, d);
+            overrideScrollWidgets.add(icon);
         }
 
         updateIconsVisibilityAndLayout();
@@ -3267,6 +3287,18 @@ public class MusicWidgetController
                 w.setHidden(true);
             }
         }
+
+        Widget root = client.getWidget(MUSIC_GROUP, 0);
+        if (backupRootStaticKids == null && root != null)
+        {
+            backupRootStaticKids = copyChildren(root, false);
+        }
+        if (backupRootDynamicKids == null && root != null)
+        {
+            backupRootDynamicKids = copyChildren(root, true);
+        }
+        overrideRootWidgets.clear();
+        overrideScrollWidgets.clear();
 
         List<DropItem> drops = dropData.getDropTableSections().stream()
                 .filter(sec ->
@@ -3301,12 +3333,15 @@ public class MusicWidgetController
                 .filter(d -> rolledIds.contains(d.getItemId()))
                 .count();
 
-        Widget root = client.getWidget(MUSIC_GROUP, 0);
         Widget title = updateTitle(dropData);
 
         if (root != null)
         {
             root.setHidden(false);
+            if (originalRootType == null)
+            {
+                originalRootType = root.getType();
+            }
             root.setType(WidgetType.LAYER);
             WidgetUtils.hideAllChildrenSafely(root);
 
@@ -3336,16 +3371,17 @@ public class MusicWidgetController
         Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
         Widget jukebox = client.getWidget(MUSIC_GROUP, 6);
 
+        purgeWidgets(overrideRootWidgets);
+        purgeWidgets(overrideScrollWidgets);
+        overrideRootWidgets.clear();
+        overrideScrollWidgets.clear();
+
         if (root != null)
         {
-            Widget[] dynRoot = root.getDynamicChildren();
-            if (dynRoot != null)
+            restoreChildren(root, backupRootStaticKids, backupRootDynamicKids);
+            if (originalRootType != null)
             {
-                for (Widget w : dynRoot)
-                {
-                    w.setHidden(true);
-                    w.revalidate();
-                }
+                root.setType(originalRootType);
             }
         }
 
@@ -3420,12 +3456,42 @@ public class MusicWidgetController
         originalTitleText = null;
         currentDrops = null;
         overrideActive = false;
+        backupRootStaticKids = null;
+        backupRootDynamicKids = null;
+        originalRootType = null;
         backupJukeboxStaticKids = null;
         backupJukeboxDynamicKids = null;
         backupScrollStaticKids = null;
         backupScrollDynamicKids = null;
         iconItemMap.clear();
         musicSearchButton.onOverrideDeactivated();
+    }
+
+
+    /**
+     * Forcefully removes widgets we created during override so they cannot
+     * be resurrected by the music tab's onLoad() which tends to unhide children.
+     */
+    private static void purgeWidgets(List<Widget> widgets)
+    {
+        if (widgets == null)
+        {
+            return;
+        }
+        for (Widget w : widgets)
+        {
+            if (w == null)
+            {
+                continue;
+            }
+            try {
+                w.setOnOpListener((JavaScriptCallback) null);
+                w.setHasListener(false);
+                w.setHidden(true);
+                w.setType(0);
+                w.revalidate();
+            } catch (Exception ignored) {}
+        }
     }
 }
 package com.chanceman.ui;
@@ -4255,138 +4321,198 @@ public class MusicSearchButton {
 package com.chanceman.ui;
 
 import com.chanceman.managers.UnlockedItemsManager;
+import com.chanceman.filters.EnsouledHeadMapping;
 import lombok.RequiredArgsConstructor;
 import lombok.Setter;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
-import net.runelite.api.ScriptID;
+import net.runelite.api.ItemComposition;
 import net.runelite.api.events.BeforeRender;
-import net.runelite.api.events.ScriptPostFired;
 import net.runelite.api.widgets.Widget;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.game.ItemManager;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import java.util.HashMap;
+import java.util.LinkedHashSet;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Dims the actual item icon widgets.
- * - Only dims when item is TRADEABLE && LOCKED.
- * - Runs at BeforeRender so scripts in the same frame can't overwrite opacity.
+ * Dims item icon widgets when item is TRADEABLE && LOCKED.
+ * Runs at BeforeRender so scripts in the same frame can't overwrite opacity.
  */
 @Singleton
 @RequiredArgsConstructor(onConstructor_ = @Inject)
-public class ItemDimmerController
-{
+public class ItemDimmerController {
     private final Client client;
     private final UnlockedItemsManager unlockedItemsManager;
     private final ItemManager itemManager;
+
+    // Cache (long-lived) for tradeable-by-canonical-id
+    private final ConcurrentHashMap<Integer, Boolean> tradeableCache = new ConcurrentHashMap<>();
+
+    // Cache (per-frame) for "should dim?" decisions by raw item id
+    private final Map<Integer, Boolean> dimDecisionCache = new HashMap<>(256);
 
     private volatile int dimOpacity = 150;
     @Setter
     private volatile boolean enabled = true;
 
-    private final ConcurrentHashMap<Integer, Boolean> tradeableCache = new ConcurrentHashMap<>();
+    public void setDimOpacity(int opacity) {
+        this.dimOpacity = Math.max(0, Math.min(255, opacity));
+    }
 
-    public void setDimOpacity(int opacity) { this.dimOpacity = Math.max(0, Math.min(255, opacity)); }
-
-    @Subscribe
-    public void onScriptPostFired(ScriptPostFired e)
+    private boolean isCollectionLogWidget(Widget w)
     {
-        if (!enabled || client.getGameState() != GameState.LOGGED_IN) return;
-
-        switch (e.getScriptId())
-        {
-            case ScriptID.INVENTORY_DRAWITEM:
-            case ScriptID.BANKMAIN_BUILD:
-            case ScriptID.BANKMAIN_FINISHBUILDING:
-            case ScriptID.BANKMAIN_SEARCH_REFRESH:
-            case ScriptID.BANK_DEPOSITBOX_INIT:
-                break;
-            default:
-                // ignore others
-        }
+        return w != null && w.getId() >>> 16 == 621;
     }
 
     /**
      * Last chance before drawing this frame; safe place to enforce opacity without races.
      */
     @Subscribe
-    public void onBeforeRender(BeforeRender e)
-    {
+    public void onBeforeRender(BeforeRender e) {
         if (!enabled || client.getGameState() != GameState.LOGGED_IN) return;
 
+        dimDecisionCache.clear();
         dimAllRoots();
     }
 
-    private void dimAllRoots()
-    {
+    private void dimAllRoots() {
         final Widget[] roots = client.getWidgetRoots();
         if (roots == null) return;
 
-        for (Widget root : roots)
-        {
-            if (root != null)
-            {
+        for (Widget root : roots) {
+            if (root != null) {
                 walkAndDim(root);
             }
         }
     }
 
-    private void walkAndDim(Widget w)
-    {
+    private void walkAndDim(Widget w) {
         if (w == null || w.isHidden()) return;
 
+        if (isCollectionLogWidget(w)) return;
         final int itemId = w.getItemId();
-        if (itemId > 0)
-        {
-            final int target = shouldDim(itemId) ? dimOpacity : 0;
-            if (w.getOpacity() != target)
-            {
-                w.setOpacity(target);
+        if (itemId > 0) {
+            // Don’t override the game’s own dim on bank placeholders
+            if (!isBankPlaceholderWidget(w)) {
+                final int target = shouldDimMemoized(itemId) ? dimOpacity : 0;
+                if (w.getOpacity() != target) {
+                    w.setOpacity(target);
+                }
             }
         }
 
         final Widget[] dyn = w.getDynamicChildren();
         if (dyn != null) for (Widget c : dyn) walkAndDim(c);
-
         final Widget[] stat = w.getStaticChildren();
         if (stat != null) for (Widget c : stat) walkAndDim(c);
-
         final Widget[] nest = w.getNestedChildren();
         if (nest != null) for (Widget c : nest) walkAndDim(c);
     }
 
-    private boolean shouldDim(int rawItemId)
-    {
-        if (!isTradeable(rawItemId)) return false;
-        return !isUnlocked(rawItemId);
+    private boolean shouldDimMemoized(int rawItemId) {
+        final int key = EnsouledHeadMapping.toTradeableId(rawItemId); // normalize cache key
+        final Boolean cached = dimDecisionCache.get(key);
+        if (cached != null) return cached;
+
+        final boolean result = shouldDim(rawItemId);
+        dimDecisionCache.put(key, result);
+        return result;
     }
 
-    private boolean isUnlocked(int itemId)
-    {
-        try { return unlockedItemsManager != null && unlockedItemsManager.isUnlocked(itemId); }
-        catch (Exception e) { return true; } // fail open
+    private boolean shouldDim(int rawItemId) {
+        final int mappedItemId = EnsouledHeadMapping.toTradeableId(rawItemId);
+        final int canonicalItemId = canonicalize(mappedItemId);
+        if (canonicalItemId <= 0) return false;
+        if (!isTradeableCanonical(canonicalItemId)) return false;
+        return !isUnlocked(mappedItemId, canonicalItemId);
     }
 
-    private boolean isTradeable(int rawItemId)
-    {
-        try
-        {
-            final int canonical = itemManager.canonicalize(rawItemId);
-            final Boolean cached = tradeableCache.get(canonical);
+    private int canonicalize(int rawItemId) {
+        try {
+            return itemManager.canonicalize(rawItemId);
+        } catch (Exception e) {
+            // Fall back to the raw ID if canonicalization fails
+            return rawItemId;
+        }
+    }
+
+    private boolean isUnlocked(int normalizedItemId, int canonicalItemId) {
+        if (unlockedItemsManager == null) return true; // fail open if manager missing
+
+        try {
+            // Fast paths: raw or canonical known unlocked
+            if (normalizedItemId > 0 && unlockedItemsManager.isUnlocked(normalizedItemId)) return true;
+            if (canonicalItemId > 0 && normalizedItemId != canonicalItemId && unlockedItemsManager.isUnlocked(canonicalItemId))
+                return true;
+
+            // Slower path: related ids (placeholders / noted variants)
+            final Set<Integer> candidates = new LinkedHashSet<>(4);
+            candidates.add(normalizedItemId);
+            candidates.add(canonicalItemId);
+
+            collectRelatedIds(normalizedItemId, candidates);
+            if (canonicalItemId != normalizedItemId) {
+                collectRelatedIds(canonicalItemId, candidates);
+            }
+
+            for (int id : candidates) {
+                if (id > 0 && unlockedItemsManager.isUnlocked(id)) {
+                    return true;
+                }
+            }
+        } catch (Exception e) {
+            return true; // fail open on unexpected errors
+        }
+
+        return false;
+    }
+
+    private void collectRelatedIds(int itemId, Set<Integer> sink) {
+        if (itemId <= 0) return;
+
+        try {
+            final ItemComposition comp = itemManager.getItemComposition(itemId);
+            if (comp == null) return;
+
+            // Placeholder
+            if (comp.getPlaceholderTemplateId() != -1) {
+                sink.add(comp.getPlaceholderId());
+            }
+
+            // Noted/unnoted pair
+            final int linkedNoteId = comp.getLinkedNoteId();
+            if (linkedNoteId > 0 && linkedNoteId != itemId) {
+                sink.add(linkedNoteId);
+            }
+        } catch (Exception ignored) {
+            // ignore bad compositions, rely on other IDs
+        }
+    }
+
+    private boolean isBankPlaceholderWidget(Widget w) {
+        return w != null && w.getItemId() > 0 && w.getItemQuantity() == 0;
+    }
+
+    private boolean isTradeableCanonical(int canonicalItemId) {
+        try {
+            final Boolean cached = tradeableCache.get(canonicalItemId);
             if (cached != null) return cached;
 
             boolean tradeable = false;
-            final var comp = itemManager.getItemComposition(canonical);
-            if (comp != null) tradeable = comp.isTradeable();
+            final ItemComposition comp = itemManager.getItemComposition(canonicalItemId);
+            if (comp != null) {
+                tradeable = comp.isTradeable();
+            }
 
-            tradeableCache.put(canonical, tradeable);
+            tradeableCache.put(canonicalItemId, tradeable);
             return tradeable;
-        }
-        catch (Exception e)
-        {
+        } catch (Exception e) {
             // If unsure, err on the side of NOT dimming
             return false;
         }
@@ -5604,6 +5730,8 @@ public enum FreeToPlayBlockedItems {
     CastleWarsBracelet3(ItemID.JEWL_CASTLEWARS_BRACELET3),
     CursedAmuletOfMagic(ItemID.AMULET_OF_MAGIC_CURSED),
     Dust(ItemID.DUST),
+    Fur(ItemID.FUR),
+    SwiftBlade(ItemID.SWIFT_BLADE),
 
     // Dyed boots and gloves
     GreyBoots(ItemID.WOLFENBOOTS_GREY),
@@ -6465,37 +6593,57 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Maps ensouled head item IDs (including untradeable drop IDs) to their tradeable IDs.
+ * Non-ensouled or unknown IDs are returned unchanged by {@link #toTradeableId(int)}.
+ */
 public final class EnsouledHeadMapping {
-    public static final int DEFAULT_ENSOULED_HEAD_ID = -1;
 
-    @Getter public static final Map<String, Integer> ENSOULED_HEAD_MAP;
+    @Getter
+    public static final Map<Integer, Integer> ENSOULED_CANONICAL_ID;
 
     static {
-        Map<String, Integer> ensouledMap = new HashMap<>();
-        ensouledMap.put("ensouled abyssal head", 13508);
-        ensouledMap.put("ensouled aviansie head", 13505);
-        ensouledMap.put("ensouled bear head", 13463);
-        ensouledMap.put("ensouled bloodveld head", 13496);
-        ensouledMap.put("ensouled chaos druid head", 13472);
-        ensouledMap.put("ensouled dagannoth head", 13493);
-        ensouledMap.put("ensouled demon head", 13502);
-        ensouledMap.put("ensouled dog head", 13469);
-        ensouledMap.put("ensouled dragon head", 13511);
-        ensouledMap.put("ensouled elf head", 13481);
-        ensouledMap.put("ensouled giant head", 13475);
-        ensouledMap.put("ensouled goblin head", 13448);
-        ensouledMap.put("ensouled hellhound head", 26997);
-        ensouledMap.put("ensouled horror head", 13487);
-        ensouledMap.put("ensouled imp head", 13454);
-        ensouledMap.put("ensouled kalphite head", 13490);
-        ensouledMap.put("ensouled minotaur head", 13457);
-        ensouledMap.put("ensouled monkey head", 13451);
-        ensouledMap.put("ensouled ogre head", 13478);
-        ensouledMap.put("ensouled scorpion head", 13460);
-        ensouledMap.put("ensouled troll head", 13484);
-        ensouledMap.put("ensouled tzhaar head", 13499);
-        ensouledMap.put("ensouled unicorn head", 13466);
-        ENSOULED_HEAD_MAP = Collections.unmodifiableMap(ensouledMap);
+        Map<Integer, Integer> idMap = new HashMap<>();
+
+        java.util.function.BiConsumer<Integer, Integer> pair = (untradeable, tradeable) -> {
+            idMap.put(untradeable, tradeable);
+            idMap.put(tradeable, tradeable);
+        };
+
+        pair.accept(13447, 13448); // Goblin
+        pair.accept(13450, 13451); // Monkey
+        pair.accept(13453, 13454); // Imp
+        pair.accept(13456, 13457); // Minotaur
+        pair.accept(13459, 13460); // Scorpion
+        pair.accept(13462, 13463); // Bear
+        pair.accept(13465, 13466); // Unicorn
+        pair.accept(13468, 13469); // Dog
+        pair.accept(13471, 13472); // Chaos Druid
+        pair.accept(13477, 13478); // Ogre
+        pair.accept(13480, 13481); // Elf
+        pair.accept(13483, 13484); // Troll
+        pair.accept(13486, 13487); // Horror
+        pair.accept(13489, 13490); // Kalphite
+        pair.accept(13492, 13493); // Dagannoth
+        pair.accept(13495, 13496); // Bloodveld
+        pair.accept(13498, 13499); // TzHaar
+        pair.accept(13501, 13502); // Demon
+        pair.accept(26996, 26997); // Hellhound
+        pair.accept(13504, 13505); // Aviansie
+        pair.accept(13507, 13508); // Abyssal
+        pair.accept(13510, 13511); // Dragon
+
+        ENSOULED_CANONICAL_ID = Collections.unmodifiableMap(idMap);
+    }
+
+    private EnsouledHeadMapping() { /* utility class, no instances */ }
+
+    /**
+     * Returns the tradeable ID for any ensouled head item ID.
+     * If the ID is already tradeable or not recognized as an ensouled head, it's returned unchanged.
+     */
+    public static int toTradeableId(int itemId) {
+        return ENSOULED_CANONICAL_ID.getOrDefault(itemId, itemId);
     }
 }
 
@@ -6534,40 +6682,6 @@ public class ItemsFilter {
     }
 
     /**
-     * Returns the correct ensouled head ID for the given item name.
-     * If not found, returns DEFAULT_ENSOULED_HEAD_ID.
-     *
-     * @param itemName the item name to check.
-     * @return the ensouled head ID if found; otherwise DEFAULT_ENSOULED_HEAD_ID.
-     */
-    public static int getEnsouledHeadId(String itemName) {
-        return (itemName == null)
-                ? EnsouledHeadMapping.DEFAULT_ENSOULED_HEAD_ID
-                : EnsouledHeadMapping.getENSOULED_HEAD_MAP().getOrDefault(
-                itemName.toLowerCase(), EnsouledHeadMapping.DEFAULT_ENSOULED_HEAD_ID);
-    }
-
-    /**
-     * Scans the provided text and returns the ensouled head ID if any known ensouled head key is found.
-     * Returns DEFAULT_ENSOULED_HEAD_ID if no match is found.
-     *
-     * @param text the text to scan.
-     * @return the ensouled head ID if a key is found; otherwise DEFAULT_ENSOULED_HEAD_ID.
-     */
-    public static int getEnsouledHeadIdFromText(String text) {
-        if (text == null) {
-            return EnsouledHeadMapping.DEFAULT_ENSOULED_HEAD_ID;
-        }
-        String lowerText = text.toLowerCase();
-        for (String key : EnsouledHeadMapping.getENSOULED_HEAD_MAP().keySet()) {
-            if (lowerText.contains(key)) {
-                return EnsouledHeadMapping.getENSOULED_HEAD_MAP().get(key);
-            }
-        }
-        return EnsouledHeadMapping.DEFAULT_ENSOULED_HEAD_ID;
-    }
-
-    /**
      * Checks if a poisonable weapon variant is eligible for rolling.
      * Base weapons are always eligible; for poisoned variants, if requireWeaponPoison is true,
      * the corresponding global weapon poison must also be unlocked.
@@ -6581,7 +6695,7 @@ public class ItemsFilter {
         return PoisonWeapons.isPoisonVariantEligible(itemId, requireWeaponPoison, unlockedItems);
     }
 
-    private boolean isGlobalWeaponPoison(int itemId) {
+    private static boolean isGlobalWeaponPoison(int itemId) {
         return itemId == PoisonWeapons.WEAPON_POISON.getBaseId() ||
                 itemId == PoisonWeapons.WEAPON_POISON_.getBaseId() ||
                 itemId == PoisonWeapons.WEAPON_POISON__.getBaseId();
@@ -6902,7 +7016,9 @@ public enum SkillOp
 
 package com.chanceman.menus;
 
+import com.chanceman.ChanceManConfig;
 import com.chanceman.ChanceManPlugin;
+import com.chanceman.filters.EnsouledHeadMapping;
 import com.chanceman.managers.UnlockedItemsManager;
 import lombok.Getter;
 import lombok.Setter;
@@ -6947,15 +7063,17 @@ public class ActionHandler {
 	/**
 	 * Normalize a MenuEntryAdded into the base item ID.
 	 */
-	private int getItemId(MenuEntryAdded event, MenuEntry entry)
-	{
+	private int getItemId(MenuEntryAdded event, MenuEntry entry) {
 		MenuAction type = entry.getType();
 		boolean hasItemId = entry.getItemId() > 0 || event.getItemId() > 0;
-		if (!GROUND_ACTIONS.contains(type) && !hasItemId) {return -1;}
+		if (!GROUND_ACTIONS.contains(type) && !hasItemId) {
+			return -1;
+		}
 		int raw = GROUND_ACTIONS.contains(type)
 				? event.getIdentifier()
 				: Math.max(event.getItemId(), entry.getItemId());
-		return plugin.getItemManager().canonicalize(raw);
+		int mapped = EnsouledHeadMapping.toTradeableId(raw);
+		return plugin.getItemManager().canonicalize(mapped);
 	}
 
 	private final HashSet<Integer> enabledUIs = new HashSet<>() {{
@@ -6967,6 +7085,8 @@ public class ActionHandler {
 	private Client client;
 	@Inject
 	private EventBus eventBus;
+    @Inject
+    private ChanceManConfig config;
 	@Inject
 	private ChanceManPlugin plugin;
 	@Inject
@@ -7032,6 +7152,9 @@ public class ActionHandler {
 			entry.setOption("<col=808080>" + option);
 			entry.setTarget("<col=808080>" + target);
 			entry.onClick(DISABLED);
+            if (config.deprioritizeLockedOptions()) {
+                entry.setDeprioritized(true);
+            }
 		}
 	}
 
@@ -7074,7 +7197,7 @@ public class ActionHandler {
 		String target = Text.removeTags(entry.getTarget());
 
 		// Always allow "Drop"
-		if (option.equalsIgnoreCase("drop"))
+		if (option.equalsIgnoreCase("drop") || option.equalsIgnoreCase("check"))
 			return true;
 		if (option.equalsIgnoreCase("clean") || option.equalsIgnoreCase("rub"))
 		{
@@ -7107,12 +7230,13 @@ public class ActionHandler {
 	 * If a ground item is locked, this method consumes the event.
 	 */
 	public static void handleGroundItems(ItemManager itemManager, UnlockedItemsManager unlockedItemsManager,
-										 MenuOptionClicked event, ChanceManPlugin plugin)
-	{
-		if (event.getMenuAction() != null && GROUND_ACTIONS.contains(event.getMenuAction()))
-		{
-			int rawItemId = event.getId() != -1 ? event.getId() : event.getMenuEntry().getItemId();
-			int canonicalGroundId = itemManager.canonicalize(rawItemId);
+										 MenuOptionClicked event, ChanceManPlugin plugin) {
+		if (event.getMenuAction() != null && GROUND_ACTIONS.contains(event.getMenuAction())) {
+			int rawItemId = event.getId() != -1
+					? event.getId()
+					: event.getMenuEntry().getItemId();
+			int mapped = EnsouledHeadMapping.toTradeableId(rawItemId);
+			int canonicalGroundId = itemManager.canonicalize(mapped);
 			if (plugin.isTradeable(canonicalGroundId)
 					&& !plugin.isNotTracked(canonicalGroundId)
 					&& unlockedItemsManager != null
@@ -7417,7 +7541,7 @@ public enum SkillItem
 	MITHRIL_PICKAXE(1273, SkillOp.MINE),
 	ADAMANT_PICKAXE(1271, SkillOp.MINE),
 	RUNE_PICKAXE(1275, SkillOp.MINE),
-	DRAGON_PICKAXE(12797,SkillOp.MINE),
+	DRAGON_PICKAXE(11920,SkillOp.MINE),
 	GILDED_PICKAXE(23276, SkillOp.MINE),
 	THIRD_AGE_PICKAXE(20014, SkillOp.MINE),
 
