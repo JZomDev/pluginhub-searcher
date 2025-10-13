@@ -1,31 +1,37 @@
-
 package com.ondrad.nekos;
 
 import com.google.inject.Provides;
 import javax.inject.Inject;
+
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
-import okhttp3.OkHttpClient;
 
 import java.awt.image.BufferedImage;
 import java.io.IOException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
+import java.util.Deque;
+import java.util.ArrayDeque;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.ArrayList;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 @Slf4j
 @PluginDescriptor(
 		name = "Nekos",
 		description = "Displays a cute neko on the screen",
-		tags = {"anime", "neko", "overlay", "catgirl, kitsune, cat"}
+		tags = {"anime", "neko", "overlay", "catgirl", "kitsune", "cat"}
 )
 public class nekoPlugin extends Plugin {
 
 	@Inject
-	private nekoConfig 	config;
+	private nekoConfig config;
 
 	@Inject
 	private OverlayManager overlayManager;
@@ -35,48 +41,179 @@ public class nekoPlugin extends Plugin {
 
 	@Inject
 	private nekoOverlay overlay;
-	private ScheduledExecutorService executorService;
+
+	private ScheduledExecutorService fetcherService;
+	private ScheduledExecutorService displayExecutor;
+	private ExecutorService fetchPool;
+	private static final int BUFFER_SIZE = 5;
+	private static final int HISTORY_SIZE = 1;
+	private final Deque<BufferedImage> imageBuffer = new ArrayDeque<>(BUFFER_SIZE);
+	private final List<BufferedImage> imageHistory = new LinkedList<>();
+	private final AtomicBoolean running = new AtomicBoolean(false);
+	private BufferedImage lastImage = null;
+
 
 	@Override
 	protected void startUp() {
 		overlayManager.add(overlay);
-		executorService = Executors.newSingleThreadScheduledExecutor();
-		int delaySeconds = config.delaySeconds();
-		executorService.scheduleAtFixedRate(this::fetchNekoImage, 0, delaySeconds, TimeUnit.SECONDS);
+		fetcherService = Executors.newSingleThreadScheduledExecutor();
+		fetchPool = Executors.newFixedThreadPool(2);
+		running.set(true);
+
+		fetcherService.submit(this::imageFetcherLoop);
+
+		if (!config.everyTick()) {
+			startDisplayExecutor(0);
+		}
 	}
 
-	private void fetchNekoImage() {
-		String endpoint;
+	private List<BufferedImage> fetchNekoImages() {
+		try {
+			return getRequest.GETRequest(getApiEndpoint());
+		} catch (IOException e) {
+			return null;
+		}
+	}
+
+	private String getApiEndpoint() {
 		switch (config.type()) {
 			case NEKOS:
-				endpoint = "https://nekos.life/api/v2/img/neko";
-				break;
+				return "https://nekos.life/api/v2/img/neko";
 			case CATS:
-				endpoint = "https://nekos.life/api/v2/img/meow";
-				break;
+				return "https://nekos.life/api/v2/img/meow";
 			case KITSUNE:
-				endpoint = "https://nekos.life/api/v2/img/fox_girl";
-				break;
+				return "https://nekos.life/api/v2/img/fox_girl";
 			default:
-				endpoint = "https://nekos.life/api/v2/img/neko";
-				break;
+				return "https://nekos.life/api/v2/img/neko";
 		}
+	}
 
-		try {
-			BufferedImage image = getRequest.GETRequest(endpoint);
-				if (image != null) {
-				overlay.updateImage(image);
+	private void imageFetcherLoop() {
+		while (running.get()) {
+			try {
+				int space;
+				synchronized (imageBuffer) {
+					space = BUFFER_SIZE - imageBuffer.size();
+				}
+				if (space > 0) {
+					int fetchCount = Math.min(space, 2);
+					List<Future<List<BufferedImage>>> futures = new ArrayList<>();
+					for (int i = 0; i < fetchCount; i++) {
+						futures.add(fetchPool.submit(this::fetchNekoImages));
+					}
+					for (Future<List<BufferedImage>> f : futures) {
+						try {
+							List<BufferedImage> imgs = f.get(5, TimeUnit.SECONDS);
+							if (imgs != null && !imgs.isEmpty()) {
+								synchronized (imageBuffer) {
+									for (BufferedImage image : imgs) {
+										if (imageBuffer.size() >= BUFFER_SIZE) break;
+										imageBuffer.addLast(image);
+									}
+								}
+							}
+						} catch (Exception e) {
+							log.warn("Failed to fetch image batch", e);
+						}
+					}
+				}
+				Thread.sleep(300);
+			} catch (Exception ex) {
+				log.warn("Error in image fetcher loop", ex);
 			}
-		} catch (IOException ex) {
-			log.error("Failed to fetch image", ex);
 		}
 	}
 
 	@Override
 	protected void shutDown() {
 		overlayManager.remove(overlay);
-		if (executorService != null) {
-			executorService.shutdown();
+		running.set(false);
+		if (fetcherService != null) {
+			fetcherService.shutdownNow();
+		}
+		if (fetchPool != null) {
+			fetchPool.shutdownNow();
+		}
+		if (displayExecutor != null) {
+			displayExecutor.shutdownNow();
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick tick) {
+		if (config.everyTick()) {
+			displayNextImage();
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event) {
+		if (!event.getGroup().equals("nekoconfig")) {
+			return;
+		}
+
+		boolean typeChanged = "type".equals(event.getKey());
+		if (typeChanged) {
+			synchronized (imageBuffer) {
+				imageBuffer.clear();
+			}
+		}
+
+		if (displayExecutor != null) {
+			displayExecutor.shutdownNow();
+			displayExecutor = null;
+		}
+
+		if (!config.everyTick()) {
+			long delayMillis = typeChanged ? 1000 : 0;
+			startDisplayExecutor(delayMillis);
+		}
+	}
+
+	private void startDisplayExecutor(long initialDelayMillis) {
+		displayExecutor = Executors.newSingleThreadScheduledExecutor();
+		long delayMillis = Math.max(1L, (long) config.delaySeconds() * 1000);
+		displayExecutor.scheduleAtFixedRate(this::displayNextImage, initialDelayMillis, delayMillis, TimeUnit.MILLISECONDS);
+	}
+
+	private void displayNextImage() {
+		BufferedImage next = null;
+		boolean bufferWasEmpty = false;
+		synchronized (imageBuffer) {
+			if (!imageBuffer.isEmpty()) {
+				next = imageBuffer.pollFirst();
+				synchronized (imageHistory) {
+					if (next != null && (imageHistory.isEmpty() || imageHistory.get(imageHistory.size() - 1) != next)) {
+						imageHistory.add(next);
+						if (imageHistory.size() > HISTORY_SIZE) {
+							imageHistory.remove(0);
+						}
+					}
+				}
+			} else {
+				bufferWasEmpty = true;
+			}
+		}
+		if (bufferWasEmpty) {
+			BufferedImage alt = null;
+			synchronized (imageHistory) {
+				for (BufferedImage img : imageHistory) {
+					if (img != lastImage) {
+						alt = img;
+						break;
+					}
+				}
+			}
+			if (alt != null) {
+				overlay.updateImage(alt);
+				return;
+			}
+		}
+		if (next != null) {
+			lastImage = next;
+		}
+		if (lastImage != null) {
+			overlay.updateImage(lastImage);
 		}
 	}
 
@@ -116,43 +253,43 @@ public interface nekoConfig extends Config
 
 
 	@ConfigItem(
-			position = 5,
-			keyName = "xpos",
-			name = "X Position",
-			description = "X position of the image"
+		position = 2,
+		keyName = "delaySeconds",
+		name = "Delay in seconds",
+		description = "The delay between images in seconds"
 	)
-	default int xpos() { return 9; }
-
-	@ConfigItem(
-			position = 6,
-			keyName = "ypos",
-			name = "Y position",
-			description = "Y position of the image"
-	)
-	default int ypos()
-	{
-		return 147;
-	}
-
-	@ConfigItem(
-			position = 2,
-			keyName = "delaySeconds",
-			name = "Delay in seconds",
-			description = "The delay between images in seconds"
-	)
-	@Range(
-			min = 1
-	)
+	@Range(min = 1)
 	default int delaySeconds()
 	{
 		return 10;
 	}
 
 	@ConfigItem(
-			position = 3,
-			keyName = "Dimensions",
-			name = "Dimensions",
-			description = "witdth and height of the image"
+		position = 3,
+		keyName = "everyTick",
+		name = "Update every game tick",
+		description = "If enabled, the image will update every RuneScape game tick (0.6s), ignoring the delay setting."
+	)
+	default boolean everyTick() {
+		return false;
+	}
+
+	@ConfigItem(
+		position = 4,
+		keyName = "opacity",
+		name = "Opacity",
+		description = "Opacity of the image in %"
+	)
+	default int opacity()
+	{
+		return 100;
+	}
+
+	@ConfigItem(
+		position = 5,
+		keyName = "Dimensions",
+		name = "Dimensions",
+		description = "Width and height of the image"
 	)
 	default Dimension dimension()
 	{
@@ -160,18 +297,22 @@ public interface nekoConfig extends Config
 	}
 
 	@ConfigItem(
-			position = 4,
-			keyName = "opacity",
-			name = "Opacity",
-			description = "Opacity of the image in %"
+		position = 6,
+		keyName = "xpos",
+		name = "X Position",
+		description = "X position of the image"
 	)
-	@Range(
-			min = 0,
-			max = 100
+	default int xpos() { return 9; }
+
+	@ConfigItem(
+		position = 7,
+		keyName = "ypos",
+		name = "Y position",
+		description = "Y position of the image"
 	)
-	default int opacity()
+	default int ypos()
 	{
-		return 100;
+		return 147;
 	}
 
 }
@@ -197,6 +338,7 @@ public class nekoOverlay extends Overlay {
     }
 
     private volatile ImageState imageState = new ImageState(null, false);
+
     @Inject
     private nekoConfig config;
 
@@ -208,14 +350,9 @@ public class nekoOverlay extends Overlay {
 
     @Override
     public Dimension render(Graphics2D graphics) {
-
         final ImageState currentState = imageState;
-
         if (currentState.loaded && currentState.image != null) {
-
             graphics.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, (float) config.opacity() / 100));
-
-
             graphics.drawImage(
                     currentState.image,
                     config.xpos(),
@@ -224,11 +361,8 @@ public class nekoOverlay extends Overlay {
                     config.dimension().height,
                     null
             );
-
         }
-
-
-        return new Dimension(1, 1);
+        return null;
     }
 
     public void updateImage(BufferedImage newImage) {
@@ -237,23 +371,35 @@ public class nekoOverlay extends Overlay {
 }
 package com.ondrad.nekos;
 
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import lombok.extern.slf4j.Slf4j;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.Response;
+import okhttp3.ResponseBody;
+
 import javax.imageio.ImageIO;
 import javax.inject.Inject;
 import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.io.InputStream;
+import java.util.ArrayList;
+import java.util.List;
 
+@Slf4j
 public class GetRequest {
     private final OkHttpClient client;
-@Inject
-    public GetRequest(OkHttpClient client) {
+    private final Gson gson;
+
+    @Inject
+    public GetRequest(OkHttpClient client, Gson gson) {
         this.client = client;
+        this.gson = gson;
     }
 
-    public BufferedImage GETRequest(String endpoint) throws IOException {
+    public List<BufferedImage> GETRequest(String endpoint) throws IOException {
+        List<BufferedImage> images = new ArrayList<>();
         Request apiRequest = new Request.Builder()
                 .url(endpoint)
                 .get()
@@ -261,25 +407,55 @@ public class GetRequest {
 
         try (Response apiResponse = client.newCall(apiRequest).execute()) {
             if (!apiResponse.isSuccessful()) {
+                log.warn("API request failed: {}", apiResponse);
+                return images;
+            }
+
+            ResponseBody body = apiResponse.body();
+            if (body == null) {
+                return images;
+            }
+
+            String jsonResponse = body.string();
+            jsonResponse = jsonResponse.trim();
+
+            try {
+                JsonObject obj = gson.fromJson(jsonResponse, JsonObject.class);
+                String imageUrl = obj.has("url") ? obj.get("url").getAsString() : null;
+                if (imageUrl != null && !imageUrl.isEmpty()) {
+                    BufferedImage img = fetchImage(imageUrl);
+                    if (img != null) {
+                        images.add(img);
+                    }
+                }
+            } catch (Exception e) {
+                log.warn("Could not parse JSON or extract image URL: {}", jsonResponse, e);
+            }
+        }
+        return images;
+    }
+
+    private BufferedImage fetchImage(String imageUrl) throws IOException {
+        Request imageRequest = new Request.Builder()
+                .url(imageUrl)
+                .build();
+        try (Response imageResponse = client.newCall(imageRequest).execute()) {
+            if (!imageResponse.isSuccessful()) {
+                log.debug("Image request failed: {}", imageResponse);
                 return null;
             }
 
-            String jsonResponse = apiResponse.body().string();
-            String imageUrl = jsonResponse
-                    .replace("{\"url\":\"", "")
-                    .replace("\"}", "");
+            ResponseBody body = imageResponse.body();
+            if (body == null) {
+                return null;
+            }
 
-            Request imageRequest = new Request.Builder()
-                    .url(imageUrl)
-                    .build();
-
-            try (Response imageResponse = client.newCall(imageRequest).execute()) {
-                if (!imageResponse.isSuccessful()) {
-                    return null;
-                }
-
-                try (InputStream inputStream = imageResponse.body().byteStream()) {
+            try (InputStream inputStream = body.byteStream()) {
+                try {
                     return ImageIO.read(inputStream);
+                } catch (Exception e) {
+                    log.debug("Failed to decode image: {} -> {}", imageUrl, e.getMessage());
+                    return null;
                 }
             }
         }
