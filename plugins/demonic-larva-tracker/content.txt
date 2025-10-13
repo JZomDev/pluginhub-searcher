@@ -265,7 +265,7 @@ class SceneOverlay extends Overlay
 			return;
 		}
 
-		final var shape = Perspective.getClickbox(client, npc.getModel(), npc.getCurrentOrientation(), lp.getX(), lp.getY(),
+		final var shape = Perspective.getClickbox(client, npc.getWorldView(), npc.getModel(), npc.getCurrentOrientation(), lp.getX(), lp.getY(),
 			Perspective.getTileHeight(client, lp, npc.getWorldView().getPlane()));
 		if (shape == null)
 		{

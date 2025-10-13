@@ -27,6 +27,7 @@ import net.runelite.client.plugins.PluginDescriptor;
 
 import java.awt.*;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 
 
@@ -98,7 +99,7 @@ public class SlayerWikiPlugin extends Plugin
 		 .put("harpie bug swarms", NpcID.HARPIE_BUG_SWARM)
 		 .put("hellhounds", NpcID.HELLHOUND)
 		 .put("hill giant", NpcID.HILL_GIANT)
-		 .put("hobgoblins", NpcID.HOBGOBLIN)
+		 .put("hobgoblins", NpcID.HOBGOBLIN_3049)
 		 .put("hydras", NpcID.HYDRA)
 		 .put("icefiends", NpcID.ICEFIEND)
 		 .put("ice giants", NpcID.ICE_GIANT)
@@ -249,7 +250,7 @@ public class SlayerWikiPlugin extends Plugin
 	@Subscribe
 	private void onMenuOptionClicked(MenuOptionClicked event) {
 		if (event.getMenuAction() == MenuAction.RUNELITE) {
-			if (event.getMenuOption() == "Task Wiki") {
+			if (Objects.equals(event.getMenuOption(), "Task Wiki")) {
 				event.consume();
 
 				final SlayerConfig slayerConfig = configManager.getConfig(SlayerConfig.class);
