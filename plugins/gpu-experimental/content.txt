@@ -228,9 +228,15 @@ import static info.sigterm.plugins.gpuzbuf.FacePrioritySorter.distanceToFaces;
 import static info.sigterm.plugins.gpuzbuf.GpuPlugin.glProgram;
 import static info.sigterm.plugins.gpuzbuf.GpuPlugin.uniBase;
 import org.lwjgl.BufferUtils;
+import static org.lwjgl.opengl.GL11.GL_UNSIGNED_INT;
 import static org.lwjgl.opengl.GL11.glDrawElements;
 import static org.lwjgl.opengl.GL11C.GL_TRIANGLES;
 import static org.lwjgl.opengl.GL14.glMultiDrawArrays;
+import static org.lwjgl.opengl.GL15C.GL_ELEMENT_ARRAY_BUFFER;
+import static org.lwjgl.opengl.GL15C.GL_STREAM_DRAW;
+import static org.lwjgl.opengl.GL15C.glBufferData;
+import static org.lwjgl.opengl.GL15C.glDeleteBuffers;
+import static org.lwjgl.opengl.GL15C.glGenBuffers;
 import static org.lwjgl.opengl.GL20C.glVertexAttribPointer;
 import static org.lwjgl.opengl.GL30C.GL_ARRAY_BUFFER;
 import static org.lwjgl.opengl.GL30C.GL_INT;
@@ -248,10 +254,9 @@ import static org.lwjgl.opengl.GL41C.glProgramUniform3i;
 class Zone
 {
 	// Zone vertex format
-	// index 0: -FLOAT.MAX_VALUE (non-array)
-	// index 1: short vec3(x, y, z)
-	// index 2: int abhsl
-	// index 3: short vec4(id, x, y, z)
+	// index 0: short vec3(x, y, z)
+	// index 1: int abhsl
+	// index 2: short vec4(id, x, y, z)
 	static final int VERT_SIZE = 20;
 
 	int glVao;
@@ -496,6 +501,7 @@ class Zone
 		// only set for static geometry as they require sorting
 		int radius;
 		int[] packedFaces;
+		byte[] renderPriorities;
 
 		static final int SKIP = 1; // temporary model is in a closer zone
 		static final int TEMP = 2; // temporary model added to a closer zone
@@ -604,6 +610,7 @@ class Zone
 
 		assert radius >= 0;
 
+		m.renderPriorities = model.getFaceRenderPriorities();
 		m.radius = 2 + (int) Math.sqrt(radius);
 
 		assert packedFaces.length > 0;
@@ -643,6 +650,7 @@ class Zone
 			{
 				alphaModels.remove(i);
 				m.packedFaces = null;
+				m.renderPriorities = null;
 				modelCache.add(m);
 			}
 			m.flags &= ~AlphaModel.SKIP;
@@ -659,6 +667,22 @@ class Zone
 	private static int lastDrawMode;
 	private static int lastVao;
 	private static int lastzx, lastzz;
+
+	private static int elementBufferId;
+
+	private static final int[] numOfPriority = FacePrioritySorter.numOfPriority;
+	private static final int[][] orderedFaces = FacePrioritySorter.orderedFaces;
+
+	static void initBuffer()
+	{
+		elementBufferId = glGenBuffers();
+	}
+
+	static void freeBuffer()
+	{
+		glDeleteBuffers(elementBufferId);
+		elementBufferId = 0;
+	}
 
 	void alphaSort(int zx, int zz, int cx, int cy, int cz)
 	{
@@ -765,22 +789,67 @@ class Zone
 				flush();
 			}
 
-			int start = m.startpos / (VERT_SIZE >> 2); // ints to verts
-			for (int i = diameter - 1; i >= 0; --i)
+			byte[] faceRenderPriorities = m.renderPriorities;
+			final int start = m.startpos / (VERT_SIZE >> 2); // ints to verts
+			if (faceRenderPriorities == null)
 			{
-				final int cnt = distanceFaceCount[i];
-				if (cnt > 0)
+				for (int i = diameter - 1; i >= 0; --i)
 				{
-					final char[] faces = distanceToFaces[i];
-
-					for (int faceIdx = 0; faceIdx < cnt; ++faceIdx)
+					final int cnt = distanceFaceCount[i];
+					if (cnt > 0)
 					{
-						int face = faces[faceIdx];
-						face *= 3;
-						face += start;
-						alphaElements.put(face++);
-						alphaElements.put(face++);
-						alphaElements.put(face++);
+						final char[] faces = distanceToFaces[i];
+
+						for (int faceIdx = 0; faceIdx < cnt; ++faceIdx)
+						{
+							int face = faces[faceIdx];
+							face *= 3;
+							face += start;
+							alphaElements.put(face++);
+							alphaElements.put(face++);
+							alphaElements.put(face++);
+						}
+					}
+				}
+			}
+			else
+			{
+				// Vanilla uses priority draw order for alpha faces and not depth draw order
+				// And since we don't have the full model here, only the alpha faces, we can't compute the
+				// 10/11 insertion points either. Just ignore those since I think they are mostly for players,
+				// which are rendered differently anyway.
+				Arrays.fill(numOfPriority, 0);
+
+				for (int i = diameter - 1; i >= 0; --i)
+				{
+					final int cnt = distanceFaceCount[i];
+					if (cnt > 0)
+					{
+						final char[] faces = distanceToFaces[i];
+
+						for (int faceIdx = 0; faceIdx < cnt; ++faceIdx)
+						{
+							final int face = faces[faceIdx];
+							final byte pri = faceRenderPriorities[face];
+							final int distIdx = numOfPriority[pri]++;
+
+							orderedFaces[pri][distIdx] = face;
+						}
+					}
+				}
+
+				for (int pri = 0; pri < 12; ++pri)
+				{
+					final int priNum = numOfPriority[pri];
+					final int[] priFaces = orderedFaces[pri];
+
+					for (int faceIdx = 0; faceIdx < priNum; ++faceIdx)
+					{
+						final int face = priFaces[faceIdx];
+						int idx = face * 3 + start;
+						alphaElements.put(idx++);
+						alphaElements.put(idx++);
+						alphaElements.put(idx++);
 					}
 				}
 			}
@@ -804,7 +873,10 @@ class Zone
 			alphaElements.flip();
 			glProgramUniform3i(glProgram, uniBase, lastzx << 10, 0, lastzz << 10);
 			glBindVertexArray(lastVao);
-			glDrawElements(GL_TRIANGLES, alphaElements);
+			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, elementBufferId);
+			glBufferData(GL_ELEMENT_ARRAY_BUFFER, alphaElements, GL_STREAM_DRAW);
+			glDrawElements(GL_TRIANGLES, alphaElements.limit(), GL_UNSIGNED_INT, 0L);
+			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
 			alphaElements.clear();
 		}
 		else if (lastDrawMode == STATIC_UNSORTED)
@@ -883,6 +955,7 @@ class Zone
 				m2.zofz = (byte) (closestZoneZ - zz);
 
 				m2.packedFaces = m.packedFaces;
+				m2.renderPriorities = m.renderPriorities;
 				m2.radius = m.radius;
 
 				m2.flags = AlphaModel.TEMP;
@@ -898,17 +971,14 @@ package info.sigterm.plugins.gpuzbuf;
 
 import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
+import static org.lwjgl.opengl.GL15.GL_WRITE_ONLY;
+import static org.lwjgl.opengl.GL15.glMapBuffer;
 import static org.lwjgl.opengl.GL15C.GL_ARRAY_BUFFER;
-import static org.lwjgl.opengl.GL15C.GL_DYNAMIC_DRAW;
 import static org.lwjgl.opengl.GL15C.glBindBuffer;
 import static org.lwjgl.opengl.GL15C.glBufferData;
 import static org.lwjgl.opengl.GL15C.glDeleteBuffers;
 import static org.lwjgl.opengl.GL15C.glGenBuffers;
 import static org.lwjgl.opengl.GL15C.glUnmapBuffer;
-import static org.lwjgl.opengl.GL30C.GL_MAP_INVALIDATE_BUFFER_BIT;
-import static org.lwjgl.opengl.GL30C.GL_MAP_UNSYNCHRONIZED_BIT;
-import static org.lwjgl.opengl.GL30C.GL_MAP_WRITE_BIT;
-import static org.lwjgl.opengl.GL30C.glMapBufferRange;
 
 class VBO
 {
@@ -924,12 +994,12 @@ class VBO
 		this.size = size;
 	}
 
-	void init()
+	void init(int usage)
 	{
 		bufId = glGenBuffers();
 
 		glBindBuffer(GL_ARRAY_BUFFER, bufId);
-		glBufferData(GL_ARRAY_BUFFER, size, GL_DYNAMIC_DRAW);
+		glBufferData(GL_ARRAY_BUFFER, size, usage);
 		glBindBuffer(GL_ARRAY_BUFFER, 0);
 	}
 
@@ -950,7 +1020,7 @@ class VBO
 	{
 		assert !mapped;
 		glBindBuffer(GL_ARRAY_BUFFER, bufId);
-		buffer = glMapBufferRange(GL_ARRAY_BUFFER, 0, size, GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT | GL_MAP_UNSYNCHRONIZED_BIT, buffer);
+		buffer = glMapBuffer(GL_ARRAY_BUFFER, GL_WRITE_ONLY, buffer);
 		if (buffer == null)
 		{
 			throw new RuntimeException("unable to map GL buffer " + bufId + " size " + size);
@@ -1867,21 +1937,21 @@ class SceneUploader
 		z.sizeO += faceCount;
 	}
 
-	private void uploadZoneRenderable(Renderable r, Zone zone, int orient, int x, int y, int z, int lx, int lz, int ux, int uz, int id, GpuIntBuffer vertexBuffer, GpuIntBuffer ab)
+	private void uploadZoneRenderable(Renderable r, Zone zone, int orient, int x, int y, int z, int lx, int lz, int ux, int uz, int id, GpuIntBuffer vb, GpuIntBuffer ab)
 	{
 		int pos = zone.vboA != null ? zone.vboA.vb.position() : 0;
 		Model model = null;
 		if (r instanceof Model)
 		{
 			model = (Model) r;
-			uploadStaticModel(model, orient, x - basex, y, z - basez, vertexBuffer, ab);
+			uploadStaticModel(model, orient, x - basex, y, z - basez, vb, ab);
 		}
 		else if (r instanceof DynamicObject)
 		{
 			model = ((DynamicObject) r).getModelZbuf();
 			if (model != null)
 			{
-				uploadStaticModel(model, orient, x - basex, y, z - basez, vertexBuffer, ab);
+				uploadStaticModel(model, orient, x - basex, y, z - basez, vb, ab);
 			}
 		}
 		int endpos = zone.vboA != null ? zone.vboA.vb.position() : 0;
@@ -2082,7 +2152,7 @@ class SceneUploader
 	}
 
 	// scene upload
-	private int uploadStaticModel(Model model, int orient, int x, int y, int z, GpuIntBuffer vertexBuffer, GpuIntBuffer ab)
+	private int uploadStaticModel(Model model, int orient, int x, int y, int z, GpuIntBuffer vb, GpuIntBuffer ab)
 	{
 		final int vertexCount = model.getVerticesCount();
 		final int triangleCount = model.getFaceCount();
@@ -2192,16 +2262,16 @@ class SceneUploader
 			alphaBias |= transparencies != null ? (transparencies[face] & 0xff) << 24 : 0;
 			alphaBias |= bias != null ? (bias[face] & 0xff) << 16 : 0;
 			int texture = faceTextures != null ? faceTextures[face] + 1 : 0;
-			GpuIntBuffer vb = alpha ? ab : vertexBuffer;
+			GpuIntBuffer buf = alpha ? ab : vb;
 
-			vb.put22224(vx1, vy1, vz1, alphaBias | color1);
-			vb.put2222(texture, modelLocalXI[texA] - vx1, modelLocalYI[texA] - vy1, modelLocalZI[texA] - vz1);
+			buf.put22224(vx1, vy1, vz1, alphaBias | color1);
+			buf.put2222(texture, modelLocalXI[texA] - vx1, modelLocalYI[texA] - vy1, modelLocalZI[texA] - vz1);
 
-			vb.put22224(vx2, vy2, vz2, alphaBias | color2);
-			vb.put2222(texture, modelLocalXI[texB] - vx2, modelLocalYI[texB] - vy2, modelLocalZI[texB] - vz2);
+			buf.put22224(vx2, vy2, vz2, alphaBias | color2);
+			buf.put2222(texture, modelLocalXI[texB] - vx2, modelLocalYI[texB] - vy2, modelLocalZI[texB] - vz2);
 
-			vb.put22224(vx3, vy3, vz3, alphaBias | color3);
-			vb.put2222(texture, modelLocalXI[texC] - vx3, modelLocalYI[texC] - vy3, modelLocalZI[texC] - vz3);
+			buf.put22224(vx3, vy3, vz3, alphaBias | color3);
+			buf.put2222(texture, modelLocalXI[texC] - vx3, modelLocalYI[texC] - vy3, modelLocalZI[texC] - vz3);
 
 			len += 3;
 		}
@@ -2782,7 +2852,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private int uniDrawDistance;
 	private int uniExpandedMapLoadingChunks;
 	private int uniWorldProj;
-	static int uniEntityProj;
+	private static int uniEntityProj;
 	static int uniEntityTint;
 	private int uniBrightness;
 	private int uniTex;
@@ -2795,6 +2865,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	private int uniTextureLightMode;
 	private int uniTick;
 	static int uniBase;
+
+	private static Projection lastProjection;
 
 	@Override
 	protected void startUp()
@@ -3184,6 +3256,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	{
 		uniformBuffer = new GpuFloatBuffer(UNIFORM_BUFFER_SIZE);
 		initGlBuffer(glUniformBuffer);
+		Zone.initBuffer();
 
 		vaoO = new VAOList();
 		vaoA = new VAOList();
@@ -3199,6 +3272,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	{
 		destroyGlBuffer(glUniformBuffer);
 		uniformBuffer = null;
+		Zone.freeBuffer();
 
 		vaoO.free();
 		vaoA.free();
@@ -3301,9 +3375,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		}
 	}
 
-	private Projection lastProjection;
-
-	private void updateEntityProject(Projection projection)
+	static void updateEntityProjection(Projection projection)
 	{
 		if (lastProjection != projection)
 		{
@@ -3549,7 +3621,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	public void drawZoneOpaque(Projection entityProjection, Scene scene, int zx, int zz)
 	{
-		updateEntityProject(entityProjection);
+		updateEntityProjection(entityProjection);
 
 		SceneContext ctx = context(scene);
 		if (ctx == null)
@@ -3572,7 +3644,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 	@Override
 	public void drawZoneAlpha(Projection entityProjection, Scene scene, int level, int zx, int zz)
 	{
-		updateEntityProject(entityProjection);
+		updateEntityProjection(entityProjection);
 
 		SceneContext ctx = context(scene);
 		if (ctx == null)
@@ -3612,7 +3684,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 			return;
 		}
 
-		updateEntityProject(projection);
+		updateEntityProjection(projection);
 
 		if (pass == DrawCallbacks.PASS_OPAQUE)
 		{
@@ -3818,7 +3890,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				if (sz > 0)
 				{
 					o = new VBO(sz);
-					o.init();
+					o.init(GL_STATIC_DRAW);
 					o.map();
 				}
 
@@ -3826,7 +3898,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 				if (sz > 0)
 				{
 					a = new VBO(sz);
-					a.init();
+					a.init(GL_STATIC_DRAW);
 					a.map();
 				}
 
@@ -4235,7 +4307,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					if (sz > 0)
 					{
 						o = new VBO(sz);
-						o.init();
+						o.init(GL_STATIC_DRAW);
 						o.map();
 					}
 
@@ -4243,7 +4315,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					if (sz > 0)
 					{
 						a = new VBO(sz);
-						a.init();
+						a.init(GL_STATIC_DRAW);
 						a.map();
 					}
 
@@ -4367,10 +4439,8 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 		SceneContext ctx0 = subs[worldViewId];
 		if (ctx0 != null)
 		{
-			log.error("Reload of an already loaded sub scene?");
-			ctx0.free();
+			throw new RuntimeException("Reload of an already loaded worldview?");
 		}
-		assert ctx0 == null;
 
 		final SceneContext ctx = new SceneContext(worldView.getSizeX() >> 3, worldView.getSizeY() >> 3);
 		subs[worldViewId] = ctx;
@@ -4400,7 +4470,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					if (sz > 0)
 					{
 						o = new VBO(sz);
-						o.init();
+						o.init(GL_STATIC_DRAW);
 						o.map();
 					}
 
@@ -4408,7 +4478,7 @@ public class GpuPlugin extends Plugin implements DrawCallbacks
 					if (sz > 0)
 					{
 						a = new VBO(sz);
-						a.init();
+						a.init(GL_STATIC_DRAW);
 						a.map();
 					}
 
@@ -4657,11 +4727,11 @@ class FacePrioritySorter
 	private static final float[] modelLocalY;
 	private static final float[] modelLocalZ;
 
-	private static final int[] numOfPriority;
+	static final int[] numOfPriority;
 	private static final int[] eq10;
 	private static final int[] eq11;
 	private static final int[] lt10;
-	private static final int[][] orderedFaces;
+	static final int[][] orderedFaces;
 
 	private static final int MAX_VERTEX_COUNT = SceneUploader.MAX_VERTEX_COUNT;
 	private static final int MAX_DIAMETER = 6000;
@@ -5292,19 +5362,18 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.FloatProjection;
 import net.runelite.api.Projection;
 import net.runelite.api.Scene;
-import static info.sigterm.plugins.gpuzbuf.GpuPlugin.uniEntityProj;
 import static info.sigterm.plugins.gpuzbuf.GpuPlugin.uniEntityTint;
+import static info.sigterm.plugins.gpuzbuf.GpuPlugin.updateEntityProjection;
+import static org.lwjgl.opengl.GL11.GL_TRIANGLES;
+import static org.lwjgl.opengl.GL11.glDrawArrays;
 import static org.lwjgl.opengl.GL11C.GL_FLOAT;
 import static org.lwjgl.opengl.GL11C.GL_INT;
 import static org.lwjgl.opengl.GL11C.GL_SHORT;
-import static org.lwjgl.opengl.GL11C.GL_TRIANGLES;
-import static org.lwjgl.opengl.GL11C.glDrawArrays;
+import static org.lwjgl.opengl.GL15.GL_DYNAMIC_DRAW;
 import static org.lwjgl.opengl.GL15C.GL_ARRAY_BUFFER;
 import static org.lwjgl.opengl.GL15C.glBindBuffer;
-import static org.lwjgl.opengl.GL20.glUniformMatrix4fv;
 import static org.lwjgl.opengl.GL20C.glEnableVertexAttribArray;
 import static org.lwjgl.opengl.GL20C.glUniform4i;
 import static org.lwjgl.opengl.GL20C.glVertexAttribPointer;
@@ -5317,9 +5386,8 @@ class VAO
 {
 	// Temporary vertex format
 	// index 0: vec3(x, y, z)
-	// index 1: Short.MIN_VALUE (non-array)
-	// index 2: int abhsl
-	// index 3: short vec4(id, x, y, z)
+	// index 1: int abhsl
+	// index 2: short vec4(id, x, y, z)
 	static final int VERT_SIZE = 24;
 
 	final VBO vbo;
@@ -5335,7 +5403,7 @@ class VAO
 		vao = glGenVertexArrays();
 		glBindVertexArray(vao);
 
-		vbo.init();
+		vbo.init(GL_DYNAMIC_DRAW);
 		glBindBuffer(GL_ARRAY_BUFFER, vbo.bufId);
 
 		glEnableVertexAttribArray(0);
@@ -5399,7 +5467,7 @@ class VAO
 
 			int count = end-start;
 
-			glUniformMatrix4fv(uniEntityProj, false, p instanceof FloatProjection ? ((FloatProjection)p).getProjection() : Mat4.identity());
+			updateEntityProjection(p);
 			glUniform4i(uniEntityTint, scene.getOverrideHue(), scene.getOverrideSaturation(), scene.getOverrideLuminance(), scene.getOverrideAmount());
 			glBindVertexArray(vao);
 			glDrawArrays(GL_TRIANGLES, start / (VERT_SIZE / 4), count / (VAO.VERT_SIZE / 4));
