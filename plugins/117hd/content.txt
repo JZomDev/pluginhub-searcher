@@ -2677,7 +2677,7 @@ public class SharedGLBuffer extends GLBuffer {
 	}
 
 	private void releaseCLBuffer() {
-		if (clId != 0)
+		if (clId != 0 && OpenCLManager.context != 0)
 			clReleaseMemObject(clId);
 		clId = 0;
 	}
@@ -10958,6 +10958,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.*;
 import net.runelite.api.events.*;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
@@ -10996,6 +10997,9 @@ public class LightManager {
 	private Client client;
 
 	@Inject
+	private ClientThread clientThread;
+
+	@Inject
 	private EventBus eventBus;
 
 	@Inject
@@ -11027,19 +11031,19 @@ public class LightManager {
 	private int currentPlane;
 
 	public void loadConfig(Gson gson, ResourcePath path) {
+		LightDefinition[] lights;
 		try {
-			LightDefinition[] lights;
-			try {
-				lights = path.loadJson(gson, LightDefinition[].class);
-				if (lights == null) {
-					log.warn("Skipping empty lights.json");
-					return;
-				}
-			} catch (IOException ex) {
-				log.error("Failed to load lights", ex);
+			lights = path.loadJson(gson, LightDefinition[].class);
+			if (lights == null) {
+				log.warn("Skipping empty lights.json");
 				return;
 			}
+		} catch (IOException ex) {
+			log.error("Failed to load lights", ex);
+			return;
+		}
 
+		clientThread.invoke(() -> {
 			WORLD_LIGHTS.clear();
 			NPC_LIGHTS.clear();
 			OBJECT_LIGHTS.clear();
@@ -11065,9 +11069,7 @@ public class LightManager {
 			// Reload lights once on plugin startup, and whenever lights.json should be hot-swapped.
 			// If we don't reload on startup, NPCs won't have lights added until RuneLite fires events
 			reloadLights = true;
-		} catch (Exception ex) {
-			log.error("Failed to parse light configuration", ex);
-		}
+		});
 	}
 
 	public void startUp() {
@@ -18157,8 +18159,12 @@ public class HdPlugin extends Plugin {
 	public static boolean SKIP_GL_ERROR_CHECKS;
 	public static GLCapabilities GL_CAPS;
 	public static boolean AMD_GPU;
+	public static boolean INTEL_GPU;
+	public static boolean NVIDIA_GPU;
 	public static boolean APPLE;
 	public static boolean APPLE_ARM;
+
+	public static boolean SUPPORTS_INDIRECT_DRAW;
 
 	public Canvas canvas;
 	public AWTContext awtContext;
@@ -18338,21 +18344,31 @@ public class HdPlugin extends Plugin {
 				useLowMemoryMode = config.lowMemoryMode();
 				BUFFER_GROWTH_MULTIPLIER = useLowMemoryMode ? 1.333f : 2;
 
-				APPLE = OSType.getOSType() == OSType.MacOS;
-				APPLE_ARM = APPLE && System.getProperty("os.arch").equals("aarch64");
+				OSType osType = OSType.getOSType();
+				String arch = System.getProperty("os.arch", "Unknown");
+				String wordSize = System.getProperty("sun.arch.data.model", "Unknown");
+				log.info("Operating system: {}", osType);
+				log.info("Architecture: {}", arch);
+				log.info("Client is {}-bit", wordSize);
+				APPLE = osType == OSType.MacOS;
+				APPLE_ARM = APPLE && arch.equals("aarch64");
 
 				String glRenderer = Objects.requireNonNullElse(glGetString(GL_RENDERER), "Unknown");
 				String glVendor = Objects.requireNonNullElse(glGetString(GL_VENDOR), "Unknown");
-				String arch = System.getProperty("sun.arch.data.model", "Unknown");
-				AMD_GPU = glRenderer.contains("AMD") || glRenderer.contains("Radeon") || glVendor.contains("ATI");
 				log.info("Using device: {} ({})", glRenderer, glVendor);
 				log.info("Using driver: {}", glGetString(GL_VERSION));
-				log.info("Client is {}-bit", arch);
-				log.info("Low memory mode: {}", useLowMemoryMode);
+				AMD_GPU = glRenderer.contains("AMD") || glRenderer.contains("Radeon") || glVendor.contains("ATI");
+				INTEL_GPU = glRenderer.contains("Intel");
+				NVIDIA_GPU = glRenderer.toLowerCase().contains("nvidia");
+
+				SUPPORTS_INDIRECT_DRAW = NVIDIA_GPU || config.forceIndirectDraw();
 
 				renderer = config.legacyRenderer() ?
 					injector.getInstance(LegacyRenderer.class) :
 					injector.getInstance(ZoneRenderer.class);
+				log.info("Using renderer: {}", renderer.getClass().getSimpleName());
+
+				log.info("Low memory mode: {}", useLowMemoryMode);
 
 				if (!Props.has("rlhd.skipGpuChecks")) {
 					List<String> fallbackDevices = List.of(
@@ -19453,6 +19469,7 @@ public class HdPlugin extends Plugin {
 							case KEY_LOW_MEMORY_MODE:
 							case KEY_REMOVE_VERTEX_SNAPPING:
 							case KEY_LEGACY_RENDERER:
+							case KEY_FORCE_INDIRECT_DRAW:
 								restartPlugin();
 								// since we'll be restarting the plugin anyway, skip pending changes
 								return;
@@ -25210,6 +25227,7 @@ import rs117.hd.utils.CommandBuffer;
 import static net.runelite.api.Perspective.*;
 import static org.lwjgl.opengl.GL33C.*;
 import static rs117.hd.HdPlugin.GL_CAPS;
+import static rs117.hd.HdPlugin.SUPPORTS_INDIRECT_DRAW;
 import static rs117.hd.HdPlugin.checkGLErrors;
 import static rs117.hd.renderer.zone.FacePrioritySorter.distanceFaceCount;
 import static rs117.hd.renderer.zone.FacePrioritySorter.distanceToFaces;
@@ -25879,7 +25897,7 @@ class Zone {
 				long byteOffset = 4L * (ZoneRenderer.eboAlphaStaging.position() - vertexCount);
 				cmd.BindVertexArray(lastVao);
 				// The EBO & IDO is bound by in ZoneRenderer
-				if (GL_CAPS.OpenGL43) {
+				if (GL_CAPS.OpenGL40 && SUPPORTS_INDIRECT_DRAW) {
 					cmd.DrawElementsIndirect(GL_TRIANGLES, vertexCount, (int) (byteOffset / 4L), ZoneRenderer.indirectDrawCmdsStaging);
 				} else {
 					cmd.DrawElements(GL_TRIANGLES, vertexCount, byteOffset);
@@ -25890,13 +25908,13 @@ class Zone {
 			convertForDraw(lastDrawMode == STATIC_UNSORTED ? VERT_SIZE : VAO.VERT_SIZE);
 			cmd.BindVertexArray(lastVao);
 			if (glDrawOffset.length == 1) {
-				if (GL_CAPS.OpenGL43) {
+				if (GL_CAPS.OpenGL40 && SUPPORTS_INDIRECT_DRAW) {
 					cmd.DrawArraysIndirect(GL_TRIANGLES, glDrawOffset[0], glDrawLength[0], ZoneRenderer.indirectDrawCmdsStaging);
 				} else {
 					cmd.DrawArrays(GL_TRIANGLES, glDrawOffset[0], glDrawLength[0]);
 				}
 			} else {
-				if (GL_CAPS.OpenGL43) {
+				if (GL_CAPS.OpenGL43 && SUPPORTS_INDIRECT_DRAW) {
 					cmd.MultiDrawArraysIndirect(GL_TRIANGLES, glDrawOffset, glDrawLength, ZoneRenderer.indirectDrawCmdsStaging);
 				} else {
 					cmd.MultiDrawArrays(GL_TRIANGLES, glDrawOffset, glDrawLength);
@@ -27867,7 +27885,6 @@ import static org.lwjgl.opengl.GL33C.*;
 import static org.lwjgl.opengl.GL40.GL_DRAW_INDIRECT_BUFFER;
 import static rs117.hd.HdPlugin.APPLE;
 import static rs117.hd.HdPlugin.COLOR_FILTER_FADE_DURATION;
-import static rs117.hd.HdPlugin.GL_CAPS;
 import static rs117.hd.HdPlugin.NEAR_PLANE;
 import static rs117.hd.HdPlugin.ORTHOGRAPHIC_ZOOM;
 import static rs117.hd.HdPlugin.checkGLErrors;
@@ -28215,7 +28232,7 @@ public class ZoneRenderer implements Renderer {
 				sceneCamera.getFrustumPlanes(plugin.cameraFrustum);
 
 				if (sceneCamera.isDirty()) {
-					int shadowDrawDistance = config.shadowDistance().getValue() * LOCAL_TILE_SIZE;
+					int shadowDrawDistance = 90 * LOCAL_TILE_SIZE;
 					directionalCamera.setPitch(environmentManager.currentSunAngles[0]);
 					directionalCamera.setYaw(PI - environmentManager.currentSunAngles[1]);
 
@@ -28555,9 +28572,6 @@ public class ZoneRenderer implements Renderer {
 			glBindBuffer(GL_DRAW_INDIRECT_BUFFER, indirectDrawCmds);
 			glBufferData(GL_DRAW_INDIRECT_BUFFER, indirectDrawCmdsStaging.getBuffer(), GL_STREAM_DRAW);
 		}
-
-		if (GL_CAPS.OpenGL43) // TODO: Specify why & gate it behind some other check, since it really supports OpenGL 4.2. Possibly even allow extensions.
-			GL43C.glMemoryBarrier(GL43C.GL_SHADER_STORAGE_BARRIER_BIT);
 
 		directionalShadowPass();
 		frameTimer.end(Timer.DRAW_SCENE);
@@ -30305,6 +30319,7 @@ import rs117.hd.utils.CommandBuffer;
 
 import static org.lwjgl.opengl.GL33C.*;
 import static rs117.hd.HdPlugin.GL_CAPS;
+import static rs117.hd.HdPlugin.SUPPORTS_INDIRECT_DRAW;
 
 class VAO {
 	// Zone vertex format
@@ -30414,7 +30429,7 @@ class VAO {
 			int end = lengths[i];
 			int count = end - start;
 
-			if (GL_CAPS.OpenGL43) {
+			if (GL_CAPS.OpenGL40 && SUPPORTS_INDIRECT_DRAW) {
 				cmd.DrawArraysIndirect(
 					GL_TRIANGLES,
 					start / (VERT_SIZE / 4),
@@ -31709,7 +31724,7 @@ public interface HdPluginConfig extends Config
 	String KEY_TILED_LIGHTING_IMAGE_STORE = "experimentalTiledLightingImageStore";
 	@ConfigItem(
 		keyName = KEY_TILED_LIGHTING_IMAGE_STORE,
-		name = "Tiled lighting image store",
+		name = "Use tiled lighting image store",
 		description = "If you experience any issues with tiled lighting, disabling this <i>might</i> help.",
 		section = experimentalSettings
 	)
@@ -31725,6 +31740,19 @@ public interface HdPluginConfig extends Config
 		section = experimentalSettings
 	)
 	default boolean roofShadows() {
+		return false;
+	}
+
+	String KEY_FORCE_INDIRECT_DRAW = "experimentalForceIndirectDraw";
+	@ConfigItem(
+		keyName = KEY_FORCE_INDIRECT_DRAW,
+		name = "Force indirect draw",
+		description =
+			"Indirect draw is currently only enabled automatically for Nvidia GPUs.<br>" +
+			"Enabling this <i>might</i> improve performance, if it is supported by your system.",
+		section = experimentalSettings
+	)
+	default boolean forceIndirectDraw() {
 		return false;
 	}
 
