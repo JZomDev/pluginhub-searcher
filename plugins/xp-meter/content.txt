@@ -1,17 +1,294 @@
-package com.xpmeter;
+package com.toofifty.xpmeter;
 
-import com.toofifty.xpmeter.XPMeterPlugin;
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
+import com.google.gson.Gson;
+import com.google.gson.JsonParser;
+import com.google.gson.annotations.Expose;
+import com.google.inject.Inject;
+import com.google.inject.Singleton;
+import static com.toofifty.xpmeter.Util.secondsToTicks;
+import java.awt.Point;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.stream.Collectors;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Skill;
 
-public class XPMeterPluginTest
+@Slf4j
+@Singleton
+public class XPTracker
 {
-	public static void main(String[] args) throws Exception
+	private static final int ONE_MINUTE = 100;
+	private static final int ONE_HOUR = 60 * ONE_MINUTE;
+
+	@Inject private XPMeterConfig config;
+	@Inject private Gson gson;
+
+	// data
+	@Expose private final Map<Skill, List<XPGain>> xpGained = new HashMap<>();
+	@Expose private final Map<Skill, Integer> lastXp = new HashMap<>();
+	@Expose private final Map<Skill, Integer> startTicks = new HashMap<>();
+
+	@Expose @Getter private int currentTick;
+	@Expose @Getter private boolean paused;
+	@Expose @Getter private final Set<Integer> pauses = new HashSet<>();
+	@Expose @Getter private final Set<Integer> logouts = new HashSet<>();
+
+	// transient
+	@Setter private Set<Skill> enabledSkills;
+
+	private final Map<Integer, Integer> cache = new HashMap<>();
+	@Getter private List<Skill> sortedSkills;
+	@Getter private int maxXpPerHour;
+
+	private int cacheHits = 0;
+	private int cacheMisses = 0;
+
+	@Getter private Performance performance;
+
+	public void track(Skill skill, int xp)
 	{
-		ExternalPluginManager.loadBuiltin(XPMeterPlugin.class);
-		RuneLite.main(args);
+		if (paused)
+		{
+			return;
+		}
+
+		if (lastXp.containsKey(skill))
+		{
+			if (!xpGained.containsKey(skill))
+			{
+				xpGained.put(skill, new ArrayList<>());
+				startTicks.put(skill, currentTick);
+			}
+
+			final var diff = xp - lastXp.get(skill);
+			if (diff != 0)
+			{
+				xpGained.get(skill).add(new XPGain(currentTick, diff));
+			}
+		}
+
+		lastXp.put(skill, xp);
+	}
+
+	public boolean isTracking()
+	{
+		return !lastXp.isEmpty();
+	}
+
+	public Set<Skill> getTrackedSkills()
+	{
+		return xpGained.keySet().stream()
+			.filter(skill -> enabledSkills.contains(skill))
+			.collect(Collectors.toSet());
+	}
+
+	public int getXPPerHourAt(Skill skill, int tick, int windowInterval, TrackingMode trackingMode)
+	{
+		final var hash = Objects.hash(skill, tick, windowInterval, trackingMode);
+
+		if (!cache.containsKey(hash) || config.disableCache())
+		{
+			final var xpGains = xpGained.getOrDefault(skill, List.of());
+			final var interval = secondsToTicks(windowInterval);
+			final var elapsed = tick - startTicks.getOrDefault(skill, 0);
+
+			final var xpGained = xpGains.stream()
+				.filter((XPGain xpGain) -> xpGain.tick <= tick && (
+					trackingMode == TrackingMode.CUMULATIVE || xpGain.tick > (tick - interval)
+				))
+				.mapToInt(xpGain -> xpGain.xp)
+				.sum();
+
+			if (trackingMode == TrackingMode.CUMULATIVE)
+			{
+				cache.put(hash, xpGained * ONE_HOUR / Math.max(ONE_MINUTE, elapsed));
+			}
+			else
+			{
+				cache.put(hash, xpGained * ONE_HOUR / interval);
+			}
+
+			cacheMisses++;
+		}
+		else
+		{
+			cacheHits++;
+		}
+
+		return cache.get(hash);
+	}
+
+	public List<Point> getHistory(Skill skill, int resolution)
+	{
+		final var history = new ArrayList<Point>();
+		final var startTick = Math.max(currentTick - secondsToTicks(config.span()), 0);
+		final var windowInterval = config.windowInterval();
+		final var trackingMode = config.trackingMode();
+		for (int t = startTick; t < currentTick; t += secondsToTicks(resolution))
+		{
+			history.add(new Point(t, getXPPerHourAt(skill, t, windowInterval, trackingMode)));
+		}
+
+		return history;
+	}
+
+	public Map<Skill, List<Point>> getAggregate(int maxPixels)
+	{
+		cacheHits = 0;
+		cacheMisses = 0;
+		final var start = Instant.now();
+
+		maxXpPerHour = 0;
+		final var pixelResolution = config.disableDynamicResolution()
+			? 1
+			: config.span() / maxPixels;
+		final var resolution = Math.max(config.resolution(), pixelResolution);
+		final var skillHistories = new HashMap<Skill, List<Point>>();
+		final var skillCurrentRates = new HashMap<Skill, Integer>();
+		for (var skill : getTrackedSkills())
+		{
+			final var history = getHistory(skill, resolution);
+			skillHistories.put(skill, history);
+
+			final var last = history.get(history.size() - 1);
+			skillCurrentRates.put(skill, last == null ? 0 : last.y);
+
+			for (var point : history)
+			{
+				if (point.y > maxXpPerHour)
+				{
+					maxXpPerHour = point.y;
+				}
+			}
+		}
+
+		sortedSkills = skillCurrentRates.entrySet().stream()
+			.sorted(Comparator.comparingInt(Map.Entry::getValue))
+			.map(Map.Entry::getKey)
+			.collect(Collectors.toList());
+
+		final var time = Duration.between(start, Instant.now()).toMillis();
+		performance = new Performance(time, cache.size(), cacheHits, cacheMisses, resolution);
+
+		return skillHistories;
+	}
+
+	public void tick()
+	{
+		currentTick++;
+	}
+
+	public void reset()
+	{
+		xpGained.clear();
+		startTicks.clear();
+		cache.clear();
+		pauses.clear();
+		logouts.clear();
+		currentTick = 0;
+	}
+
+	public void clearCache()
+	{
+		cache.clear();
+	}
+
+	public void pause()
+	{
+		paused = true;
+		pauses.add(currentTick);
+	}
+
+	public void unpause()
+	{
+		paused = false;
+	}
+
+	public void trackLogout()
+	{
+		logouts.add(currentTick);
+	}
+
+	public String export()
+	{
+		return gson.newBuilder()
+			.excludeFieldsWithoutExposeAnnotation()
+			.create()
+			.toJson(this);
+	}
+
+	public void restore(String json)
+	{
+		reset();
+		var data = new JsonParser().parse(json).getAsJsonObject();
+
+		for (var entry : data.get("xpGained").getAsJsonObject().entrySet())
+		{
+			var jsonGains = entry.getValue().getAsJsonArray();
+			var gains = new ArrayList<XPGain>();
+			for (var jsonGain : jsonGains)
+			{
+				var gain = jsonGain.getAsJsonObject();
+				gains.add(new XPGain(gain.get("tick").getAsInt(), gain.get("xp").getAsInt()));
+			}
+			xpGained.put(Skill.valueOf(entry.getKey()), gains);
+		}
+
+		for (var entry : data.get("lastXp").getAsJsonObject().entrySet())
+		{
+			lastXp.put(Skill.valueOf(entry.getKey()), entry.getValue().getAsInt());
+		}
+
+		for (var entry : data.get("startTicks").getAsJsonObject().entrySet())
+		{
+			startTicks.put(Skill.valueOf(entry.getKey()), entry.getValue().getAsInt());
+		}
+
+		currentTick = data.get("currentTick").getAsInt();
+
+		paused = data.get("paused").getAsBoolean();
+
+		for (var logout : data.get("pauses").getAsJsonArray())
+		{
+			pauses.add(logout.getAsInt());
+		}
+
+		for (var logout : data.get("logouts").getAsJsonArray())
+		{
+			logouts.add(logout.getAsInt());
+		}
+	}
+
+	@AllArgsConstructor
+	static class XPGain
+	{
+		@Expose private int tick;
+		@Expose private int xp;
+	}
+
+	@Getter
+	@AllArgsConstructor
+	static class Performance
+	{
+		private long computeTime;
+		private int cacheSize;
+		private int cacheHits;
+		private int cacheMisses;
+		private int renderedResolution;
 	}
 }
+
 package com.toofifty.xpmeter;
 
 import net.runelite.client.config.Config;
@@ -357,6 +634,18 @@ public interface XPMeterConfig extends Config
 		return true;
 	}
 
+	@ConfigItem(
+			name = "Sailing",
+			keyName = "trackSailing",
+			description = "Track Sailing",
+			position = 24,
+			section = skills
+	)
+	default boolean trackSailing()
+	{
+		return true;
+	}
+
 	@ConfigSection(
 		name = "Display",
 		description = "Display settings",
@@ -626,470 +915,6 @@ public interface XPMeterConfig extends Config
 
 package com.toofifty.xpmeter;
 
-import lombok.AllArgsConstructor;
-
-@AllArgsConstructor
-public enum TrackingMode
-{
-	CUMULATIVE("Cumulative"),
-	SLIDING_WINDOW("Sliding window");
-
-	private final String name;
-}
-
-package com.toofifty.xpmeter;
-
-public class Util
-{
-	public static int ticksToSeconds(int ticks)
-	{
-		return (int) (ticks * 0.6d);
-	}
-
-	public static int secondsToTicks(int seconds)
-	{
-		return (int) ((double) seconds / 0.6d);
-	}
-
-	public static String ticksToTime(int ticks)
-	{
-		final var seconds = ticksToSeconds(ticks);
-		final var minutes = (int) (seconds / 60d);
-		final var hours = (int) (minutes / 60d);
-
-		return hours > 0
-			? String.format("%d:%02d:%02d", hours, minutes % 60, seconds % 60)
-			: String.format("%02d:%02d", minutes % 60, seconds % 60);
-	}
-
-	public static String format(int number)
-	{
-		if (number < 100000)
-		{
-			return String.format("%,d", number);
-		}
-
-		if (number < 10000000)
-		{
-			return String.format("%,dK", number / 1000);
-		}
-
-		return String.format("%,dM", number / 1000000);
-	}
-
-	public static String shortFormat(int number)
-	{
-		if (number < 1000)
-		{
-			return "" + number;
-		}
-
-		if (number < 1_000_000)
-		{
-			return String.format("%,dK", number / 1000);
-		}
-
-		return String.format("%,dM", number / 1000000);
-	}
-}
-
-package com.toofifty.xpmeter;
-
-import com.google.gson.Gson;
-import com.google.gson.JsonParser;
-import com.google.gson.annotations.Expose;
-import com.google.inject.Inject;
-import com.google.inject.Singleton;
-import static com.toofifty.xpmeter.Util.secondsToTicks;
-import java.awt.Point;
-import java.time.Duration;
-import java.time.Instant;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Set;
-import java.util.stream.Collectors;
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Skill;
-
-@Slf4j
-@Singleton
-public class XPTracker
-{
-	private static final int ONE_MINUTE = 100;
-	private static final int ONE_HOUR = 60 * ONE_MINUTE;
-
-	@Inject private XPMeterConfig config;
-	@Inject private Gson gson;
-
-	// data
-	@Expose private final Map<Skill, List<XPGain>> xpGained = new HashMap<>();
-	@Expose private final Map<Skill, Integer> lastXp = new HashMap<>();
-	@Expose private final Map<Skill, Integer> startTicks = new HashMap<>();
-
-	@Expose @Getter private int currentTick;
-	@Expose @Getter private boolean paused;
-	@Expose @Getter private final Set<Integer> pauses = new HashSet<>();
-	@Expose @Getter private final Set<Integer> logouts = new HashSet<>();
-
-	// transient
-	@Setter private Set<Skill> enabledSkills;
-
-	private final Map<Integer, Integer> cache = new HashMap<>();
-	@Getter private List<Skill> sortedSkills;
-	@Getter private int maxXpPerHour;
-
-	private int cacheHits = 0;
-	private int cacheMisses = 0;
-
-	@Getter private Performance performance;
-
-	public void track(Skill skill, int xp)
-	{
-		if (paused)
-		{
-			return;
-		}
-
-		if (lastXp.containsKey(skill))
-		{
-			if (!xpGained.containsKey(skill))
-			{
-				xpGained.put(skill, new ArrayList<>());
-				startTicks.put(skill, currentTick);
-			}
-
-			final var diff = xp - lastXp.get(skill);
-			if (diff != 0)
-			{
-				xpGained.get(skill).add(new XPGain(currentTick, diff));
-			}
-		}
-
-		lastXp.put(skill, xp);
-	}
-
-	public boolean isTracking()
-	{
-		return !lastXp.isEmpty();
-	}
-
-	public Set<Skill> getTrackedSkills()
-	{
-		return xpGained.keySet().stream()
-			.filter(skill -> enabledSkills.contains(skill))
-			.collect(Collectors.toSet());
-	}
-
-	public int getXPPerHourAt(Skill skill, int tick, int windowInterval, TrackingMode trackingMode)
-	{
-		final var hash = Objects.hash(skill, tick, windowInterval, trackingMode);
-
-		if (!cache.containsKey(hash) || config.disableCache())
-		{
-			final var xpGains = xpGained.getOrDefault(skill, List.of());
-			final var interval = secondsToTicks(windowInterval);
-			final var elapsed = tick - startTicks.getOrDefault(skill, 0);
-
-			final var xpGained = xpGains.stream()
-				.filter((XPGain xpGain) -> xpGain.tick <= tick && (
-					trackingMode == TrackingMode.CUMULATIVE || xpGain.tick > (tick - interval)
-				))
-				.mapToInt(xpGain -> xpGain.xp)
-				.sum();
-
-			if (trackingMode == TrackingMode.CUMULATIVE)
-			{
-				cache.put(hash, xpGained * ONE_HOUR / Math.max(ONE_MINUTE, elapsed));
-			}
-			else
-			{
-				cache.put(hash, xpGained * ONE_HOUR / interval);
-			}
-
-			cacheMisses++;
-		}
-		else
-		{
-			cacheHits++;
-		}
-
-		return cache.get(hash);
-	}
-
-	public List<Point> getHistory(Skill skill, int resolution)
-	{
-		final var history = new ArrayList<Point>();
-		final var startTick = Math.max(currentTick - secondsToTicks(config.span()), 0);
-		final var windowInterval = config.windowInterval();
-		final var trackingMode = config.trackingMode();
-		for (int t = startTick; t < currentTick; t += secondsToTicks(resolution))
-		{
-			history.add(new Point(t, getXPPerHourAt(skill, t, windowInterval, trackingMode)));
-		}
-
-		return history;
-	}
-
-	public Map<Skill, List<Point>> getAggregate(int maxPixels)
-	{
-		cacheHits = 0;
-		cacheMisses = 0;
-		final var start = Instant.now();
-
-		maxXpPerHour = 0;
-		final var pixelResolution = config.disableDynamicResolution()
-			? 1
-			: config.span() / maxPixels;
-		final var resolution = Math.max(config.resolution(), pixelResolution);
-		final var skillHistories = new HashMap<Skill, List<Point>>();
-		final var skillCurrentRates = new HashMap<Skill, Integer>();
-		for (var skill : getTrackedSkills())
-		{
-			final var history = getHistory(skill, resolution);
-			skillHistories.put(skill, history);
-
-			final var last = history.get(history.size() - 1);
-			skillCurrentRates.put(skill, last == null ? 0 : last.y);
-
-			for (var point : history)
-			{
-				if (point.y > maxXpPerHour)
-				{
-					maxXpPerHour = point.y;
-				}
-			}
-		}
-
-		sortedSkills = skillCurrentRates.entrySet().stream()
-			.sorted(Comparator.comparingInt(Map.Entry::getValue))
-			.map(Map.Entry::getKey)
-			.collect(Collectors.toList());
-
-		final var time = Duration.between(start, Instant.now()).toMillis();
-		performance = new Performance(time, cache.size(), cacheHits, cacheMisses, resolution);
-
-		return skillHistories;
-	}
-
-	public void tick()
-	{
-		currentTick++;
-	}
-
-	public void reset()
-	{
-		xpGained.clear();
-		startTicks.clear();
-		cache.clear();
-		pauses.clear();
-		logouts.clear();
-		currentTick = 0;
-	}
-
-	public void clearCache()
-	{
-		cache.clear();
-	}
-
-	public void pause()
-	{
-		paused = true;
-		pauses.add(currentTick);
-	}
-
-	public void unpause()
-	{
-		paused = false;
-	}
-
-	public void trackLogout()
-	{
-		logouts.add(currentTick);
-	}
-
-	public String export()
-	{
-		return gson.newBuilder()
-			.excludeFieldsWithoutExposeAnnotation()
-			.create()
-			.toJson(this);
-	}
-
-	public void restore(String json)
-	{
-		reset();
-		var data = new JsonParser().parse(json).getAsJsonObject();
-
-		for (var entry : data.get("xpGained").getAsJsonObject().entrySet())
-		{
-			var jsonGains = entry.getValue().getAsJsonArray();
-			var gains = new ArrayList<XPGain>();
-			for (var jsonGain : jsonGains)
-			{
-				var gain = jsonGain.getAsJsonObject();
-				gains.add(new XPGain(gain.get("tick").getAsInt(), gain.get("xp").getAsInt()));
-			}
-			xpGained.put(Skill.valueOf(entry.getKey()), gains);
-		}
-
-		for (var entry : data.get("lastXp").getAsJsonObject().entrySet())
-		{
-			lastXp.put(Skill.valueOf(entry.getKey()), entry.getValue().getAsInt());
-		}
-
-		for (var entry : data.get("startTicks").getAsJsonObject().entrySet())
-		{
-			startTicks.put(Skill.valueOf(entry.getKey()), entry.getValue().getAsInt());
-		}
-
-		currentTick = data.get("currentTick").getAsInt();
-
-		paused = data.get("paused").getAsBoolean();
-
-		for (var logout : data.get("pauses").getAsJsonArray())
-		{
-			pauses.add(logout.getAsInt());
-		}
-
-		for (var logout : data.get("logouts").getAsJsonArray())
-		{
-			logouts.add(logout.getAsInt());
-		}
-	}
-
-	@AllArgsConstructor
-	static class XPGain
-	{
-		@Expose private int tick;
-		@Expose private int xp;
-	}
-
-	@Getter
-	@AllArgsConstructor
-	static class Performance
-	{
-		private long computeTime;
-		private int cacheSize;
-		private int cacheHits;
-		private int cacheMisses;
-		private int renderedResolution;
-	}
-}
-
-package com.toofifty.xpmeter;
-
-import static com.toofifty.xpmeter.Util.secondsToTicks;
-import static com.toofifty.xpmeter.Util.ticksToSeconds;
-import java.util.ArrayList;
-import java.util.List;
-
-public class Intervals
-{
-	/**
-	 * Generate XP intervals based on the maximum XP
-	 * displayed in the chart.
-	 * Aims to have 1-3 intervals displayed at one time.
-	 */
-	public static List<Integer> getXpIntervals(int max)
-	{
-		var interval = 500_000;
-		if (max < 10_000)
-		{
-			interval = 5_000;
-		}
-		else if (max < 25_000)
-		{
-			interval = 10_000;
-		}
-		else if (max < 100_000)
-		{
-			interval = 25_000;
-		}
-		else if (max < 200_000)
-		{
-			interval = 50_000;
-		}
-		else if (max < 500_000)
-		{
-			interval = 100_000;
-		}
-		else if (max < 1_000_000)
-		{
-			interval = 250_000;
-		}
-
-		final var xpIntervals = new ArrayList<Integer>();
-		for (var i = 0; i < max; i += interval)
-		{
-			xpIntervals.add(i);
-		}
-		return xpIntervals;
-	}
-
-	/**
-	 * Generate time intervals based on the time span
-	 * displayed in the chart.
-	 * Aims to have 4-8 intervals displayed at one time.
-	 */
-	public static List<Integer> getTimeIntervals(int startTick, int endTick)
-	{
-		final var span = ticksToSeconds(endTick - startTick);
-
-		var interval = secondsToTicks(3600);
-		if (span < 120) // 2min
-		{
-			interval = secondsToTicks(15);
-		}
-		else if (span < 240) // 4min
-		{
-			interval = secondsToTicks(30);
-		}
-		else if (span < 480) // 8min
-		{
-			interval = secondsToTicks(60);
-		}
-		else if (span < 1800) // 30min
-		{
-			interval = secondsToTicks(300);
-		}
-		else if (span < 3600) // 1h
-		{
-			interval = secondsToTicks(900);
-		}
-		else if (span < 7200) // 2h
-		{
-			interval = secondsToTicks(1800);
-		}
-
-		final var timeIntervals = new ArrayList<Integer>();
-
-		// always add span start time
-		timeIntervals.add(startTick);
-
-		// generate all time intervals up to current tick
-		// only keep if > spanStart
-		for (var i = 0; i < endTick; i += interval)
-		{
-			if (i > startTick) timeIntervals.add(i);
-		}
-
-		// always add current time
-		timeIntervals.add(endTick);
-
-		return timeIntervals;
-	}
-}
-
-package com.toofifty.xpmeter;
-
 import java.awt.Color;
 import java.awt.Dimension;
 import java.awt.FontMetrics;
@@ -1299,258 +1124,101 @@ public abstract class XPChartBase implements LayoutableRenderableEntity
 
 package com.toofifty.xpmeter;
 
-import com.google.inject.Inject;
-import com.google.inject.Provides;
-import static com.toofifty.xpmeter.Util.secondsToTicks;
-import java.util.HashSet;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.api.GameState;
-import net.runelite.api.KeyCode;
+import java.awt.Color;
+import lombok.AllArgsConstructor;
 import net.runelite.api.Skill;
-import net.runelite.api.events.GameStateChanged;
-import net.runelite.api.events.GameTick;
-import net.runelite.api.events.ScriptCallbackEvent;
-import net.runelite.api.events.StatChanged;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.config.RuneLiteConfig;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.ConfigChanged;
-import net.runelite.client.events.OverlayMenuClicked;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.ui.overlay.OverlayManager;
 
-@Slf4j
-@PluginDescriptor(
-	name = "XP Meter",
-	description = "Interactive XP/h Meter"
-)
-public class XPMeterPlugin extends Plugin
+@AllArgsConstructor
+public enum SkillColor
 {
-	@Inject private Client client;
-	@Inject private OverlayManager overlayManager;
-	@Inject private ConfigManager configManager;
-	@Inject private RuneLiteConfig runeLiteConfig;
+	// must match order of Skill enum
 
-	@Inject private XPMeterConfig config;
-	@Inject private XPTracker tracker;
-	@Inject private XPMeterOverlay overlay;
+	ATTACK(new Color(145, 58, 42)),
+	DEFENCE(new Color(119, 133, 196)),
+	STRENGTH(new Color(57, 113, 78)),
+	HITPOINTS(new Color(167, 57, 30)),
+	RANGED(new Color(93, 111, 35)),
+	PRAYER(new Color(192, 185, 185)),
+	MAGIC(new Color(76, 77, 157)),
+	COOKING(new Color(109, 53, 137)),
+	WOODCUTTING(new Color(128, 110, 65)),
+	FLETCHING(new Color(65, 101, 105)),
+	FISHING(new Color(134, 172, 221)),
+	FIREMAKING(new Color(198, 135, 44)),
+	CRAFTING(new Color(115, 94, 71)),
+	SMITHING(new Color(84, 84, 67)),
+	MINING(new Color(81, 80, 65)),
+	HERBLORE(new Color(60, 139, 22)),
+	AGILITY(new Color(68, 68, 201)),
+	THIEVING(new Color(109, 71, 99)),
+	SLAYER(new Color(104, 95, 95)),
+	FARMING(new Color(57, 89, 45)),
+	RUNECRAFT(new Color(178, 178, 168)),
+	HUNTER(new Color(128, 124, 103)),
+	CONSTRUCTION(new Color(169, 159, 138)),
+	SAILING(new Color(0, 71, 255));
 
-	@Override
-	protected void startUp()
+	private final Color color;
+
+	public static Color get(Skill skill)
 	{
-		overlayManager.add(overlay);
-		syncConfig(null);
+		return values()[skill.ordinal()].color;
+	}
+}
+
+package com.toofifty.xpmeter;
+
+public class Util
+{
+	public static int ticksToSeconds(int ticks)
+	{
+		return (int) (ticks * 0.6d);
 	}
 
-	@Override
-	protected void shutDown()
+	public static int secondsToTicks(int seconds)
 	{
-		overlayManager.remove(overlay);
+		return (int) ((double) seconds / 0.6d);
 	}
 
-	@Subscribe
-	public void onStatChanged(StatChanged event)
+	public static String ticksToTime(int ticks)
 	{
-		tracker.track(event.getSkill(), event.getXp());
+		final var seconds = ticksToSeconds(ticks);
+		final var minutes = (int) (seconds / 60d);
+		final var hours = (int) (minutes / 60d);
+
+		return hours > 0
+			? String.format("%d:%02d:%02d", hours, minutes % 60, seconds % 60)
+			: String.format("%02d:%02d", minutes % 60, seconds % 60);
 	}
 
-	@Subscribe
-	public void onGameTick(GameTick event)
+	public static String format(int number)
 	{
-		if (client.getGameState() != GameState.LOGGED_IN)
+		if (number < 100000)
 		{
-			return;
+			return String.format("%,d", number);
 		}
 
-		if (tracker.isPaused())
+		if (number < 10000000)
 		{
-			return;
+			return String.format("%,dK", number / 1000);
 		}
 
-		tracker.tick();
-		// only update histories every Nth tick, otherwise the plotted
-		// lines start to wobble (as the current tick changes, it calculates each
-		// history point off-phase which means the values are different every tick)
-		if (tracker.getCurrentTick() % secondsToTicks(config.resolution()) == 0)
-		{
-			update();
-		}
+		return String.format("%,dM", number / 1000000);
 	}
 
-	@Subscribe
-	public void onGameStateChanged(GameStateChanged event)
+	public static String shortFormat(int number)
 	{
-		if (event.getGameState() != GameState.LOGGED_IN
-			&& event.getGameState() != GameState.LOADING
-			&& tracker.isTracking())
+		if (number < 1000)
 		{
-			tracker.trackLogout();
-		}
-	}
-
-	@Subscribe
-	public void onConfigChanged(ConfigChanged event)
-	{
-		if (event.getGroup().equals(XPMeterConfig.GROUP_NAME))
-		{
-			syncConfig(event.getKey());
-
-			if (event.getKey().equals("enableDataMenuOptions"))
-			{
-				overlay.updateMenuEntries(config.enableDataMenuOptions());
-			}
+			return "" + number;
 		}
 
-		// listen to changes in runelite config's overlay color,
-		// since setting the overlay color to "null" causes it to
-		// become out of sync with the runelite setting
-		if (event.getGroup().equals(RuneLiteConfig.GROUP_NAME)
-			&& event.getKey().equals("overlayBackgroundColor"))
+		if (number < 1_000_000)
 		{
-			syncConfig(null);
-		}
-	}
-
-	@Subscribe
-	public void onOverlayMenuClicked(OverlayMenuClicked event)
-	{
-		if (event.getOverlay() == overlay)
-		{
-			if (event.getEntry().getOption().equals("Export data"))
-			{
-				configManager.setConfiguration(
-					XPMeterConfig.GROUP_NAME,
-					"sessionData",
-					tracker.export()
-				);
-			}
-			else if (event.getEntry().getOption().equals("Restore data"))
-			{
-				tracker.restore(config.sessionData());
-			}
-		}
-	}
-
-	@Subscribe
-	public void onScriptCallbackEvent(ScriptCallbackEvent event)
-	{
-		if (!config.scrollZoom())
-		{
-			return;
+			return String.format("%,dK", number / 1000);
 		}
 
-		if ("scrollWheelZoomIncrement".equals(event.getEventName())
-			&& overlay.isMouseOver()
-			&& client.isKeyPressed(KeyCode.KC_SHIFT))
-		{
-			final var intStack = client.getIntStack();
-
-			updateScroll(intStack[1]);
-
-			// this stops the client scroll - don't ask how
-			intStack[2] = -intStack[1];
-		}
-	}
-
-	/**
-	 * Push config values into overlay, so they aren't
-	 * read every frame
-	 */
-	private void syncConfig(String changedKey)
-	{
-		final var chart = overlay.getChart();
-
-		chart.setSpan(secondsToTicks(config.span()));
-		chart.setChartHeight(config.chartHeight());
-		chart.setShowTimeLabels(config.showTimeLabels());
-		chart.setShowTimeMarkers(config.showTimeMarkers());
-		chart.setShowXpLabels(config.showXpLabels());
-		chart.setShowXpMarkers(config.showXpMarkers());
-		chart.setShowCurrentRates(config.showCurrentRates());
-		chart.setStackCurrentRates(config.stackCurrentRates());
-		chart.setShowSkillIcons(config.showSkillIcons());
-		chart.setLongFormatNumbers(config.longFormatNumbers());
-		chart.setShowPerformance(config.showPerformance());
-		chart.setShowHoverTooltips(config.showHoverTooltips());
-		chart.setDimNonHoveredSkills(config.dimNonHoveredSkills());
-		chart.setShowAllHovers(config.showAllHovers());
-
-		overlay.setBackgroundColor(
-			config.theme().overlayBackground != null
-				? config.theme().overlayBackground
-				: runeLiteConfig.overlayBackgroundColor()
-		);
-		chart.setTheme(config.theme());
-
-		if ("windowInterval".equals(changedKey)
-			|| "trackingMode".equals(changedKey))
-		{
-			tracker.clearCache();
-		}
-
-		if (changedKey == null || changedKey.startsWith("track"))
-		{
-			final var enabledSkills = new HashSet<Skill>();
-			for (var skill : Skill.values())
-			{
-				final var enabled = configManager.<Boolean>getConfiguration(
-					XPMeterConfig.GROUP_NAME,
-					"track" + skill.getName(),
-					boolean.class
-				);
-				if (enabled)
-				{
-					enabledSkills.add(skill);
-				}
-			}
-			tracker.setEnabledSkills(enabledSkills);
-
-			if (changedKey != null)
-			{
-				// immediately show changes in skill filtering in
-				// the chart
-				update();
-			}
-		}
-
-		if ("span".equals(changedKey))
-		{
-			// stops line segments overflowing the chart
-			// before the next update tick
-			update();
-		}
-	}
-
-	private void update()
-	{
-		final var chart = overlay.getChart();
-
-		chart.setSkillXpHistories(tracker.getAggregate(chart.getBounds().width));
-		chart.setSortedSkills(tracker.getSortedSkills());
-		chart.setMaxXpPerHour(tracker.getMaxXpPerHour());
-		chart.setCurrentTick(tracker.getCurrentTick());
-		chart.setPauses(tracker.getPauses());
-		chart.setLogouts(tracker.getLogouts());
-		chart.setPerformance(tracker.getPerformance());
-	}
-
-	private void updateScroll(int dir)
-	{
-		final var span = (int) (config.span() * Math.pow(1.2, dir));
-
-		configManager.setConfiguration(
-			XPMeterConfig.GROUP_NAME,
-			"span",
-			Math.max(span, 10)
-		);
-	}
-
-	@Provides
-	public XPMeterConfig getConfig(ConfigManager configManager)
-	{
-		return configManager.getConfig(XPMeterConfig.class);
+		return String.format("%,dM", number / 1000000);
 	}
 }
 
@@ -1652,6 +1320,241 @@ public enum Theme
 	public final int ratePadding;
 	// x margin outside container
 	public final int rateMargin;
+}
+
+package com.toofifty.xpmeter;
+
+import static com.toofifty.xpmeter.Util.secondsToTicks;
+import static com.toofifty.xpmeter.Util.ticksToSeconds;
+import java.util.ArrayList;
+import java.util.List;
+
+public class Intervals
+{
+	/**
+	 * Generate XP intervals based on the maximum XP
+	 * displayed in the chart.
+	 * Aims to have 1-3 intervals displayed at one time.
+	 */
+	public static List<Integer> getXpIntervals(int max)
+	{
+		var interval = 500_000;
+		if (max < 10_000)
+		{
+			interval = 5_000;
+		}
+		else if (max < 25_000)
+		{
+			interval = 10_000;
+		}
+		else if (max < 100_000)
+		{
+			interval = 25_000;
+		}
+		else if (max < 200_000)
+		{
+			interval = 50_000;
+		}
+		else if (max < 500_000)
+		{
+			interval = 100_000;
+		}
+		else if (max < 1_000_000)
+		{
+			interval = 250_000;
+		}
+
+		final var xpIntervals = new ArrayList<Integer>();
+		for (var i = 0; i < max; i += interval)
+		{
+			xpIntervals.add(i);
+		}
+		return xpIntervals;
+	}
+
+	/**
+	 * Generate time intervals based on the time span
+	 * displayed in the chart.
+	 * Aims to have 4-8 intervals displayed at one time.
+	 */
+	public static List<Integer> getTimeIntervals(int startTick, int endTick)
+	{
+		final var span = ticksToSeconds(endTick - startTick);
+
+		var interval = secondsToTicks(3600);
+		if (span < 120) // 2min
+		{
+			interval = secondsToTicks(15);
+		}
+		else if (span < 240) // 4min
+		{
+			interval = secondsToTicks(30);
+		}
+		else if (span < 480) // 8min
+		{
+			interval = secondsToTicks(60);
+		}
+		else if (span < 1800) // 30min
+		{
+			interval = secondsToTicks(300);
+		}
+		else if (span < 3600) // 1h
+		{
+			interval = secondsToTicks(900);
+		}
+		else if (span < 7200) // 2h
+		{
+			interval = secondsToTicks(1800);
+		}
+
+		final var timeIntervals = new ArrayList<Integer>();
+
+		// always add span start time
+		timeIntervals.add(startTick);
+
+		// generate all time intervals up to current tick
+		// only keep if > spanStart
+		for (var i = 0; i < endTick; i += interval)
+		{
+			if (i > startTick) timeIntervals.add(i);
+		}
+
+		// always add current time
+		timeIntervals.add(endTick);
+
+		return timeIntervals;
+	}
+}
+
+package com.toofifty.xpmeter;
+
+import com.google.inject.Inject;
+import com.google.inject.Singleton;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.Point;
+import lombok.Getter;
+import net.runelite.api.Client;
+import net.runelite.api.MenuAction;
+import net.runelite.client.game.SkillIconManager;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+@Singleton
+public class XPMeterOverlay extends OverlayPanel
+{
+	public static final int DEFAULT_WIDTH = 180;
+	public static final int DEFAULT_HEIGHT = 60;
+
+	@Inject private XPTracker tracker;
+	@Inject private Client client;
+
+	@Getter private final XPChart chart = new XPChart();
+	@Getter private boolean isMouseOver = false;
+
+	@Inject
+	private XPMeterOverlay(SkillIconManager skillIconManager, XPMeterConfig config)
+	{
+		if (getPreferredSize() == null)
+		{
+			setPreferredSize(new Dimension(DEFAULT_WIDTH, DEFAULT_HEIGHT));
+		}
+
+		setPosition(OverlayPosition.TOP_LEFT);
+		setMinimumSize(XPChart.MIN_WIDTH);
+		setResettable(true);
+
+		chart.setSkillIconManager(skillIconManager);
+
+		addMenuEntry(
+			MenuAction.RUNELITE_OVERLAY,
+			"Reset",
+			"XP Meter",
+			e -> tracker.reset()
+		);
+
+		updateMenuEntries(config.enableDataMenuOptions());
+	}
+
+	public void updateMenuEntries(boolean enableDataMenuOptions)
+	{
+		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Pause", "XP Meter");
+		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Unpause", "XP Meter");
+
+		addMenuEntry(
+			MenuAction.RUNELITE_OVERLAY,
+			// tracker will be null on first call
+			tracker != null && tracker.isPaused() ? "Unpause" : "Pause",
+			"XP Meter",
+			e -> {
+				if (tracker.isPaused())
+				{
+					tracker.unpause();
+				}
+				else
+				{
+					tracker.pause();
+				}
+
+				updateMenuEntries(enableDataMenuOptions);
+			}
+		);
+
+		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Export data", "XP Meter");
+		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Restore data", "XP Meter");
+
+		if (enableDataMenuOptions)
+		{
+			addMenuEntry(MenuAction.RUNELITE_OVERLAY, "Export data", "XP Meter");
+			addMenuEntry(MenuAction.RUNELITE_OVERLAY, "Restore data", "XP Meter");
+		}
+	}
+
+	public void setBackgroundColor(Color color)
+	{
+		setPreferredColor(color);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (chart.hasData())
+		{
+			panelComponent.getChildren().add(chart);
+		}
+		else
+		{
+			panelComponent.getChildren().add(
+				LineComponent.builder()
+					.left("XP Meter inactive")
+					.build()
+			);
+		}
+
+		// onMouseOver() is called each frame immediately after render,
+		// so we can flick off the value for it to be re-set immediately
+		// (if mouse is hovering)
+		isMouseOver = false;
+
+		return super.render(graphics);
+	}
+
+	@Override
+	public void onMouseOver()
+	{
+		isMouseOver = true;
+
+		final var bounds = getBounds();
+		final var canvas = client.getMouseCanvasPosition();
+		final var mouse = new Point(
+			canvas.getX() - bounds.x,
+			canvas.getY() - bounds.y
+		);
+
+		chart.setMouse(mouse);
+	}
 }
 
 package com.toofifty.xpmeter;
@@ -2263,174 +2166,284 @@ public class XPChart extends XPChartBase implements LayoutableRenderableEntity
 package com.toofifty.xpmeter;
 
 import com.google.inject.Inject;
-import com.google.inject.Singleton;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.Graphics2D;
-import java.awt.Point;
-import lombok.Getter;
+import com.google.inject.Provides;
+import static com.toofifty.xpmeter.Util.secondsToTicks;
+import java.util.HashSet;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.MenuAction;
-import net.runelite.client.game.SkillIconManager;
-import net.runelite.client.ui.overlay.OverlayPanel;
-import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.api.GameState;
+import net.runelite.api.KeyCode;
+import net.runelite.api.Skill;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ScriptCallbackEvent;
+import net.runelite.api.events.StatChanged;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneLiteConfig;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.OverlayMenuClicked;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
 
-@Singleton
-public class XPMeterOverlay extends OverlayPanel
+@Slf4j
+@PluginDescriptor(
+	name = "XP Meter",
+	description = "Interactive XP/h Meter"
+)
+public class XPMeterPlugin extends Plugin
 {
-	public static final int DEFAULT_WIDTH = 180;
-	public static final int DEFAULT_HEIGHT = 60;
-
-	@Inject private XPTracker tracker;
 	@Inject private Client client;
+	@Inject private OverlayManager overlayManager;
+	@Inject private ConfigManager configManager;
+	@Inject private RuneLiteConfig runeLiteConfig;
 
-	@Getter private final XPChart chart = new XPChart();
-	@Getter private boolean isMouseOver = false;
+	@Inject private XPMeterConfig config;
+	@Inject private XPTracker tracker;
+	@Inject private XPMeterOverlay overlay;
 
-	@Inject
-	private XPMeterOverlay(SkillIconManager skillIconManager, XPMeterConfig config)
+	@Override
+	protected void startUp()
 	{
-		if (getPreferredSize() == null)
-		{
-			setPreferredSize(new Dimension(DEFAULT_WIDTH, DEFAULT_HEIGHT));
-		}
-
-		setPosition(OverlayPosition.TOP_LEFT);
-		setMinimumSize(XPChart.MIN_WIDTH);
-		setResettable(true);
-
-		chart.setSkillIconManager(skillIconManager);
-
-		addMenuEntry(
-			MenuAction.RUNELITE_OVERLAY,
-			"Reset",
-			"XP Meter",
-			e -> tracker.reset()
-		);
-
-		updateMenuEntries(config.enableDataMenuOptions());
+		overlayManager.add(overlay);
+		syncConfig(null);
 	}
 
-	public void updateMenuEntries(boolean enableDataMenuOptions)
+	@Override
+	protected void shutDown()
 	{
-		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Pause", "XP Meter");
-		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Unpause", "XP Meter");
+		overlayManager.remove(overlay);
+	}
 
-		addMenuEntry(
-			MenuAction.RUNELITE_OVERLAY,
-			// tracker will be null on first call
-			tracker != null && tracker.isPaused() ? "Unpause" : "Pause",
-			"XP Meter",
-			e -> {
-				if (tracker.isPaused())
-				{
-					tracker.unpause();
-				}
-				else
-				{
-					tracker.pause();
-				}
+	@Subscribe
+	public void onStatChanged(StatChanged event)
+	{
+		tracker.track(event.getSkill(), event.getXp());
+	}
 
-				updateMenuEntries(enableDataMenuOptions);
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		if (client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+
+		if (tracker.isPaused())
+		{
+			return;
+		}
+
+		tracker.tick();
+		// only update histories every Nth tick, otherwise the plotted
+		// lines start to wobble (as the current tick changes, it calculates each
+		// history point off-phase which means the values are different every tick)
+		if (tracker.getCurrentTick() % secondsToTicks(config.resolution()) == 0)
+		{
+			update();
+		}
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged event)
+	{
+		if (event.getGameState() != GameState.LOGGED_IN
+			&& event.getGameState() != GameState.LOADING
+			&& tracker.isTracking())
+		{
+			tracker.trackLogout();
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (event.getGroup().equals(XPMeterConfig.GROUP_NAME))
+		{
+			syncConfig(event.getKey());
+
+			if (event.getKey().equals("enableDataMenuOptions"))
+			{
+				overlay.updateMenuEntries(config.enableDataMenuOptions());
 			}
+		}
+
+		// listen to changes in runelite config's overlay color,
+		// since setting the overlay color to "null" causes it to
+		// become out of sync with the runelite setting
+		if (event.getGroup().equals(RuneLiteConfig.GROUP_NAME)
+			&& event.getKey().equals("overlayBackgroundColor"))
+		{
+			syncConfig(null);
+		}
+	}
+
+	@Subscribe
+	public void onOverlayMenuClicked(OverlayMenuClicked event)
+	{
+		if (event.getOverlay() == overlay)
+		{
+			if (event.getEntry().getOption().equals("Export data"))
+			{
+				configManager.setConfiguration(
+					XPMeterConfig.GROUP_NAME,
+					"sessionData",
+					tracker.export()
+				);
+			}
+			else if (event.getEntry().getOption().equals("Restore data"))
+			{
+				tracker.restore(config.sessionData());
+			}
+		}
+	}
+
+	@Subscribe
+	public void onScriptCallbackEvent(ScriptCallbackEvent event)
+	{
+		if (!config.scrollZoom())
+		{
+			return;
+		}
+
+		if ("scrollWheelZoomIncrement".equals(event.getEventName())
+			&& overlay.isMouseOver()
+			&& client.isKeyPressed(KeyCode.KC_SHIFT))
+		{
+			final var intStack = client.getIntStack();
+
+			updateScroll(intStack[1]);
+
+			// this stops the client scroll - don't ask how
+			intStack[2] = -intStack[1];
+		}
+	}
+
+	/**
+	 * Push config values into overlay, so they aren't
+	 * read every frame
+	 */
+	private void syncConfig(String changedKey)
+	{
+		final var chart = overlay.getChart();
+
+		chart.setSpan(secondsToTicks(config.span()));
+		chart.setChartHeight(config.chartHeight());
+		chart.setShowTimeLabels(config.showTimeLabels());
+		chart.setShowTimeMarkers(config.showTimeMarkers());
+		chart.setShowXpLabels(config.showXpLabels());
+		chart.setShowXpMarkers(config.showXpMarkers());
+		chart.setShowCurrentRates(config.showCurrentRates());
+		chart.setStackCurrentRates(config.stackCurrentRates());
+		chart.setShowSkillIcons(config.showSkillIcons());
+		chart.setLongFormatNumbers(config.longFormatNumbers());
+		chart.setShowPerformance(config.showPerformance());
+		chart.setShowHoverTooltips(config.showHoverTooltips());
+		chart.setDimNonHoveredSkills(config.dimNonHoveredSkills());
+		chart.setShowAllHovers(config.showAllHovers());
+
+		overlay.setBackgroundColor(
+			config.theme().overlayBackground != null
+				? config.theme().overlayBackground
+				: runeLiteConfig.overlayBackgroundColor()
 		);
+		chart.setTheme(config.theme());
 
-		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Export data", "XP Meter");
-		removeMenuEntry(MenuAction.RUNELITE_OVERLAY, "Restore data", "XP Meter");
-
-		if (enableDataMenuOptions)
+		if ("windowInterval".equals(changedKey)
+			|| "trackingMode".equals(changedKey))
 		{
-			addMenuEntry(MenuAction.RUNELITE_OVERLAY, "Export data", "XP Meter");
-			addMenuEntry(MenuAction.RUNELITE_OVERLAY, "Restore data", "XP Meter");
+			tracker.clearCache();
+		}
+
+		if (changedKey == null || changedKey.startsWith("track"))
+		{
+			final var enabledSkills = new HashSet<Skill>();
+			for (var skill : Skill.values())
+			{
+				final var enabled = configManager.<Boolean>getConfiguration(
+					XPMeterConfig.GROUP_NAME,
+					"track" + skill.getName(),
+					boolean.class
+				);
+				if (enabled)
+				{
+					enabledSkills.add(skill);
+				}
+			}
+			tracker.setEnabledSkills(enabledSkills);
+
+			if (changedKey != null)
+			{
+				// immediately show changes in skill filtering in
+				// the chart
+				update();
+			}
+		}
+
+		if ("span".equals(changedKey))
+		{
+			// stops line segments overflowing the chart
+			// before the next update tick
+			update();
 		}
 	}
 
-	public void setBackgroundColor(Color color)
+	private void update()
 	{
-		setPreferredColor(color);
+		final var chart = overlay.getChart();
+
+		chart.setSkillXpHistories(tracker.getAggregate(chart.getBounds().width));
+		chart.setSortedSkills(tracker.getSortedSkills());
+		chart.setMaxXpPerHour(tracker.getMaxXpPerHour());
+		chart.setCurrentTick(tracker.getCurrentTick());
+		chart.setPauses(tracker.getPauses());
+		chart.setLogouts(tracker.getLogouts());
+		chart.setPerformance(tracker.getPerformance());
 	}
 
-	@Override
-	public Dimension render(Graphics2D graphics)
+	private void updateScroll(int dir)
 	{
-		if (chart.hasData())
-		{
-			panelComponent.getChildren().add(chart);
-		}
-		else
-		{
-			panelComponent.getChildren().add(
-				LineComponent.builder()
-					.left("XP Meter inactive")
-					.build()
-			);
-		}
+		final var span = (int) (config.span() * Math.pow(1.2, dir));
 
-		// onMouseOver() is called each frame immediately after render,
-		// so we can flick off the value for it to be re-set immediately
-		// (if mouse is hovering)
-		isMouseOver = false;
-
-		return super.render(graphics);
-	}
-
-	@Override
-	public void onMouseOver()
-	{
-		isMouseOver = true;
-
-		final var bounds = getBounds();
-		final var canvas = client.getMouseCanvasPosition();
-		final var mouse = new Point(
-			canvas.getX() - bounds.x,
-			canvas.getY() - bounds.y
+		configManager.setConfiguration(
+			XPMeterConfig.GROUP_NAME,
+			"span",
+			Math.max(span, 10)
 		);
+	}
 
-		chart.setMouse(mouse);
+	@Provides
+	public XPMeterConfig getConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(XPMeterConfig.class);
 	}
 }
 
 package com.toofifty.xpmeter;
 
-import java.awt.Color;
 import lombok.AllArgsConstructor;
-import net.runelite.api.Skill;
 
 @AllArgsConstructor
-public enum SkillColor
+public enum TrackingMode
 {
-	// must match order of Skill enum
+	CUMULATIVE("Cumulative"),
+	SLIDING_WINDOW("Sliding window");
 
-	ATTACK(new Color(145, 58, 42)),
-	DEFENCE(new Color(119, 133, 196)),
-	STRENGTH(new Color(57, 113, 78)),
-	HITPOINTS(new Color(167, 57, 30)),
-	RANGED(new Color(93, 111, 35)),
-	PRAYER(new Color(192, 185, 185)),
-	MAGIC(new Color(76, 77, 157)),
-	COOKING(new Color(109, 53, 137)),
-	WOODCUTTING(new Color(128, 110, 65)),
-	FLETCHING(new Color(65, 101, 105)),
-	FISHING(new Color(134, 172, 221)),
-	FIREMAKING(new Color(198, 135, 44)),
-	CRAFTING(new Color(115, 94, 71)),
-	SMITHING(new Color(84, 84, 67)),
-	MINING(new Color(81, 80, 65)),
-	HERBLORE(new Color(60, 139, 22)),
-	AGILITY(new Color(68, 68, 201)),
-	THIEVING(new Color(109, 71, 99)),
-	SLAYER(new Color(104, 95, 95)),
-	FARMING(new Color(57, 89, 45)),
-	RUNECRAFT(new Color(178, 178, 168)),
-	HUNTER(new Color(128, 124, 103)),
-	CONSTRUCTION(new Color(169, 159, 138));
-
-	private final Color color;
-
-	public static Color get(Skill skill)
-	{
-		return values()[skill.ordinal()].color;
-	}
+	private final String name;
 }
 
+package com.xpmeter;
+
+import com.toofifty.xpmeter.XPMeterPlugin;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class XPMeterPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(XPMeterPlugin.class);
+		RuneLite.main(args);
+	}
+}
