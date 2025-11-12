@@ -44,6 +44,7 @@ import net.runelite.client.events.PluginMessage;
 import net.runelite.client.events.ScreenshotTaken;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
 import net.runelite.client.util.Text;
 import okhttp3.OkHttpClient;
 
@@ -51,6 +52,7 @@ import javax.inject.Inject;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -64,7 +66,7 @@ import static com.savereplaybufferforobs.Constants.PLUGIN_IDENTIFIER;
         tags = {"external", "videos", "integration", "OBS"}
 )
 @Slf4j
-public class SaveReplayBufferForObsPlugin extends Plugin
+public class SaveReplayBufferForObsPlugin extends Plugin implements DisplaysExceptions
 {
     @Inject
     private SaveReplayBufferForObsConfig config;
@@ -80,10 +82,37 @@ public class SaveReplayBufferForObsPlugin extends Plugin
     @Inject
     private Gson gson;
 
+    @Inject
+    private OverlayManager overlayManager;
+
+    private ObsExceptionOverlay obsExceptionOverlay = null;
+
+    private ScheduledFuture<?> healthcheck;
+
     @Provides
     SaveReplayBufferForObsConfig getConfig(ConfigManager configManager)
     {
         return configManager.getConfig(SaveReplayBufferForObsConfig.class);
+    }
+
+    @Override
+    public void setObsException(ObsException exception) {
+        if (obsExceptionOverlay != null) {
+            if (obsExceptionOverlay.isSameException(exception))
+            {
+                // no need to redraw last overlay
+                return;
+            }
+            overlayManager.remove(obsExceptionOverlay);
+        }
+        obsExceptionOverlay = new ObsExceptionOverlay(config, exception);
+        overlayManager.add(obsExceptionOverlay);
+    }
+
+    @Override
+    public void clearObsException() {
+        overlayManager.remove(obsExceptionOverlay);
+        obsExceptionOverlay = null;
     }
 
     protected enum EventType
@@ -160,11 +189,31 @@ public class SaveReplayBufferForObsPlugin extends Plugin
     private void reconnect()
     {
         if (obsClient != null) {
+            if (healthcheck != null) {
+                healthcheck.cancel(true);
+            }
             obsClient.disconnect();
         }
 
-        obsClient = new WebSocketClientForObs(okHttpClient, gson, config.websocketServerHost(), config.websocketPort(), config.websocketPassword());
+        clearObsException();
+        obsClient = new WebSocketClientForObs(
+                okHttpClient,
+                gson,
+                config.websocketServerHost(),
+                config.websocketPort(),
+                config.websocketPassword(),
+                this
+        );
         obsClient.connect();
+        if (config.checkReplayBufferActive())
+        {
+            healthcheck = scheduledExecutorService.scheduleAtFixedRate(
+                    obsClient::pingHealth,
+                    1,
+                    Math.max(1, config.checkReplayBufferFrequency()),
+                    TimeUnit.SECONDS
+            );
+        }
     }
 
     @Subscribe
@@ -201,6 +250,7 @@ public class SaveReplayBufferForObsPlugin extends Plugin
     @Override
     protected void shutDown()
     {
+        clearObsException();
         if (this.obsClient != null) {
             log.debug("Shutdown OBS Connection");
             this.obsClient.disconnect();
@@ -485,7 +535,6 @@ public class SaveReplayBufferForObsPlugin extends Plugin
             queuedScreenshotType = null;
             shouldTakeScreenshot = false;
         }
-
     }
 
 }
@@ -526,10 +575,32 @@ import static com.savereplaybufferforobs.Constants.PLUGIN_IDENTIFIER;
 @ConfigGroup(PLUGIN_IDENTIFIER)
 public interface SaveReplayBufferForObsConfig extends Config
 {
+    @ConfigItem(
+            keyName = "checkReplayBufferActive",
+            name = "Check if Replay Buffer is active",
+            description = "Display a warning overlay if the Replay Buffer is not actively running.",
+            position = 0
+    )
+    default boolean checkReplayBufferActive()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "checkReplayBufferFrequency",
+            name = "Check every (s)",
+            description = "Specify how frequently the Replay Buffer status should be checked. Minimum 1.",
+            position = 1
+    )
+    default int checkReplayBufferFrequency()
+    {
+        return 1;
+    }
+
     @ConfigSection(
             name = "Events to capture",
             description = "Options for what triggers saving the Replay Buffer",
-            position = 0
+            position = 2
     )
     String whatSection = "what";
 
@@ -780,7 +851,7 @@ public interface SaveReplayBufferForObsConfig extends Config
     @ConfigSection(
             name = "Delay before capture (s)",
             description = "Delay before saving the replay buffer after the event occurs, to capture live reactions to the event",
-            position = 1
+            position = 3
     )
     String delaySection = "delay";
 
@@ -959,6 +1030,15 @@ public interface SaveReplayBufferForObsConfig extends Config
             section = wsSection
     )
     default String websocketServerHost() { return "localhost"; }
+
+    @ConfigItem(
+            keyName = "displayErrorOverlay",
+            name = "Show connection error overlays",
+            description = "Adds overlay warnings given WebSocket connection errors",
+            position = 3,
+            section = wsSection
+    )
+    default boolean displayErrorOverlay() { return true; }
 }
 
 package com.savereplaybufferforobs;
@@ -973,7 +1053,10 @@ import okhttp3.WebSocketListener;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.text.Format;
+import java.text.MessageFormat;
 import java.util.Base64;
+import java.util.Objects;
 
 @Slf4j
 public class WebSocketListenerForObs extends WebSocketListener {
@@ -983,9 +1066,15 @@ public class WebSocketListenerForObs extends WebSocketListener {
 
     private final Gson gson;
 
-    public WebSocketListenerForObs(Gson gson, String password) {
+    private final DisplaysExceptions exceptionsDisplay;
+
+    private final WebSocketClientForObs client;
+
+    public WebSocketListenerForObs(WebSocketClientForObs client, Gson gson, String password, DisplaysExceptions displaysExceptions) {
+        this.client = client;
         this.gson = gson;
         this.password = password;
+        this.exceptionsDisplay = displaysExceptions;
     }
 
 
@@ -1025,6 +1114,16 @@ public class WebSocketListenerForObs extends WebSocketListener {
                 }
             }
         }
+    }
+
+    private static class RequestResponse {
+        public String requestId;
+        public String requestType;
+        private Object responseData;
+    }
+
+    private static class HealthResponse {
+        public boolean outputActive;
     }
 
     private String computeAuthentication(String salt, String challenge) {
@@ -1096,18 +1195,58 @@ public class WebSocketListenerForObs extends WebSocketListener {
             webSocket.send(gson.toJson(identifyRequest));
         } else if (response.op == 2) { // Opcode 2: Identified (Success after Identify/Auth)
             log.info("OBS successfully Identified. Connection ready.");
+            client.setConnected(true);
+        } else if (response.op == 7) { // Opcode 7: RequestResponse
+            RequestResponse responseData = gson.fromJson(response.d, RequestResponse.class);
+            if (Objects.equals(responseData.requestType, "GetReplayBufferStatus")) {
+                // healthcheck response
+                HealthResponse healthResponse = gson.fromJson(responseData.responseData.toString(), HealthResponse.class);
+                if (healthResponse.outputActive) {
+                    exceptionsDisplay.clearObsException();
+                }
+                else
+                {
+                    exceptionsDisplay.setObsException(new ObsException("OBS Replay Buffer is not active!"));
+                }
+            }
         }
     }
 
     @Override
     public void onClosing(WebSocket webSocket, int code, String reason) {
         log.info("WebSocket closed with code: {}, reason: {}", code, reason);
+        client.setConnected(false);
+
+        if (code != 1000) {
+            exceptionsDisplay.setObsException(new ObsException(
+                MessageFormat.format("OBS WebSocket connection closed unexpectedly: {0}", reason)
+            ));
+        }
     }
+
+    @Override
+    public void onFailure(WebSocket webSocket, Throwable t, Response response) {
+        log.info("WebSocket failed: {}", t.getMessage());
+        exceptionsDisplay.setObsException(new ObsException(
+                "Unable to connect to the OBS WebSocket Server. Is OBS running and configured?"
+        ));
+    }
+
+
+}
+
+package com.savereplaybufferforobs;
+
+public interface DisplaysExceptions {
+    public void setObsException(ObsException exception);
+
+    public void clearObsException();
 }
 
 package com.savereplaybufferforobs;
 
 import com.google.gson.Gson;
+import lombok.Setter;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
 import okhttp3.WebSocket;
@@ -1120,6 +1259,11 @@ public class WebSocketClientForObs {
     private final Gson gson;
 
     private WebSocket webSocket;
+
+    private DisplaysExceptions exceptionsDisplay;
+
+    @Setter
+    private boolean isConnected;
 
     private class ObsRequest {
         private final int op = 6;
@@ -1142,11 +1286,12 @@ public class WebSocketClientForObs {
         }
     }
 
-    public WebSocketClientForObs(OkHttpClient client, Gson gson, String host, int port, String password) {
+    public WebSocketClientForObs(OkHttpClient client, Gson gson, String host, int port, String password, DisplaysExceptions exceptionsDisplay) {
         this.client = client;
         this.gson = gson;
         this.websocketUrl = "ws://" + host + ":" + port;
         this.password = password;
+        this.exceptionsDisplay = exceptionsDisplay;
     }
 
     public void makeOBSRequest(String requestType, String requestId, Object requestData) {
@@ -1163,11 +1308,77 @@ public class WebSocketClientForObs {
         Request request = new Request.Builder()
                 .url(websocketUrl)
                 .build();
-        this.webSocket = client.newWebSocket(request, new WebSocketListenerForObs(gson, password));
+        this.webSocket = client.newWebSocket(request, new WebSocketListenerForObs(this, gson, password, exceptionsDisplay));
     }
 
     public void disconnect() {
         this.webSocket.close(1000, "Normal Shutdown");
+    }
+
+    public void pingHealth() {
+        if (isConnected)
+        {
+            makeOBSRequest("GetReplayBufferStatus", "runelite-healthcheck-req", new Object());
+        }
+    }
+}
+
+package com.savereplaybufferforobs;
+
+public class ObsException extends Exception
+{
+    public ObsException(String message)
+    {
+        super(message);
+    }
+}
+package com.savereplaybufferforobs;
+
+import lombok.NonNull;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+import java.awt.*;
+import java.util.Objects;
+
+public class ObsExceptionOverlay extends OverlayPanel {
+    private final SaveReplayBufferForObsConfig config;
+
+    private final ObsException obsException;
+
+    public ObsExceptionOverlay(SaveReplayBufferForObsConfig config, ObsException obsException) {
+        this.config = config;
+        this.obsException = obsException;
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        if (!config.displayErrorOverlay()) {
+            return null;
+        }
+        final int padding = 10;
+        final String displayText = obsException.getMessage();
+
+        panelComponent.getChildren().clear();
+        panelComponent.getChildren().add(LineComponent.builder()
+                .left(displayText)
+                .leftColor(Color.RED)
+                .build());
+
+        panelComponent.setPreferredSize(getTextWidth(graphics, displayText, padding));
+
+        return panelComponent.render(graphics);
+    }
+
+    @NonNull
+    private Dimension getTextWidth(Graphics2D graphics, String string, int offset) {
+        FontMetrics fontMetrics = graphics.getFontMetrics();
+        int stringWidth = fontMetrics.stringWidth(string);
+        return new Dimension(stringWidth + offset, 0);
+    }
+
+    public boolean isSameException(ObsException otherException) {
+        return Objects.equals(otherException.getMessage(), obsException.getMessage());
     }
 }
 
