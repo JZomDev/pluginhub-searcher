@@ -42,7 +42,7 @@ public class TemporossPlugin extends Plugin
 	private static final int VARB_IS_TETHERED = 11895;
 	private static final int VARB_REWARD_POOL_NUMBER = 11936;
 
-	private static final int TEMPOROSS_REGION = 12078;
+	private static final int TEMPOROSS_REGION = 12076;
 	private static final int UNKAH_REWARD_POOL_REGION = 12588;
 	private static final int UNKAH_BOAT_REGION = 12332;
 
