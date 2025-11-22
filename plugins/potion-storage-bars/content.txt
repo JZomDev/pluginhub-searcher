@@ -52,7 +52,7 @@ public class PotionBarPlugin extends Plugin  {
 		public Widget backgroundBar;
 	}
 
-	private List<PotionPanel> potionPanels;
+	private List<PotionPanel> potionPanels = new ArrayList<>();
 
 	@Provides
 	PotionBarConfig provideConfig(ConfigManager configManager) {
@@ -89,7 +89,7 @@ public class PotionBarPlugin extends Plugin  {
 	}
 
 	private void createProgressBars() {
-		potionPanels = new ArrayList<>();
+		potionPanels.clear();
 
 		Widget w = client.getWidget(ComponentID.BANK_POTIONSTORE_CONTENT);
 		Widget[] children = w.getDynamicChildren();
