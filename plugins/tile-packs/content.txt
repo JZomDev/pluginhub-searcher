@@ -387,14 +387,19 @@ public class GroundMarkerPoint {
  */
 package com.tilepacks;
 
+import com.google.common.collect.ArrayListMultimap;
+import com.google.common.collect.ListMultimap;
 import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 import com.tilepacks.data.ColorTileMarker;
 import com.tilepacks.data.GroundMarkerPoint;
 import com.tilepacks.data.TilePack;
+import lombok.Getter;
 import lombok.Value;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.WorldEntity;
+import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 
 import javax.inject.Inject;
@@ -408,7 +413,8 @@ import java.util.stream.Collectors;
 @Value
 public class PointManager {
 
-    private List<ColorTileMarker> points = new ArrayList<>();
+    @Getter
+    private ListMultimap<WorldView, ColorTileMarker> points = ArrayListMultimap.create();
 
     private final TilePackManager tilePackManager;
     private final Gson gson;
@@ -425,18 +431,36 @@ public class PointManager {
     public void loadPoints() {
         points.clear();
 
-        int[] regions = client.getMapRegions();
-
-        if (regions == null) {
+        WorldView worldView = client.getTopLevelWorldView();
+        if (worldView == null)
+        {
             return;
         }
 
-        for (int regionId : regions) {
-            Collection<GroundMarkerPoint> regionPoints = getActivePoints(regionId);
-            Collection<ColorTileMarker> colorTileMarkers = translateToColorTileMarker(regionPoints);
-            points.addAll(colorTileMarkers);
+        loadWorldViewPoints(worldView);
+
+        for (WorldEntity we : worldView.worldEntities())
+        {
+            loadWorldViewPoints(we.getWorldView());
         }
-        log.debug("active points - {}",points);
+    }
+
+    public void loadWorldViewPoints(WorldView worldView)
+    {
+        points.removeAll(worldView);
+
+        int[] regions = worldView.getMapRegions();
+        if (regions == null)
+        {
+            return;
+        }
+
+        for (int regionId : regions)
+        {
+            Collection<GroundMarkerPoint> regionPoints = getActivePoints(regionId);
+            Collection<ColorTileMarker> colorTileMarkers = translateToColorTileMarker(worldView, regionPoints);
+            points.putAll(worldView, colorTileMarkers);
+        }
     }
 
     //gets all the active points for all enabled packs.
@@ -467,8 +491,10 @@ public class PointManager {
     }
 
 
-    private Collection<ColorTileMarker> translateToColorTileMarker(Collection<GroundMarkerPoint> points) {
-        if (points.isEmpty()) {
+    private Collection<ColorTileMarker> translateToColorTileMarker(WorldView wv, Collection<GroundMarkerPoint> points)
+    {
+        if (points.isEmpty())
+        {
             return Collections.emptyList();
         }
 
@@ -478,7 +504,7 @@ public class PointManager {
                         point.getColor(), point.getLabel()))
                 .flatMap(colorTile ->
                 {
-                    final Collection<WorldPoint> localWorldPoints = WorldPoint.toLocalInstance(client, colorTile.getWorldPoint());
+                    final Collection<WorldPoint> localWorldPoints = WorldPoint.toLocalInstance(wv, colorTile.getWorldPoint());
                     return localWorldPoints.stream().map(wp -> new ColorTileMarker(wp, colorTile.getColor(), colorTile.getLabel()));
                 })
                 .collect(Collectors.toList());
@@ -522,10 +548,12 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.WorldViewLoaded;
 import net.runelite.client.chat.ChatMessageManager;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.ProfileChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
@@ -618,17 +646,21 @@ public class TilePacksPlugin extends Plugin {
                     }
                     break;
             }
+        } else {
+            pointManager.loadPoints();
         }
+    }
+    @Subscribe
+    public void onProfileChanged(ProfileChanged profileChanged)
+    {
+        pointManager.loadPoints();
     }
 
     @Subscribe
-    public void onGameStateChanged(GameStateChanged gameStateChanged) {
-        if (gameStateChanged.getGameState() != GameState.LOGGED_IN) {
-            return;
-        }
-
+    public void onWorldViewLoaded(WorldViewLoaded event) {
+        log.debug("Changing world view");
         // map region has just been updated
-        pointManager.loadPoints();
+        pointManager.loadWorldViewPoints(event.getWorldView());
     }
 
     @Provides
@@ -666,13 +698,14 @@ public class TilePacksPlugin extends Plugin {
 package com.tilepacks.ui.overlay;
 
 import com.google.common.base.Strings;
+import com.google.common.collect.Multimap;
 import com.tilepacks.PointManager;
 import com.tilepacks.TilePacksConfig;
 import com.tilepacks.data.ColorTileMarker;
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.Perspective;
 import net.runelite.api.Point;
+import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.ui.overlay.*;
@@ -697,49 +730,56 @@ public class GroundMarkerOverlay extends Overlay {
         this.client = client;
         this.config = config;
         setPosition(OverlayPosition.DYNAMIC);
-        setPriority(OverlayPriority.LOW);
+        setPriority(PRIORITY_LOW);
         setLayer(OverlayLayer.ABOVE_SCENE);
     }
 
     @Override
     public Dimension render(Graphics2D graphics) {
-        if (pointManager.getPoints().isEmpty()) {
+        final Multimap<WorldView, ColorTileMarker> points = pointManager.getPoints();
+        if (points.isEmpty()) {
             return null;
         }
 
         Stroke stroke = new BasicStroke((float) config.borderWidth());
-        for (final ColorTileMarker point : pointManager.getPoints()) {
-            WorldPoint worldPoint = point.getWorldPoint();
-            if (worldPoint.getPlane() != client.getPlane()) {
-                continue;
-            }
+        for (WorldView worldView : points.keySet()) {
+            for (final ColorTileMarker point : points.get(worldView)) {
+                WorldPoint worldPoint = point.getWorldPoint();
+                if (worldPoint.getPlane() != worldView.getPlane()) {
+                    continue;
+                }
 
-            Color tileColor;
-            if (config.overrideColorActive()) {
-                tileColor = config.overrideColor();
-            } else {
-                tileColor = point.getColor();
-            }
+                Color tileColor;
+                if (config.overrideColorActive()) {
+                    tileColor = config.overrideColor();
+                } else {
+                    tileColor = point.getColor();
+                }
 
-            String label = null;
-            if (config.showLabels()) {
-                label = point.getLabel();
-            }
+                String label = null;
+                if (config.showLabels()) {
+                    label = point.getLabel();
+                }
 
-            drawTile(graphics, worldPoint, tileColor, label, stroke);
+                drawTile(graphics, worldView, worldPoint, tileColor, label, stroke);
+            }
         }
 
         return null;
     }
 
-    private void drawTile(Graphics2D graphics, WorldPoint point, Color color, @Nullable String label, Stroke borderStroke) {
-        WorldPoint playerLocation = client.getLocalPlayer().getWorldLocation();
+    private void drawTile(Graphics2D graphics, WorldView worldView, WorldPoint point, Color color, @Nullable String label, Stroke borderStroke) {
+        if (client.getLocalPlayer().getWorldView().isTopLevel())
+        {
+            WorldPoint playerLocation = client.getLocalPlayer().getWorldLocation();
 
-        if (point.distanceTo(playerLocation) >= MAX_DRAW_DISTANCE) {
-            return;
+            if (point.distanceTo(playerLocation) >= MAX_DRAW_DISTANCE)
+            {
+                return;
+            }
         }
 
-        LocalPoint lp = LocalPoint.fromWorld(client, point);
+        LocalPoint lp = LocalPoint.fromWorld(worldView, point);
         if (lp == null) {
             return;
         }
@@ -784,18 +824,20 @@ public class GroundMarkerOverlay extends Overlay {
  */
 package com.tilepacks.ui.overlay;
 
+import com.google.common.collect.Multimap;
 import com.tilepacks.PointManager;
 import com.tilepacks.TilePacksConfig;
 import com.tilepacks.data.ColorTileMarker;
+import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.Perspective;
 import net.runelite.api.Point;
+import net.runelite.api.WorldView;
 import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.OverlayPriority;
 
 import javax.inject.Inject;
 import java.awt.*;
@@ -803,6 +845,7 @@ import java.awt.*;
 /**
  * Manages the drawing of the markers on the minimap
  */
+@Slf4j
 public class GroundMarkerMinimapOverlay extends Overlay {
     private final PointManager pointManager;
     private final Client client;
@@ -814,7 +857,7 @@ public class GroundMarkerMinimapOverlay extends Overlay {
         this.client = client;
         this.config = config;
         setPosition(OverlayPosition.DYNAMIC);
-        setPriority(OverlayPriority.LOW);
+        setPriority(PRIORITY_LOW);
         setLayer(OverlayLayer.ABOVE_WIDGETS);
     }
 
@@ -824,40 +867,45 @@ public class GroundMarkerMinimapOverlay extends Overlay {
             return null;
         }
 
-        for (final ColorTileMarker point : pointManager.getPoints()) {
-            WorldPoint worldPoint = point.getWorldPoint();
-            if (worldPoint.getPlane() != client.getPlane()) {
-                continue;
-            }
+        final Multimap<WorldView, ColorTileMarker> points = pointManager.getPoints();
+        if (points.isEmpty()) {
+            return null;
+        }
+        for (WorldView worldView : points.keySet()) {
+            for (final ColorTileMarker point : points.get(worldView)) {
+                WorldPoint worldPoint = point.getWorldPoint();
+                if (worldPoint.getPlane() != worldView.getPlane()) {
+                    continue;
+                }
 
-            Color tileColor;
-            if (config.overrideColorActive()) {
-                tileColor = config.overrideColor();
-            } else {
-                tileColor = point.getColor();
-            }
+                Color tileColor;
+                if (config.overrideColorActive()) {
+                    tileColor = config.overrideColor();
+                } else {
+                    tileColor = point.getColor();
+                }
 
-            drawOnMinimap(graphics, worldPoint, tileColor);
+                drawOnMinimap(graphics, worldView, worldPoint, tileColor);
+            }
         }
 
         return null;
     }
 
-    private void drawOnMinimap(Graphics2D graphics, WorldPoint point, Color color) {
-        if (!point.isInScene(client)) {
+    private void drawOnMinimap(Graphics2D graphics, WorldView worldView, WorldPoint point, Color color) {
+        LocalPoint localPoint = LocalPoint.fromWorld(worldView, point);
+        if (localPoint == null)
+        {
             return;
         }
 
-        int x = point.getX() - client.getBaseX();
-        int y = point.getY() - client.getBaseY();
+        int x = localPoint.getX() & -Perspective.LOCAL_TILE_SIZE;
+        int y = localPoint.getY() & -Perspective.LOCAL_TILE_SIZE;
 
-        x <<= Perspective.LOCAL_COORD_BITS;
-        y <<= Perspective.LOCAL_COORD_BITS;
-
-        Point mp1 = Perspective.localToMinimap(client, new LocalPoint(x, y));
-        Point mp2 = Perspective.localToMinimap(client, new LocalPoint(x, y + Perspective.LOCAL_TILE_SIZE));
-        Point mp3 = Perspective.localToMinimap(client, new LocalPoint(x + Perspective.LOCAL_TILE_SIZE, y + Perspective.LOCAL_TILE_SIZE));
-        Point mp4 = Perspective.localToMinimap(client, new LocalPoint(x + Perspective.LOCAL_TILE_SIZE, y));
+        Point mp1 = Perspective.localToMinimap(client, new LocalPoint(x, y, worldView.getId()));
+        Point mp2 = Perspective.localToMinimap(client, new LocalPoint(x, y + Perspective.LOCAL_TILE_SIZE, worldView.getId()));
+        Point mp3 = Perspective.localToMinimap(client, new LocalPoint(x + Perspective.LOCAL_TILE_SIZE, y + Perspective.LOCAL_TILE_SIZE, worldView.getId()));
+        Point mp4 = Perspective.localToMinimap(client, new LocalPoint(x + Perspective.LOCAL_TILE_SIZE, y, worldView.getId()));
 
         if (mp1 == null || mp2 == null || mp3 == null || mp4 == null) {
             return;
