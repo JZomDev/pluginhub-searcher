@@ -113,7 +113,7 @@ public class FunnyBossNamesPlugin extends Plugin {
             return _config.enableKalphiteQueen() ? bossName.replace("Kalphite Queen", _config.kalphiteQueen()) : bossName;
         } else if (bossName.contains("Dusk")) {
             return _config.enableDusk() ? bossName.replace("Dusk", _config.dusk()) : bossName;
-        } else if (bossName.contains("Dawn")) {
+        } else if (bossName.equals("Dawn")) {
             return _config.enableDawn() ? bossName.replace("Dawn", _config.dawn()) : bossName;
         } else if (bossName.contains("Alchemical Hydra")) {
             return _config.enableAlchemicalHydra() ? bossName.replace("Alchemical Hydra", _config.alchemicalHydra()) : bossName;
