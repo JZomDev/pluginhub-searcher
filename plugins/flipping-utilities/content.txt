@@ -595,11 +595,13 @@ public class DataHandler {
             accountWideData.setDefaults();
             accountSpecificData = new HashMap<>();
             accountWideDataChanged = true;
+            plugin.getRecipeHandler().setLocalRecipes(accountWideData.getLocalRecipes());
             return;
         }
 
         backupCheckpoints = plugin.tradePersister.fetchBackupCheckpoints();
         accountWideData = fetchAccountWideData();
+        plugin.getRecipeHandler().setLocalRecipes(accountWideData.getLocalRecipes());
         accountSpecificData = fetchAndPrepareAllAccountData();
         backupAllAccountData();
     }
@@ -690,6 +692,7 @@ public class DataHandler {
     // Used by other components to set accountWideData on DataHandler
     public void loadAccountWideData() {
         accountWideData = fetchAccountWideData();
+        plugin.getRecipeHandler().setLocalRecipes(accountWideData.getLocalRecipes());
     }
     
     // Used by other components to set account data on DataHandler
@@ -1769,6 +1772,7 @@ public class FlippingPlugin extends Plugin {
     private EventBus eventBus;
 
     public TradePersister tradePersister;
+    @Getter
     private RecipeHandler recipeHandler;
     private FlippingItemHandler flippingItemHandler;
     @Getter
@@ -1779,7 +1783,7 @@ public class FlippingPlugin extends Plugin {
         accountCurrentlyViewed = ACCOUNT_WIDE;
 
         tradePersister = new TradePersister(gson);
-        recipeHandler = new RecipeHandler(gson, httpClient);
+        recipeHandler = new RecipeHandler(gson, httpClient, null);
         flippingItemHandler = new FlippingItemHandler(this);
 
         optionHandler = new OptionHandler(this);
@@ -3032,14 +3036,18 @@ import okhttp3.Response;
 public class RecipeHandler {
 
     private Gson gson;
-    private final Optional<Map<Integer, List<Recipe>>> idToRecipes;
+    private Optional<Map<Integer, List<Recipe>>> idToRecipes;
     private final Optional<Map<Integer, PotionGroup>> idToPotionGroup;
     private OkHttpClient httpClient;
+    private List<Recipe> localRecipes;
+    private Optional<List<Recipe>> apiRecipes;
 
-    public RecipeHandler(Gson gson, OkHttpClient httpClient) {
+    public RecipeHandler(Gson gson, OkHttpClient httpClient, List<Recipe> localRecipes) {
         this.gson = gson;
         this.httpClient = httpClient;
-        this.idToRecipes = getItemIdToRecipes(loadRecipes());
+        this.localRecipes = localRecipes != null ? localRecipes : new ArrayList<>();
+        this.apiRecipes = loadRecipes();
+        this.idToRecipes = getItemIdToRecipes(apiRecipes);
         this.idToPotionGroup = getItemIdToPotionGroup(loadPotionGroups());
 
         if (idToRecipes.isPresent()) {
@@ -3202,16 +3210,26 @@ public class RecipeHandler {
 
     /**
      * Gets a mapping of item id to the recipes it is in.
+     * removed early exit to allow custom recipes to work even when api recipes fail to load.
+     * if we returned empty immediately when api recipes are missing, local recipes would never be added to the map.
      */
     private Optional<Map<Integer, List<Recipe>>> getItemIdToRecipes(Optional<List<Recipe>> optionalRecipes) {
-        if (!optionalRecipes.isPresent()) {
-            return Optional.empty();
+        Map<Integer, List<Recipe>> idToRecipes = new HashMap<>();
+
+        if (optionalRecipes.isPresent()) {
+            List<Recipe> recipes = optionalRecipes.get();
+            stripElementalRunesFromRecipes(recipes);
+            deduplicateRecipes(recipes);
+            addRecipesToMap(recipes, idToRecipes);
         }
 
-        Map<Integer, List<Recipe>> idToRecipes = new HashMap<>();
-        List<Recipe> recipes = optionalRecipes.get();
-        stripElementalRunesFromRecipes(recipes);
-        deduplicateRecipes(recipes);
+        stripElementalRunesFromRecipes(localRecipes);
+        addRecipesToMap(localRecipes, idToRecipes);
+
+        return idToRecipes.isEmpty() ? Optional.empty() : Optional.of(idToRecipes);
+    }
+
+    private void addRecipesToMap(List<Recipe> recipes, Map<Integer, List<Recipe>> idToRecipes) {
         recipes.forEach(r -> {
             r.getIds().forEach(id -> {
                 if (idToRecipes.containsKey(id)) {
@@ -3221,8 +3239,6 @@ public class RecipeHandler {
                 }
             });
         });
-
-        return Optional.of(idToRecipes);
     }
 
     /**
@@ -3515,6 +3531,47 @@ public class RecipeHandler {
         });
 
         return future;
+    }
+
+    public void addLocalRecipe(Recipe recipe) {
+        if (recipe == null || recipe.getName() == null || recipe.getName().isEmpty()) {
+            return;
+        }
+        localRecipes.add(recipe);
+        refreshRecipeMappings();
+    }
+
+    public boolean removeLocalRecipe(Recipe recipe) {
+        boolean removed = localRecipes.remove(recipe);
+        if (removed) {
+            refreshRecipeMappings();
+        }
+        return removed;
+    }
+
+    public void updateLocalRecipe(Recipe oldRecipe, Recipe newRecipe) {
+        int index = localRecipes.indexOf(oldRecipe);
+        if (index == -1) {
+            return;
+        }
+        localRecipes.set(index, newRecipe);
+        refreshRecipeMappings();
+    }
+
+    public List<Recipe> getLocalRecipes() {
+        return new ArrayList<>(localRecipes);
+    }
+
+    public void setLocalRecipes(List<Recipe> localRecipes) {
+        this.localRecipes = localRecipes != null ? localRecipes : new ArrayList<>();
+        refreshRecipeMappings();
+    }
+
+    private void refreshRecipeMappings() {
+        this.idToRecipes = getItemIdToRecipes(apiRecipes);
+        log.info("Refreshed recipe mappings. Total items with recipes: {}", idToRecipes.isPresent() ? idToRecipes.get().size() : 0);
+        log.info("Local recipes count: {}", localRecipes.size());
+        localRecipes.forEach(r -> log.info("  - Local recipe: {} (items: {})", r.getName(), r.getIds()));
     }
 }
 package com.flippingutilities.utilities;
@@ -4169,6 +4226,25 @@ public class PotionGroup {
     }
 
 }
+package com.flippingutilities;
+
+public enum RecipeSortOption {
+	INPUT_COUNT("Input Count"),
+	OUTPUT_COUNT("Output Count"),
+	NAME("Name");
+
+	private final String displayName;
+
+	RecipeSortOption(String displayName) {
+		this.displayName = displayName;
+	}
+
+	@Override
+	public String toString() {
+		return displayName;
+	}
+}
+
 package com.flippingutilities.model;
 
 import lombok.Data;
@@ -4872,6 +4948,7 @@ public class HistoryManager
 }
 package com.flippingutilities.model;
 
+import com.flippingutilities.utilities.Recipe;
 import lombok.Data;
 import lombok.extern.slf4j.Slf4j;
 
@@ -4883,6 +4960,7 @@ import java.util.List;
 public class AccountWideData {
     List<Option> options = new ArrayList<>();
     List<Section> sections = new ArrayList<>();
+    List<Recipe> localRecipes = new ArrayList<>();
     boolean shouldMakeNewAdditions = true;
     boolean enhancedSlots = true;
     String jwt;
@@ -6413,6 +6491,57 @@ public interface FlippingConfig extends Config
 	)
 	default boolean showAutoSaveDisplay() {
 		return true;
+	}
+
+	@ConfigSection(
+			name = "Custom Recipes",
+			description = "Settings for custom recipe search",
+			position = 110
+	)
+	String customRecipesSection = "customRecipesSection";
+
+	@ConfigItem(
+			keyName = "includeNotedItems",
+			name = "Include noted items",
+			description = "Show noted versions of items when searching for recipe ingredients",
+			section = customRecipesSection,
+			position = 1
+	)
+	default boolean includeNotedItems() {
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "includeUntradeableItems",
+			name = "Include untradeable items",
+			description = "Show items that cannot be traded on the Grand Exchange",
+			section = customRecipesSection,
+			position = 2
+	)
+	default boolean includeUntradeableItems() {
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "defaultRecipeSort",
+			name = "Default sort option",
+			description = "How your custom recipes are sorted when you open the manager",
+			section = customRecipesSection,
+			position = 3
+	)
+	default RecipeSortOption defaultRecipeSort() {
+		return RecipeSortOption.INPUT_COUNT;
+	}
+
+	@ConfigItem(
+			keyName = "defaultRecipeSortDirection",
+			name = "Default sort direction",
+			description = "Sort order for custom recipes (ascending or descending)",
+			section = customRecipesSection,
+			position = 4
+	)
+	default SortDirection defaultRecipeSortDirection() {
+		return SortDirection.ASCENDING;
 	}
 }
 
@@ -12794,6 +12923,7 @@ package com.flippingutilities.ui.statistics.recipes;
 import com.flippingutilities.controller.FlippingPlugin;
 import com.flippingutilities.model.RecipeFlipGroup;
 import com.flippingutilities.ui.statistics.StatsPanel;
+import com.flippingutilities.ui.statistics.recipes.customrecipes.CustomRecipeManagerPanel;
 import com.flippingutilities.ui.uiutilities.Icons;
 import com.flippingutilities.ui.uiutilities.Paginator;
 import com.flippingutilities.ui.uiutilities.UIUtilities;
@@ -12827,6 +12957,7 @@ public class RecipeGroupContainerPanel extends JPanel {
 
         setLayout(new BorderLayout());
 
+        add(createHeaderPanel(), BorderLayout.NORTH);
         add(scrollPane, BorderLayout.CENTER);
         add(paginator, BorderLayout.SOUTH);
     }
@@ -12921,6 +13052,915 @@ public class RecipeGroupContainerPanel extends JPanel {
 
     public void updateTimeDisplay() {
         activePanels.forEach(RecipeFlipGroupPanel::updateTimeLabels);
+    }
+
+    private JPanel createHeaderPanel() {
+        JPanel headerPanel = new JPanel(new BorderLayout());
+        headerPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        headerPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+
+        JButton manageRecipesButton = new JButton("Manage Custom Recipes");
+        manageRecipesButton.setToolTipText("Create and manage your own custom recipes");
+        manageRecipesButton.addActionListener(e -> openCustomRecipeManager());
+
+        headerPanel.add(manageRecipesButton, BorderLayout.CENTER);
+
+        return headerPanel;
+    }
+
+    private void openCustomRecipeManager() {
+        CustomRecipeManagerPanel managerPanel = new CustomRecipeManagerPanel(plugin);
+
+        JDialog dialog = new JDialog();
+        dialog.setTitle("Custom Recipe Manager");
+        dialog.setModal(true);
+        dialog.setIconImage(Icons.FU_ICON.getImage());
+        dialog.add(managerPanel);
+        dialog.pack();
+
+        int minHeight = 160 + (2 * 145);
+        Dimension packedSize = dialog.getSize();
+        dialog.setSize(Math.max(packedSize.width, 735), Math.max(packedSize.height, minHeight));
+
+        dialog.setLocationRelativeTo(null);
+        dialog.setVisible(true);
+    }
+}
+
+
+package com.flippingutilities.ui.statistics.recipes.customrecipes;
+
+import com.flippingutilities.controller.FlippingPlugin;
+import net.runelite.api.ItemComposition;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.AsyncBufferedImage;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.util.function.Consumer;
+
+public class SelectedItemRow extends JPanel {
+    private final FlippingPlugin plugin;
+    private final int itemId;
+    private final JSpinner quantitySpinner;
+
+    public SelectedItemRow(FlippingPlugin plugin, int itemId, int quantity, Consumer<SelectedItemRow> onRemove) {
+        this.plugin = plugin;
+        this.itemId = itemId;
+
+        setLayout(new BorderLayout(5, 0));
+        setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        setBorder(new EmptyBorder(3, 5, 3, 5));
+        setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+
+        JPanel itemInfoPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        itemInfoPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        JLabel iconLabel = new JLabel();
+        iconLabel.setPreferredSize(new Dimension(32, 32));
+
+        JLabel nameLabel = new JLabel();
+        nameLabel.setPreferredSize(new Dimension(170, 25));
+
+        JLabel priceLabel = new JLabel();
+        priceLabel.setForeground(Color.YELLOW);
+
+        plugin.getClientThread().invoke(() -> {
+            ItemManager itemManager = plugin.getItemManager();
+            ItemComposition item = itemManager.getItemComposition(itemId);
+            int price = itemManager.getItemPrice(itemId);
+            SwingUtilities.invokeLater(() -> {
+                AsyncBufferedImage itemImage = itemManager.getImage(itemId);
+                itemImage.addTo(iconLabel);
+                nameLabel.setText(item.getName());
+                if (price > 0) {
+                    priceLabel.setText(String.format("%,d gp", price));
+                }
+            });
+        });
+
+        itemInfoPanel.add(iconLabel);
+        itemInfoPanel.add(nameLabel);
+        itemInfoPanel.add(priceLabel);
+
+        JPanel controlPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        controlPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        quantitySpinner = new JSpinner(new SpinnerNumberModel(quantity, 1, 999999, 1));
+        quantitySpinner.setPreferredSize(new Dimension(80, 25));
+
+        JButton removeButton = new JButton("×");
+        removeButton.setPreferredSize(new Dimension(30, 25));
+        removeButton.setMargin(new Insets(0, 0, 0, 0));
+        removeButton.addActionListener(e -> onRemove.accept(this));
+
+        controlPanel.add(new JLabel("Qty:"));
+        controlPanel.add(quantitySpinner);
+        controlPanel.add(removeButton);
+
+        add(itemInfoPanel, BorderLayout.WEST);
+        add(controlPanel, BorderLayout.EAST);
+    }
+
+    public int getItemId() {
+        return itemId;
+    }
+
+    public int getQuantity() {
+        return (Integer) quantitySpinner.getValue();
+    }
+}
+
+package com.flippingutilities.ui.statistics.recipes.customrecipes;
+
+import com.flippingutilities.FlippingConfig;
+import com.flippingutilities.controller.FlippingPlugin;
+import net.runelite.api.ItemComposition;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.util.AsyncBufferedImage;
+import net.runelite.http.api.item.ItemPrice;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.function.BiConsumer;
+
+public class ItemSearchBox extends JPanel {
+    private final FlippingPlugin plugin;
+    private final JTextField searchField;
+    private final JSpinner quantitySpinner;
+    private final JPopupMenu suggestionPopup;
+    private final BiConsumer<Integer, Integer> onItemSelected;
+
+    public ItemSearchBox(FlippingPlugin plugin, BiConsumer<Integer, Integer> onItemSelected) {
+        this.plugin = plugin;
+        this.onItemSelected = onItemSelected;
+
+        setLayout(new FlowLayout(FlowLayout.LEFT, 5, 0));
+        setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        setBorder(new EmptyBorder(5, 5, 5, 5));
+        setMaximumSize(new Dimension(Integer.MAX_VALUE, 40));
+
+        add(new JLabel("Search:"));
+
+        searchField = new JTextField(15);
+        searchField.setToolTipText("Item name...");
+        add(searchField);
+
+        add(new JLabel("Qty:"));
+
+        quantitySpinner = new JSpinner(new SpinnerNumberModel(1, 1, 999999, 1));
+        quantitySpinner.setPreferredSize(new Dimension(80, 25));
+        add(quantitySpinner);
+
+        suggestionPopup = new JPopupMenu();
+        suggestionPopup.setFocusable(false);
+
+        searchField.getDocument().addDocumentListener(new DocumentListener() {
+            @Override
+            public void insertUpdate(DocumentEvent e) {
+                updateSuggestions();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e) {
+                updateSuggestions();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e) {
+                updateSuggestions();
+            }
+        });
+    }
+
+    private void updateSuggestions() {
+        String query = searchField.getText().toLowerCase().trim();
+        if (query.length() < 2) {
+            suggestionPopup.setVisible(false);
+            return;
+        }
+
+        plugin.getClientThread().invoke(() -> {
+            List<ItemComposition> matches = findMatchingItems(query);
+            List<SuggestionData> suggestionData = new ArrayList<>();
+
+            ItemManager itemManager = plugin.getItemManager();
+            for (ItemComposition item : matches.subList(0, Math.min(10, matches.size()))) {
+                int price = itemManager.getItemPrice(item.getId());
+                AsyncBufferedImage image = itemManager.getImage(item.getId());
+                suggestionData.add(new SuggestionData(item.getId(), item.getName(), price, image));
+            }
+
+            SwingUtilities.invokeLater(() -> {
+                suggestionPopup.removeAll();
+
+                if (suggestionData.isEmpty()) {
+                    suggestionPopup.setVisible(false);
+                    return;
+                }
+
+                for (SuggestionData data : suggestionData) {
+                    JMenuItem menuItem = createSuggestionItem(data);
+                    suggestionPopup.add(menuItem);
+                }
+
+                suggestionPopup.pack();
+                suggestionPopup.show(searchField, 0, searchField.getHeight());
+            });
+        });
+    }
+
+    private JMenuItem createSuggestionItem(SuggestionData data) {
+        String priceText = data.price > 0 ? String.format(" (%,d gp)", data.price) : " (untradeable)";
+        JMenuItem menuItem = new JMenuItem(data.name + priceText);
+        menuItem.setPreferredSize(new Dimension(280, 30));
+        data.image.onLoaded(() -> menuItem.setIcon(new ImageIcon(data.image)));
+
+        menuItem.addActionListener(e -> {
+            int quantity = (Integer) quantitySpinner.getValue();
+            onItemSelected.accept(data.itemId, quantity);
+            searchField.setText("");
+            quantitySpinner.setValue(1);
+            suggestionPopup.setVisible(false);
+        });
+
+        return menuItem;
+    }
+
+    private List<ItemComposition> findMatchingItems(String query) {
+        FlippingConfig pluginConfig = plugin.getConfig();
+        boolean includeNoted = pluginConfig.includeNotedItems();
+        boolean includeUntradeable = pluginConfig.includeUntradeableItems();
+
+        // itemmanager.search() is 30-40x faster but only returns tradeable items
+        // if user wants untradeable/noted items, we fall back to the "slow" 30k loop
+        return (includeUntradeable || includeNoted)
+            ? findMatchingItemsFullScan(query, includeNoted, includeUntradeable)
+            : findMatchingItemsOptimized(query);
+    }
+
+    private List<ItemComposition> findMatchingItemsOptimized(String query) {
+        List<ItemComposition> matches = new ArrayList<>();
+        ItemManager itemManager = plugin.getItemManager();
+
+        for (ItemPrice itemInfo : itemManager.search(query)) {
+            ItemComposition item = itemManager.getItemComposition(itemInfo.getId());
+            if (isInvalidItem(item)) continue;
+
+            matches.add(item);
+            if (matches.size() >= 10) break;
+        }
+        return matches;
+    }
+
+    private List<ItemComposition> findMatchingItemsFullScan(String query, boolean includeNoted, boolean includeUntradeable) {
+        List<ItemComposition> matches = new ArrayList<>();
+        ItemManager itemManager = plugin.getItemManager();
+
+        int maximumAmountOfItems = plugin.getClient().getItemCount();
+        for (int i = 0; i < maximumAmountOfItems; i++) {
+            ItemComposition item = itemManager.getItemComposition(i);
+            if (isInvalidItem(item)) continue;
+            if (!item.getName().toLowerCase().contains(query)) continue;
+            if (!passesFilters(item, includeNoted, includeUntradeable, itemManager)) continue;
+
+            matches.add(item);
+            if (matches.size() >= 10) break;
+        }
+        return matches;
+    }
+
+    private boolean isInvalidItem(ItemComposition item) {
+        return item == null || item.getName() == null || item.getName().equals("null");
+    }
+
+    private boolean passesFilters(ItemComposition item, boolean includeNoted, boolean includeUntradeable, ItemManager itemManager) {
+        int price = itemManager.getItemPrice(item.getId());
+        if (!includeUntradeable && price == 0) return false;
+
+        return includeNoted || item.getNote() == -1;
+    }
+}
+
+package com.flippingutilities.ui.statistics.recipes.customrecipes;
+
+import com.flippingutilities.controller.DataHandler;
+import com.flippingutilities.controller.FlippingPlugin;
+import com.flippingutilities.controller.RecipeHandler;
+import com.flippingutilities.ui.uiutilities.Icons;
+import com.flippingutilities.utilities.Recipe;
+import com.flippingutilities.utilities.RecipeItem;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.stream.Collectors;
+
+public class CustomRecipeManagerPanel extends JPanel {
+    private final FlippingPlugin plugin;
+    private JPanel recipeListPanel;
+    private String currentSortOption;
+    private String currentSortDirection;
+    private String searchQuery = "";
+
+    public CustomRecipeManagerPanel(FlippingPlugin plugin) {
+        this.plugin = plugin;
+        this.currentSortOption = plugin.getConfig().defaultRecipeSort().toString();
+        this.currentSortDirection = plugin.getConfig().defaultRecipeSortDirection().toString();
+        setLayout(new BorderLayout());
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        JPanel topPanel = new JPanel();
+        topPanel.setLayout(new BoxLayout(topPanel, BoxLayout.Y_AXIS));
+        topPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        topPanel.add(createHeaderPanel());
+        topPanel.add(createSortPanel());
+
+        add(topPanel, BorderLayout.NORTH);
+        add(createRecipeListScrollPane(), BorderLayout.CENTER);
+    }
+
+    private JPanel createHeaderPanel() {
+        JPanel headerPanel = new JPanel(new BorderLayout());
+        headerPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        headerPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        JLabel titleLabel = new JLabel("Custom Recipes");
+        titleLabel.setFont(FontManager.getRunescapeBoldFont());
+
+        JButton addButton = new JButton("Add Recipe");
+        addButton.addActionListener(e -> openRecipeEditorDialog(null));
+
+        headerPanel.add(titleLabel, BorderLayout.WEST);
+        headerPanel.add(addButton, BorderLayout.EAST);
+
+        return headerPanel;
+    }
+
+    private JPanel createSortPanel() {
+        JPanel sortPanel = new JPanel(new BorderLayout());
+        sortPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        sortPanel.setBorder(new EmptyBorder(5, 10, 5, 10));
+
+        JPanel leftPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 10, 0));
+        leftPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        JLabel sortLabel = new JLabel("Sort by:");
+        sortLabel.setFont(FontManager.getRunescapeFont());
+
+        String[] sortOptions = {"Input Count", "Output Count", "Name"};
+        JComboBox<String> sortDropdown = new JComboBox<>(sortOptions);
+        sortDropdown.setSelectedItem(currentSortOption);
+        sortDropdown.addActionListener(e -> {
+            currentSortOption = (String) sortDropdown.getSelectedItem();
+            refreshRecipeList();
+        });
+
+        JLabel directionLabel = new JLabel("Direction:");
+        directionLabel.setFont(FontManager.getRunescapeFont());
+
+        String[] directionOptions = {"Ascending", "Descending"};
+        JComboBox<String> directionDropdown = new JComboBox<>(directionOptions);
+        directionDropdown.setSelectedItem(currentSortDirection);
+        directionDropdown.addActionListener(e -> {
+            currentSortDirection = (String) directionDropdown.getSelectedItem();
+            refreshRecipeList();
+        });
+
+        leftPanel.add(sortLabel);
+        leftPanel.add(sortDropdown);
+        leftPanel.add(directionLabel);
+        leftPanel.add(directionDropdown);
+
+        JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
+        rightPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        JLabel searchLabel = new JLabel("Search:");
+        searchLabel.setFont(FontManager.getRunescapeFont());
+
+        JLabel helpLabel = new JLabel("?");
+        helpLabel.setFont(FontManager.getRunescapeFont());
+        helpLabel.setForeground(Color.GRAY);
+        helpLabel.setToolTipText("Search by recipe name or ingredient names");
+
+        JTextField searchField = new JTextField(15);
+        searchField.setText("Type to search...");
+        searchField.setForeground(Color.GRAY);
+        searchField.addFocusListener(new java.awt.event.FocusAdapter() {
+            public void focusGained(java.awt.event.FocusEvent e) {
+                if (searchField.getText().equals("Type to search...")) {
+                    searchField.setText("");
+                    searchField.setForeground(Color.WHITE);
+                }
+            }
+            public void focusLost(java.awt.event.FocusEvent e) {
+                if (searchField.getText().isEmpty()) {
+                    searchField.setText("Type to search...");
+                    searchField.setForeground(Color.GRAY);
+                }
+            }
+        });
+        searchField.getDocument().addDocumentListener(new javax.swing.event.DocumentListener() {
+            public void insertUpdate(javax.swing.event.DocumentEvent e) { updateSearch(); }
+            public void removeUpdate(javax.swing.event.DocumentEvent e) { updateSearch(); }
+            public void changedUpdate(javax.swing.event.DocumentEvent e) { updateSearch(); }
+            private void updateSearch() {
+                String text = searchField.getText();
+                if (text.equals("Type to search...")) {
+                    searchQuery = "";
+                } else {
+                    searchQuery = text.toLowerCase().trim();
+                }
+                plugin.getClientThread().invokeLater(() -> {
+                    List<Recipe> allRecipes = new ArrayList<>(plugin.getRecipeHandler().getLocalRecipes());
+                    List<Recipe> filtered = searchQuery.isEmpty() ? allRecipes : filterRecipes(allRecipes);
+                    sortRecipes(filtered);
+                    SwingUtilities.invokeLater(() -> displayRecipes(filtered));
+                });
+            }
+        });
+
+        rightPanel.add(searchLabel);
+        rightPanel.add(helpLabel);
+        rightPanel.add(searchField);
+
+        sortPanel.add(leftPanel, BorderLayout.WEST);
+        sortPanel.add(rightPanel, BorderLayout.EAST);
+
+        return sortPanel;
+    }
+
+    private JScrollPane createRecipeListScrollPane() {
+        recipeListPanel = new JPanel();
+        recipeListPanel.setLayout(new BoxLayout(recipeListPanel, BoxLayout.Y_AXIS));
+        recipeListPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        recipeListPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+
+        refreshRecipeList();
+
+        JScrollPane scrollPane = new JScrollPane(recipeListPanel);
+        scrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        scrollPane.getVerticalScrollBar().setPreferredSize(new Dimension(5, 0));
+        scrollPane.setBorder(null);
+
+        return scrollPane;
+    }
+
+    private void refreshRecipeList() {
+        plugin.getClientThread().invokeLater(() -> {
+            List<Recipe> allRecipes = new ArrayList<>(plugin.getRecipeHandler().getLocalRecipes());
+            List<Recipe> filtered = searchQuery.isEmpty() ? allRecipes : filterRecipes(allRecipes);
+            sortRecipes(filtered);
+            SwingUtilities.invokeLater(() -> displayRecipes(filtered));
+        });
+    }
+
+    private void displayRecipes(List<Recipe> recipes) {
+        recipeListPanel.removeAll();
+
+        if (recipes.isEmpty()) {
+            JSeparator separator = new JSeparator(SwingConstants.HORIZONTAL);
+            separator.setMaximumSize(new Dimension(Integer.MAX_VALUE, 2));
+            separator.setBackground(Color.GRAY);
+            separator.setForeground(Color.GRAY);
+            recipeListPanel.add(separator);
+            recipeListPanel.add(Box.createVerticalStrut(10));
+
+            String message = searchQuery.isEmpty()
+                ? "No custom recipes yet. Click 'Add Recipe' to create one."
+                : "No recipes found matching '" + searchQuery + "'";
+            JLabel emptyLabel = new JLabel(message);
+            emptyLabel.setFont(FontManager.getRunescapeFont());
+            emptyLabel.setBorder(new EmptyBorder(20, 10, 20, 10));
+            recipeListPanel.add(emptyLabel);
+        } else {
+            for (int i = 0; i < recipes.size(); i++) {
+                recipeListPanel.add(createRecipePanel(recipes.get(i)));
+                if (i < recipes.size() - 1) {
+                    recipeListPanel.add(Box.createVerticalStrut(10));
+                }
+            }
+        }
+
+        recipeListPanel.revalidate();
+        recipeListPanel.repaint();
+    }
+
+    private List<Recipe> filterRecipes(List<Recipe> recipes) {
+        return recipes.stream().filter(recipe -> {
+            if (recipe.getName().toLowerCase().contains(searchQuery)) {
+                return true;
+            }
+
+            for (RecipeItem item : recipe.getInputs()) {
+                String itemName = getItemName(item.getId());
+                if (itemName.toLowerCase().contains(searchQuery)) {
+                    return true;
+                }
+            }
+
+            for (RecipeItem item : recipe.getOutputs()) {
+                String itemName = getItemName(item.getId());
+                if (itemName.toLowerCase().contains(searchQuery)) {
+                    return true;
+                }
+            }
+
+            return false;
+        }).collect(Collectors.toList());
+    }
+
+    private String getItemName(int itemId) {
+        try {
+            return plugin.getItemManager().getItemComposition(itemId).getName();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private void sortRecipes(List<Recipe> recipes) {
+        Comparator<Recipe> comparator;
+
+        switch (currentSortOption) {
+            case "Input Count":
+                comparator = Comparator.comparingInt(r -> r.getInputs().size());
+                break;
+            case "Output Count":
+                comparator = Comparator.comparingInt(r -> r.getOutputs().size());
+                break;
+            case "Name":
+                comparator = Comparator.comparing(Recipe::getName, String.CASE_INSENSITIVE_ORDER);
+                break;
+            default:
+                comparator = Comparator.comparingInt(r -> r.getInputs().size());
+                break;
+        }
+
+        if ("Descending".equals(currentSortDirection)) {
+            comparator = comparator.reversed();
+        }
+
+        recipes.sort(comparator);
+    }
+
+    private JPanel createRecipePanel(Recipe recipe) {
+        JPanel panel = new JPanel(new BorderLayout(10, 5));
+        panel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        panel.setBorder(new EmptyBorder(15, 15, 15, 15));
+
+        int maxItems = Math.max(recipe.getInputs().size(), recipe.getOutputs().size());
+        int dynamicHeight = 70 + (maxItems * 38); // base + item height per row
+        panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, dynamicHeight));
+
+        JPanel leftPanel = new JPanel();
+        leftPanel.setLayout(new BoxLayout(leftPanel, BoxLayout.Y_AXIS));
+        leftPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        JLabel nameLabel = new JLabel(recipe.getName());
+        nameLabel.setFont(FontManager.getRunescapeBoldFont());
+        nameLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        leftPanel.add(nameLabel);
+
+        leftPanel.add(Box.createVerticalStrut(5));
+
+        JSeparator separator = new JSeparator(SwingConstants.HORIZONTAL);
+        separator.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
+        separator.setForeground(new Color(60, 60, 60));
+        leftPanel.add(separator);
+
+        leftPanel.add(Box.createVerticalStrut(5));
+
+        JPanel tablesPanel = new JPanel();
+        tablesPanel.setLayout(new BoxLayout(tablesPanel, BoxLayout.X_AXIS));
+        tablesPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        tablesPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+
+        tablesPanel.add(createItemsTable("Inputs", recipe.getInputs()));
+        tablesPanel.add(Box.createHorizontalStrut(15));
+
+        JLabel arrowLabel = new JLabel("→");
+        arrowLabel.setFont(new Font("Arial", Font.BOLD, 24));
+        arrowLabel.setAlignmentY(Component.TOP_ALIGNMENT);
+        tablesPanel.add(arrowLabel);
+        tablesPanel.add(Box.createHorizontalStrut(15));
+
+        tablesPanel.add(createItemsTable("Outputs", recipe.getOutputs()));
+
+        leftPanel.add(tablesPanel);
+
+        JPanel buttonPanel = new JPanel();
+        buttonPanel.setLayout(new BoxLayout(buttonPanel, BoxLayout.Y_AXIS));
+        buttonPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        JButton editButton = new JButton("Edit");
+        editButton.setAlignmentX(Component.CENTER_ALIGNMENT);
+        editButton.addActionListener(e -> openRecipeEditorDialog(recipe));
+
+        JButton deleteButton = new JButton("Delete");
+        deleteButton.setAlignmentX(Component.CENTER_ALIGNMENT);
+        deleteButton.addActionListener(e -> deleteRecipe(recipe));
+
+        buttonPanel.add(Box.createVerticalGlue());
+        buttonPanel.add(editButton);
+        buttonPanel.add(Box.createVerticalStrut(5));
+        buttonPanel.add(deleteButton);
+        buttonPanel.add(Box.createVerticalGlue());
+
+        panel.add(leftPanel, BorderLayout.CENTER);
+        panel.add(buttonPanel, BorderLayout.EAST);
+
+        return panel;
+    }
+
+    private JPanel createItemsTable(String title, List<RecipeItem> items) {
+        JPanel container = new JPanel();
+        container.setLayout(new BoxLayout(container, BoxLayout.Y_AXIS));
+        container.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        container.setAlignmentY(Component.TOP_ALIGNMENT);
+
+        String displayTitle = items.size() == 1 ? title.replaceAll("s$", "") : title;
+        JLabel titleLabel = new JLabel(displayTitle + ":");
+        titleLabel.setFont(FontManager.getRunescapeBoldFont());
+        titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+        container.add(titleLabel);
+        container.add(Box.createVerticalStrut(2));
+
+        ItemManager itemManager = plugin.getItemManager();
+        for (int i = 0; i < items.size(); i++) {
+            RecipeItem item = items.get(i);
+
+            JPanel row = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+            row.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            row.setAlignmentX(Component.LEFT_ALIGNMENT);
+            row.setMaximumSize(new Dimension(250, 36));
+
+            JLabel iconLabel = new JLabel();
+            iconLabel.setPreferredSize(new Dimension(32, 32));
+
+            JLabel nameLabel = new JLabel("Loading...");
+            nameLabel.setPreferredSize(new Dimension(170, 32));
+
+            JLabel qtyLabel = new JLabel("×" + item.getQuantity());
+            qtyLabel.setPreferredSize(new Dimension(50, 32));
+
+            plugin.getClientThread().invoke(() -> {
+                net.runelite.api.ItemComposition itemComp = itemManager.getItemComposition(item.getId());
+                net.runelite.client.util.AsyncBufferedImage itemImage = itemManager.getImage(item.getId());
+                SwingUtilities.invokeLater(() -> {
+                    itemImage.addTo(iconLabel);
+                    nameLabel.setText(itemComp.getName());
+                });
+            });
+
+            row.add(iconLabel);
+            row.add(nameLabel);
+            row.add(qtyLabel);
+
+            container.add(row);
+
+            if (i < items.size() - 1) {
+                container.add(Box.createVerticalStrut(2));
+            }
+        }
+
+        return container;
+    }
+
+    private void openRecipeEditorDialog(Recipe existingRecipe) {
+        JDialog dialog = new JDialog();
+        dialog.setTitle(existingRecipe == null ? "Add Recipe" : "Edit Recipe");
+        dialog.setModal(true);
+        dialog.setIconImage(((ImageIcon) Icons.FU_ICON).getImage());
+
+        RecipeEditorPanel editorPanel = new RecipeEditorPanel(existingRecipe, plugin);
+        dialog.add(editorPanel);
+
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        JButton saveButton = new JButton("Save");
+        saveButton.addActionListener(e -> {
+            Recipe recipe = editorPanel.buildRecipe();
+            if (recipe == null) {
+                JOptionPane.showMessageDialog(dialog, "Please fill all fields correctly. Some fields are missing.");
+                return;
+            }
+
+            RecipeHandler recipeHandler = plugin.getRecipeHandler();
+            if (existingRecipe != null) {
+                recipeHandler.updateLocalRecipe(existingRecipe, recipe);
+            } else {
+                recipeHandler.addLocalRecipe(recipe);
+            }
+
+            List<Recipe> fromHandler = recipeHandler.getLocalRecipes();
+            DataHandler dataHandler = plugin.getDataHandler();
+            List<Recipe> localRecipes = dataHandler.getAccountWideData().getLocalRecipes();
+            localRecipes.clear();
+            localRecipes.addAll(fromHandler);
+            dataHandler.markDataAsHavingChanged(FlippingPlugin.ACCOUNT_WIDE);
+            dataHandler.storeData();
+
+            refreshRecipeList();
+            dialog.dispose();
+        });
+
+        JButton cancelButton = new JButton("Cancel");
+        cancelButton.addActionListener(e -> dialog.dispose());
+
+        buttonPanel.add(saveButton);
+        buttonPanel.add(cancelButton);
+
+        dialog.add(buttonPanel, BorderLayout.SOUTH);
+        dialog.pack();
+        dialog.setMinimumSize(new Dimension(560, dialog.getHeight()));
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+
+    private void deleteRecipe(Recipe recipe) {
+        int confirm = JOptionPane.showConfirmDialog(
+                this,
+                "Are you sure you want to delete '" + recipe.getName() + "'?",
+                "Delete Recipe",
+                JOptionPane.YES_NO_OPTION
+        );
+
+        if (confirm != JOptionPane.YES_OPTION) {
+            return;
+        }
+
+        RecipeHandler recipeHandler = plugin.getRecipeHandler();
+        recipeHandler.removeLocalRecipe(recipe);
+        List<Recipe> fromHandler = recipeHandler.getLocalRecipes();
+        DataHandler dataHandler = plugin.getDataHandler();
+        List<Recipe> localRecipes = dataHandler.getAccountWideData().getLocalRecipes();
+        localRecipes.clear();
+        localRecipes.addAll(fromHandler);
+        dataHandler.markDataAsHavingChanged(FlippingPlugin.ACCOUNT_WIDE);
+        dataHandler.storeData();
+
+        refreshRecipeList();
+    }
+}
+
+package com.flippingutilities.ui.statistics.recipes.customrecipes;
+
+import com.flippingutilities.controller.FlippingPlugin;
+import com.flippingutilities.utilities.Recipe;
+import com.flippingutilities.utilities.RecipeItem;
+import net.runelite.client.ui.ColorScheme;
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.util.ArrayList;
+import java.util.List;
+
+public class RecipeEditorPanel extends JPanel {
+    private final FlippingPlugin plugin;
+    private final JTextField nameField;
+    private final JPanel inputItemsContainer;
+    private final JPanel outputItemsContainer;
+    private final List<SelectedItemRow> inputRows = new ArrayList<>();
+    private final List<SelectedItemRow> outputRows = new ArrayList<>();
+
+    public RecipeEditorPanel(Recipe existingRecipe, FlippingPlugin plugin) {
+        this.plugin = plugin;
+        setLayout(new BorderLayout(10, 10));
+        setBorder(new EmptyBorder(10, 10, 10, 10));
+
+        JPanel mainPanel = new JPanel();
+        mainPanel.setLayout(new BoxLayout(mainPanel, BoxLayout.Y_AXIS));
+
+        JPanel namePanel = new JPanel(new BorderLayout(5, 0));
+        namePanel.add(new JLabel("Recipe Name:"), BorderLayout.WEST);
+        nameField = new JTextField(existingRecipe != null ? existingRecipe.getName() : "");
+        nameField.setPreferredSize(new Dimension(300, 25));
+        namePanel.add(nameField, BorderLayout.CENTER);
+        mainPanel.add(namePanel);
+
+        mainPanel.add(Box.createVerticalStrut(15));
+
+        inputItemsContainer = new JPanel();
+        inputItemsContainer.setLayout(new BoxLayout(inputItemsContainer, BoxLayout.Y_AXIS));
+        mainPanel.add(createItemSection("Inputs", inputItemsContainer, inputRows, existingRecipe != null ? existingRecipe.getInputs() : null));
+
+        mainPanel.add(Box.createVerticalStrut(15));
+
+        outputItemsContainer = new JPanel();
+        outputItemsContainer.setLayout(new BoxLayout(outputItemsContainer, BoxLayout.Y_AXIS));
+        mainPanel.add(createItemSection("Outputs", outputItemsContainer, outputRows, existingRecipe != null ? existingRecipe.getOutputs() : null));
+
+        add(mainPanel, BorderLayout.CENTER);
+    }
+
+    private JPanel createItemSection(String title, JPanel itemsContainer, List<SelectedItemRow> rows, List<RecipeItem> existingItems) {
+        JPanel section = new JPanel();
+        section.setLayout(new BoxLayout(section, BoxLayout.Y_AXIS));
+        section.setBorder(BorderFactory.createTitledBorder(title));
+        section.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        JLabel placeholderLabel = new JLabel("Look for an item in the input field and click on it to add it here");
+        placeholderLabel.setForeground(Color.GRAY);
+        placeholderLabel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        itemsContainer.add(placeholderLabel);
+
+        if (existingItems != null && !existingItems.isEmpty()) {
+            itemsContainer.remove(placeholderLabel);
+            existingItems.forEach(item -> addItemRow(itemsContainer, rows, item.getId(), item.getQuantity()));
+        }
+
+        JScrollPane scrollPane = new JScrollPane(itemsContainer);
+        scrollPane.setPreferredSize(new Dimension(450, 120));
+        scrollPane.setBorder(new EmptyBorder(5, 5, 5, 5));
+        section.add(scrollPane);
+
+        ItemSearchBox searchBox = new ItemSearchBox(plugin, (itemId, quantity) -> {
+            if (itemsContainer.getComponentCount() > 0 && itemsContainer.getComponent(0) == placeholderLabel) {
+                itemsContainer.remove(placeholderLabel);
+            }
+            addItemRow(itemsContainer, rows, itemId, quantity);
+        });
+        section.add(searchBox);
+
+        return section;
+    }
+
+    private void addItemRow(JPanel container, List<SelectedItemRow> rows, int itemId, int quantity) {
+        SelectedItemRow row = new SelectedItemRow(plugin, itemId, quantity, (r) -> removeItemRow(container, rows, r));
+        rows.add(row);
+        container.add(row);
+        container.revalidate();
+        container.repaint();
+    }
+
+    private void removeItemRow(JPanel container, List<SelectedItemRow> rows, SelectedItemRow row) {
+        rows.remove(row);
+        container.remove(row);
+
+        if (container.getComponentCount() == 0) {
+            JLabel placeholderLabel = new JLabel("Look for an item in the input field and click on it to add it here");
+            placeholderLabel.setForeground(Color.GRAY);
+            placeholderLabel.setBorder(new EmptyBorder(10, 10, 10, 10));
+            container.add(placeholderLabel);
+        }
+
+        container.revalidate();
+        container.repaint();
+    }
+
+    public Recipe buildRecipe() {
+        String name = nameField.getText().trim();
+        if (name.isEmpty()) {
+            return null;
+        }
+
+        List<RecipeItem> inputs = new ArrayList<>();
+        for (SelectedItemRow row : inputRows) {
+            inputs.add(new RecipeItem(row.getItemId(), row.getQuantity()));
+        }
+
+        List<RecipeItem> outputs = new ArrayList<>();
+        for (SelectedItemRow row : outputRows) {
+            outputs.add(new RecipeItem(row.getItemId(), row.getQuantity()));
+        }
+
+        if (inputs.isEmpty() || outputs.isEmpty()) {
+            return null;
+        }
+
+        return new Recipe(inputs, outputs, name);
+    }
+}
+
+package com.flippingutilities.ui.statistics.recipes.customrecipes;
+
+import net.runelite.client.util.AsyncBufferedImage;
+
+class SuggestionData {
+    final int itemId;
+    final String name;
+    final int price;
+    final AsyncBufferedImage image;
+
+    SuggestionData(int itemId, String name, int price, AsyncBufferedImage image) {
+        this.itemId = itemId;
+        this.name = name;
+        this.price = price;
+        this.image = image;
     }
 }
 
@@ -16877,6 +17917,24 @@ public class WikiDataFetcherJob {
     }
 }
 
+
+package com.flippingutilities;
+
+public enum SortDirection {
+	ASCENDING("Ascending"),
+	DESCENDING("Descending");
+
+	private final String displayName;
+
+	SortDirection(String displayName) {
+		this.displayName = displayName;
+	}
+
+	@Override
+	public String toString() {
+		return displayName;
+	}
+}
 
 package com.flippingutilities;
 

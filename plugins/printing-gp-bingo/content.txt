@@ -1,0 +1,263 @@
+package com.printinggpbingo;
+
+import com.google.common.base.Strings;
+import com.google.gson.JsonObject;
+import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.DrawManager;
+import net.runelite.client.util.Text;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.MultipartBody;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
+import javax.imageio.ImageIO;
+import javax.inject.Inject;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Slf4j
+@PluginDescriptor(
+        name = "Printing GP Bingo Plugin",
+        description = "Broadcasts specified item drops to a Discord webhook for bingo events.",
+        tags = {"bingo", "discord", "broadcast", "loot", "gp", "printing"}
+)
+public class PrintingGpBingoPlugin extends Plugin {
+
+    private static final String VALUABLE_DROP_PREFIX = "Valuable drop: ";
+    private static final String UNTRADEABLE_DROP_PREFIX = "Untradeable drop: ";
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private PrintingGpBingoConfig config;
+
+    @Inject
+    private OkHttpClient okHttpClient;
+
+    @Inject
+    private DrawManager drawManager;
+
+    private final Set<String> broadcastItems = new HashSet<>();
+
+    @Provides
+    PrintingGpBingoConfig provideConfig(ConfigManager configManager) {
+        return configManager.getConfig(PrintingGpBingoConfig.class);
+    }
+
+    @Override
+    protected void startUp() throws Exception {
+        updateBroadcastItems();
+    }
+
+    @Override
+    protected void shutDown() throws Exception {
+        broadcastItems.clear();
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if (event.getGroup().equals("printinggpbingo")) {
+            updateBroadcastItems();
+        }
+    }
+
+    @Subscribe
+    public void onChatMessage(ChatMessage chatMessage) {
+        if (chatMessage.getType() != ChatMessageType.GAMEMESSAGE && chatMessage.getType() != ChatMessageType.SPAM) {
+            return;
+        }
+
+        String message = Text.removeTags(chatMessage.getMessage());
+        String itemName = null;
+
+        if (message.startsWith(VALUABLE_DROP_PREFIX)) {
+            String dropString = message.substring(VALUABLE_DROP_PREFIX.length());
+            int valueIndex = dropString.lastIndexOf(" (");
+            if (valueIndex != -1) {
+                String itemPart = dropString.substring(0, valueIndex).trim();
+
+                // Check for " x " to separate quantity and item name
+                int splitIndex = itemPart.indexOf(" x ");
+                if (splitIndex > 0) { // Check > 0 to ensure it's not the first character
+                    try {
+                        itemName = itemPart.substring(splitIndex + 3); // " x " is 3 chars long
+                    } catch (NumberFormatException e) {
+                        // If parsing fails, assume the whole string is the item name
+                        itemName = itemPart;
+                    }
+                } else {
+                    itemName = itemPart;
+                }
+            }
+        } else if (message.startsWith(UNTRADEABLE_DROP_PREFIX)) {
+            String itemPart = message.substring(UNTRADEABLE_DROP_PREFIX.length());
+
+            // Check for " x " to separate quantity and item name
+            int splitIndex = itemPart.indexOf(" x ");
+            if (splitIndex > 0) {
+                try {
+                    itemName = itemPart.substring(splitIndex + 3);
+                } catch (NumberFormatException e) {
+                    itemName = itemPart;
+                }
+            } else {
+                itemName = itemPart;
+            }
+        }
+
+        if (itemName != null && broadcastItems.contains(itemName.toLowerCase())) {
+            String playerName = client.getLocalPlayer().getName();
+            takeScreenshotAndSendWebhook(playerName, itemName);
+        }
+    }
+
+    private void takeScreenshotAndSendWebhook(String playerName, String itemName) {
+        drawManager.requestNextFrameListener(image ->
+        {
+            BufferedImage bufferedImage = (BufferedImage) image;
+            try {
+                byte[] imageBytes = toByteArray(bufferedImage);
+                sendWebhook(playerName, itemName, imageBytes);
+            } catch (IOException e) {
+                log.warn("Error converting screenshot to byte array", e);
+            }
+        });
+    }
+
+    private void updateBroadcastItems() {
+        broadcastItems.clear();
+        if (!Strings.isNullOrEmpty(config.itemList())) {
+            broadcastItems.addAll(
+                    Arrays.stream(config.itemList().split("\n"))
+                            .map(String::trim)
+                            .map(String::toLowerCase)
+                            .collect(Collectors.toSet())
+            );
+        }
+        log.info("Printing GP Bingo Plugin item list updated with {} items.", broadcastItems.size());
+    }
+
+    private void sendWebhook(String playerName, String itemName, byte[] imageBytes) {
+        String webhookUrl = config.webhookUrl();
+        if (Strings.isNullOrEmpty(webhookUrl)) {
+            return;
+        }
+
+        // Create the embed object
+        JsonObject embed = new JsonObject();
+        embed.addProperty("content", String.format("**%s** Obtained bingo item: **%s**",
+                playerName, itemName));
+
+        // Build the multipart request body
+        RequestBody requestBody = new MultipartBody.Builder()
+                .setType(MultipartBody.FORM)
+                .addFormDataPart("payload_json", embed.toString())
+                .addFormDataPart("file1", "screenshot.png", RequestBody.create(MediaType.parse("image/png"), imageBytes))
+                .build();
+
+        Request request = new Request.Builder()
+                .url(webhookUrl)
+                .post(requestBody)
+                .build();
+
+        okHttpClient.newCall(request).enqueue(new Callback() {
+            @Override
+            public void onFailure(Call call, IOException e) {
+                log.warn("Error sending Bingo webhook message", e);
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                if (response.isSuccessful()) {
+                    log.info("Successfully sent Bingo webhook message for {}.", itemName);
+                } else {
+                    log.warn("Failed to send Bingo webhook message: {} - {}", response.code(), response.body() != null ? response.body().string() : "No body");
+                }
+                response.close();
+            }
+        });
+    }
+
+    private static byte[] toByteArray(BufferedImage bi) throws IOException {
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        ImageIO.write(bi, "png", baos);
+        return baos.toByteArray();
+    }
+}
+
+
+package com.printinggpbingo;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+@ConfigGroup("printinggpbingo")
+public interface PrintingGpBingoConfig extends Config {
+
+    @ConfigSection(
+            name = "Discord Settings",
+            description = "Settings for the Discord webhook.",
+            position = 0
+    )
+    String discordSection = "discordSection";
+
+    @ConfigItem(
+            keyName = "webhookUrl",
+            name = "Webhook URL",
+            description = "The Discord webhook URL to send messages to.",
+            position = 1,
+            section = discordSection
+    )
+    String webhookUrl();
+
+    @ConfigSection(
+            name = "Item List",
+            description = "The list of items to announce.",
+            position = 2
+    )
+    String itemSection = "itemSection";
+
+    @ConfigItem(
+            keyName = "itemList",
+            name = "Items to Announce",
+            description = "A comma-separated list of items to broadcast. (e.g., Dragon warhammer, Twisted bow, Abyssal whip)",
+            position = 3,
+            section = itemSection
+    )
+    String itemList();
+}
+
+package com.printinggpbingo;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PrintingGpBingoTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(PrintingGpBingoPlugin.class);
+		RuneLite.main(args);
+	}
+}

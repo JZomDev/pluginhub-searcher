@@ -1,0 +1,977 @@
+package xyz.peppie.splashhelper;
+
+import java.awt.Color;
+import net.runelite.client.config.Alpha;
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("splashhelper")
+public interface SplashHelperConfig extends Config
+{
+	@ConfigItem(
+		keyName = "enableWelcomeMessage",
+		name = "Enable Welcome Message",
+		description = "Display a welcome message when logging in"
+	)
+	default boolean enableWelcomeMessage()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "targetNpc",
+		name = "Target NPC",
+		description = "Select the NPC to track for splashing"
+	)
+	default TargetNpc targetNpc()
+	{
+		return TargetNpc.KNIGHT_OF_ARDOUGNE;
+	}
+
+	@ConfigItem(
+		keyName = "timerDuration",
+		name = "Timer Duration (minutes)",
+		description = "How many minutes the timer should count down"
+	)
+	default int timerDuration()
+	{
+		return 15;
+	}
+
+	@ConfigItem(
+		keyName = "showOverlay",
+		name = "Show Timer Overlay",
+		description = "Display the timer overlay on screen"
+	)
+	default boolean showOverlay()
+	{
+		return true;
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "boundaryTileColor",
+		name = "Boundary Tile Color",
+		description = "Color of the boundary tile marker"
+	)
+	default Color boundaryTileColor()
+	{
+		return new Color(255, 0, 0, 100); // Semi-transparent red
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "knightTile1Color",
+		name = "Knight Tile 1 Color",
+		description = "Color of the Knight Tile 1 marker"
+	)
+	default Color knightTile1Color()
+	{
+		return new Color(0, 255, 0, 255); // Green
+	}
+
+	@Alpha
+	@ConfigItem(
+		keyName = "knightTile2Color",
+		name = "Knight Tile 2 Color",
+		description = "Color of the Knight Tile 2 marker"
+	)
+	default Color knightTile2Color()
+	{
+		return new Color(0, 0, 255, 255); // Blue
+	}
+}
+
+package xyz.peppie.splashhelper;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+@Getter
+@RequiredArgsConstructor
+public enum TargetNpc
+{
+	KNIGHT_OF_ARDOUGNE("Knight of Ardougne"),
+	RAT("Rat"),
+	GUARD("Guard");
+
+	private final String npcName;
+
+	@Override
+	public String toString()
+	{
+		return npcName;
+	}
+}
+
+package xyz.peppie.splashhelper;
+
+import com.google.inject.Provides;
+import java.time.Duration;
+import java.time.Instant;
+import java.awt.TrayIcon;
+import java.awt.Color;
+import javax.inject.Inject;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Actor;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.Menu;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
+import net.runelite.api.NPC;
+import net.runelite.api.Tile;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.ActorDeath;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.api.events.InteractingChanged;
+import net.runelite.client.Notifier;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.FlashNotification;
+import net.runelite.client.config.Notification;
+import net.runelite.client.config.NotificationSound;
+import net.runelite.client.config.RequestFocusType;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Splash Helper",
+	description = "A helper plugin for splashing in Old School RuneScape",
+	tags = {"combat", "magic", "splashing"}
+)
+public class SplashHelperPlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private SplashHelperConfig config;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private SplashHelperOverlay overlay;
+
+	@Inject
+	private BoundaryTileOverlay boundaryOverlay;
+
+	@Inject
+	private Notifier notifier;
+
+	@Getter
+	private Instant timerEnd;
+
+	private boolean hasNotified = false;
+	
+	@Getter
+	private WorldPoint boundaryTile = null;
+	@Getter
+	private WorldPoint knightTile1 = null;
+	@Getter
+	private WorldPoint knightTile2 = null;
+	private Actor currentTarget = null;
+	private boolean boundaryNotified = false;
+	
+	// Movement tracking
+	private WorldPoint lastNpcPosition = null;
+	private int movementCount = 0;
+	private Instant trackingStartTime = null;
+	@Getter
+	private double movementsPerMinute = 0.0;
+
+	@Provides
+	SplashHelperConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(SplashHelperConfig.class);
+	}
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		log.info("Splash Helper started!");
+		overlay.setPlugin(this);
+		boundaryOverlay.setPlugin(this);
+		overlayManager.add(overlay);
+		overlayManager.add(boundaryOverlay);
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		log.info("Splash Helper stopped!");
+		overlayManager.remove(overlay);
+		overlayManager.remove(boundaryOverlay);
+		timerEnd = null;
+		hasNotified = false;
+		boundaryTile = null;
+		knightTile1 = null;
+		knightTile2 = null;
+		currentTarget = null;
+		boundaryNotified = false;
+		lastNpcPosition = null;
+		movementCount = 0;
+		trackingStartTime = null;
+		movementsPerMinute = 0.0;
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		if (gameStateChanged.getGameState() == GameState.LOGGED_IN)
+		{
+			if (config.enableWelcomeMessage())
+			{
+				client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Splash Helper is active!", null);
+			}
+		}
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event)
+	{
+		// Check if timer has expired and send notification
+		if (timerEnd != null && !hasNotified)
+		{
+			Duration remaining = Duration.between(Instant.now(), timerEnd);
+			if (remaining.isNegative() || remaining.isZero())
+			{
+				sendNotification("Splash timer has expired!");
+				hasNotified = true;
+				log.info("Timer expired - notification sent");
+			}
+		}
+
+		// Check if NPC is on boundary tile
+		if (boundaryTile != null && currentTarget != null)
+		{
+			if (client.getTopLevelWorldView() == null)
+			{
+				return;
+			}
+			
+			String configuredNpc = config.targetNpc().getNpcName();
+			
+			for (NPC npc : client.getTopLevelWorldView().npcs())
+			{
+				if (npc != null && npc.getWorldLocation() != null)
+				{
+					String npcName = cleanNpcName(npc.getName());
+					
+					// Check if NPC matches configured name (if set)
+					boolean nameMatches = configuredNpc == null || configuredNpc.isEmpty() || 
+						(npcName != null && npcName.equalsIgnoreCase(configuredNpc));
+					
+					if (nameMatches)
+					{
+						if (npc.getWorldLocation().equals(boundaryTile))
+						{
+							String displayName = npcName != null ? npcName : "NPC";
+							sendNotification(displayName + " reached boundary tile!");
+							boundaryNotified = true;
+							log.info("✓ NPC '{}' reached boundary at {}", displayName, boundaryTile);
+							break;
+						}
+					}
+				}
+			}
+		}
+		
+		// Track NPC movement between Knight Tile 1 and Knight Tile 2
+		if (knightTile1 != null && knightTile2 != null && currentTarget != null)
+		{
+			WorldPoint currentPosition = currentTarget.getWorldLocation();
+			
+			if (currentPosition != null)
+			{
+				// Check if NPC is on either Knight Tile
+				boolean onTile1 = currentPosition.equals(knightTile1);
+				boolean onTile2 = currentPosition.equals(knightTile2);
+				
+				if (onTile1 || onTile2)
+				{
+					// Initialize tracking on first detection
+					if (trackingStartTime == null)
+					{
+						trackingStartTime = Instant.now();
+						lastNpcPosition = currentPosition;
+					}
+					// Check if NPC moved between tiles
+					else if (lastNpcPosition != null && !currentPosition.equals(lastNpcPosition))
+					{
+						// Only count movements between the two tiles
+						boolean wasOnTile1 = lastNpcPosition.equals(knightTile1);
+						boolean wasOnTile2 = lastNpcPosition.equals(knightTile2);
+						
+						if ((wasOnTile1 && onTile2) || (wasOnTile2 && onTile1))
+						{
+							movementCount++;
+						}
+						
+						lastNpcPosition = currentPosition;
+					}
+					
+					// Calculate movements per minute
+					if (trackingStartTime != null)
+					{
+						Duration trackingDuration = Duration.between(trackingStartTime, Instant.now());
+						double minutes = trackingDuration.toMillis() / 60000.0;
+						
+						if (minutes > 0)
+						{
+							movementsPerMinute = movementCount / minutes;
+						}
+					}
+				}
+				// Update last position if NPC is on either tile
+				if (onTile1 || onTile2)
+				{
+					lastNpcPosition = currentPosition;
+				}
+			}
+		}
+	}
+
+	@Subscribe
+	public void onInteractingChanged(InteractingChanged event)
+	{
+		if (event.getTarget() != null && event.getTarget().getName() != null) 
+		{
+			String sourceName = event.getSource().getName();
+			String playerName = client.getLocalPlayer().getName();
+			if (sourceName != null && sourceName.equalsIgnoreCase(playerName)) {
+				String interactedNpcName = cleanNpcName(event.getTarget().getName());
+	
+				// Check if NPC is allowed and matches configured name
+				if (isAllowedNpc(interactedNpcName) && interactedNpcName.equalsIgnoreCase(config.targetNpc().getNpcName()))
+				{
+					currentTarget = event.getTarget();
+					startTimer();	
+				}
+			}
+		}
+	}
+
+	@Subscribe
+	public void onActorDeath(ActorDeath event)
+	{
+		if (event.getActor() == currentTarget)
+		{
+			sendNotification("Actor died, resetting timer");
+			currentTarget = null;
+			timerEnd = null;
+			hasNotified = false;
+		}
+	}
+
+	@Subscribe
+	public void onMenuOpened(MenuOpened event)
+	{
+		// Add "Knight Boundary" submenu to tile right-click menu
+		MenuEntry[] entries = event.getMenuEntries();
+		
+		// Find the first Walk menu entry to get tile coordinates
+		for (MenuEntry entry : entries)
+		{
+			if (entry.getType() == MenuAction.WALK)
+			{
+				// Create main "Knight Boundary" menu entry
+				MenuEntry boundaryMenu = client.createMenuEntry(1)
+					.setOption("Knight Boundary")
+					.setTarget("")
+					.setType(MenuAction.RUNELITE);
+				
+				// Create submenu
+				Menu submenu = boundaryMenu.createSubMenu();
+				
+				// Add Set/Unset option to submenu
+				if (boundaryTile == null)
+				{
+					submenu.createMenuEntry(-1)
+						.setOption("Set")
+						.setType(MenuAction.RUNELITE)
+						.setParam0(entry.getParam0())
+						.setParam1(entry.getParam1())
+						.onClick(this::onBoundarySetClick);
+				}
+				else
+				{
+					submenu.createMenuEntry(-1)
+						.setOption("Unset")
+						.setType(MenuAction.RUNELITE)
+						.setParam0(entry.getParam0())
+						.setParam1(entry.getParam1())
+						.onClick(this::onBoundaryUnsetClick);
+				}
+				
+				// Add Color option to submenu
+				submenu.createMenuEntry(-1)
+					.setOption("Color")
+					.setType(MenuAction.RUNELITE)
+					.setParam0(entry.getParam0())
+					.setParam1(entry.getParam1())
+					.onClick(this::onBoundaryColorClick);
+				
+				// Create main "Knight Tile 1" menu entry
+				MenuEntry tile1Menu = client.createMenuEntry(2)
+					.setOption("Knight Tile 1")
+					.setTarget("")
+					.setType(MenuAction.RUNELITE);
+				
+				// Create submenu for Knight Tile 1
+				Menu submenu1 = tile1Menu.createSubMenu();
+				
+				// Add Set/Unset option to submenu
+				if (knightTile1 == null)
+				{
+					submenu1.createMenuEntry(-1)
+						.setOption("Set")
+						.setType(MenuAction.RUNELITE)
+						.setParam0(entry.getParam0())
+						.setParam1(entry.getParam1())
+						.onClick(this::onKnightTile1SetClick);
+				}
+				else
+				{
+					submenu1.createMenuEntry(-1)
+						.setOption("Unset")
+						.setType(MenuAction.RUNELITE)
+						.setParam0(entry.getParam0())
+						.setParam1(entry.getParam1())
+						.onClick(this::onKnightTile1UnsetClick);
+				}
+				
+				// Add Color option to submenu
+				submenu1.createMenuEntry(-1)
+					.setOption("Color")
+					.setType(MenuAction.RUNELITE)
+					.setParam0(entry.getParam0())
+					.setParam1(entry.getParam1())
+					.onClick(this::onKnightTile1ColorClick);
+				
+				// Create main "Knight Tile 2" menu entry
+				MenuEntry tile2Menu = client.createMenuEntry(3)
+					.setOption("Knight Tile 2")
+					.setTarget("")
+					.setType(MenuAction.RUNELITE);
+				
+				// Create submenu for Knight Tile 2
+				Menu submenu2 = tile2Menu.createSubMenu();
+				
+				// Add Set/Unset option to submenu
+				if (knightTile2 == null)
+				{
+					submenu2.createMenuEntry(-1)
+						.setOption("Set")
+						.setType(MenuAction.RUNELITE)
+						.setParam0(entry.getParam0())
+						.setParam1(entry.getParam1())
+						.onClick(this::onKnightTile2SetClick);
+				}
+				else
+				{
+					submenu2.createMenuEntry(-1)
+						.setOption("Unset")
+						.setType(MenuAction.RUNELITE)
+						.setParam0(entry.getParam0())
+						.setParam1(entry.getParam1())
+						.onClick(this::onKnightTile2UnsetClick);
+				}
+				
+				// Add Color option to submenu
+				submenu2.createMenuEntry(-1)
+					.setOption("Color")
+					.setType(MenuAction.RUNELITE)
+					.setParam0(entry.getParam0())
+					.setParam1(entry.getParam1())
+					.onClick(this::onKnightTile2ColorClick);
+				
+				// Only add it once
+				break;
+			}
+		}
+	}
+
+	private void onBoundarySetClick(MenuEntry entry)
+	{
+		if (client.getTopLevelWorldView() == null)
+		{
+			log.warn("TopLevelWorldView is null, cannot set boundary");
+			return;
+		}
+		
+		Tile tile = client.getTopLevelWorldView().getSelectedSceneTile();
+		
+		if (tile != null)
+		{
+			boundaryTile = tile.getWorldLocation();
+			boundaryNotified = false;
+			log.info("✓ Boundary tile successfully set to: {}", boundaryTile);
+			sendNotification("Boundary tile set at: " + boundaryTile.getX() + ", " + boundaryTile.getY());
+		}
+	}
+
+	private void onBoundaryUnsetClick(MenuEntry entry)
+	{
+		boundaryTile = null;
+		boundaryNotified = false;
+		log.info("✓ Boundary tile unset");
+		sendNotification("Boundary tile unset");
+	}
+
+	private void onBoundaryColorClick(MenuEntry entry)
+	{
+		// The color picker is automatically shown by RuneLite's config system
+		// when the user changes the boundaryTileColor config item
+		sendNotification("Change boundary color in the plugin settings");
+	}
+
+	private void onKnightTile1SetClick(MenuEntry entry)
+	{
+		if (client.getTopLevelWorldView() == null)
+		{
+			log.warn("TopLevelWorldView is null, cannot set Knight Tile 1");
+			return;
+		}
+		
+		Tile tile = client.getTopLevelWorldView().getSelectedSceneTile();
+		
+		if (tile != null)
+		{
+			knightTile1 = tile.getWorldLocation();
+			log.info("✓ Knight Tile 1 successfully set to: {}", knightTile1);
+			sendNotification("Knight Tile 1 set at: " + knightTile1.getX() + ", " + knightTile1.getY());
+			
+			// Initialize tracking if both tiles are set
+			if (knightTile1 != null && knightTile2 != null)
+			{
+				resetMovementTracking();
+			}
+		}
+	}
+
+	private void onKnightTile1UnsetClick(MenuEntry entry)
+	{
+		knightTile1 = null;
+		resetMovementTracking();
+		log.info("✓ Knight Tile 1 unset");
+		sendNotification("Knight Tile 1 unset");
+	}
+
+	private void onKnightTile1ColorClick(MenuEntry entry)
+	{
+		sendNotification("Change Knight Tile 1 color in the plugin settings");
+	}
+
+	private void onKnightTile2SetClick(MenuEntry entry)
+	{
+		if (client.getTopLevelWorldView() == null)
+		{
+			log.warn("TopLevelWorldView is null, cannot set Knight Tile 2");
+			return;
+		}
+		
+		Tile tile = client.getTopLevelWorldView().getSelectedSceneTile();
+		
+		if (tile != null)
+		{
+			knightTile2 = tile.getWorldLocation();
+			log.info("✓ Knight Tile 2 successfully set to: {}", knightTile2);
+			sendNotification("Knight Tile 2 set at: " + knightTile2.getX() + ", " + knightTile2.getY());
+			
+			// Initialize tracking if both tiles are set
+			if (knightTile1 != null && knightTile2 != null)
+			{
+				resetMovementTracking();
+			}
+		}
+	}
+
+	private void onKnightTile2UnsetClick(MenuEntry entry)
+	{
+		knightTile2 = null;
+		resetMovementTracking();
+		log.info("✓ Knight Tile 2 unset");
+		sendNotification("Knight Tile 2 unset");
+	}
+
+	private void onKnightTile2ColorClick(MenuEntry entry)
+	{
+		sendNotification("Change Knight Tile 2 color in the plugin settings");
+	}
+
+	private void resetMovementTracking()
+	{
+		lastNpcPosition = null;
+		movementCount = 0;
+		trackingStartTime = null;
+		movementsPerMinute = 0.0;
+	}
+
+	/**
+	 * Checks if an NPC is allowed to be set as a target.
+	 * @param npcName The cleaned NPC name
+	 * @return true if the NPC is allowed, false otherwise
+	 */
+	private boolean isAllowedNpc(String npcName)
+	{
+		if (npcName == null)
+		{
+			return false;
+		}
+		
+		// List of allowed NPCs for targeting
+		return npcName.equalsIgnoreCase("Knight of Ardougne") ||
+			   npcName.equalsIgnoreCase("Rat") ||
+			   npcName.equalsIgnoreCase("Guard");
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		// Check if the click is an NPC interaction
+		if (event.getMenuAction() != MenuAction.NPC_FIRST_OPTION &&
+			event.getMenuAction() != MenuAction.NPC_SECOND_OPTION &&
+			event.getMenuAction() != MenuAction.NPC_THIRD_OPTION &&
+			event.getMenuAction() != MenuAction.NPC_FOURTH_OPTION &&
+			event.getMenuAction() != MenuAction.NPC_FIFTH_OPTION)
+		{
+			return;
+		}
+
+		// Get the NPC that was clicked
+		String targetName = cleanNpcName(event.getMenuTarget());
+		Actor clickedActor = client.getTopLevelWorldView().npcs().byIndex(event.getId());
+
+		// Check if this is the NPC we're tracking and if it's allowed
+		String configuredNpc = config.targetNpc().getNpcName();
+		if (configuredNpc != null && !configuredNpc.isEmpty())
+		{
+			if (isAllowedNpc(targetName) && targetName.equalsIgnoreCase(configuredNpc))
+			{
+				startTimer();
+				currentTarget = clickedActor;
+			}
+		}
+	}
+
+	private void startTimer()
+	{
+		int durationMinutes = config.timerDuration();
+		timerEnd = Instant.now().plus(Duration.ofMinutes(durationMinutes));
+		hasNotified = false;
+		
+		log.info("Timer started for {} minutes", durationMinutes);
+		
+		if (config.enableWelcomeMessage())
+		{
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", 
+				String.format("Timer started: %d minutes", durationMinutes), null);
+		}
+	}
+
+	/**
+	 * Cleans an NPC name by removing color tags, level information, and trailing whitespace.
+	 * @param npcName The raw NPC name from the game (e.g., "<col=ffffff>Knight of Ardougne (level-46)")
+	 * @return The cleaned NPC name (e.g., "Knight of Ardougne")
+	 */
+	private String cleanNpcName(String npcName)
+	{
+		if (npcName == null)
+		{
+			return null;
+		}
+		
+		// Remove color tags like <col=ffffff>
+		String cleaned = npcName.replaceAll("<.*?>", "");
+		
+		// Remove level information like (level-46)
+		cleaned = cleaned.replaceAll("\\s*\\([^)]*\\)\\s*$", "");
+		
+		// Trim any remaining whitespace
+		return cleaned.trim();
+	}
+
+	private void sendNotification(String message)
+	{
+		client.addChatMessage(ChatMessageType.GAMEMESSAGE, this.getName(),  message, null);
+		// Send notification with sound using RuneLite's notifier
+		Notification notification = new Notification(
+			true,
+			true,
+			false,
+			false,
+			TrayIcon.MessageType.WARNING,
+			RequestFocusType.OFF,
+			NotificationSound.CUSTOM,
+			null,
+			client.getMusicVolume(),
+			1,
+			true,
+			FlashNotification.DISABLED,
+			Color.GREEN,
+			false
+
+		
+			);
+		notifier.notify(notification, message);
+	}
+}
+
+package xyz.peppie.splashhelper;
+
+import java.awt.BasicStroke;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.Polygon;
+import java.awt.Stroke;
+import javax.inject.Inject;
+import net.runelite.api.Client;
+import net.runelite.api.Perspective;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+public class BoundaryTileOverlay extends Overlay
+{
+	private final Client client;
+	private final SplashHelperConfig config;
+	private SplashHelperPlugin plugin;
+
+	@Inject
+	private BoundaryTileOverlay(Client client, SplashHelperConfig config)
+	{
+		this.client = client;
+		this.config = config;
+		setPosition(OverlayPosition.DYNAMIC);
+		setLayer(OverlayLayer.ABOVE_SCENE);
+	}
+
+	public void setPlugin(SplashHelperPlugin plugin)
+	{
+		this.plugin = plugin;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (plugin == null)
+		{
+			return null;
+		}
+
+		Stroke originalStroke = graphics.getStroke();
+
+		// Render boundary tile
+		if (plugin.getBoundaryTile() != null)
+		{
+			renderTile(graphics, plugin.getBoundaryTile(), config.boundaryTileColor(), originalStroke);
+		}
+
+		// Render Knight Tile 1
+		if (plugin.getKnightTile1() != null)
+		{
+			renderTile(graphics, plugin.getKnightTile1(), config.knightTile1Color(), originalStroke);
+		}
+
+		// Render Knight Tile 2
+		if (plugin.getKnightTile2() != null)
+		{
+			renderTile(graphics, plugin.getKnightTile2(), config.knightTile2Color(), originalStroke);
+		}
+
+		return null;
+	}
+
+	private void renderTile(Graphics2D graphics, WorldPoint worldPoint, java.awt.Color color, Stroke originalStroke)
+	{
+		LocalPoint localPoint = LocalPoint.fromWorld(client.getTopLevelWorldView(), worldPoint);
+
+		if (localPoint == null)
+		{
+			return;
+		}
+
+		// Get the tile polygon
+		Polygon tilePoly = Perspective.getCanvasTilePoly(client, localPoint);
+
+		if (tilePoly == null)
+		{
+			return;
+		}
+
+		// Fill with transparent dark gray
+		graphics.setColor(new java.awt.Color(0, 0, 0, 100));
+		graphics.fillPolygon(tilePoly);
+
+		// Draw colored border
+		graphics.setStroke(new BasicStroke(2));
+		graphics.setColor(color);
+		graphics.drawPolygon(tilePoly);
+		graphics.setStroke(originalStroke);
+	}
+}
+
+package xyz.peppie.splashhelper;
+
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.time.Duration;
+import java.time.Instant;
+import javax.inject.Inject;
+
+import net.runelite.api.Client;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+public class SplashHelperOverlay extends Overlay
+{
+	private SplashHelperPlugin plugin;
+	private final SplashHelperConfig config;
+	private final PanelComponent panelComponent = new PanelComponent();
+
+	@Inject
+	private SplashHelperOverlay(Client client, SplashHelperConfig config)
+	{
+		setPosition(OverlayPosition.ABOVE_CHATBOX_RIGHT);
+		this.config = config;
+	}
+
+	public void setPlugin(SplashHelperPlugin plugin)
+	{
+		this.plugin = plugin;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		panelComponent.getChildren().clear();
+		String overlayTitle = "Splash Timer";
+
+		// Add title
+		panelComponent.getChildren().add(TitleComponent.builder()
+			.text(overlayTitle)
+			.color(Color.CYAN)
+			.build());
+
+		panelComponent.setPreferredSize(new Dimension(
+            graphics.getFontMetrics().stringWidth(overlayTitle) + 90,
+            0));
+
+		// Check if plugin is initialized
+		if (plugin == null)
+		{
+			return null;
+		}
+		
+		// Show boundary tile status
+		if (plugin.getBoundaryTile() != null)
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Boundary:")
+				.right("SET")
+				.rightColor(Color.GREEN)
+				.build());
+		}
+		
+		// Show movement tracking stats
+		if (plugin.getKnightTile1() != null && plugin.getKnightTile2() != null)
+		{
+			double movementsPerMin = plugin.getMovementsPerMinute();
+			String movementText = String.format("%.1f/min", movementsPerMin);
+			
+			Color movementColor = Color.CYAN;
+			if (movementsPerMin > 0)
+			{
+				movementColor = Color.GREEN;
+			}
+			
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Movements:")
+				.right(movementText)
+				.rightColor(movementColor)
+				.build());
+		}
+		
+		// Check if timer is initialized
+		if (plugin.getTimerEnd() == null)
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Timer:")
+				.right("Not started")
+				.rightColor(Color.GRAY)
+				.build());
+			return panelComponent.render(graphics);
+		}
+
+		// Calculate remaining time
+		Duration remaining = Duration.between(Instant.now(), plugin.getTimerEnd());
+		
+		if (remaining.isNegative() || remaining.isZero())
+		{
+			// Timer expired
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Time:")
+				.right("EXPIRED")
+				.rightColor(Color.RED)
+				.build());
+		}
+		else
+		{
+			// Format time as MM:SS
+			long totalSeconds = remaining.getSeconds();
+			long minutes = totalSeconds / 60;
+			long seconds = totalSeconds % 60;
+			String timeString = String.format("%02d:%02d", minutes, seconds);
+
+			Color timeColor = Color.GREEN;
+			if (minutes < 1)
+			{
+				timeColor = Color.YELLOW;
+			}
+			if (seconds < 30 && minutes == 0)
+			{
+				timeColor = Color.RED;
+			}
+
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Time Remaining:")
+				.right(timeString)
+				.rightColor(timeColor)
+				.build());
+		}
+
+		return panelComponent.render(graphics);
+	}
+}
+
+package xyz.peppie.splashhelper;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class SplashHelperPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(SplashHelperPlugin.class);
+		RuneLite.main(args);
+	}
+}
+
