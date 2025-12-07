@@ -1,0 +1,1622 @@
+package gimhub;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.MenuAction;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ScriptPostFired;
+import net.runelite.api.events.ScriptPreFired;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarbitID;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+
+@Slf4j
+@Singleton
+public class CollectionLogWidgetSubscriber {
+    @Inject
+    private EventBus eventBus;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private CollectionLogManager collectionLogManager;
+
+    private boolean searchTriggered = false;
+    private int searchTriggeredTick = -1;
+
+    public void startUp() {
+        eventBus.register(this);
+    }
+
+    public void shutDown() {
+        eventBus.unregister(this);
+    }
+
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged e) {
+        GameState s = e.getGameState();
+        if (s != GameState.HOPPING && s != GameState.LOGGED_IN) {
+            searchTriggered = false;
+            searchTriggeredTick = -1;
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick tick) {
+        if (searchTriggeredTick != -1) {
+            int currentTick = client.getTickCount();
+
+            if (currentTick - searchTriggeredTick >= 500) {
+                searchTriggered = false;
+                searchTriggeredTick = -1;
+            }
+        }
+    }
+
+    @Subscribe
+    public void onScriptPreFired(ScriptPreFired pre) {
+        // Script 4100 fires when collection log items are enumerated via search
+        if (pre.getScriptId() == 4100) {
+            // Arguments: [widgetId, itemId, qty]
+            Object[] args = pre.getScriptEvent().getArguments();
+            if (args != null && args.length >= 3) {
+                try {
+                    int itemId = (int) args[1];
+                    int quantity = (int) args[2];
+                    collectionLogManager.storeClogItem(itemId, quantity);
+                } catch (Exception ignored) {
+                    //
+                }
+            }
+        }
+    }
+
+    @Subscribe
+    public void onScriptPostFired(ScriptPostFired post) {
+        final int COLLECTION_LOG_SETUP = 7797;
+        if (post.getScriptId() == COLLECTION_LOG_SETUP) {
+            if (searchTriggered) return;
+            boolean isAdventureLog = client.getVarbitValue(VarbitID.COLLECTION_POH_HOST_BOOK_OPEN) == 1;
+            if (isAdventureLog) return;
+
+            searchTriggered = true;
+            searchTriggeredTick = client.getTickCount();
+            client.menuAction(-1, InterfaceID.Collection.SEARCH_TOGGLE, MenuAction.CC_OP, 1, -1, "Search", null);
+            final int COLLECTION_INIT = 2240;
+            client.runScript(COLLECTION_INIT);
+        }
+    }
+}
+
+package gimhub;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import javax.annotation.Nullable;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
+import net.runelite.client.game.ItemManager;
+
+@Slf4j
+public class ItemContainerState implements ConsumableState {
+    private final List<ItemContainerItem> items;
+    private final String playerName;
+
+    public ItemContainerState(String playerName, ItemContainer container, ItemManager itemManager) {
+        this.playerName = playerName;
+        items = new ArrayList<>();
+        Item[] contents = container.getItems();
+        for (final Item item : contents) {
+            if (isItemValid(item, itemManager)) {
+                items.add(new ItemContainerItem(itemManager.canonicalize(item.getId()), item.getQuantity()));
+            }
+        }
+    }
+
+    // NOTE: This is for when we care about the order of the items in the container
+    // like the player inventory and equipment.
+    public ItemContainerState(String playerName, ItemContainer container, ItemManager itemManager, int containerSize) {
+        this.playerName = playerName;
+        items = new ArrayList<>();
+        for (int i = 0; i < containerSize; i++) {
+            Item item = container.getItem(i);
+
+            if (!isItemValid(item, itemManager)) {
+                items.add(new ItemContainerItem(0, 0));
+            } else {
+                items.add(new ItemContainerItem(itemManager.canonicalize(item.getId()), item.getQuantity()));
+            }
+        }
+    }
+
+    public ItemContainerState(String playerName, List<ItemContainerItem> items) {
+        this.playerName = playerName;
+        this.items = items;
+    }
+
+    @Nullable public ItemContainerState add(ItemContainerState itemsToAdd) {
+        if (itemsToAdd == null || !itemsToAdd.whoOwnsThis().equals(whoOwnsThis())) return null;
+        Map<Integer, ItemContainerItem> thisItems = getItemMap();
+        Map<Integer, ItemContainerItem> otherItems = itemsToAdd.getItemMap();
+        List<ItemContainerItem> result = new ArrayList<>();
+
+        for (Map.Entry<Integer, ItemContainerItem> entry : thisItems.entrySet()) {
+            Integer itemId = entry.getKey();
+            ItemContainerItem item = entry.getValue();
+            if (otherItems.containsKey(itemId)) {
+                item.addQuantity(otherItems.get(itemId).getQuantity());
+            }
+            result.add(item);
+        }
+
+        for (Map.Entry<Integer, ItemContainerItem> entry : otherItems.entrySet()) {
+            Integer itemId = entry.getKey();
+            if (!thisItems.containsKey(itemId)) {
+                result.add(entry.getValue());
+            }
+        }
+
+        return new ItemContainerState(whoOwnsThis(), result);
+    }
+
+    @Nullable public ItemContainerState whatGotRemoved(ItemContainerState other) {
+        if (other == null || !other.whoOwnsThis().equals(whoOwnsThis())) return null;
+        Map<Integer, ItemContainerItem> thisItems = getItemMap();
+        Map<Integer, ItemContainerItem> otherItems = other.getItemMap();
+        List<ItemContainerItem> result = new ArrayList<>();
+
+        for (Map.Entry<Integer, ItemContainerItem> entry : otherItems.entrySet()) {
+            Integer itemId = entry.getKey();
+            ItemContainerItem otherItem = entry.getValue();
+            if (otherItem.getId() == 0) continue;
+
+            if (thisItems.containsKey(itemId)) {
+                ItemContainerItem thisItem = thisItems.get(itemId);
+                int quantityDifference = otherItem.getQuantity() - thisItem.getQuantity();
+                if (quantityDifference > 0) {
+                    result.add(new ItemContainerItem(itemId, quantityDifference));
+                }
+            } else {
+                result.add(new ItemContainerItem(itemId, otherItem.getQuantity()));
+            }
+        }
+
+        return new ItemContainerState(playerName, result);
+    }
+
+    public Map<Integer, ItemContainerItem> getItemMap() {
+        Map<Integer, ItemContainerItem> itemMap = new HashMap<>();
+        for (ItemContainerItem itemContainerItem : items) {
+            Integer id = itemContainerItem.getId();
+            if (itemMap.containsKey(id)) {
+                itemMap.get(id).addQuantity(itemContainerItem.getQuantity());
+            } else {
+                itemMap.put(id, new ItemContainerItem(id, itemContainerItem.getQuantity()));
+            }
+        }
+
+        return itemMap;
+    }
+
+    private boolean isItemValid(Item item, ItemManager itemManager) {
+        if (item == null) return false;
+        final int id = item.getId();
+        final int quantity = item.getQuantity();
+        if (itemManager != null) {
+            final boolean isPlaceholder = itemManager.getItemComposition(id).getPlaceholderTemplateId() != -1;
+
+            return id >= 0 && quantity >= 0 && !isPlaceholder;
+        }
+        return false;
+    }
+
+    public List<Integer> asFlatList() {
+        List<Integer> result = new ArrayList<>(items.size() * 2);
+
+        for (ItemContainerItem item : items) {
+            result.add(item.getId());
+            result.add(item.getQuantity());
+        }
+
+        return result;
+    }
+
+    @Override
+    public Object get() {
+        return asFlatList();
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof ItemContainerState)) return false;
+        ItemContainerState other = (ItemContainerState) o;
+        if (other.items.size() != items.size()) return false;
+
+        for (int i = 0; i < items.size(); i++) {
+            if (!items.get(i).equals(other.items.get(i))) return false;
+        }
+
+        return true;
+    }
+
+    @Override
+    public int hashCode() {
+        return items.hashCode();
+    }
+}
+
+package gimhub;
+
+import net.runelite.api.Client;
+
+public class AchievementDiaryState implements ConsumableState {
+    private final String playerName;
+
+    private static final int[][] DIARY_VARBITS = {
+        {3566, 3567, 3568, 3569, 3570, 3571, 3572, 3573, 3574, 3575}, // Karamja Easy
+        {
+            3579, 3580, 3581, 3582, 3583, 3584, 3596, 3586, 3587, 3588, 3589, 3590, 3591, 3592, 3593, 3594, 3595, 3597,
+            3585
+        }, // Karamja Medium
+        {3600, 3601, 3602, 3603, 3604, 3605, 3606, 3607, 3608, 3609} // Karamja Hard
+    };
+
+    private static final int[][] DIARY_VARPS = {
+        {1196, 1197}, // Ardougne
+        {1198, 1199}, // Desert
+        {1186, 1187}, // Falador
+        {1184, 1185}, // Fremennik
+        {1178, 1179}, // Kandarin
+        {1200}, // Karamja Elite
+        {2085, 2086}, // Kourend & Kebos
+        {1194, 1195}, // Lumbridge & Draynor
+        {1180, 1181}, // Morytania
+        {1176, 1177}, // Varrock
+        {1182, 1183}, // Western Provinces
+        {1192, 1193} // Wilderness
+    };
+
+    private final int[] diaryVarValues;
+
+    public AchievementDiaryState(String playerName, Client client) {
+        this.playerName = playerName;
+
+        int totalLength = 0;
+        for (int[] group : DIARY_VARPS) {
+            totalLength += group.length;
+        }
+        for (int[] group : DIARY_VARBITS) {
+            totalLength += group.length;
+        }
+
+        diaryVarValues = new int[totalLength];
+        int index = 0;
+
+        for (int[] group : DIARY_VARPS) {
+            for (int varp : group) {
+                diaryVarValues[index++] = client.getVarpValue(varp);
+            }
+        }
+
+        for (int[] group : DIARY_VARBITS) {
+            for (int varbit : group) {
+                diaryVarValues[index++] = client.getVarbitValue(varbit);
+            }
+        }
+    }
+
+    @Override
+    public Object get() {
+        return diaryVarValues;
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof AchievementDiaryState)) return false;
+
+        AchievementDiaryState other = (AchievementDiaryState) o;
+        for (int i = 0; i < diaryVarValues.length; ++i) {
+            if (diaryVarValues[i] != other.diaryVarValues[i]) return false;
+        }
+
+        return true;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = 1;
+        for (int value : diaryVarValues) {
+            result = 31 * result + value;
+        }
+
+        return result;
+    }
+}
+
+package gimhub;
+
+import com.google.inject.Provides;
+import java.time.temporal.ChronoUnit;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.VarPlayerID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.config.RuneScapeProfileType;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.task.Schedule;
+
+@Slf4j
+@PluginDescriptor(name = "GIM hub")
+public class GimHubPlugin extends Plugin {
+    @Inject
+    private Client client;
+
+    @Inject
+    private DataManager dataManager;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private CollectionLogWidgetSubscriber collectionLogWidgetSubscriber;
+
+    private int itemsDeposited = 0;
+
+    private static final int SECONDS_BETWEEN_UPLOADS = 1;
+    private static final int SECONDS_BETWEEN_INFREQUENT_DATA_CHANGES = 60;
+    private static final int GAME_TICKS_FOR_DEPOSIT_DETECTION = 2;
+
+    private static final int WIDGET_DEPOSIT_ITEM_BUTTON = 12582935;
+    private static final int WIDGET_DEPOSIT_INVENTORY_BUTTON = 12582941;
+    private static final int WIDGET_DEPOSIT_EQUIPMENT_BUTTON = 12582942;
+    private static final int SCRIPT_CHATBOX_ENTERED = 681;
+    private static final int WIDGET_GROUP_STORAGE_LOADER_PARENT = 293;
+    private static final int WIDGET_GROUP_STORAGE_LOADER_TEXT_CHILD = 1;
+
+    @Override
+    protected void startUp() throws Exception {
+        collectionLogWidgetSubscriber.startUp();
+        log.info("GIM hub started!");
+    }
+
+    @Override
+    protected void shutDown() throws Exception {
+        collectionLogWidgetSubscriber.shutDown();
+        log.info("GIM hub stopped!");
+    }
+
+    @Schedule(period = SECONDS_BETWEEN_UPLOADS, unit = ChronoUnit.SECONDS, asynchronous = true)
+    public void submitToApi() {
+        if (doNotUseThisData()) return;
+
+        String playerName = client.getLocalPlayer().getName();
+        dataManager.submitToApi(playerName);
+    }
+
+    @Schedule(period = SECONDS_BETWEEN_UPLOADS, unit = ChronoUnit.SECONDS)
+    public void updateThingsThatDoChangeOften() {
+        if (doNotUseThisData()) return;
+        Player player = client.getLocalPlayer();
+        String playerName = player.getName();
+        StateRepository states = dataManager.getStateRepository();
+
+        states.getResources().update(new ResourcesState(playerName, client));
+
+        final int worldViewID = player.getWorldView().getId();
+        final boolean isOnBoat = worldViewID != -1;
+        WorldPoint location = WorldPoint.fromLocalInstance(client, player.getLocalLocation());
+        if (isOnBoat) {
+            WorldEntity worldEntity =
+                    client.getTopLevelWorldView().worldEntities().byIndex(worldViewID);
+            location = WorldPoint.fromLocalInstance(client, worldEntity.getLocalLocation());
+        }
+
+        states.getPosition().update(new LocationState(playerName, location, isOnBoat));
+
+        states.getRunePouch().update(new RunePouchState(playerName, client));
+        states.getQuiver().update(new QuiverState(playerName, client, itemManager));
+    }
+
+    @Schedule(period = SECONDS_BETWEEN_INFREQUENT_DATA_CHANGES, unit = ChronoUnit.SECONDS)
+    public void updateThingsThatDoNotChangeOften() {
+        if (doNotUseThisData()) return;
+        String playerName = client.getLocalPlayer().getName();
+        StateRepository states = dataManager.getStateRepository();
+        states.getQuests().update(new QuestState(playerName, client));
+        states.getAchievementDiary().update(new AchievementDiaryState(playerName, client));
+    }
+
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged event) {
+        if (doNotUseThisData()) return;
+
+        final int varpId = event.getVarpId();
+        if (varpId == VarPlayerID.DIZANAS_QUIVER_TEMP_AMMO || varpId == VarPlayerID.DIZANAS_QUIVER_TEMP_AMMO_AMOUNT) {
+            String playerName = client.getLocalPlayer().getName();
+            dataManager.getStateRepository().getQuiver().update(new QuiverState(playerName, client, itemManager));
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick gameTick) {
+        if (doNotUseThisData()) return;
+
+        if (itemsDeposited > 0) {
+            --itemsDeposited;
+        }
+        updateInteracting();
+
+        Widget groupStorageLoaderText =
+                client.getWidget(WIDGET_GROUP_STORAGE_LOADER_PARENT, WIDGET_GROUP_STORAGE_LOADER_TEXT_CHILD);
+        if (groupStorageLoaderText != null && groupStorageLoaderText.getText().equalsIgnoreCase("saving...")) {
+            dataManager.getStateRepository().getSharedBank().commitTransaction();
+        }
+    }
+
+    @Subscribe
+    public void onStatChanged(StatChanged statChanged) {
+        if (doNotUseThisData()) return;
+        String playerName = client.getLocalPlayer().getName();
+        dataManager.getStateRepository().getSkills().update(new SkillState(playerName, client));
+    }
+
+    @Subscribe
+    public void onItemContainerChanged(ItemContainerChanged event) {
+        if (doNotUseThisData()) return;
+        String playerName = client.getLocalPlayer().getName();
+        StateRepository states = dataManager.getStateRepository();
+        final int id = event.getContainerId();
+        ItemContainer container = event.getItemContainer();
+
+        if (id == InventoryID.BANK) {
+            states.getDeposited().reset();
+            states.getBank().update(new ItemContainerState(playerName, container, itemManager));
+        } else if (id == InventoryID.SEED_VAULT) {
+            states.getSeedVault().update(new ItemContainerState(playerName, container, itemManager));
+        } else if (id == InventoryID.INV) {
+            ItemContainerState newInventoryState = new ItemContainerState(playerName, container, itemManager, 28);
+            if (itemsDeposited > 0) {
+                updateDeposited(newInventoryState, (ItemContainerState)
+                        states.getInventory().mostRecentState());
+            }
+            states.getInventory().update(newInventoryState);
+        } else if (id == InventoryID.WORN) {
+            ItemContainerState newEquipmentState = new ItemContainerState(playerName, container, itemManager, 14);
+            if (itemsDeposited > 0) {
+                updateDeposited(newEquipmentState, (ItemContainerState)
+                        states.getEquipment().mostRecentState());
+            }
+            states.getEquipment().update(newEquipmentState);
+        } else if (id == InventoryID.INV_GROUP_TEMP) {
+            states.getSharedBank().update(new ItemContainerState(playerName, container, itemManager));
+        }
+    }
+
+    @Subscribe
+    private void onScriptPostFired(ScriptPostFired event) {
+        if (doNotUseThisData()) return;
+
+        if (event.getScriptId() == SCRIPT_CHATBOX_ENTERED
+                && client.getWidget(InterfaceID.BankDepositbox.INVENTORY) != null) {
+            itemsMayHaveBeenDeposited();
+        }
+    }
+
+    @Subscribe
+    private void onMenuOptionClicked(MenuOptionClicked event) {
+        if (doNotUseThisData()) return;
+
+        final int param1 = event.getParam1();
+        final MenuAction menuAction = event.getMenuAction();
+        if (menuAction == MenuAction.CC_OP
+                && (param1 == WIDGET_DEPOSIT_ITEM_BUTTON
+                        || param1 == WIDGET_DEPOSIT_INVENTORY_BUTTON
+                        || param1 == WIDGET_DEPOSIT_EQUIPMENT_BUTTON)) {
+            itemsMayHaveBeenDeposited();
+        }
+    }
+
+    @Subscribe
+    private void onInteractingChanged(InteractingChanged event) {
+        if (doNotUseThisData()) return;
+
+        if (event.getSource() != client.getLocalPlayer()) return;
+        updateInteracting();
+    }
+
+    private void itemsMayHaveBeenDeposited() {
+        itemsDeposited = GAME_TICKS_FOR_DEPOSIT_DETECTION;
+    }
+
+    private void updateInteracting() {
+        Player player = client.getLocalPlayer();
+
+        if (player != null) {
+            Actor actor = player.getInteracting();
+
+            if (actor != null) {
+                String playerName = player.getName();
+                dataManager
+                        .getStateRepository()
+                        .getInteracting()
+                        .update(new InteractingState(playerName, actor, client));
+            }
+        }
+    }
+
+    private void updateDeposited(ItemContainerState newState, ItemContainerState previousState) {
+        ItemContainerState deposited = newState.whatGotRemoved(previousState);
+        dataManager.getStateRepository().getDeposited().add(deposited);
+    }
+
+    /**
+     * A guard blocking client callbacks that may write invalid state, such as when the player is not logged in to a
+     * main-game profile.
+     */
+    private boolean doNotUseThisData() {
+        boolean isStandardProfile = RuneScapeProfileType.getCurrent(client) == RuneScapeProfileType.STANDARD;
+
+        return client.getGameState() != GameState.LOGGED_IN || client.getLocalPlayer() == null || !isStandardProfile;
+    }
+
+    @Provides
+    GimHubConfig provideConfig(ConfigManager configManager) {
+        return configManager.getConfig(GimHubConfig.class);
+    }
+}
+
+package gimhub;
+
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
+
+public class DataState {
+    private final AtomicReference<ConsumableState> state = new AtomicReference<>();
+    private ConsumableState previousState;
+    private final String key;
+    private final boolean transactionBased;
+
+    DataState(String key, boolean transactionBased) {
+        this.key = key;
+        this.transactionBased = transactionBased;
+    }
+
+    public void update(ConsumableState o) {
+        if (!o.equals(previousState)) {
+            previousState = o;
+
+            if (!transactionBased) {
+                state.set(o);
+            }
+        }
+    }
+
+    public void consumeState(Map<String, Object> output) {
+        final ConsumableState consumedState = state.getAndSet(null);
+        final Object whoIsUpdating = output.get("name");
+        if (consumedState != null) {
+            final String whoOwnsThis = consumedState.whoOwnsThis();
+            if (whoOwnsThis != null && whoOwnsThis.equals(whoIsUpdating)) {
+                Object c = consumedState.get();
+                output.put(key, c);
+            }
+        }
+    }
+
+    public ConsumableState mostRecentState() {
+        return this.previousState;
+    }
+
+    public void restoreState() {
+        state.compareAndSet(null, previousState);
+    }
+
+    public void commitTransaction() {
+        state.set(previousState);
+    }
+}
+
+package gimhub;
+
+import java.util.Map;
+import javax.inject.Singleton;
+import lombok.Getter;
+
+@Singleton
+public class StateRepository {
+    @Getter
+    private final DataState inventory = new DataState("inventory", false);
+
+    @Getter
+    private final DataState bank = new DataState("bank", false);
+
+    @Getter
+    private final DataState equipment = new DataState("equipment", false);
+
+    @Getter
+    private final DataState sharedBank = new DataState("shared_bank", true);
+
+    @Getter
+    private final DataState resources = new DataState("stats", false);
+
+    @Getter
+    private final DataState skills = new DataState("skills", false);
+
+    @Getter
+    private final DataState quests = new DataState("quests", false);
+
+    @Getter
+    private final DataState position = new DataState("coordinates", false);
+
+    @Getter
+    private final DataState runePouch = new DataState("rune_pouch", false);
+
+    @Getter
+    private final DataState quiver = new DataState("quiver", false);
+
+    @Getter
+    private final DataState interacting = new DataState("interacting", false);
+
+    @Getter
+    private final DataState seedVault = new DataState("seed_vault", false);
+
+    @Getter
+    private final DataState achievementDiary = new DataState("diary_vars", false);
+
+    @Getter
+    private final DepositedItems deposited = new DepositedItems();
+
+    public void consumeAllStates(Map<String, Object> updates) {
+        inventory.consumeState(updates);
+        bank.consumeState(updates);
+        equipment.consumeState(updates);
+        sharedBank.consumeState(updates);
+        resources.consumeState(updates);
+        skills.consumeState(updates);
+        quests.consumeState(updates);
+        position.consumeState(updates);
+        runePouch.consumeState(updates);
+        quiver.consumeState(updates);
+        interacting.consumeState(updates);
+        seedVault.consumeState(updates);
+        achievementDiary.consumeState(updates);
+        deposited.consumeState(updates);
+    }
+
+    public void restoreAllStates() {
+        inventory.restoreState();
+        bank.restoreState();
+        equipment.restoreState();
+        sharedBank.restoreState();
+        resources.restoreState();
+        skills.restoreState();
+        quests.restoreState();
+        position.restoreState();
+        runePouch.restoreState();
+        quiver.restoreState();
+        interacting.restoreState();
+        seedVault.restoreState();
+        achievementDiary.restoreState();
+        deposited.restoreState();
+    }
+}
+
+package gimhub;
+
+import java.util.HashMap;
+import java.util.Map;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+@Singleton
+public class DataManager {
+    @Inject
+    private GimHubConfig config;
+
+    @Inject
+    private HttpRequestService httpRequestService;
+
+    @Inject
+    private CollectionLogManager collectionLogManager;
+
+    @Getter
+    @Inject
+    private StateRepository stateRepository;
+
+    @Inject
+    private ApiUrlBuilder apiUrlBuilder;
+
+    private boolean isMemberInGroup = false;
+    private int skipNextNAttempts = 0;
+
+    public void submitToApi(String playerName) {
+        if (skipNextNAttempts-- > 0) return;
+
+        String groupToken = config.authorizationToken().trim();
+
+        if (groupToken.isEmpty()) return;
+
+        if (!isMemberInGroup) {
+            isMemberInGroup = fetchIsMember(groupToken, playerName);
+        }
+
+        if (!isMemberInGroup) {
+            log.debug("Skip POST: not a member. Backing off.");
+            skipNextNAttempts = 10;
+            return;
+        }
+
+        String url = apiUrlBuilder.getUpdateGroupMemberUrl();
+        if (url == null) {
+            log.debug("Skip POST: Update Group Member URL is null (check base URL and group name).");
+            return;
+        }
+
+        Map<String, Object> updates = new HashMap<>();
+        updates.put("name", playerName);
+        stateRepository.consumeAllStates(updates);
+        collectionLogManager.consumeState(updates);
+
+        // We require greater than 1 since name field is automatically included
+        if (updates.size() <= 1) {
+            log.debug("Skip POST: no changes to send (fields={})", updates.size());
+            return;
+        }
+
+        HttpRequestService.HttpResponse response = httpRequestService.post(url, groupToken, updates);
+
+        if (!response.isSuccessful()) {
+            skipNextNAttempts = 10;
+            if (response.getCode() == 422) {
+                isMemberInGroup = false;
+            }
+            stateRepository.restoreAllStates();
+            return;
+        }
+
+        collectionLogManager.clearClogItems();
+    }
+
+    private boolean fetchIsMember(String groupToken, String playerName) {
+        String url = apiUrlBuilder.getMembershipCheckUrl(playerName);
+        if (url == null) {
+            log.debug("Skip POST: Membership Check URL is null (check base URL and group name).");
+            return false;
+        }
+
+        return httpRequestService.get(url, groupToken).isSuccessful();
+    }
+}
+
+package gimhub;
+
+import lombok.Getter;
+
+public class ItemContainerItem {
+    @Getter
+    private final int id;
+
+    @Getter
+    private int quantity;
+
+    ItemContainerItem(int id, int quantity) {
+        this.id = id;
+        this.quantity = quantity;
+    }
+
+    public void addQuantity(int quantity) {
+        this.quantity += quantity;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof ItemContainerItem)) return false;
+        ItemContainerItem other = (ItemContainerItem) o;
+
+        return other.id == id && other.quantity == quantity;
+    }
+
+    @Override
+    public int hashCode() {
+        int result = Integer.hashCode(id);
+        result = 31 * result + Integer.hashCode(quantity);
+
+        return result;
+    }
+}
+
+package gimhub;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+@ConfigGroup("GimHub")
+public interface GimHubConfig extends Config {
+    @ConfigSection(
+            name = "Group config",
+            description = "Enter the group details you created on the website here.",
+            position = 0)
+    String GROUP_SECTION = "GroupSection";
+
+    @ConfigSection(
+            name = "Self hosted config",
+            description = "Configure your connection to a self hosted server.",
+            position = 1,
+            closedByDefault = true)
+    String CONNECTION_SECTION = "ConnectionSection";
+
+    @ConfigItem(
+            keyName = "groupName",
+            name = "Group name (on the website)",
+            description = "This is the group name you provided on the website when creating your group.",
+            section = GROUP_SECTION)
+    default String groupName() {
+        return "";
+    }
+
+    @ConfigItem(
+            keyName = "groupToken",
+            name = "Group token",
+            description =
+                    "Secret token for your group provided by the website. Get this from the member which created the group on the site, or create a new one by visiting the site.",
+            secret = true,
+            section = GROUP_SECTION)
+    default String authorizationToken() {
+        return "";
+    }
+
+    @ConfigItem(
+            keyName = "baseUrlOverride",
+            name = "Server base URL override (leave blank to use public server)",
+            description =
+                    "Overrides the public server URL used to send data. Only change this if you are hosting your own server.",
+            section = CONNECTION_SECTION)
+    default String baseUrlOverride() {
+        return "";
+    }
+}
+
+package gimhub;
+
+import java.util.Map;
+
+public class DepositedItems {
+    private ItemContainerState items = null;
+    private ItemContainerState consumedItems = null;
+
+    public DepositedItems() {}
+
+    public synchronized void add(ItemContainerState deposited) {
+        if (deposited == null) return;
+        if (items == null || !deposited.whoOwnsThis().equals(items.whoOwnsThis())) {
+            items = deposited;
+        } else {
+            items = items.add(deposited);
+        }
+    }
+
+    public synchronized void consumeState(Map<String, Object> output) {
+        if (items != null) {
+            final String whoOwnsThis = items.whoOwnsThis();
+            final String whoIsUpdating = (String) output.get("name");
+            if (whoOwnsThis != null && whoOwnsThis.equals(whoIsUpdating)) output.put("deposited", items.get());
+        }
+        consumedItems = items;
+        items = null;
+    }
+
+    public synchronized void restoreState() {
+        add(consumedItems);
+        consumedItems = null;
+    }
+
+    public synchronized void reset() {
+        items = null;
+        consumedItems = null;
+    }
+}
+
+package gimhub;
+
+import java.util.*;
+import java.util.stream.Collectors;
+import net.runelite.api.Client;
+import net.runelite.api.Quest;
+
+public class QuestState implements ConsumableState {
+    private final Map<Integer, net.runelite.api.QuestState> questStateMap;
+    private final transient String playerName;
+    private final List<Integer> sortedQuestIds =
+            Arrays.stream(Quest.values()).map(Quest::getId).sorted().collect(Collectors.toList());
+
+    public QuestState(String playerName, Client client) {
+        this.playerName = playerName;
+        this.questStateMap = new HashMap<>();
+        for (Quest quest : Quest.values()) {
+            questStateMap.put(quest.getId(), quest.getState(client));
+        }
+    }
+
+    @Override
+    public Object get() {
+        List<Integer> result = new ArrayList<>(questStateMap.size());
+        for (Integer questId : sortedQuestIds) {
+            result.add(questStateMap.get(questId).ordinal());
+        }
+
+        return result;
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof QuestState)) return false;
+
+        QuestState other = (QuestState) o;
+        for (Quest quest : Quest.values()) {
+            Integer questId = quest.getId();
+            if (questStateMap.get(questId) != other.questStateMap.get(questId)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+package gimhub;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Singleton
+public class ApiUrlBuilder {
+    @Inject
+    private GimHubConfig config;
+
+    @Inject
+    private HttpRequestService httpRequestService;
+
+    public String getUpdateGroupMemberUrl() {
+        String baseUrl = httpRequestService.getBaseUrl();
+        String groupName = getGroupName();
+
+        if (baseUrl == null || groupName == null) return null;
+
+        return String.format("%s/api/group/%s/update-group-member", baseUrl, groupName);
+    }
+
+    public String getMembershipCheckUrl(String playerName) {
+        String baseUrl = httpRequestService.getBaseUrl();
+        String groupName = getGroupName();
+
+        if (baseUrl == null || groupName == null) return null;
+
+        return String.format("%s/api/group/%s/am-i-in-group?member_name=%s", baseUrl, groupName, playerName);
+    }
+
+    private String getGroupName() {
+        String groupName = config.groupName().trim();
+
+        return groupName.isEmpty() ? null : groupName;
+    }
+}
+
+package gimhub;
+
+import com.google.gson.Gson;
+import java.io.IOException;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLiteProperties;
+import okhttp3.*;
+
+@Slf4j
+@Singleton
+public class HttpRequestService {
+    private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
+    private static final String USER_AGENT = "GIM-hub/RuneLite/" + RuneLiteProperties.getVersion();
+    private static final String PUBLIC_BASE_URL = "https://gim-hub.com";
+
+    @Inject
+    private OkHttpClient okHttpClient;
+
+    @Inject
+    private GimHubConfig config;
+
+    @Inject
+    private Gson gson;
+
+    public HttpResponse get(String url, String authToken) {
+        Request request = buildRequest(url, authToken).get().build();
+
+        return executeRequest(request, "GET", url, null);
+    }
+
+    public HttpResponse post(String url, String authToken, Object requestBody) {
+        String requestJson = gson.toJson(requestBody);
+        RequestBody body = RequestBody.create(JSON, requestJson);
+
+        Request request = buildRequest(url, authToken).post(body).build();
+
+        return executeRequest(request, "POST", url, requestJson);
+    }
+
+    private Request.Builder buildRequest(String url, String authToken) {
+        Request.Builder requestBuilder = new Request.Builder().url(url).header("User-Agent", USER_AGENT);
+
+        if (isInternalUrl(url)) {
+            if (authToken != null && !authToken.trim().isEmpty()) {
+                requestBuilder.header("Authorization", authToken);
+            }
+            requestBuilder.header("Accept", "application/json");
+        }
+
+        return requestBuilder;
+    }
+
+    private boolean isInternalUrl(String url) {
+        return url.startsWith(getBaseUrl());
+    }
+
+    private HttpResponse executeRequest(Request request, String method, String url, String requestBody) {
+        Call call = okHttpClient.newCall(request);
+
+        try (Response response = call.execute()) {
+            String responseBody = readBodySafe(response);
+            logRequest(method, url, requestBody, response, responseBody);
+
+            return new HttpResponse(response.isSuccessful(), response.code(), responseBody);
+        } catch (IOException ex) {
+            log.warn("{} {} failed: {}", method, url, ex.toString());
+
+            return new HttpResponse(false, -1, ex.getMessage());
+        }
+    }
+
+    private void logRequest(String method, String url, String requestBody, Response response, String responseBody) {
+        if (!log.isDebugEnabled()) {
+            return;
+        }
+
+        switch (method) {
+            case "GET":
+                log.debug("GET {} -> {}\nResponse: {}", url, response.code(), responseBody);
+                break;
+            case "POST":
+                log.debug("POST {}\nRequest: {}\nResponse({}): {}", url, requestBody, response.code(), responseBody);
+                break;
+            default:
+                log.debug("{} {} -> {}\nResponse: {}", method, url, response.code(), responseBody);
+        }
+    }
+
+    private static String readBodySafe(Response response) {
+        try {
+            ResponseBody responseBody = response.body();
+
+            return responseBody != null ? responseBody.string() : "<no body>";
+        } catch (Exception e) {
+            return "<unavailable: " + e.getMessage() + ">";
+        }
+    }
+
+    public String getBaseUrl() {
+        String baseUrlOverride = config.baseUrlOverride().trim();
+        if (!baseUrlOverride.isEmpty()) {
+            return baseUrlOverride;
+        }
+        return PUBLIC_BASE_URL;
+    }
+
+    @Getter
+    public static class HttpResponse {
+        private final boolean successful;
+        private final int code;
+        private final String body;
+
+        public HttpResponse(boolean successful, int code, String body) {
+            this.successful = successful;
+            this.code = code;
+            this.body = body;
+        }
+    }
+}
+
+package gimhub;
+
+public interface ConsumableState {
+    Object get();
+
+    String whoOwnsThis();
+}
+
+package gimhub;
+
+import net.runelite.api.Client;
+import net.runelite.api.gameval.VarPlayerID;
+import net.runelite.client.game.ItemManager;
+
+public class QuiverState implements ConsumableState {
+    private final ItemContainerItem ammo;
+    private final String playerName;
+
+    public QuiverState(String playerName, Client client, ItemManager itemManager) {
+        this.playerName = playerName;
+
+        int id = client.getVarpValue(VarPlayerID.DIZANAS_QUIVER_TEMP_AMMO);
+        int qty = client.getVarpValue(VarPlayerID.DIZANAS_QUIVER_TEMP_AMMO_AMOUNT);
+        if (id <= 0 || qty <= 0) {
+            this.ammo = new ItemContainerItem(0, 0);
+        } else {
+            int canonId = itemManager.canonicalize(id);
+            this.ammo = new ItemContainerItem(canonId, qty);
+        }
+    }
+
+    @Override
+    public Object get() {
+        return new int[] {ammo.getId(), ammo.getQuantity()};
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) {
+            return true;
+        }
+
+        if (!(o instanceof QuiverState)) {
+            return false;
+        }
+
+        QuiverState other = (QuiverState) o;
+
+        return this.ammo.equals(other.ammo);
+    }
+
+    @Override
+    public int hashCode() {
+        int result = 17;
+        result = 31 * result + ammo.getId();
+        result = 31 * result + ammo.getQuantity();
+
+        return result;
+    }
+}
+
+package gimhub;
+
+import lombok.Getter;
+import net.runelite.api.coords.WorldPoint;
+
+public class LocationState implements ConsumableState {
+    @Getter
+    private final int x;
+
+    @Getter
+    private final int y;
+
+    @Getter
+    private final int plane;
+
+    @Getter
+    private final boolean isOnBoat;
+
+    private final transient String playerName;
+
+    LocationState(String playerName, WorldPoint worldPoint, boolean isOnBoat) {
+        this.playerName = playerName;
+        x = worldPoint.getX();
+        y = worldPoint.getY();
+        plane = worldPoint.getPlane();
+        this.isOnBoat = isOnBoat;
+    }
+
+    @Override
+    public Object get() {
+        return new int[] {x, y, plane, isOnBoat ? 1 : 0};
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof LocationState)) return false;
+
+        LocationState other = (LocationState) o;
+
+        return (x == other.x) && (y == other.y) && (plane == other.plane) && (isOnBoat == other.isOnBoat);
+    }
+
+    @Override
+    public String toString() {
+        return String.format("{ x: %d, y: %d, plane: %d, isOnBoat: %b }", x, y, plane, isOnBoat);
+    }
+}
+
+package gimhub;
+
+import java.util.*;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Skill;
+
+@Slf4j
+public class SkillState implements ConsumableState {
+    private final Map<String, Integer> skillXpMap;
+    private final transient String playerName;
+
+    public SkillState(String playerName, Client client) {
+        this.playerName = playerName;
+        skillXpMap = new HashMap<>();
+        for (Skill skill : Skill.values()) {
+            skillXpMap.put(skill.getName(), client.getSkillExperience(skill));
+        }
+    }
+
+    @Override
+    public Object get() {
+        return new int[] {
+            skillXpMap.get("Agility"),
+            skillXpMap.get("Attack"),
+            skillXpMap.get("Construction"),
+            skillXpMap.get("Cooking"),
+            skillXpMap.get("Crafting"),
+            skillXpMap.get("Defence"),
+            skillXpMap.get("Farming"),
+            skillXpMap.get("Firemaking"),
+            skillXpMap.get("Fishing"),
+            skillXpMap.get("Fletching"),
+            skillXpMap.get("Herblore"),
+            skillXpMap.get("Hitpoints"),
+            skillXpMap.get("Hunter"),
+            skillXpMap.get("Magic"),
+            skillXpMap.get("Mining"),
+            skillXpMap.get("Prayer"),
+            skillXpMap.get("Ranged"),
+            skillXpMap.get("Runecraft"),
+            skillXpMap.get("Slayer"),
+            skillXpMap.get("Smithing"),
+            skillXpMap.get("Strength"),
+            skillXpMap.get("Thieving"),
+            skillXpMap.get("Woodcutting"),
+            skillXpMap.get("Sailing"),
+        };
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof SkillState)) return false;
+
+        SkillState other = (SkillState) o;
+        for (Skill skill : Skill.values()) {
+            String skillName = skill.getName();
+            if (!skillXpMap.get(skillName).equals(other.skillXpMap.get(skillName))) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+package gimhub;
+
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import javax.inject.Singleton;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.GameState;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.client.eventbus.Subscribe;
+
+@Slf4j
+@Singleton
+public class CollectionLogManager {
+    // item id -> quantity
+    private final Map<Integer, Integer> clogItems = new HashMap<>();
+
+    public synchronized void storeClogItem(int itemId, int quantity) {
+        if (quantity <= 0) return;
+        clogItems.put(itemId, quantity);
+    }
+
+    public synchronized void consumeState(Map<String, Object> updates) {
+        if (clogItems.isEmpty()) return;
+
+        List<Integer> result = new ArrayList<>(clogItems.size() * 2);
+        for (Map.Entry<Integer, Integer> item : clogItems.entrySet()) {
+            result.add(item.getKey());
+            result.add(item.getValue());
+        }
+        updates.put("collection_log_v2", result);
+    }
+
+    public synchronized void clearClogItems() {
+        clogItems.clear();
+    }
+
+    @Subscribe
+    public synchronized void onGameStateChanged(GameStateChanged ev) {
+        if (ev.getGameState() != GameState.LOGGED_IN) {
+            clogItems.clear();
+        }
+    }
+}
+
+package gimhub;
+
+import lombok.Getter;
+import net.runelite.api.Client;
+import net.runelite.api.Skill;
+
+public class ResourcesState implements ConsumableState {
+    private static class CurrentMax {
+        @Getter
+        private final int current;
+
+        @Getter
+        private final int max;
+
+        CurrentMax(int current, int max) {
+            this.current = current;
+            this.max = max;
+        }
+
+        @Override
+        public boolean equals(Object o) {
+            if (o == this) return true;
+            if (!(o instanceof CurrentMax)) return false;
+
+            CurrentMax other = (CurrentMax) o;
+
+            return other.getCurrent() == current && other.getMax() == max;
+        }
+    }
+
+    @Getter
+    private final CurrentMax hitpoints;
+
+    @Getter
+    private final CurrentMax prayer;
+
+    @Getter
+    private final CurrentMax energy;
+
+    @Getter
+    int world;
+
+    private final transient String playerName;
+
+    ResourcesState(String playerName, Client client) {
+        this.playerName = playerName;
+        hitpoints =
+                new CurrentMax(client.getBoostedSkillLevel(Skill.HITPOINTS), client.getRealSkillLevel(Skill.HITPOINTS));
+        prayer = new CurrentMax(client.getBoostedSkillLevel(Skill.PRAYER), client.getRealSkillLevel(Skill.PRAYER));
+        energy = new CurrentMax(client.getEnergy(), 100);
+        world = client.getWorld();
+    }
+
+    @Override
+    public Object get() {
+        return new int[] {
+            hitpoints.current, hitpoints.max, prayer.current, prayer.max, energy.current, energy.max, world
+        };
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof ResourcesState)) return false;
+
+        ResourcesState other = (ResourcesState) o;
+
+        return other.world == world
+                && other.hitpoints.equals(hitpoints)
+                && other.prayer.equals(prayer)
+                && other.energy.equals(energy);
+    }
+}
+
+package gimhub;
+
+import net.runelite.api.Client;
+import net.runelite.api.EnumComposition;
+import net.runelite.api.EnumID;
+import net.runelite.api.gameval.VarbitID;
+
+public class RunePouchState implements ConsumableState {
+    private final ItemContainerItem rune1;
+    private final ItemContainerItem rune2;
+    private final ItemContainerItem rune3;
+    private final ItemContainerItem rune4;
+    private final transient String playerName;
+
+    public RunePouchState(String playerName, Client client) {
+        this.playerName = playerName;
+        final EnumComposition runepouchEnum = client.getEnum(EnumID.RUNEPOUCH_RUNE);
+        rune1 = itemForRune(
+                client.getVarbitValue(VarbitID.RUNE_POUCH_TYPE_1),
+                client.getVarbitValue(VarbitID.RUNE_POUCH_QUANTITY_1),
+                runepouchEnum);
+        rune2 = itemForRune(
+                client.getVarbitValue(VarbitID.RUNE_POUCH_TYPE_2),
+                client.getVarbitValue(VarbitID.RUNE_POUCH_QUANTITY_2),
+                runepouchEnum);
+        rune3 = itemForRune(
+                client.getVarbitValue(VarbitID.RUNE_POUCH_TYPE_3),
+                client.getVarbitValue(VarbitID.RUNE_POUCH_QUANTITY_3),
+                runepouchEnum);
+        rune4 = itemForRune(
+                client.getVarbitValue(VarbitID.RUNE_POUCH_TYPE_4),
+                client.getVarbitValue(VarbitID.RUNE_POUCH_QUANTITY_4),
+                runepouchEnum);
+    }
+
+    private ItemContainerItem itemForRune(int runeId, int amount, EnumComposition runepouchEnum) {
+        return new ItemContainerItem(runepouchEnum.getIntValue(runeId), amount);
+    }
+
+    @Override
+    public Object get() {
+        return new int[] {
+            rune1.getId(), rune1.getQuantity(),
+            rune2.getId(), rune2.getQuantity(),
+            rune3.getId(), rune3.getQuantity(),
+            rune4.getId(), rune4.getQuantity()
+        };
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (o == this) return true;
+        if (!(o instanceof RunePouchState)) return false;
+        RunePouchState other = (RunePouchState) o;
+
+        return rune1.equals(other.rune1)
+                && rune2.equals(other.rune2)
+                && rune3.equals(other.rune3)
+                && rune4.equals(other.rune4);
+    }
+}
+
+package gimhub;
+
+import lombok.Getter;
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.coords.WorldPoint;
+
+public class InteractingState implements ConsumableState {
+    private final String playerName;
+
+    @Getter
+    private final String name;
+
+    @Getter
+    private final int scale;
+
+    @Getter
+    private final int ratio;
+
+    @Getter
+    private final LocationState location;
+
+    public InteractingState(String playerName, Actor actor, Client client) {
+        this.playerName = playerName;
+        this.scale = actor.getHealthScale();
+        this.ratio = actor.getHealthRatio();
+        this.name = actor.getName();
+
+        WorldPoint worldPoint = WorldPoint.fromLocalInstance(client, actor.getLocalLocation());
+        this.location = new LocationState(playerName, worldPoint, false);
+    }
+
+    @Override
+    public Object get() {
+        return this;
+    }
+
+    @Override
+    public String whoOwnsThis() {
+        return playerName;
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        // NOTE: For interactions, we want to keep sending the data until the player stops interacting
+        // even if nothing changed about what is being interacted with. The UI will handle not showing
+        // the interaction once it goes stale from the player not interacting with anything.
+        return o == this;
+    }
+
+    @Override
+    public int hashCode() {
+        // Since equals() always returns false (except for self-reference),
+        // each instance should have a unique hash code
+        return System.identityHashCode(this);
+    }
+}
+
+package gimhub;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class GimHubPluginTest {
+    public static void main(String[] args) throws Exception {
+        ExternalPluginManager.loadBuiltin(GimHubPlugin.class);
+        RuneLite.main(args);
+    }
+}
+
