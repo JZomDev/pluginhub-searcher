@@ -1,0 +1,1540 @@
+package com.resourcetracker;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("resourcetracker")
+public interface ResourceTrackerConfig extends Config
+{
+	@ConfigItem(
+		keyName = "trackedItems",
+		name = "Tracked Items",
+		description = "Serialized data of tracked items (internal use)",
+		hidden = true
+	)
+	default String trackedItems()
+	{
+		return "";
+	}
+}
+
+package com.resourcetracker;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.ui.components.IconTextField;
+import net.runelite.client.util.AsyncBufferedImage;
+import net.runelite.client.util.SwingUtil;
+import net.runelite.client.game.chatbox.ChatboxPanelManager;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
+import javax.swing.text.AbstractDocument;
+import javax.swing.text.AttributeSet;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.Document;
+import javax.swing.text.DocumentFilter;
+import java.awt.*;
+import java.awt.datatransfer.Clipboard;
+import java.awt.datatransfer.DataFlavor;
+import java.awt.datatransfer.StringSelection;
+import java.awt.datatransfer.UnsupportedFlavorException;
+import java.awt.event.ActionEvent;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Slf4j
+public class ResourceTrackerPanel extends PluginPanel implements Scrollable
+{
+    private static class ItemDefinition
+    {
+        private final int id;
+        private final String name;
+
+        ItemDefinition(int id, String name)
+        {
+            this.id = id;
+            this.name = name;
+        }
+
+        public int getId()
+        {
+            return id;
+        }
+
+        public String getName()
+        {
+            return name;
+        }
+    }
+    // handles amount input like "100k", "2M"
+    static class QuantityDocumentFilter extends DocumentFilter {
+        private final Pattern pattern = Pattern.compile("\\d*[kKmMbB]?");
+
+        private boolean test(String text) {
+            return pattern.matcher(text).matches();
+        }
+
+        @Override
+        public void insertString(FilterBypass fb, int offset, String string, AttributeSet attr) throws BadLocationException {
+            Document doc = fb.getDocument();
+            StringBuilder sb = new StringBuilder();
+            sb.append(doc.getText(0, doc.getLength()));
+            sb.insert(offset, string);
+
+            if (test(sb.toString())) {
+                super.insertString(fb, offset, string, attr);
+            }
+        }
+
+        @Override
+        public void replace(FilterBypass fb, int offset, int length, String text, AttributeSet attrs) throws BadLocationException {
+            Document doc = fb.getDocument();
+            StringBuilder sb = new StringBuilder();
+            sb.append(doc.getText(0, doc.getLength()));
+            sb.replace(offset, offset + length, text);
+
+            if (test(sb.toString())) {
+                super.replace(fb, offset, length, text, attrs);
+            }
+        }
+    }
+
+    private final ResourceTrackerPlugin plugin;
+    private final ItemManager itemManager;
+    private final ChatboxPanelManager chatboxPanelManager;
+
+    private final JPanel itemListPanel;
+    private final JPanel searchResultsPanel;
+    private final JPanel contentWrapper;
+    private final JScrollPane searchScrollPane;
+    private final JScrollPane itemScrollPane;
+    private final IconTextField searchBar;
+    private final JTextField categoryNameField;
+    private final List<TrackedItem> trackedItems = new CopyOnWriteArrayList<>();
+    private final List<CategoryBox> categoryBoxes = new ArrayList<>();
+    private String selectedCategory = null;
+    private static final int MAX_SEARCH_RESULTS = 30;
+    private Timer searchDebounceTimer;
+
+    public ResourceTrackerPanel(ResourceTrackerPlugin plugin, ItemManager itemManager, ChatboxPanelManager chatboxPanelManager)
+    {
+        super(false);
+        this.plugin = plugin;
+        this.itemManager = itemManager;
+        this.chatboxPanelManager = chatboxPanelManager;
+
+        setBorder(new EmptyBorder(6, 6, 6, 6));
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+        setLayout(new BorderLayout());
+
+        // Search area - always visible at top
+        JPanel searchAreaPanel = new JPanel();
+        searchAreaPanel.setLayout(new BoxLayout(searchAreaPanel, BoxLayout.Y_AXIS));
+        searchAreaPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        searchAreaPanel.setBorder(BorderFactory.createCompoundBorder(
+                BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.DARK_GRAY_COLOR.darker()),
+                new EmptyBorder(5, 5, 5, 5)
+        ));
+        add(searchAreaPanel, BorderLayout.NORTH);
+
+        // Category name input field
+        categoryNameField = new JTextField();
+        categoryNameField.setPreferredSize(new Dimension(0, 30));
+        categoryNameField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        categoryNameField.setForeground(Color.GRAY);
+        categoryNameField.setText("Add category...");
+        categoryNameField.setCaretColor(Color.WHITE);
+
+        ((AbstractDocument) categoryNameField.getDocument()).setDocumentFilter(new DocumentFilter() {
+            private static final int MAX_LENGTH = 30;
+
+            @Override
+            public void insertString(FilterBypass fb, int offset, String string, AttributeSet attr) throws BadLocationException {
+                if ((fb.getDocument().getLength() + string.length()) <= MAX_LENGTH) {
+                    super.insertString(fb, offset, string, attr);
+                }
+            }
+
+            @Override
+            public void replace(FilterBypass fb, int offset, int length, String text, AttributeSet attrs) throws BadLocationException {
+                if ((fb.getDocument().getLength() + (text != null ? text.length() : 0) - length) <= MAX_LENGTH) {
+                    super.replace(fb, offset, length, text, attrs);
+                }
+            }
+        });
+
+        categoryNameField.addFocusListener(new java.awt.event.FocusAdapter()
+        {
+            @Override
+            public void focusGained(java.awt.event.FocusEvent e)
+            {
+                if (categoryNameField.getText().equals("Add category..."))
+                {
+                    categoryNameField.setText("");
+                    categoryNameField.setForeground(Color.WHITE);
+                }
+            }
+
+            @Override
+            public void focusLost(java.awt.event.FocusEvent e)
+            {
+                if (categoryNameField.getText().isEmpty())
+                {
+                    categoryNameField.setText("Add category...");
+                    categoryNameField.setForeground(Color.GRAY);
+                }
+            }
+        });
+        categoryNameField.addActionListener(e ->
+        {
+            String categoryName = categoryNameField.getText().trim();
+            if (!categoryName.isEmpty() && !categoryName.equals("Add category..."))
+            {
+                createNewCategory(categoryName);
+                categoryNameField.setText("Add category...");
+                categoryNameField.setForeground(Color.GRAY);
+            }
+        });
+
+        searchAreaPanel.add(categoryNameField);
+
+        // Search bar
+        searchBar = new IconTextField();
+        searchBar.setIcon(IconTextField.Icon.SEARCH);
+        searchBar.setPreferredSize(new Dimension(0, 30));
+        searchBar.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        searchBar.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        searchBar.setEnabled(true);
+        searchBar.setToolTipText("Create/select a category to add items");
+        searchBar.getDocument().addDocumentListener(new DocumentListener()
+        {
+            @Override
+            public void insertUpdate(DocumentEvent e)
+            {
+                scheduleSearch();
+            }
+
+            @Override
+            public void removeUpdate(DocumentEvent e)
+            {
+                scheduleSearch();
+            }
+
+            @Override
+            public void changedUpdate(DocumentEvent e)
+            {
+                scheduleSearch();
+            }
+        });
+        searchBar.addClearListener(this::onSearchChanged);
+
+        // Add key listener for Esc key
+        searchBar.addKeyListener(new KeyAdapter()
+        {
+            @Override
+            public void keyPressed(KeyEvent e)
+            {
+                if (e.getKeyCode() == KeyEvent.VK_ESCAPE)
+                {
+                    searchBar.setText("");
+                    onSearchChanged();
+                }
+            }
+        });
+
+        searchAreaPanel.add(Box.createRigidArea(new Dimension(0, 5)));
+        searchAreaPanel.add(searchBar);
+
+
+        // Wrapper panel for content (search results OR tracked items)
+        contentWrapper = new JPanel(new BorderLayout());
+        contentWrapper.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        add(contentWrapper, BorderLayout.CENTER);
+
+        // Search results panel - shown when searching
+        searchResultsPanel = new JPanel();
+        searchResultsPanel.setLayout(new BoxLayout(searchResultsPanel, BoxLayout.Y_AXIS));
+        searchResultsPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        searchScrollPane = new JScrollPane(searchResultsPanel);
+        searchScrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        searchScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        searchScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        searchScrollPane.setBorder(null);
+
+        // Tracked items panel
+        itemListPanel = new JPanel();
+        itemListPanel.setLayout(new BoxLayout(itemListPanel, BoxLayout.Y_AXIS));
+        itemListPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+        JPanel itemPanelWrapper = new JPanel(new BorderLayout());
+        itemPanelWrapper.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        itemPanelWrapper.add(itemListPanel, BorderLayout.NORTH);
+
+
+        itemScrollPane = new JScrollPane(itemPanelWrapper);
+        itemScrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        itemScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        itemScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        itemScrollPane.setBorder(null);
+
+
+        contentWrapper.add(itemScrollPane, BorderLayout.CENTER);
+
+        // Add keybinding for focusing the search bar
+        KeyStroke ctrlF = KeyStroke.getKeyStroke(KeyEvent.VK_F, Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx());
+        getInputMap(JComponent.WHEN_IN_FOCUSED_WINDOW).put(ctrlF, "focusSearch");
+        getActionMap().put("focusSearch", new AbstractAction()
+        {
+            @Override
+            public void actionPerformed(ActionEvent e)
+            {
+                searchBar.requestFocusInWindow();
+            }
+        });
+    }
+
+    @Override
+    public Dimension getPreferredScrollableViewportSize()
+    {
+        return getPreferredSize();
+    }
+
+    @Override
+    public int getScrollableUnitIncrement(Rectangle visibleRect, int orientation, int direction)
+    {
+        return 16;
+    }
+
+    @Override
+    public int getScrollableBlockIncrement(Rectangle visibleRect, int orientation, int direction)
+    {
+        return 16;
+    }
+
+    @Override
+    public boolean getScrollableTracksViewportWidth()
+    {
+        return true;
+    }
+
+    @Override
+    public boolean getScrollableTracksViewportHeight()
+    {
+        return false;
+    }
+
+    public void addTrackedItem(TrackedItem item)
+    {
+        trackedItems.add(item);
+        plugin.saveTrackedItems(trackedItems);
+        rebuildTrackedItems();
+    }
+
+    public void removeTrackedItem(TrackedItem item)
+    {
+        trackedItems.remove(item);
+        plugin.saveTrackedItems(trackedItems);
+        rebuildTrackedItems();
+    }
+
+
+    public List<TrackedItem> getTrackedItems()
+    {
+        return trackedItems;
+    }
+
+    public void setTrackedItems(List<TrackedItem> items)
+    {
+        trackedItems.clear();
+        trackedItems.addAll(items);
+        rebuildTrackedItems();
+    }
+
+    public void resetPanel()
+    {
+        SwingUtilities.invokeLater(() -> {
+            trackedItems.clear();
+            selectedCategory = null;
+            searchBar.setEnabled(true);
+            searchBar.setToolTipText("Create or select a category to add items");
+
+            categoryNameField.setText("Add category...");
+            categoryNameField.setForeground(Color.GRAY);
+
+            rebuildTrackedItems();
+        });
+    }
+
+    public void rebuild()
+    {
+        rebuildTrackedItems();
+    }
+
+    public void setSelectedCategory(String category)
+    {
+        // Close all other categories, open this one
+        selectedCategory = category;
+        searchBar.setEnabled(true); // Enable search when category is selected
+
+        // Update search bar placeholder/tooltip
+        searchBar.setToolTipText("Search items to add to " + category);
+
+        for (CategoryBox box : categoryBoxes)
+        {
+            if (!box.getCategoryName().equals(category) && !box.isCollapsed())
+            {
+                box.collapse();
+            }
+        }
+    }
+
+    public void deleteCategory(String categoryName)
+    {
+        // Remove all items in this category
+        trackedItems.removeIf(item -> item.getCategory().equals(categoryName));
+
+        // Clear selected category if it's the one being deleted
+        if (categoryName.equals(selectedCategory))
+        {
+            selectedCategory = null;
+            searchBar.setEnabled(true);
+            searchBar.setToolTipText("Create or select a category to add items");
+        }
+
+        plugin.saveTrackedItems(trackedItems);
+        rebuildTrackedItems();
+    }
+
+    public void exportCategory(String categoryName)
+    {
+        List<TrackedItem> categoryItems = trackedItems.stream()
+                .filter(item -> item.getCategory().equals(categoryName))
+                .collect(Collectors.toList());
+
+        if (categoryItems.isEmpty())
+        {
+            return;
+        }
+
+        // Create a new list of items with amounts reset to 0 for export
+        List<TrackedItem> itemsForExport = new ArrayList<>();
+        for (TrackedItem originalItem : categoryItems)
+        {
+            TrackedItem exportItem = new TrackedItem(
+                originalItem.getItemId(),
+                originalItem.getItemName(),
+                originalItem.getGoalAmount(),
+                originalItem.getCategory()
+            );
+            // The constructor already sets currentAmount to 0, but this is explicit
+            exportItem.setCurrentAmount(0);
+            itemsForExport.add(exportItem);
+        }
+
+        String json = plugin.getGson().toJson(itemsForExport);
+        final StringSelection stringSelection = new StringSelection(json);
+        Toolkit.getDefaultToolkit().getSystemClipboard().setContents(stringSelection, null);
+    }
+
+    public void importCategoryFromClipboard(String targetCategory)
+    {
+        final String clipboardText;
+        try
+        {
+            clipboardText = Toolkit.getDefaultToolkit()
+                .getSystemClipboard()
+                .getData(DataFlavor.stringFlavor)
+                .toString();
+        }
+        catch (IOException | UnsupportedFlavorException ex)
+        {
+            log.warn("Error reading clipboard", ex);
+            plugin.sendChatMessage("Unable to read system clipboard.");
+            return;
+        }
+
+        if (clipboardText == null || clipboardText.isEmpty())
+        {
+            plugin.sendChatMessage("You do not have any items copied in your clipboard.");
+            return;
+        }
+
+        List<TrackedItem> importItems;
+        try
+        {
+            java.lang.reflect.Type listType = new com.google.gson.reflect.TypeToken<ArrayList<TrackedItem>>(){}.getType();
+            importItems = plugin.getGson().fromJson(clipboardText, listType);
+        }
+        catch (com.google.gson.JsonSyntaxException | IllegalStateException e)
+        {
+            plugin.sendChatMessage("You do not have any valid categories copied in your clipboard.");
+            return;
+        }
+
+        if (importItems == null || importItems.isEmpty())
+        {
+            plugin.sendChatMessage("You do not have any valid categories copied in your clipboard.");
+            return;
+        }
+
+        plugin.getClientUi().requestFocus();
+
+        chatboxPanelManager.openTextMenuInput("Are you sure you want to import " + importItems.size() + " items into '" + targetCategory + "'?")
+                .option("Yes", () ->
+                {
+                    importCategory(importItems, targetCategory);
+                    plugin.sendChatMessage(importItems.size() + " items were imported to " + targetCategory + ".");
+                })
+                .option("No", () -> {})
+                .build();
+    }
+
+    public void importCategory(List<TrackedItem> importedItems, String targetCategory)
+    {
+        // Update category and add to list
+        for (TrackedItem importedItem : importedItems)
+        {
+            if (importedItem != null && importedItem.getItemId() > 0 && importedItem.getItemName() != null)
+            {
+                importedItem.setCategory(targetCategory);
+                // Reset current amount, as it's based on bank state
+                importedItem.setCurrentAmount(0);
+                // Remove existing item if present in the same category before adding the new one
+                trackedItems.removeIf(existing -> existing.getItemId() == importedItem.getItemId() && existing.getCategory().equals(targetCategory));
+                trackedItems.add(importedItem);
+            }
+        }
+
+        plugin.saveTrackedItems(trackedItems);
+        rebuildTrackedItems();
+    }
+
+    private void createNewCategory(String categoryName)
+    {
+        if (categoryName == null || categoryName.trim().isEmpty())
+        {
+            return;
+        }
+
+        String trimmedCategoryName = categoryName.trim();
+
+        // Check if category already exists
+        boolean exists = trackedItems.stream()
+                .anyMatch(item -> item.getCategory().equalsIgnoreCase(trimmedCategoryName));
+
+        if (exists)
+        {
+            return; // Silently ignore duplicates
+        }
+
+        // Set as selected and focus search
+        selectedCategory = trimmedCategoryName;
+        searchBar.setEnabled(true);
+        searchBar.requestFocusInWindow();
+
+        // Force rebuild to show the empty category
+        rebuildTrackedItems();
+    }
+
+    private void scheduleSearch()
+    {
+        if (searchDebounceTimer != null)
+        {
+            searchDebounceTimer.stop();
+        }
+
+        // Schedule new search with 200ms delay
+        searchDebounceTimer = new Timer(200, e -> {
+            onSearchChanged();
+            searchDebounceTimer = null;
+        });
+        searchDebounceTimer.setRepeats(false);
+        searchDebounceTimer.start();
+    }
+
+    private void onSearchChanged()
+    {
+        String query = searchBar.getText().trim();
+
+        if (query.isEmpty())
+        {
+            // Show tracked items
+            contentWrapper.removeAll();
+            contentWrapper.add(itemScrollPane, BorderLayout.CENTER);
+            contentWrapper.revalidate();
+            contentWrapper.repaint();
+        }
+        else
+        {
+            // Show search results
+            contentWrapper.removeAll();
+            contentWrapper.add(searchScrollPane, BorderLayout.CENTER);
+            showSearchResults(query);
+            contentWrapper.revalidate();
+            contentWrapper.repaint();
+        }
+    }
+
+    private void showSearchResults(String query)
+    {
+        SwingUtil.fastRemoveAll(searchResultsPanel);
+
+        if (categoryBoxes.isEmpty())
+        {
+            JLabel noCategory = new JLabel("Create a category to tracking items");
+            noCategory.setForeground(Color.LIGHT_GRAY);
+            noCategory.setBorder(new EmptyBorder(10, 10, 10, 10));
+            searchResultsPanel.add(noCategory);
+            searchResultsPanel.revalidate();
+            searchResultsPanel.repaint();
+            return;
+        }
+
+        String lowerQuery = query.toLowerCase();
+
+        // Use ItemManager to search for items
+        List<ItemDefinition> results = itemManager.search(query).stream()
+                .filter(itemPrice -> {
+                    String itemName = itemPrice.getName().toLowerCase();
+                    // Filter out placeholder, noted, and other variants
+                    return !itemName.contains("->") && !itemName.equals("null");
+                })
+                .map(itemPrice -> new ItemDefinition(itemPrice.getId(), itemPrice.getName()))
+                .sorted(Comparator.comparingInt((ItemDefinition item) -> {
+                    String itemName = item.getName().toLowerCase();
+                    if (itemName.equals(lowerQuery)) return 0;
+                    if (itemName.startsWith(lowerQuery)) return 1;
+                    return 2;
+                }).thenComparing(item -> item.getName().length()))
+                .limit(MAX_SEARCH_RESULTS)
+                .collect(Collectors.toList());
+
+        for (ItemDefinition item : results)
+        {
+            JPanel itemPanel = createSearchResultPanel(item);
+            searchResultsPanel.add(itemPanel);
+            searchResultsPanel.add(Box.createRigidArea(new Dimension(0, 2)));
+        }
+
+        if (results.isEmpty())
+        {
+            JLabel noResults = new JLabel("No items found");
+            noResults.setForeground(Color.LIGHT_GRAY);
+            noResults.setBorder(new EmptyBorder(10, 10, 10, 10));
+            searchResultsPanel.add(noResults);
+        }
+
+        // Add glue to push items to the top
+        searchResultsPanel.add(Box.createVerticalGlue());
+
+        searchResultsPanel.revalidate();
+        searchResultsPanel.repaint();
+    }
+
+    private JPanel createSearchResultPanel(ItemDefinition itemDef)
+    {
+        JPanel panel = new JPanel(new BorderLayout(5, 0));
+        panel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        panel.setBorder(new EmptyBorder(8, 10, 8, 10));
+        panel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 50));
+        panel.setPreferredSize(new Dimension(panel.getPreferredSize().width, 50));
+
+        // Left: Icon and Name
+        JPanel leftPanel = new JPanel(new BorderLayout(5, 0));
+        leftPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        JLabel iconLabel = new JLabel();
+        iconLabel.setPreferredSize(new Dimension(36, 32));
+        AsyncBufferedImage itemImage = itemManager.getImage(itemDef.getId());
+        if (itemImage != null)
+        {
+            itemImage.addTo(iconLabel);
+        }
+
+        JLabel nameLabel = new JLabel(itemDef.getName());
+        nameLabel.setForeground(Color.WHITE);
+
+        leftPanel.add(iconLabel, BorderLayout.WEST);
+        leftPanel.add(nameLabel, BorderLayout.CENTER);
+
+        panel.add(leftPanel, BorderLayout.CENTER);
+
+        // Right: Goal input and + button
+        JPanel rightPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 3, 0));
+        rightPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+        JTextField goalField = new JTextField(5);
+        goalField.setPreferredSize(new Dimension(60, 25));
+        goalField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        goalField.setForeground(Color.WHITE);
+        goalField.setCaretColor(Color.WHITE);
+        goalField.setToolTipText("Enter goal amount");
+        ((AbstractDocument) goalField.getDocument()).setDocumentFilter(new QuantityDocumentFilter());
+
+        JButton addButton = new JButton("+");
+        goalField.addActionListener(e -> addButton.doClick());
+
+        if (selectedCategory == null)
+        {
+            goalField.setEnabled(false);
+            addButton.setEnabled(false);
+            goalField.setToolTipText("Select a category to add an item");
+            addButton.setToolTipText("Select a category to add an item");
+        }
+        else
+        {
+            goalField.setEnabled(true);
+            addButton.setEnabled(true);
+            goalField.setToolTipText("Enter goal amount");
+            addButton.setToolTipText("Add to tracking");
+        }
+
+        addButton.setPreferredSize(new Dimension(35, 25));
+        addButton.setMinimumSize(new Dimension(35, 25));
+        addButton.setMaximumSize(new Dimension(35, 25));
+        addButton.setToolTipText("Add to tracking");
+        addButton.addActionListener(e -> {
+            String goalText = goalField.getText().trim();
+            Integer goal = null;
+
+            try
+            {
+                if (!goalText.isEmpty())
+                {
+                    long parsedGoal = QuantityFormatter.parseQuantity(goalText);
+                    if (parsedGoal > QuantityFormatter.getMaxStackSize())
+                    {
+                        parsedGoal = QuantityFormatter.getMaxStackSize();
+                    }
+
+                    if (parsedGoal > 0)
+                    {
+                        goal = (int) parsedGoal;
+                    }
+                }
+
+                // Check if already tracked in the current category, if so, update it
+                for (TrackedItem existing : trackedItems)
+                {
+                    if (existing.getItemId() == itemDef.getId() && existing.getCategory().equals(selectedCategory))
+                    {
+                        existing.setGoalAmount(goal);
+                        plugin.saveTrackedItems(trackedItems);
+                        clearSearchAndRebuild();
+                        return;
+                    }
+                }
+
+                // If not tracked, add as a new item
+                if (selectedCategory == null || selectedCategory.isEmpty())
+                {
+                    return; // Should not happen
+                }
+
+                TrackedItem newItem = new TrackedItem(itemDef.getId(), itemDef.getName(), goal, selectedCategory);
+                addTrackedItem(newItem);
+                clearSearchAndRebuild();
+            }
+            catch (NumberFormatException ex)
+            {
+                plugin.sendChatMessage("Please enter a valid number.");
+            }
+        });
+
+        rightPanel.add(goalField);
+        rightPanel.add(addButton);
+
+        panel.add(rightPanel, BorderLayout.EAST);
+
+        return panel;
+    }
+
+    private void clearSearchAndRebuild()
+    {
+        searchBar.setText("");
+        contentWrapper.removeAll();
+        contentWrapper.add(itemScrollPane, BorderLayout.CENTER);
+        contentWrapper.revalidate();
+        contentWrapper.repaint();
+        rebuildTrackedItems();
+    }
+
+
+    private void rebuildTrackedItems()
+    {
+        SwingUtilities.invokeLater(() ->
+        {
+            SwingUtil.fastRemoveAll(itemListPanel);
+            categoryBoxes.clear();
+
+            // Ensure all items have a category (for backward compatibility)
+            trackedItems.forEach(item -> {
+                if (item.getCategory() == null || item.getCategory().isEmpty())
+                {
+                    item.setCategory("Default");
+                }
+            });
+
+            // Group items by category
+            java.util.Map<String, List<TrackedItem>> itemsByCategory = trackedItems.stream()
+                    .collect(Collectors.groupingBy(TrackedItem::getCategory));
+
+            // Use a LinkedHashSet to preserve insertion order
+            java.util.Set<String> categoryNames = new java.util.LinkedHashSet<>();
+            for (TrackedItem item : trackedItems)
+            {
+                categoryNames.add(item.getCategory());
+            }
+
+            // Add the currently selected (potentially new and empty) category to the end
+            if (selectedCategory != null && !selectedCategory.isEmpty())
+            {
+                categoryNames.add(selectedCategory);
+            }
+
+            // Create all CategoryBoxes first (like LootTracker buildBox pattern)
+            for (String categoryName : categoryNames)
+            {
+                List<TrackedItem> itemsForCategory = itemsByCategory.getOrDefault(categoryName, new ArrayList<>());
+                CategoryBox categoryBox = new CategoryBox(categoryName, plugin, itemManager, this, chatboxPanelManager);
+                categoryBoxes.add(categoryBox);
+
+                // Build the box with its items
+                categoryBox.rebuild(itemsForCategory);
+
+                // Add to panel
+                itemListPanel.add(categoryBox);
+            }
+
+            for (CategoryBox box : categoryBoxes)
+            {
+                if (box.getCategoryName().equals(selectedCategory))
+                {
+                    box.expand();
+                }
+                else
+                {
+                    box.collapse();
+                }
+            }
+
+            itemListPanel.revalidate();
+        });
+    }
+}
+
+
+package com.resourcetracker;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import com.google.inject.Provides;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.GameState;
+import net.runelite.api.Item;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.client.game.chatbox.ChatboxPanelManager;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.ChatMessageType;
+
+import javax.inject.Inject;
+import javax.swing.SwingUtilities;
+import java.awt.image.BufferedImage;
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@PluginDescriptor(
+        name = "Resource Tracker",
+        description = "Track items in your bank with goals",
+        tags = {"bank", "items", "tracker", "goals"}
+)
+public class ResourceTrackerPlugin extends Plugin
+{
+        @Inject
+        private ClientToolbar clientToolbar;
+
+        @Inject
+        private ItemManager itemManager;
+
+        @Inject
+        private ConfigManager configManager;
+
+        @Inject
+        @Getter
+        private Gson gson;
+
+        @Inject
+        @Getter
+        private ChatboxPanelManager chatboxPanelManager;
+
+        @Inject
+        private ChatMessageManager chatMessageManager;
+
+        @Inject
+        private net.runelite.client.ui.ClientUI clientUi;
+
+        private ResourceTrackerPanel panel;
+        private NavigationButton navButton;
+
+        @Override
+        protected void startUp()
+        {
+                log.debug("Resource Tracker started");
+
+                panel = new ResourceTrackerPanel(this, itemManager, chatboxPanelManager);
+
+                final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "/com/resourcetracker/icon.png");
+
+                navButton = NavigationButton.builder()
+                        .tooltip("Resource Tracker")
+                        .icon(icon)
+                        .priority(5)
+                        .panel(panel)
+                        .build();
+
+                clientToolbar.addNavigation(navButton);
+
+                loadTrackedItems();
+        }
+
+        @Override
+        protected void shutDown()
+        {
+                log.debug("Resource Tracker stopped!");
+                saveTrackedItems(panel.getTrackedItems());
+                clientToolbar.removeNavigation(navButton);
+        }
+
+        @SuppressWarnings("unused")
+        @Subscribe
+        public void onGameStateChanged(GameStateChanged event)
+        {
+                if (event.getGameState() == GameState.LOGGED_IN)
+                {
+                        // Load tracked items when player logs in
+                        loadTrackedItems();
+                }
+                else if (event.getGameState() == GameState.LOGIN_SCREEN)
+                {
+                        // Clear panel when logging out
+                        panel.resetPanel();
+                }
+        }
+
+        public void sendChatMessage(String message)
+        {
+                chatMessageManager.queue(QueuedMessage.builder()
+                        .type(ChatMessageType.CONSOLE)
+                        .runeLiteFormattedMessage(message)
+                        .build());
+        }
+
+        @SuppressWarnings("unused")
+        @Subscribe
+        public void onItemContainerChanged(ItemContainerChanged event)
+        {
+                if (event.getContainerId() == InventoryID.BANK)
+                {
+                        updateBankItems(event.getItemContainer());
+                }
+        }
+
+        private void updateBankItems(ItemContainer itemContainer)
+        {
+                if (itemContainer == null)
+                {
+                        return;
+                }
+
+                Map<Integer, Integer> bankItems = new HashMap<>();
+                for (Item item : itemContainer.getItems())
+                {
+                        if (item.getId() > 0)
+                        {
+                                bankItems.merge(item.getId(), item.getQuantity(), Integer::sum);
+                        }
+                }
+
+                boolean needsUpdate = false;
+                List<TrackedItem> items = panel.getTrackedItems();
+
+                for (TrackedItem trackedItem : items)
+                {
+                        int amount = bankItems.getOrDefault(trackedItem.getItemId(), 0);
+                        if (trackedItem.getCurrentAmount() != amount)
+                        {
+                                trackedItem.setCurrentAmount(amount);
+                                needsUpdate = true;
+                        }
+                }
+
+                if (needsUpdate)
+                {
+                        saveTrackedItems(items);
+                        SwingUtilities.invokeLater(() -> panel.rebuild());
+                }
+        }
+
+        public void saveTrackedItems(List<TrackedItem> items)
+        {
+                String json = gson.toJson(items);
+                log.debug("Saving tracked items: {}", json);
+                configManager.setRSProfileConfiguration("resourcetracker", "trackedItems", json);
+        }
+
+
+        private void loadTrackedItems()
+        {
+                String json = configManager.getRSProfileConfiguration("resourcetracker", "trackedItems");
+                log.debug("Loading tracked items: {}", json);
+
+                if (json == null || json.isEmpty())
+                {
+                        log.debug("No tracked items found in profile");
+                        return;
+                }
+
+                try
+                {
+                        Type listType = new TypeToken<ArrayList<TrackedItem>>(){}.getType();
+                        List<TrackedItem> items = gson.fromJson(json, listType);
+                        if (items != null)
+                        {
+                                log.debug("Loaded {} items", items.size());
+                                panel.setTrackedItems(items);
+                        }
+                }
+                catch (Exception e)
+                {
+                        log.error("Failed to load tracked items", e);
+                }
+        }
+
+        public net.runelite.client.ui.ClientUI getClientUi() {
+            return clientUi;
+        }
+
+        @Provides
+        ResourceTrackerConfig provideConfig(ConfigManager configManager)
+        {
+                return configManager.getConfig(ResourceTrackerConfig.class);
+        }
+}
+
+package com.resourcetracker;
+
+import java.awt.Color;
+import javax.swing.JLabel;
+
+public final class QuantityFormatter
+{
+	private static final int MAX_STACK_SIZE = 2_147_483_647;
+
+	/**
+	 * Formats a number into a stack-like string, e.g., 100k, 10M.
+	 *
+	 * @param quantity The number to format.
+	 * @return A formatted string.
+	 */
+	public static String formatNumber(long quantity)
+	{
+		if (quantity >= 10_000_000)
+		{
+			return (quantity / 1_000_000) + "M";
+		}
+		if (quantity >= 100_000)
+		{
+			return (quantity / 1_000) + "K";
+		}
+		return String.valueOf(quantity);
+	}
+
+	/**
+	 * Updates a JLabel with formatted text and color based on the quantity.
+	 *
+	 * @param label         The JLabel to update.
+	 * @param quantity      The quantity to display.
+	 * @param defaultColor  The default color for the text.
+	 * @param highlightGreen If true, color will be green for quantities >= 10M.
+	 */
+	public static void formatLabel(JLabel label, long quantity, Color defaultColor, boolean highlightGreen)
+	{
+		label.setText(formatNumber(quantity));
+
+		if (highlightGreen && quantity >= 10_000_000)
+		{
+			label.setForeground(Color.GREEN);
+		}
+		else
+		{
+			label.setForeground(defaultColor);
+		}
+	}
+
+	/**
+	 * Gets the maximum allowed value for an item stack.
+	 *
+	 * @return The maximum stack size.
+	 */
+	public static int getMaxStackSize()
+	{
+		return MAX_STACK_SIZE;
+	}
+
+	/**
+	 * Parses a string with suffixes (e.g., 'k', 'm', 'b') into a long.
+	 *
+	 * @param text The string to parse.
+	 * @return The parsed long value.
+	 * @throws NumberFormatException if the string is not a valid number or format.
+	 */
+	public static long parseQuantity(String text) throws NumberFormatException
+	{
+		if (text == null || text.isEmpty())
+		{
+			throw new NumberFormatException("Input string is empty");
+		}
+
+		text = text.toLowerCase().trim();
+		char lastChar = text.charAt(text.length() - 1);
+		long multiplier = 1;
+
+		if (Character.isLetter(lastChar))
+		{
+			switch (lastChar)
+			{
+				case 'k':
+					multiplier = 1_000;
+					break;
+				case 'm':
+					multiplier = 1_000_000;
+					break;
+				case 'b':
+					multiplier = 1_000_000_000;
+					break;
+				default:
+					throw new NumberFormatException("Invalid suffix: " + lastChar);
+			}
+			// Remove the suffix
+			text = text.substring(0, text.length() - 1);
+		}
+
+		try
+		{
+			// Use double parsing to allow for decimals like "1.5m"
+			double value = Double.parseDouble(text);
+			long result = (long) (value * multiplier);
+
+			// Check for overflow
+			if (result < 0) {
+				return Long.MAX_VALUE;
+			}
+
+			return result;
+		}
+		catch (NumberFormatException e)
+		{
+			throw new NumberFormatException("Invalid number format: " + text);
+		}
+	}
+}
+
+package com.resourcetracker;
+
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.chatbox.ChatboxPanelManager;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.util.AsyncBufferedImage;
+
+
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.List;
+import java.util.function.Consumer;
+
+public class CategoryBox extends JPanel
+{
+	private static final int ITEMS_PER_ROW = 5;
+
+	private final String categoryName;
+	private final ResourceTrackerPlugin plugin;
+	private final ItemManager itemManager;
+	private final ResourceTrackerPanel parentPanel;
+	private final ChatboxPanelManager chatboxPanelManager;
+	private final JPanel itemContainer = new JPanel();
+	private final JPanel headerPanel = new JPanel();
+
+	private List<TrackedItem> items;
+
+	public CategoryBox(String categoryName, ResourceTrackerPlugin plugin, ItemManager itemManager, ResourceTrackerPanel parentPanel, ChatboxPanelManager chatboxPanelManager)
+	{
+		this.categoryName = categoryName;
+		this.plugin = plugin;
+		this.itemManager = itemManager;
+		this.parentPanel = parentPanel;
+		this.chatboxPanelManager = chatboxPanelManager;
+
+		setLayout(new BorderLayout(0, 1));
+		setBorder(new EmptyBorder(5, 0, 0, 0));
+
+		// Header panel
+		headerPanel.setLayout(new BoxLayout(headerPanel, BoxLayout.X_AXIS));
+		headerPanel.setBorder(new EmptyBorder(7, 7, 7, 7));
+		headerPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR.darker());
+
+		JLabel titleLabel = new JLabel();
+		titleLabel.setText(categoryName);
+		titleLabel.setFont(FontManager.getRunescapeSmallFont());
+		titleLabel.setForeground(Color.WHITE);
+		headerPanel.add(titleLabel);
+		headerPanel.add(Box.createHorizontalGlue());
+
+		add(headerPanel, BorderLayout.NORTH);
+		add(itemContainer, BorderLayout.CENTER);
+
+		// Make header clickable for collapse/expand
+		headerPanel.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				if (e.getButton() == MouseEvent.BUTTON1)
+				{
+					if (isCollapsed())
+					{
+						expand();
+					}
+					else
+					{
+						collapse();
+					}
+				}
+			}
+		});
+
+		// Add context menu for category management
+		final JPopupMenu categoryPopup = new JPopupMenu();
+		categoryPopup.setBorder(new EmptyBorder(5, 5, 5, 5));
+
+		JMenuItem exportCategory = new JMenuItem("Export Category");
+		exportCategory.addActionListener(e -> parentPanel.exportCategory(categoryName));
+		categoryPopup.add(exportCategory);
+
+		JMenuItem importCategory = new JMenuItem("Import from Clipboard");
+		importCategory.addActionListener(e -> parentPanel.importCategoryFromClipboard(categoryName));
+		categoryPopup.add(importCategory);
+
+		categoryPopup.addSeparator();
+
+		JMenuItem deleteCategory = new JMenuItem("Delete Category");
+		deleteCategory.addActionListener(e -> {
+			plugin.getClientUi().requestFocus();
+			chatboxPanelManager.openTextMenuInput("Delete category '" + categoryName + "' and all its items?")
+				.option("Yes", () -> parentPanel.deleteCategory(categoryName))
+				.option("No", () -> {})
+				.build();
+		});
+		categoryPopup.add(deleteCategory);
+
+		headerPanel.setComponentPopupMenu(categoryPopup);
+	}
+
+	public void collapse()
+	{
+		if (!isCollapsed())
+		{
+			itemContainer.setVisible(false);
+			applyDimmer(false, headerPanel);
+			parentPanel.revalidate();
+			parentPanel.repaint();
+		}
+	}
+
+	public void expand()
+	{
+		if (isCollapsed())
+		{
+			itemContainer.setVisible(true);
+			applyDimmer(true, headerPanel);
+			parentPanel.setSelectedCategory(categoryName);
+			parentPanel.revalidate();
+			parentPanel.repaint();
+		}
+	}
+
+	public boolean isCollapsed()
+	{
+		return !itemContainer.isVisible();
+	}
+
+	private void applyDimmer(boolean brighten, JPanel panel)
+	{
+		for (Component component : panel.getComponents())
+		{
+			Color color = component.getForeground();
+			component.setForeground(brighten ? color.brighter() : color.darker());
+		}
+	}
+
+	public String getCategoryName()
+	{
+		return categoryName;
+	}
+
+
+	public void rebuild(List<TrackedItem> items)
+	{
+		this.items = items;
+		buildItems();
+	}
+
+	private void buildItems()
+	{
+		itemContainer.removeAll();
+
+		if (items == null || items.isEmpty())
+		{
+			itemContainer.setVisible(true);
+			itemContainer.setLayout(new BorderLayout());
+			JLabel emptyLabel = new JLabel("No items");
+			emptyLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
+			emptyLabel.setHorizontalAlignment(SwingConstants.CENTER);
+			emptyLabel.setBorder(new EmptyBorder(10, 10, 10, 10));
+			itemContainer.add(emptyLabel, BorderLayout.CENTER);
+			itemContainer.setPreferredSize(new Dimension(0, 30));
+			itemContainer.revalidate();
+			return;
+		}
+
+		itemContainer.setVisible(true);
+
+		// Calculate rows needed (like LootTracker)
+		final int rowSize = ((items.size() % ITEMS_PER_ROW == 0) ? 0 : 1) + items.size() / ITEMS_PER_ROW;
+
+		itemContainer.setLayout(new GridLayout(rowSize, ITEMS_PER_ROW, 1, 1));
+
+
+		for (TrackedItem item : items)
+		{
+			itemContainer.add(createTrackedItemBox(item));
+		}
+
+		// Fill remaining slots with empty panels
+		int itemsAdded = items.size();
+		for (int i = itemsAdded; i < rowSize * ITEMS_PER_ROW; i++)
+		{
+			final JPanel emptySlot = new JPanel();
+			emptySlot.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			itemContainer.add(emptySlot);
+		}
+
+		itemContainer.revalidate();
+	}
+
+	private JPanel createTrackedItemBox(TrackedItem item)
+	{
+		JPanel slotContainer = new JPanel(new BorderLayout());
+		slotContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+		JPanel centerPanel = new JPanel(null);
+		centerPanel.setOpaque(false);
+		centerPanel.setPreferredSize(new Dimension(40, 40));
+
+		// Current amount (top-left, yellow)
+		JLabel currentLabel = new JLabel();
+		QuantityFormatter.formatLabel(currentLabel, item.getCurrentAmount(), Color.YELLOW, false);
+		currentLabel.setFont(FontManager.getRunescapeSmallFont());
+		currentLabel.setBounds(1, 0, 38, 12);
+		centerPanel.add(currentLabel);
+
+		// Goal amount (bottom-right, white)
+		if (item.getGoalAmount() != null)
+		{
+			JLabel goalLabel = new JLabel();
+			QuantityFormatter.formatLabel(goalLabel, item.getGoalAmount(), Color.WHITE, true);
+			goalLabel.setFont(FontManager.getRunescapeSmallFont());
+			goalLabel.setHorizontalAlignment(SwingConstants.RIGHT);
+			goalLabel.setBounds(0, 28, 40, 12);
+			centerPanel.add(goalLabel);
+		}
+
+		// Item icon (centered)
+		JLabel iconLabel = new JLabel();
+		iconLabel.setToolTipText(item.getItemName());
+		iconLabel.setVerticalAlignment(SwingConstants.CENTER);
+		iconLabel.setHorizontalAlignment(SwingConstants.CENTER);
+		AsyncBufferedImage itemImage = itemManager.getImage(item.getItemId());
+		itemImage.addTo(iconLabel);
+		iconLabel.setBounds(0, 0, 40, 40);
+		centerPanel.add(iconLabel);
+
+		slotContainer.add(centerPanel, BorderLayout.CENTER);
+
+		// Progress bar at bottom
+		if (item.getGoalAmount() != null && item.getGoalAmount() > 0)
+		{
+			JPanel progressBar = new JPanel()
+			{
+				@Override
+				protected void paintComponent(Graphics g)
+				{
+					super.paintComponent(g);
+					if (item.getGoalAmount() != null && item.getGoalAmount() > 0)
+					{
+						float progress = Math.min(1.0f, (float) item.getCurrentAmount() / item.getGoalAmount());
+						Color barColor = progress < 0.33f ? new Color(200, 0, 0)
+							: progress < 0.67f ? new Color(255, 165, 0)
+							: progress < 1.0f ? new Color(255, 200, 0)
+							: new Color(0, 200, 0);
+						g.setColor(barColor);
+						g.fillRect(0, 0, (int) (getWidth() * progress), getHeight());
+					}
+				}
+			};
+			progressBar.setPreferredSize(new Dimension(40, 2));
+			progressBar.setOpaque(false);
+			slotContainer.add(progressBar, BorderLayout.SOUTH);
+		}
+
+		// Context menu
+		final JPopupMenu popupMenu = new JPopupMenu();
+		popupMenu.setBorder(new EmptyBorder(5, 5, 5, 5));
+
+		JMenuItem editItem = new JMenuItem("Edit Goal");
+		editItem.addActionListener(ev -> openEditDialog(item));
+		popupMenu.add(editItem);
+
+		JMenuItem deleteItem = new JMenuItem("Remove");
+		deleteItem.addActionListener(ev -> parentPanel.removeTrackedItem(item));
+		popupMenu.add(deleteItem);
+
+		setComponentPopupMenu(slotContainer, popupMenu);
+
+		return slotContainer;
+	}
+
+	private void setComponentPopupMenu(Component component, final JPopupMenu popup)
+	{
+		if (component instanceof JComponent)
+		{
+			((JComponent) component).setComponentPopupMenu(popup);
+		}
+
+		if (component instanceof Container)
+		{
+			for (Component c : ((Container) component).getComponents())
+			{
+				setComponentPopupMenu(c, popup);
+			}
+		}
+	}
+
+	private void openEditDialog(TrackedItem item)
+	{
+		chatboxPanelManager.openTextInput("Enter new goal for " + item.getItemName() + ":")
+			.onDone((Consumer<String>) (input) -> {
+				SwingUtilities.invokeLater(() -> {
+					try
+					{
+						Integer newGoal = null;
+						if (input != null && !input.trim().isEmpty())
+						{
+							long parsedGoal = QuantityFormatter.parseQuantity(input.trim());
+							if (parsedGoal > QuantityFormatter.getMaxStackSize())
+							{
+								parsedGoal = QuantityFormatter.getMaxStackSize();
+							}
+
+							if (parsedGoal > 0)
+							{
+								newGoal = (int) parsedGoal;
+							}
+						}
+
+						item.setGoalAmount(newGoal);
+						plugin.saveTrackedItems(parentPanel.getTrackedItems());
+						parentPanel.rebuild();
+					}
+					catch (NumberFormatException ex)
+					{
+						plugin.sendChatMessage("Please enter a valid number.");
+					}
+				});
+			})
+			.build();
+	}
+}
+
+package com.resourcetracker;
+
+import lombok.Data;
+
+@Data
+public class TrackedItem
+{
+	private int itemId;
+	private String itemName;
+	private int currentAmount;
+	private Integer goalAmount;
+	private String category = "Default";
+
+
+
+	public TrackedItem(int itemId, String itemName, Integer goalAmount, String category)
+	{
+		this.itemId = itemId;
+		this.itemName = itemName;
+		this.currentAmount = 0;
+		this.goalAmount = goalAmount;
+		this.category = category;
+	}
+
+}
+
+package com.resourcetracker;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PluginLauncher
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(ResourceTrackerPlugin.class);
+		RuneLite.main(args);
+	}
+}
