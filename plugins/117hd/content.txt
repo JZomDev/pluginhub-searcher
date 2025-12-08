@@ -4564,12 +4564,10 @@ package rs117.hd.utils.jobs;
 import java.util.concurrent.Semaphore;
 
 public final class ClientCallbackJob {
-	private static final ThreadLocal<ClientCallbackJob> POOL = new ThreadLocal<>();
+	private static final ThreadLocal<ClientCallbackJob> POOL = ThreadLocal.withInitial(ClientCallbackJob::new);
 
 	public static ClientCallbackJob current() {
 		ClientCallbackJob callback = POOL.get();
-		if (callback == null)
-			callback = new ClientCallbackJob();
 		callback.semaphore.drainPermits();
 		return callback;
 	}
@@ -4583,12 +4581,12 @@ package rs117.hd.utils.jobs;
 
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.LinkedBlockingDeque;
-import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.atomic.AtomicBoolean;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 
 import static rs117.hd.utils.HDUtils.getThreadStackTrace;
+import static rs117.hd.utils.MathUtils.*;
 import static rs117.hd.utils.jobs.JobSystem.VALIDATE;
 
 @Slf4j
@@ -4604,10 +4602,26 @@ public final class Worker {
 	final BlockingDeque<JobHandle> localWorkQueue = new LinkedBlockingDeque<>();
 	final AtomicBoolean inflight = new AtomicBoolean();
 
+	boolean findNextStealTarget() {
+		// Find the best target to steal work from
+		int nextVictimIdx = -1;
+		int nextVictimWorkCount = -1;
+		for (int i = 0; i < jobSystem.workers.length; i++) {
+			if (i == workerIdx || !jobSystem.workers[i].inflight.get())
+				continue; // Don't query ourselves or a worker that is idle
+			int workCount = jobSystem.workers[i].localWorkQueue.size();
+			if (workCount > nextVictimWorkCount) {
+				nextVictimIdx = i;
+				nextVictimWorkCount = workCount;
+			}
+		}
+		stealTargetIdx = nextVictimIdx;
+		return nextVictimWorkCount > 0;
+	}
+
 	void run() {
 		name = thread.getName();
 		pausedName = name + " [Paused]";
-		ThreadLocalRandom random = ThreadLocalRandom.current();
 		while (jobSystem.active) {
 			// Check local work queue
 			handle = localWorkQueue.poll();
@@ -4615,7 +4629,7 @@ public final class Worker {
 			while (handle == null) {
 				if (stealTargetIdx >= 0) {
 					final Worker victim = jobSystem.workers[stealTargetIdx];
-					int stealCount = victim.localWorkQueue.size() / 2;
+					int stealCount = max(1, victim.localWorkQueue.size() / jobSystem.workers.length);
 
 					JobHandle stolenHandle;
 					while (stealCount-- > 0 && (stolenHandle = victim.localWorkQueue.poll()) != null) {
@@ -4631,18 +4645,27 @@ public final class Worker {
 				}
 
 				if (handle == null) {
-					// Reset steal worker idx since its queue is empty
-					stealTargetIdx = random.nextInt(0, jobSystem.workers.length);
-
-					if (stealTargetIdx == workerIdx) // Don't steal from yourself
-						stealTargetIdx = (stealTargetIdx + 1) % jobSystem.workers.length;
-
-					// Still no work, wait longer on the main work Queue
+					// Check if any work is in the main queue before attempting to steal again
 					handle = jobSystem.workQueue.poll();
+				}
+
+				if (handle == null && !findNextStealTarget()) {
+					// Wait for a signal that there is work to be had
+					try {
+						jobSystem.workerSemaphore.acquire();
+					} catch (InterruptedException ignored) {
+						// Interrupts are used to signal that the worker should shutdown, we'll pick this up and shutdown
+						thread.isInterrupted(); // Consume the interrupt to prevent it from cancelling the next job
+					}
 
 					if (handle == null) {
-						inflight.lazySet(false);
-						Thread.onSpinWait();
+						// We've been signaled that there is work to be had, try the main queue again
+						handle = jobSystem.workQueue.poll();
+					}
+
+					if (handle == null) {
+						// No work in the main queue, this must mean it was pushed to a local queue and as such should find it
+						findNextStealTarget();
 					}
 				}
 
@@ -4701,8 +4724,10 @@ package rs117.hd.utils.jobs;
 
 import com.google.inject.Injector;
 import java.util.HashMap;
+import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingDeque;
 import java.util.concurrent.LinkedBlockingDeque;
+import java.util.concurrent.Semaphore;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.Getter;
@@ -4741,10 +4766,11 @@ public final class JobSystem {
 	private final int workerCount = max(2, PROCESSOR_COUNT - 1);
 
 	final BlockingDeque<JobHandle> workQueue = new LinkedBlockingDeque<>();
-	private final BlockingDeque<ClientCallbackJob> clientCallbacks = new LinkedBlockingDeque<>(workerCount);
+	private final ArrayBlockingQueue<ClientCallbackJob> clientCallbacks = new ArrayBlockingQueue<>(workerCount);
 
 	private final HashMap<Thread, Worker> threadToWorker = new HashMap<>();
 	Worker[] workers;
+	Semaphore workerSemaphore = new Semaphore(workerCount);
 
 	private boolean clientInvokeScheduled;
 
@@ -4774,6 +4800,13 @@ public final class JobSystem {
 				inflightCount++;
 		}
 		return inflightCount;
+	}
+
+	void signalWorkAvailable(int workCount) {
+		int availPermits = workerSemaphore.availablePermits();
+		if (availPermits >= workCount)
+			return;
+		workerSemaphore.release(min(workCount, workCount - availPermits));
 	}
 
 	public int getWorkQueueSize() {
@@ -4884,6 +4917,8 @@ public final class JobSystem {
 				workQueue.addLast(newHandle);
 			}
 		}
+
+		signalWorkAvailable(1);
 	}
 
 	void invokeClientCallback(boolean immediate, Runnable callback) throws InterruptedException {
@@ -4897,10 +4932,7 @@ public final class JobSystem {
 		clientCallback.callback = callback;
 		clientCallback.immediate = immediate;
 
-		if (immediate)
-			clientCallbacks.addFirst(clientCallback);
-		else
-			clientCallbacks.addLast(clientCallback);
+		clientCallbacks.add(clientCallback);
 
 		if (!clientInvokeScheduled) {
 			clientInvokeScheduled = true;
@@ -4930,7 +4962,7 @@ public final class JobSystem {
 		ClientCallbackJob pair;
 		while (size-- > 0 && (pair = clientCallbacks.poll()) != null) {
 			if (!pair.immediate && immediateOnly) {
-				clientCallbacks.addLast(pair); // Add it back onto the end
+				clientCallbacks.add(pair); // Add it back onto the end
 				continue;
 			}
 
@@ -5099,6 +5131,7 @@ final class JobHandle extends AbstractQueuedSynchronizer {
 		if (VALIDATE)
 			log.debug("Handle [{}] Completed", this);
 
+		int queuedWork = 0;
 		JobHandle dep;
 		while ((dep = dependants.pollFirst()) != null) {
 			if (wasCancelled) {
@@ -5116,8 +5149,13 @@ final class JobHandle extends AbstractQueuedSynchronizer {
 				} else {
 					worker.localWorkQueue.addLast(dep);
 				}
+
+				queuedWork++;
 			}
 		}
+
+		if (queuedWork > 1)
+			JOB_SYSTEM.signalWorkAvailable(queuedWork - 1);
 	}
 
 	private void setJobState(int newState) {
@@ -16352,6 +16390,8 @@ public class SceneContext {
 	public boolean enableAreaHiding;
 	public boolean fillGaps;
 	public boolean isPrepared;
+	public boolean isInChambersOfXeric;
+	public boolean isInHouse;
 
 	@Nullable
 	public Area currentArea;
@@ -19651,8 +19691,6 @@ public class HdPlugin extends Plugin {
 	private boolean lwjglInitialized;
 	public boolean hasLoggedIn;
 	public boolean redrawPreviousFrame;
-	public boolean isInChambersOfXeric;
-	public boolean isInHouse;
 	public boolean justChangedArea;
 	public Scene skipScene;
 
@@ -19905,8 +19943,6 @@ public class HdPlugin extends Plugin {
 				hasLoggedIn = client.getGameState().getState() > GameState.LOGGING_IN.getState();
 				redrawPreviousFrame = false;
 				skipScene = null;
-				isInHouse = false;
-				isInChambersOfXeric = false;
 
 				// Force the client to reload the scene since we're changing GPU flags, and to restore any removed tiles
 				if (client.getGameState() == GameState.LOGGED_IN)
@@ -20015,7 +20051,7 @@ public class HdPlugin extends Plugin {
 
 	@Nullable
 	public SceneContext getSceneContext() {
-		return renderer.getSceneContext();
+		return renderer == null ? null : renderer.getSceneContext();
 	}
 
 	public void toggleFreezeFrame() {
@@ -21104,10 +21140,10 @@ public class HdPlugin extends Plugin {
 		if (configAsyncUICopy)
 			asyncUICopy.complete();
 
-		if (client.getScene() == null)
-			return;
 		// The game runs significantly slower with lower planes in Chambers of Xeric
-		client.getScene().setMinLevel(isInChambersOfXeric ? client.getPlane() : client.getScene().getMinLevel());
+		var ctx = getSceneContext();
+		if (ctx != null)
+			ctx.scene.setMinLevel(ctx.isInChambersOfXeric ? client.getPlane() : ctx.scene.getMinLevel());
 	}
 
 	@Subscribe
@@ -24005,8 +24041,8 @@ public class LegacyRenderer implements Renderer {
 
 		int expandedChunks = plugin.getExpandedMapLoadingChunks();
 		if (HDUtils.sceneIntersects(scene, expandedChunks, areaManager.getArea("PLAYER_OWNED_HOUSE"))) {
-			// Reload once the POH is done loading
-			if (!plugin.isInHouse)
+			// Reload once the POH is done loading, upon first entering the POH
+			if (sceneContext == null || !sceneContext.isInHouse)
 				reloadSceneIn(2);
 		} else if (plugin.skipScene != scene && HDUtils.sceneIntersects(
 			scene,
@@ -24110,11 +24146,11 @@ public class LegacyRenderer implements Renderer {
 		sceneContext.stagingBufferNormals.clear();
 
 		if (sceneContext.intersects(areaManager.getArea("PLAYER_OWNED_HOUSE"))) {
-			plugin.isInHouse = true;
-			plugin.isInChambersOfXeric = false;
+			sceneContext.isInHouse = true;
+			sceneContext.isInChambersOfXeric = false;
 		} else {
-			plugin.isInHouse = false;
-			plugin.isInChambersOfXeric = sceneContext.intersects(areaManager.getArea("CHAMBERS_OF_XERIC"));
+			sceneContext.isInHouse = false;
+			sceneContext.isInChambersOfXeric = sceneContext.intersects(areaManager.getArea("CHAMBERS_OF_XERIC"));
 		}
 	}
 
@@ -29403,8 +29439,9 @@ public final class ZoneUploadJob extends Job {
 		}
 	}
 
-	WorldViewContext viewContext;
-	ZoneSceneContext sceneContext;
+	private WorldViewContext viewContext;
+	private ZoneSceneContext sceneContext;
+
 	Zone zone;
 	int x, z;
 	float delay;
@@ -29412,25 +29449,29 @@ public final class ZoneUploadJob extends Job {
 	@Override
 	protected void onRun() throws InterruptedException {
 		final ZoneUploader sceneUploader = THREAD_LOCAL_SCENE_UPLOADER.get();
-		workerHandleCancel();
-
-		sceneUploader.job = this;
-		sceneUploader.setScene(sceneContext.scene);
-		sceneUploader.estimateZoneSize(sceneContext, zone, x, z);
-
-		if (zone.sizeO > 0 || zone.sizeA > 0) {
+		try {
 			workerHandleCancel();
 
-			invokeClientCallback(isHighPriority(), this::mapZoneVertexBuffers);
-			workerHandleCancel();
+			sceneUploader.job = this;
+			sceneUploader.setScene(sceneContext.scene);
+			sceneUploader.estimateZoneSize(sceneContext, zone, x, z);
 
-			sceneUploader.uploadZone(sceneContext, zone, x, z);
-			workerHandleCancel();
+			if (zone.sizeO > 0 || zone.sizeA > 0) {
+				workerHandleCancel();
 
-			invokeClientCallback(isHighPriority(), this::unmapZoneVertexBuffers);
-		} else {
-			// The zone should not be left uninitialized, as this will prevent drawing anything within it
-			zone.initialized = true;
+				invokeClientCallback(isHighPriority(), this::mapZoneVertexBuffers);
+				workerHandleCancel();
+
+				sceneUploader.uploadZone(sceneContext, zone, x, z);
+				workerHandleCancel();
+
+				invokeClientCallback(isHighPriority(), this::unmapZoneVertexBuffers);
+			} else {
+				// The zone should not be left uninitialized, as this will prevent drawing anything within it
+				zone.initialized = true;
+			}
+		} finally {
+			sceneUploader.clear();
 		}
 	}
 
@@ -29475,6 +29516,10 @@ public final class ZoneUploadJob extends Job {
 	protected void onCancel() {
 		if (viewContext.zones[x][z] != zone)
 			viewContext.pendingCull.add(zone);
+
+		// Avoid holding a reference to the context after the job is done
+		viewContext = null;
+		sceneContext = null;
 	}
 
 	@Override
@@ -29514,6 +29559,12 @@ public final class ZoneUploadJob extends Job {
 			viewContext != null ? viewContext.worldViewId : "null",
 			x, z
 		);
+	}
+
+	@Override
+	@SuppressWarnings("deprecation")
+	protected void finalize() {
+		log.debug("ZoneUploadJob finalized, it should have been pooled? - {}", this);
 	}
 }
 
@@ -31739,8 +31790,9 @@ public class WorldViewContext {
 	public long sceneSwapTime;
 
 	final LinkedBlockingDeque<Zone> pendingCull = new LinkedBlockingDeque<>();
-	final JobGroup<ZoneUploadJob> sceneLoadGroup = new JobGroup<>(true, false);
+	final JobGroup<ZoneUploadJob> sceneLoadGroup = new JobGroup<>(true, true);
 	final JobGroup<ZoneUploadJob> streamingGroup = new JobGroup<>(false, false);
+	final JobGroup<ZoneUploadJob> invalidationGroup = new JobGroup<>(true, false);
 
 	WorldViewContext(
 		SceneManager sceneManager,
@@ -31848,6 +31900,17 @@ public class WorldViewContext {
 		return queuedWork;
 	}
 
+	void completeInvalidation() {
+		if (isLoading)
+			return;
+
+		invalidationGroup.complete();
+
+		for (int x = 0; x < sizeX; x++)
+			for (int z = 0; z < sizeZ; z++)
+				handleZoneSwap(-1.0f, x, z);
+	}
+
 	void free() {
 		sceneLoadGroup.cancel();
 		streamingGroup.cancel();
@@ -31905,7 +31968,7 @@ public class WorldViewContext {
 		curZone.uploadJob = ZoneUploadJob.build(this, sceneContext, newZone, zx, zz);
 		curZone.uploadJob.delay = prevUploadDelay;
 		if (curZone.uploadJob.delay < 0.0f)
-			curZone.uploadJob.queue(streamingGroup, sceneManager.getGenerateSceneDataTask());
+			curZone.uploadJob.queue(invalidationGroup, sceneManager.getGenerateSceneDataTask());
 	}
 }
 
@@ -32027,6 +32090,10 @@ public class SceneManager {
 	private Zone[][] nextZones;
 	private boolean reloadRequested;
 
+	public boolean isZoneStreamingEnabled() {
+		return plugin.configZoneStreaming;
+	}
+
 	@Getter
 	public final ReentrantLock loadingLock = new ReentrantLock();
 
@@ -32110,22 +32177,28 @@ public class SceneManager {
 			}
 		}
 
-		boolean anyScenesLoading = root.isLoading;
-		boolean queuedWork = root.update(plugin.deltaTime);
+		root.update(plugin.deltaTime);
 
 		WorldView wv = client.getTopLevelWorldView();
 		if (wv != null) {
 			for (WorldEntity we : wv.worldEntities()) {
 				WorldViewContext ctx = getContext(we.getWorldView());
-				if (ctx != null) {
-					anyScenesLoading = anyScenesLoading || ctx.isLoading;
-					queuedWork = ctx.update(plugin.deltaTime) || queuedWork;
-				}
+				if (ctx != null)
+					ctx.update(plugin.deltaTime);
 			}
 		}
 
-		if (plugin.isInHouse && queuedWork)
-			root.streamingGroup.complete();
+		// TODO: Wait for zone invalidations without blocking other async loading
+		// Ensure any queued zone invalidations are now completed
+//		root.completeInvalidation();
+//
+//		if (wv != null) {
+//			for (WorldEntity we : wv.worldEntities()) {
+//				WorldViewContext ctx = getContext(we.getWorldView());
+//				if (ctx != null)
+//					ctx.completeInvalidation();
+//			}
+//		}
 	}
 
 	private void updateAreaHiding() {
@@ -32206,6 +32279,7 @@ public class SceneManager {
 	public void completeAllStreaming() {
 		root.sceneLoadGroup.complete();
 		root.streamingGroup.complete();
+		root.invalidationGroup.complete();
 
 		WorldView wv = client.getTopLevelWorldView();
 		if (wv != null) {
@@ -32214,6 +32288,7 @@ public class SceneManager {
 				if (ctx != null) {
 					ctx.sceneLoadGroup.complete();
 					ctx.streamingGroup.complete();
+					ctx.invalidationGroup.complete();
 				}
 			}
 		}
@@ -32319,6 +32394,7 @@ public class SceneManager {
 
 			root.sceneLoadGroup.complete();
 			root.streamingGroup.complete();
+			root.invalidationGroup.complete();
 
 			if (nextSceneContext != null)
 				nextSceneContext.destroy();
@@ -32338,13 +32414,21 @@ public class SceneManager {
 
 			nextSceneContext.enableAreaHiding = nextSceneContext.sceneBase != null && config.hideUnrelatedAreas();
 
+			if (nextSceneContext.intersects(areaManager.getArea("PLAYER_OWNED_HOUSE"))) {
+				nextSceneContext.isInHouse = true;
+				nextSceneContext.isInChambersOfXeric = false;
+			} else {
+				nextSceneContext.isInHouse = false;
+				nextSceneContext.isInChambersOfXeric = nextSceneContext.intersects(areaManager.getArea("CHAMBERS_OF_XERIC"));
+			}
+
 			environmentManager.loadSceneEnvironments(nextSceneContext);
 
 			loadSceneLightsTask.cancel();
 			calculateRoofChangesTask.cancel();
 
-			generateSceneDataTask.setExecuteAsync(plugin.configZoneStreaming).queue();
-			loadSceneLightsTask.setExecuteAsync(plugin.configZoneStreaming).queue();
+			generateSceneDataTask.queue();
+			loadSceneLightsTask.queue();
 
 			if (nextSceneContext.enableAreaHiding) {
 				assert nextSceneContext.sceneBase != null;
@@ -32395,7 +32479,7 @@ public class SceneManager {
 			}
 
 			// Queue after ensuring previous scene has been cancelled
-			calculateRoofChangesTask.setExecuteAsync(plugin.configZoneStreaming).queue();
+			calculateRoofChangesTask.queue();
 
 			final int dx = scene.getBaseX() - prev.getBaseX() >> 3;
 			final int dy = scene.getBaseY() - prev.getBaseY() >> 3;
@@ -32416,21 +32500,28 @@ public class SceneManager {
 						if (!old.initialized || (old.sizeO == 0 && old.sizeA == 0))
 							continue;
 
-						old.cull = false;
 						old.needsRoofUpdate = true;
 
 						if (old.hasWater || old.dirty || isEdgeTile(ctx.zones, ox, oz)) {
 							float dist = distance(vec(x, z), vec(NUM_ZONES / 2, NUM_ZONES / 2));
 							sortedZones.add(SortedZone.getZone(old, x, z, dist));
 							nextSceneContext.totalDeferred++;
+						} else {
+							// The zone can be reused without modifications
+							old.cull = false;
+							nextSceneContext.totalReused++;
 						}
 
 						nextZones[x][z] = old;
-						nextSceneContext.totalReused++;
 					}
 				}
 			}
 
+			boolean staggerLoad =
+				isZoneStreamingEnabled() &&
+				!nextSceneContext.isInHouse &&
+				root.sceneContext != null &&
+				nextSceneContext.totalReused + nextSceneContext.totalDeferred > 0;
 			for (int x = 0; x < NUM_ZONES; ++x) {
 				for (int z = 0; z < NUM_ZONES; ++z) {
 					Zone zone = nextZones[x][z];
@@ -32439,10 +32530,9 @@ public class SceneManager {
 
 					if (!zone.initialized) {
 						float dist = distance(vec(x, z), vec(NUM_ZONES / 2, NUM_ZONES / 2));
-						if (root.sceneContext == null || dist < ZONE_DEFER_DIST_START) {
+						if (!staggerLoad || dist < ZONE_DEFER_DIST_START) {
 							ZoneUploadJob
 								.build(ctx, nextSceneContext, zone, x, z)
-								.setExecuteAsync(plugin.configZoneStreaming)
 								.queue(ctx.sceneLoadGroup, generateSceneDataTask);
 							nextSceneContext.totalMapZones++;
 						} else {
@@ -32456,10 +32546,18 @@ public class SceneManager {
 			for (SortedZone sorted : sortedZones) {
 				Zone newZone = new Zone();
 				newZone.dirty = sorted.zone.dirty;
-				sorted.zone.uploadJob = ZoneUploadJob
-					.build(ctx, nextSceneContext, newZone, sorted.x, sorted.z)
-					.setExecuteAsync(plugin.configZoneStreaming);
-				sorted.zone.uploadJob.delay = 0.5f + clamp(sorted.dist / 15.0f, 0.0f, 1.0f) * 1.5f;
+				if (staggerLoad) {
+					// Reuse the old zone while uploading a correct one
+					sorted.zone.cull = false;
+					sorted.zone.uploadJob = ZoneUploadJob
+						.build(ctx, nextSceneContext, newZone, sorted.x, sorted.z);
+					sorted.zone.uploadJob.delay = 0.5f + clamp(sorted.dist / 15.0f, 0.0f, 1.0f) * 1.5f;
+				} else {
+					nextZones[sorted.x][sorted.z] = newZone;
+					ZoneUploadJob
+						.build(ctx, nextSceneContext, newZone, sorted.x, sorted.z)
+						.queue(ctx.sceneLoadGroup, generateSceneDataTask);
+				}
 				sorted.free();
 			}
 			sortedZones.clear();
@@ -32490,14 +32588,6 @@ public class SceneManager {
 
 		fishingSpotReplacer.despawnRuneLiteObjects();
 		npcDisplacementCache.clear();
-
-		if (nextSceneContext.intersects(areaManager.getArea("PLAYER_OWNED_HOUSE"))) {
-			plugin.isInHouse = true;
-			plugin.isInChambersOfXeric = false;
-		} else {
-			plugin.isInHouse = false;
-			plugin.isInChambersOfXeric = nextSceneContext.intersects(areaManager.getArea("CHAMBERS_OF_XERIC"));
-		}
 
 		boolean isFirst = root.sceneContext == null;
 		if (!isFirst)
@@ -32534,8 +32624,6 @@ public class SceneManager {
 		long sceneUploadTimeStart = sw.elapsed(TimeUnit.NANOSECONDS);
 		int blockingCount = root.sceneLoadGroup.getPendingCount();
 		root.sceneLoadGroup.complete();
-		if (plugin.isInHouse)
-			root.streamingGroup.complete();
 
 		int totalOpaque = 0;
 		int totalAlpha = 0;
@@ -32623,8 +32711,8 @@ public class SceneManager {
 
 		for (int x = 0; x < ctx.sizeX; ++x)
 			for (int z = 0; z < ctx.sizeZ; ++z)
-				ZoneUploadJob.build(ctx, sceneContext, ctx.zones[x][z], x, z)
-					.setExecuteAsync(plugin.configZoneStreaming)
+				ZoneUploadJob
+					.build(ctx, sceneContext, ctx.zones[x][z], x, z)
 					.queue(ctx.sceneLoadGroup);
 
 		ctx.loadTime = sw.elapsed(TimeUnit.NANOSECONDS);
