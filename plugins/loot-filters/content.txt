@@ -270,6 +270,7 @@ import net.runelite.api.events.ItemDespawned;
 import net.runelite.api.events.ItemQuantityChanged;
 import net.runelite.api.events.ItemSpawned;
 import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.WorldViewUnloaded;
 import net.runelite.client.Notifier;
 import net.runelite.client.audio.AudioPlayer;
 import net.runelite.client.callback.ClientThread;
@@ -546,7 +547,7 @@ public class LootFiltersPlugin extends Plugin {
 			lootbeamIndex.put(tile, item, beam);
 		}
 		if (match.isNotify()) {
-			notifier.notify(item.getName());
+			notifier.notify("[Loot Filters] You received a drop: " + item.getName());
 		}
 		if (match.getSound() != null && config.soundVolume() > 0) {
 			queuedAudio.add(match.getSound());
@@ -569,10 +570,11 @@ public class LootFiltersPlugin extends Plugin {
 	}
 
 	@Subscribe
-	public void onGameStateChanged(GameStateChanged event) {
-		if (event.getGameState() == GameState.LOADING) {
-			clearIndices();
-		}
+	public void onWorldViewUnloaded(WorldViewUnloaded event) {
+		tileItemIndex.remove(event.getWorldView());
+		lootbeamIndex.remove(event.getWorldView());
+		displayIndex.remove(event.getWorldView());
+		iconIndex.remove(event.getWorldView());
 	}
 
 	@Subscribe
@@ -1176,7 +1178,7 @@ public class LootFiltersOverlay extends Overlay {
                     }
                 }
 
-                var loc = LocalPoint.fromWorld(client.getTopLevelWorldView(), tile.getWorldLocation());
+                var loc = LocalPoint.fromWorld(tile.getItemLayer().getWorldView(), tile.getWorldLocation());
                 if (loc == null) {
                     continue;
                 }
@@ -1271,7 +1273,7 @@ public class LootFiltersOverlay extends Overlay {
             return -1;
         }
 
-        var loc = LocalPoint.fromWorld(client.getTopLevelWorldView(), tile.getWorldLocation());
+        var loc = LocalPoint.fromWorld(tile.getItemLayer().getWorldView(), tile.getWorldLocation());
         if (loc == null) {
             return -1;
         }
@@ -1421,7 +1423,7 @@ public class LootFiltersOverlay extends Overlay {
 
             var errs = "";
             var errno = 0;
-            var loc = LocalPoint.fromWorld(client.getTopLevelWorldView(), tile.getWorldLocation());
+            var loc = tile.getLocalLocation();
             if (loc == null) {
                 ++errno;
                 errs += "[LOC]";
@@ -1613,8 +1615,27 @@ public class LootFiltersOverlay extends Overlay {
         }
     }
 
-    private static boolean inRenderRange(Player player, Tile tile) {
-        return player.getLocalLocation().distanceTo(tile.getLocalLocation()) <= MAX_DISTANCE;
+    private boolean inRenderRange(Player player, Tile tile) {
+        var pLoc = player.getLocalLocation();
+        var tLoc = tile.getLocalLocation();
+        if (pLoc.getWorldView() == tLoc.getWorldView()) { // avoid transforming unless we absolutely must
+            return pLoc.distanceTo(tLoc) <= MAX_DISTANCE;
+        }
+
+        if (pLoc.getWorldView() != -1) {
+            pLoc = toTopLevel(client, pLoc);
+        }
+        if (tLoc.getWorldView() != -1) {
+            tLoc = toTopLevel(client, tLoc);
+        }
+        return pLoc.distanceTo(tLoc) <= MAX_DISTANCE;
+    }
+
+    private static LocalPoint toTopLevel(Client client, LocalPoint loc) {
+        return client.getTopLevelWorldView()
+                .worldEntities()
+                .byIndex(loc.getWorldView())
+                .transformToMainWorld(loc);
     }
 
     private static Point getCanvasImageLocation(@Nonnull Client client, @Nonnull LocalPoint localLocation, @Nonnull BufferedImage image, int zOffset) {
@@ -3879,6 +3900,8 @@ public class PluginTileItem {
     @Getter private final boolean isStackable;
     @Getter private final boolean isNoted;
     @Getter private final boolean isTradeable;
+    @Getter private final Tile tile;
+    @Getter private final int worldView;
 
     @Setter
     private int quantityOverride = -1;
@@ -3897,6 +3920,8 @@ public class PluginTileItem {
         this.isStackable = composition.isStackable();
         this.isNoted = composition.getNote() != -1;
         this.isTradeable = composition.isTradeable() || linkedNoteComposition.isTradeable();
+        this.tile = tile;
+        this.worldView = tile.getItemLayer().getWorldView().getId();
     }
 
     public int getGePrice() {
@@ -3987,11 +4012,11 @@ package com.lootfilters.model;
 
 import com.lootfilters.LootFiltersPlugin;
 import lombok.RequiredArgsConstructor;
+import net.runelite.api.WorldView;
 
 import java.awt.image.BufferedImage;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.Optional;
 
 @RequiredArgsConstructor
 public class IconIndex {
@@ -4005,10 +4030,12 @@ public class IconIndex {
     public void inc(BufferedImageProvider provider, PluginTileItem item, int... height) {
         index.compute(provider.getCacheKey(item, height), (k, entry) -> {
             if (entry == null) {
-                return new CacheEntry(provider.getImage(plugin, item, height));
+                var newEntry = new CacheEntry(provider.getImage(plugin, item, height));
+                newEntry.incRef(item.getWorldView());
+                return newEntry;
             }
 
-            ++entry.refCount;
+            entry.incRef(item.getWorldView());
             return entry;
         });
     }
@@ -4018,9 +4045,17 @@ public class IconIndex {
             if (entry == null) {
                 return null;
             }
-            --entry.refCount;
-            return entry.refCount == 0 ? null : entry;
+
+            entry.decRef(item.getWorldView());
+            return entry.refCount() == 0 ? null : entry;
         });
+    }
+
+    public void remove(WorldView worldView) {
+        for (var entry : index.values()) {
+            entry.removeRef(worldView.getId());
+        }
+        index.values().removeIf(it -> it.refCount() == 0);
     }
 
     public int size() {
@@ -4046,7 +4081,29 @@ public class IconIndex {
     @RequiredArgsConstructor
     private static final class CacheEntry {
         final BufferedImage image;
-        int refCount = 1;
+        Map<Integer, Integer> refCounts = new HashMap<>(); // wv id -> count
+
+        public void incRef(int wvId) {
+            refCounts.compute(wvId, (k, count) -> count != null ? ++count : 1);
+        }
+
+        public void decRef(int wvId) {
+            if (refCounts.containsKey(wvId)) {
+                refCounts.compute(wvId, (k, count) -> count > 1 ? --count : null);
+            }
+        }
+
+        public void removeRef(int wvId) {
+            refCounts.remove(wvId);
+        }
+
+        public int refCount() {
+            var total = 0;
+            for (var count : refCounts.values()) {
+                total += count;
+            }
+            return total;
+        }
     }
 }
 
@@ -4131,6 +4188,7 @@ import com.lootfilters.DisplayConfig;
 import com.lootfilters.LootFiltersPlugin;
 import lombok.AllArgsConstructor;
 import lombok.NonNull;
+import net.runelite.api.WorldView;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -4150,6 +4208,10 @@ public class DisplayConfigIndex {
 
     public void remove(PluginTileItem item) {
         index.remove(item);
+    }
+
+    public void remove(WorldView worldView) {
+        index.keySet().removeIf(it -> it.getTile().getItemLayer().getWorldView().getId() == worldView.getId());
     }
 
     public int size() {
@@ -4176,6 +4238,7 @@ package com.lootfilters;
 import com.lootfilters.model.PluginTileItem;
 import lombok.AllArgsConstructor;
 import net.runelite.api.Tile;
+import net.runelite.api.WorldView;
 
 import java.util.HashMap;
 import java.util.Map;
@@ -4217,6 +4280,18 @@ public class LootbeamIndex {
         if (beams.isEmpty()) {
             index.remove(tile);
         }
+    }
+
+    public void remove(WorldView worldView) {
+        for (var tile : index.keySet()) {
+            if (tile.getItemLayer().getWorldView().getId() == worldView.getId()) {
+                var beams = index.get(tile);
+                for (var beam : beams.values()) {
+                    beam.remove();
+                }
+            }
+        }
+        index.keySet().removeIf(it -> it.getItemLayer().getWorldView().getId() == worldView.getId());
     }
 
     public void clear() {
@@ -4395,6 +4470,7 @@ package com.lootfilters;
 
 import com.lootfilters.model.PluginTileItem;
 import lombok.AllArgsConstructor;
+import net.runelite.api.Client;
 import net.runelite.api.MenuAction;
 import net.runelite.api.MenuEntry;
 import net.runelite.api.coords.WorldPoint;
@@ -4543,7 +4619,7 @@ public class MenuEntryComposer {
     }
 
     private List<PluginTileItem> getItemsForEntry(MenuEntry entry) {
-        var wv = plugin.getClient().getTopLevelWorldView();
+        var wv = plugin.getClient().getWorldView(entry.getWorldViewId());
         var point = WorldPoint.fromScene(wv, entry.getParam0(), entry.getParam1(), wv.getPlane());
         return plugin.getTileItemIndex().findItem(point, entry.getIdentifier());
     }
@@ -5291,6 +5367,7 @@ package com.lootfilters;
 import com.lootfilters.model.PluginTileItem;
 import net.runelite.api.Tile;
 import net.runelite.api.TileItem;
+import net.runelite.api.WorldView;
 import net.runelite.api.coords.WorldPoint;
 
 import java.util.ArrayList;
@@ -5354,6 +5431,11 @@ public class TileItemIndex {
             itemIndex.remove(tile);
             pointIndex.remove(tile.getWorldLocation());
         }
+    }
+
+    public void remove(WorldView worldView) {
+        itemIndex.keySet().removeIf(it -> it.getItemLayer().getWorldView().getId() == worldView.getId());
+        pointIndex.values().removeIf(it -> it.getItemLayer().getWorldView().getId() == worldView.getId());
     }
 
     public int pointIndexSize() {
