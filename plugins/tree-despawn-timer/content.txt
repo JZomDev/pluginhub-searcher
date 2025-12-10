@@ -24,9 +24,12 @@ public enum TreeConfig {
             new int[]{ObjectID.YEW_TREE_10822, NullObjectID.NULL_10823,
                     // 10828 = Lumbridge Graveyard tree
                     NullObjectID.NULL_10828, ObjectID.YEW_TREE_36683, ObjectID.YEW_TREE_40756, ObjectID.YEW_TREE_42391}),
+    CAMPHOR(60 + 54, new int[]{ObjectID.CAMPHOR_TREE}),
     MAGIC(60 * 3 + 54, new int[]{ObjectID.MAGIC_TREE_10834, NullObjectID.NULL_10835}),
+    IRONWOOD(60 * 3 + 54, new int[]{ObjectID.IRONWOOD_TREE}),
     REDWOOD(60 * 4 + 24,
-            new int[]{ObjectID.REDWOOD_TREE, ObjectID.REDWOOD_TREE_29670});
+            new int[]{ObjectID.REDWOOD_TREE, ObjectID.REDWOOD_TREE_29670}),
+    ROSEWOOD(60 * 4 + 24, new int[]{ObjectID.ROSEWOOD_TREE});
 
     private static final ArrayList<Integer> blockedRegions = new ArrayList<>(List.of(
             // Miscellania
