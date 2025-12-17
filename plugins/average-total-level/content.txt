@@ -26,7 +26,7 @@ import java.text.DecimalFormat;
 )
 public class AverageTotalLevelPlugin extends Plugin
 {
-	private static final String TTL_LEVEL_TEXT_PREFIX = "Ttl: ";
+	private static final String TTL_LEVEL_TEXT_PREFIX = "Total level: ";
 	private static final String AVG_LEVEL_TEXT_PREFIX = "Avg: ";
 
 	@Inject
@@ -89,12 +89,12 @@ public class AverageTotalLevelPlugin extends Plugin
 			// In order to be compatible with virtual total levels the total level already stored in the string stack
 			// is retrieved and concatenated into this plugin's string. This plugin's load priority is lower than
 			// Virtual total level's so the correct total should always be displayed
-			int displayedTotalLevel = Integer.parseInt(((String) objStack[objStackSize - 1]).split("<br>")[1]);
+			int displayedTotalLevel = Integer.parseInt(((String) objStack[objStackSize - 1]).split(":")[1].trim());
 			
 			objStack[objStackSize  - 1] =
 				TTL_LEVEL_TEXT_PREFIX +
 				displayedTotalLevel +
-				"<br>" +
+				"    " +
 				AVG_LEVEL_TEXT_PREFIX +
 				getAverageSkillLevel(displayedTotalLevel);
 		}
