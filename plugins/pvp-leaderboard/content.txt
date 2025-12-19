@@ -410,6 +410,7 @@ public class MatchesCacheEntry
 package com.pvp.leaderboard.game;
 
 import com.pvp.leaderboard.config.PvPLeaderboardConfig;
+import com.pvp.leaderboard.overlay.RankOverlay;
 import com.pvp.leaderboard.ui.DashboardPanel;
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -432,6 +433,7 @@ public class MenuHandler
 
     // Dependencies set after startup via init/update
     private DashboardPanel dashboardPanel;
+    private RankOverlay rankOverlay;
     private NavigationButton navButton;
 
     @Inject
@@ -442,9 +444,10 @@ public class MenuHandler
         this.clientToolbar = clientToolbar;
     }
 
-    public void init(DashboardPanel dashboardPanel, NavigationButton navButton)
+    public void init(DashboardPanel dashboardPanel, RankOverlay rankOverlay, NavigationButton navButton)
     {
         this.dashboardPanel = dashboardPanel;
+        this.rankOverlay = rankOverlay;
         this.navButton = navButton;
         
         refreshMenuOption();
@@ -515,16 +518,20 @@ public class MenuHandler
 
 package com.pvp.leaderboard.game;
 
+import com.google.gson.JsonObject;
 import com.pvp.leaderboard.config.PvPLeaderboardConfig;
+import com.pvp.leaderboard.overlay.RankOverlay;
 import com.pvp.leaderboard.service.ClientIdentityService;
 import com.pvp.leaderboard.service.CognitoAuthService;
 import com.pvp.leaderboard.service.MatchResult;
 import com.pvp.leaderboard.service.MatchResultService;
 import com.pvp.leaderboard.service.PvPDataService;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.atomic.AtomicLong;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import lombok.extern.slf4j.Slf4j;
@@ -549,8 +556,8 @@ public class FightMonitor
     private final CognitoAuthService cognitoAuthService;
     private final ClientIdentityService clientIdentityService;
 
-    // Dependencies injected via init
-    // private DashboardPanel dashboardPanel; 
+    // RankOverlay reference for MMR notifications
+    private RankOverlay rankOverlay;
 
     // --- Fight State ---
     private boolean inFight = false;
@@ -560,12 +567,8 @@ public class FightMonitor
     private volatile String lastExactOpponentName = null;
     private long fightStartTime = 0;
 
-    // Tracks multiple simultaneous fights (per-opponent)
+    // Tracks multiple simultaneous fights (per-opponent) - damage is now tracked per-FightEntry
     private final ConcurrentHashMap<String, FightEntry> activeFights = new ConcurrentHashMap<>();
-    
-    // Damage accounting
-    private final ConcurrentHashMap<String, Long> damageFromOpponent = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, Long> damageToOpponent = new ConcurrentHashMap<>();
     
     // Tick counters
     private int suppressFightStartTicks = 0;
@@ -576,8 +579,8 @@ public class FightMonitor
     private static final int OUT_OF_COMBAT_TICKS = 16;
     private int gcTicksCounter = 0;
 
-    // Finalization state
-    // (removed unused fields)
+    // MMR tracking for notifications
+    private volatile Double preFightMmr = null;
 
     @Inject
     public FightMonitor(
@@ -598,6 +601,14 @@ public class FightMonitor
         this.clientIdentityService = clientIdentityService;
     }
 
+    /**
+     * Initialize with RankOverlay for MMR change notifications.
+     */
+    public void init(RankOverlay rankOverlay)
+    {
+        this.rankOverlay = rankOverlay;
+    }
+
     public void resetFightState()
     {
         inFight = false;
@@ -607,10 +618,39 @@ public class FightMonitor
         fightStartTime = 0;
         suppressFightStartTicks = 2;
         activeFights.clear();
-        damageFromOpponent.clear();
-        damageToOpponent.clear();
+        perOpponentSuppressUntilTicks.clear();
+        shardPresence.clear();
         lastCombatActivityTick = 0;
+        lastExactOpponentName = null;
+        preFightMmr = null;
         try { log.debug("[Fight] state reset; suppressTicks={}", suppressFightStartTicks); } catch (Exception ignore) {}
+    }
+    
+    /**
+     * Clear only a specific fight without affecting other ongoing fights.
+     * Used when a fight ends but other multi-combat fights continue.
+     */
+    private void clearFightFor(String opponentName)
+    {
+        activeFights.remove(opponentName);
+        perOpponentSuppressUntilTicks.put(opponentName, 5);
+        shardPresence.remove(opponentName);
+        
+        // Only reset global state if ALL fights are done
+        if (activeFights.isEmpty())
+        {
+            inFight = false;
+            wasInMulti = false;
+            fightStartSpellbook = -1;
+            opponent = null;
+            fightStartTime = 0;
+            suppressFightStartTicks = 2;
+            preFightMmr = null;
+        }
+        else
+        {
+            inFight = true;
+        }
     }
 
     public void handleGameTick(GameTick tick)
@@ -647,7 +687,6 @@ public class FightMonitor
                     FightEntry fe = e.getValue();
                     if (fe == null) return true;
                     if (!fe.finalized && now - fe.lastActivityMs > 10_000L) {
-                        // log.debug("[Fight] expire inactive vs={} lastActivity={}msAgo", e.getKey(), now - fe.lastActivityMs);
                         return true;
                     }
                     return false;
@@ -655,14 +694,8 @@ public class FightMonitor
                 inFight = !activeFights.isEmpty();
             }
 
-            // Combat window idle check
-            int tickNow = client.getTickCount();
-            if (tickNow - lastCombatActivityTick > OUT_OF_COMBAT_TICKS && (!damageFromOpponent.isEmpty() || !damageToOpponent.isEmpty()))
-            {
-                damageFromOpponent.clear();
-                damageToOpponent.clear();
-                // log.debug("[Fight] window cleared on tick={} (idle>{} ticks)", tickNow, OUT_OF_COMBAT_TICKS);
-            }
+            // Combat window idle check - individual fight expiration is handled by GC above
+            // No global damage maps to clear anymore; damage is per-FightEntry
         }
         catch (Exception e)
         {
@@ -690,11 +723,7 @@ public class FightMonitor
             String hitPlayerName = hitPlayer.getName();
             String localPlayerName = localPlayer.getName();
 
-            // log.debug("[Hitsplat] on='{}' amt={} type={} isMine={} localPlayer='{}'", 
-            //     hitPlayerName, amt, hitsplatType, isMine, localPlayerName);
-
-            // Only process relevant damage hitsplat types (matching pvp-performance-tracker approach)
-            // For non-zero hits, only process relevant hitsplat types
+            // Only process relevant damage hitsplat types
             if (amt > 0)
             {
                 if (!(hitsplatType == HitsplatID.DAMAGE_ME
@@ -702,28 +731,21 @@ public class FightMonitor
                     || hitsplatType == HitsplatID.POISON
                     || hitsplatType == HitsplatID.VENOM))
                 {
-                    // log.debug("[Hitsplat] SKIPPED - irrelevant type={}", hitsplatType);
                     return;
                 }
             }
 
-            // Determine if this should start/continue a fight (only for direct damage, not poison/venom)
+            // Determine if this should start/continue a fight
             boolean startFromThisHit = (amt > 0) && 
                 (hitsplatType == HitsplatID.DAMAGE_ME || hitsplatType == HitsplatID.DAMAGE_OTHER);
 
             String opponentName = null;
             boolean startNow = false;
 
-            // Key insight from pvp-performance-tracker:
-            // - If hitsplat lands on LOCAL PLAYER -> opponent dealt that damage to us
-            // - If hitsplat lands on OPPONENT -> we dealt that damage to them
-            // This is more reliable than using isMine() which may not work for all damage types
-
             if (hitPlayer == localPlayer)
             {
                 // Hitsplat on us = opponent dealt damage to us
                 opponentName = resolveInboundAttacker(localPlayer);
-                // log.debug("[Hitsplat] ON US - resolved attacker='{}' amt={}", opponentName, amt);
                 if (opponentName != null)
                 {
                     lastExactOpponentName = opponentName;
@@ -735,45 +757,33 @@ public class FightMonitor
                 // Hitsplat on another player
                 if (hitPlayerName == null) return;
 
-                // Check if this player is someone we're actively fighting or interacting with
                 boolean isActiveOpponent = activeFights.containsKey(hitPlayerName);
                 Player interacting = (Player) localPlayer.getInteracting();
                 boolean isCurrentTarget = interacting != null && interacting == hitPlayer;
                 Player theirTarget = (Player) hitPlayer.getInteracting();
                 boolean isTargetingUs = theirTarget != null && theirTarget == localPlayer;
 
-                // log.debug("[Hitsplat] ON OTHER '{}': isActiveOpp={} isTarget={} targetsUs={} activeFights={}", 
-                //     hitPlayerName, isActiveOpponent, isCurrentTarget, isTargetingUs, activeFights.keySet());
-
-                // If the hit player is our active opponent or current target, we dealt that damage
                 if (isActiveOpponent || isCurrentTarget || isTargetingUs)
                 {
                     opponentName = hitPlayerName;
                     if (startFromThisHit) startNow = true;
                 }
-                else
-                {
-                    // log.debug("[Hitsplat] NOT COUNTED - '{}' not recognized as opponent", hitPlayerName);
-                }
             }
 
-            // Handle fight start/continuation - do window reset BEFORE adding damage
+            // Handle fight start/continuation
             boolean validOpp = (opponentName != null && isPlayerOpponent(opponentName));
             if (startNow && opponentName != null && validOpp)
             {
                 int tickNow = client.getTickCount();
                 
-                // Check for combat window reset FIRST, before adding damage
+                // Check for combat window reset FIRST - clear stale fights after long idle
                 if (tickNow - lastCombatActivityTick > OUT_OF_COMBAT_TICKS)
                 {
                     activeFights.clear();
-                    damageFromOpponent.clear();
-                    damageToOpponent.clear();
-                    // log.debug("[Fight] combat window reset after {} ticks idle", tickNow - lastCombatActivityTick);
                 }
                 lastCombatActivityTick = tickNow;
 
-                if (opponentName.equals(localPlayer.getName())) return; // Ignore self
+                if (opponentName.equals(localPlayer.getName())) return;
                 if (suppressFightStartTicks > 0) return;
                 if (perOpponentSuppressUntilTicks.containsKey(opponentName)) return;
 
@@ -783,22 +793,20 @@ public class FightMonitor
                 if (client.getVarbitValue(Varbits.MULTICOMBAT_AREA) == 1) wasInMulti = true;
             }
 
-            // NOW add the damage to maps AFTER window reset check
+            // Add the damage to per-fight tracking in FightEntry
             if (opponentName != null && amt > 0)
             {
-                if (hitPlayer == localPlayer)
+                FightEntry fe = activeFights.get(opponentName);
+                if (fe != null)
                 {
-                    // Inbound damage
-                    damageFromOpponent.merge(opponentName, (long) amt, Long::sum);
-                    // log.debug("[Hitsplat] INBOUND DMG: {} dealt {} to us, total from them={}", 
-                    //     opponentName, amt, damageFromOpponent.get(opponentName));
-                }
-                else
-                {
-                    // Outbound damage
-                    damageToOpponent.merge(opponentName, (long) amt, Long::sum);
-                    // log.debug("[Hitsplat] OUTBOUND DMG: we dealt {} to {}, total to them={}", 
-                    //     amt, opponentName, damageToOpponent.get(opponentName));
+                    if (hitPlayer == localPlayer)
+                    {
+                        fe.addDamageReceived(amt);
+                    }
+                    else
+                    {
+                        fe.addDamageDealt(amt);
+                    }
                 }
             }
         }
@@ -818,23 +826,32 @@ public class FightMonitor
 
             if (player == localPlayer)
             {
-                // Self death
+                // Self death - find who killed us
                 String killer = findActualKiller(localPlayer);
                 if (killer != null) opponent = killer;
 
-                // Pick killer from damage attribution
                 if (killer == null) killer = findKillerByDamage();
                 if (killer == null) killer = opponent;
                 if (killer == null) killer = mostRecentActiveOpponent();
 
-                if (killer != null) endFightFor(killer, "loss");
-                else {
-                    activeFights.clear(); inFight = false;
+                // Submit loss against the killer
+                if (killer != null)
+                {
+                    endFightFor(killer, "loss");
                 }
+                
+                // Clear remaining fights without submitting (we died, they didn't kill us)
+                for (String remaining : new ArrayList<>(activeFights.keySet()))
+                {
+                    clearFightFor(remaining);
+                }
+                
+                // Ensure full reset after self-death
+                resetFightState();
             }
             else
             {
-                // Other death
+                // Other player death
                 String name = player.getName();
                 if (name != null)
                 {
@@ -859,38 +876,41 @@ public class FightMonitor
         wasInMulti = client.getVarbitValue(Varbits.MULTICOMBAT_AREA) == 1;
         fightStartSpellbook = client.getVarbitValue(Varbits.SPELLBOOK);
         fightStartTime = System.currentTimeMillis() / 1000;
-        // log.debug("[Fight] startFight opp='{}' world={} startSpell={} multi={}", opponentName, client.getWorld(), fightStartSpellbook, wasInMulti);
     }
 
     private void endFightFor(String opponentName, String result)
     {
-        FightEntry fe = activeFights.remove(opponentName);
-        if (fe != null) fe.finalized = true;
+        FightEntry fe = activeFights.get(opponentName);
+        if (fe == null || fe.finalized) return;
+        
+        fe.finalized = true;
         finalizeFight(opponentName, result, fe);
-        inFight = !activeFights.isEmpty();
+        clearFightFor(opponentName);  // Use targeted clear instead of resetFightState
     }
 
     private void finalizeFight(String opponentName, String result, FightEntry entry)
     {
+        if (entry == null) return;  // Require valid FightEntry for accurate data
+        
         final int currentSpellbook = client.getVarbitValue(Varbits.SPELLBOOK);
         final int world = client.getWorld();
         final long now = System.currentTimeMillis() / 1000;
         final String selfName = getLocalPlayerName();
         final String idTokenSafe = cognitoAuthService.getStoredIdToken();
 
-        final long startTs = (entry != null) ? entry.startTs : fightStartTime;
-        final int startSb = (entry != null) ? entry.startSpellbook : fightStartSpellbook;
-        final boolean wasMulti = (entry != null) ? entry.wasInMulti : wasInMulti;
-        // bucket logic removed as unused
+        final long startTs = entry.startTs;
+        
+        // Skip submission if start timestamp wasn't captured (fight was already in progress)
+        if (startTs <= 0)
+        {
+            log.debug("[MatchSubmit] Skipping - fight start not captured (startTs={}). Plugin likely started tracking mid-fight.", startTs);
+            return;
+        }
+        final int startSb = entry.startSpellbook;
+        final boolean wasMulti = entry.wasInMulti;
 
         final String resolvedOpponent = (opponentName != null) ? opponentName : "Unknown";
-        final long dmgOut = damageToOpponent.getOrDefault(resolvedOpponent, 0L);
-
-        // Debug: Log full damage state
-        // log.debug("[Fight] Finalizing: res={} opp='{}' world={} start={} end={} multi={}", result, resolvedOpponent, world, startTs, now, wasMulti);
-        // log.debug("[Fight] damageToOpponent map: {}", damageToOpponent);
-        // log.debug("[Fight] damageFromOpponent map: {}", damageFromOpponent);
-        // log.debug("[Fight] Using dmgOut={} for opponent='{}'", dmgOut, resolvedOpponent);
+        final long dmgOut = entry.damageDealt.get();  // Read from FightEntry
 
         // Async Submission
         java.util.concurrent.CompletableFuture.runAsync(() -> {
@@ -901,20 +921,7 @@ public class FightMonitor
             }
         }, scheduler);
 
-        // Update UI
-        // dashboardPanel.getTierLabelByName(resolvedOpponent, bucket); 
-
-        // Suppression
-        if (resolvedOpponent != null && !"Unknown".equals(resolvedOpponent)) {
-            perOpponentSuppressUntilTicks.put(resolvedOpponent, 5);
-        }
-        
-        // Reset if main fight
-        if (entry == null || (opponent != null && opponent.equals(opponentName))) {
-            resetFightState();
-        }
-
-        // Schedule API refreshes
+        // Schedule API refreshes (includes MMR notification)
         scheduleApiRefreshes(resolvedOpponent);
     }
 
@@ -950,32 +957,100 @@ public class FightMonitor
     }
 
     private void scheduleApiRefreshes(String opponentName) {
-         // Always fetch fresh ranks after a fight so players see rank changes immediately
-         // API results persist until shard is refreshed (1 hour)
-         log.debug("[PostFight] Scheduling API refresh in 15s for self and opponent={}", opponentName);
-         scheduler.schedule(() -> {
-             try {
+        log.debug("[PostFight] Scheduling API refresh in 15s for self and opponent={}", opponentName);
+        
+        // Store pre-fight MMR before the refresh happens
+        final Double storedPreFightMmr = preFightMmr;
+        
+        scheduler.schedule(() -> {
+            try {
                 String bucket = "overall";
                 String selfName = getLocalPlayerName();
                 log.debug("[PostFight] Executing API refresh: self={} opponent={} bucket={}", selfName, opponentName, bucket);
                 
-                // Refresh self rank using profile API (more reliable) - with retry
+                // Refresh self rank using profile API with MMR notification
                 if (selfName != null) {
-                    fetchTierWithRetry(selfName, bucket, 3);
+                    fetchProfileWithMmrNotification(selfName, bucket, 3, storedPreFightMmr);
                 } else {
                     log.debug("[PostFight] selfName is null, skipping self refresh");
                 }
                 
-                // Refresh opponent rank using profile API - with retry
+                // Refresh opponent rank
                 if (opponentName != null) {
                     fetchTierWithRetry(opponentName, bucket, 3);
                 } else {
                     log.debug("[PostFight] opponentName is null, skipping opponent refresh");
                 }
-             } catch(Exception e){
+            } catch(Exception e){
                 log.debug("[PostFight] API refresh exception: {}", e.getMessage());
-             }
-         }, 15L, java.util.concurrent.TimeUnit.SECONDS);
+            }
+        }, 15L, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    /**
+     * Fetch profile for self with MMR change notification support.
+     */
+    private void fetchProfileWithMmrNotification(String playerName, String bucket, int retriesLeft, Double oldMmr) {
+        log.debug("[PostFight] fetchProfileWithMmrNotification: player={} bucket={} retriesLeft={} oldMmr={}", 
+            playerName, bucket, retriesLeft, oldMmr);
+        
+        pvpDataService.getUserProfile(playerName, null, true).thenAccept(profile -> {
+            if (profile != null) {
+                // Extract and set tier in overlay
+                String tier = extractTierFromProfile(profile);
+                if (tier != null && rankOverlay != null) {
+                    rankOverlay.setRankFromApi(playerName, tier);
+                    log.debug("[PostFight] Set rank from API: player={} tier={}", playerName, tier);
+                }
+                
+                // Handle MMR change notification
+                if (oldMmr != null && config.showMmrChangeNotification() && rankOverlay != null) {
+                    if (profile.has("mmr") && !profile.get("mmr").isJsonNull()) {
+                        double newMmr = profile.get("mmr").getAsDouble();
+                        rankOverlay.onMmrUpdated(newMmr, oldMmr);
+                        log.debug("[PostFight] MMR notification triggered: old={} new={} delta={}", 
+                            oldMmr, newMmr, newMmr - oldMmr);
+                    }
+                }
+            } else if (retriesLeft > 0) {
+                log.debug("[PostFight] profile is null for player={}, retrying ({} left)", playerName, retriesLeft - 1);
+                scheduler.schedule(() -> fetchProfileWithMmrNotification(playerName, bucket, retriesLeft - 1, oldMmr), 
+                    2L, java.util.concurrent.TimeUnit.SECONDS);
+            } else {
+                log.debug("[PostFight] FAILED: profile is null for player={}, no retries left", playerName);
+            }
+        }).exceptionally(ex -> {
+            if (retriesLeft > 0) {
+                log.debug("[PostFight] Exception for player={}: {}, retrying ({} left)", playerName, ex.getMessage(), retriesLeft - 1);
+                scheduler.schedule(() -> fetchProfileWithMmrNotification(playerName, bucket, retriesLeft - 1, oldMmr), 
+                    2L, java.util.concurrent.TimeUnit.SECONDS);
+            } else {
+                log.debug("[PostFight] FAILED with exception for player={}: {}, no retries left", playerName, ex.getMessage());
+            }
+            return null;
+        });
+    }
+
+    /**
+     * Extract tier string from user profile response.
+     */
+    private String extractTierFromProfile(JsonObject profile) {
+        if (profile == null) return null;
+        
+        String rank = null;
+        int division = 0;
+        
+        if (profile.has("rank") && !profile.get("rank").isJsonNull()) {
+            rank = profile.get("rank").getAsString();
+        }
+        if (profile.has("division") && !profile.get("division").isJsonNull()) {
+            division = profile.get("division").getAsInt();
+        }
+        
+        if (rank != null && !rank.isEmpty()) {
+            return division > 0 ? rank + " " + division : rank;
+        }
+        return null;
     }
     
     private void fetchTierWithRetry(String playerName, String bucket, int retriesLeft) {
@@ -983,6 +1058,9 @@ public class FightMonitor
         pvpDataService.getTierFromProfile(playerName, bucket).thenAccept(tier -> {
             if (tier != null) {
                 log.debug("[PostFight] SUCCESS: tier={} for player={}", tier, playerName);
+                if (rankOverlay != null) {
+                    rankOverlay.setRankFromApi(playerName, tier);
+                }
             } else if (retriesLeft > 0) {
                 log.debug("[PostFight] tier is null for player={}, retrying ({} left)", playerName, retriesLeft - 1);
                 scheduler.schedule(() -> fetchTierWithRetry(playerName, bucket, retriesLeft - 1), 
@@ -1014,11 +1092,23 @@ public class FightMonitor
             return v;
         });
 
+        // Store pre-fight MMR for self (only once per fight session)
+        if (preFightMmr == null && config.showMmrChangeNotification()) {
+            String selfName = getLocalPlayerName();
+            if (selfName != null) {
+                pvpDataService.getUserProfile(selfName, null).thenAccept(profile -> {
+                    if (profile != null && profile.has("mmr") && !profile.get("mmr").isJsonNull()) {
+                        preFightMmr = profile.get("mmr").getAsDouble();
+                        log.debug("[Fight] Stored pre-fight MMR for {}: {}", selfName, preFightMmr);
+                    }
+                });
+            }
+        }
+
         if (!shardPresence.containsKey(opponentName))
         {
             String bucket = "overall";
             
-            // Single call - getShardRankByName handles everything internally
             pvpDataService.getShardRankByName(opponentName, bucket).thenAccept(shardRank -> {
                 if (shardRank != null && shardRank.rank > 0) {
                     shardPresence.put(opponentName, Boolean.TRUE);
@@ -1063,10 +1153,18 @@ public class FightMonitor
 
     private String findKillerByDamage()
     {
-        String killer = null; long bestDmg = -1L;
-        for (Map.Entry<String, Long> e : damageFromOpponent.entrySet()) {
-            long v = (e.getValue() != null ? e.getValue() : 0L);
-            if (v > bestDmg) { bestDmg = v; killer = e.getKey(); }
+        String killer = null;
+        long bestDmg = -1L;
+        for (Map.Entry<String, FightEntry> e : activeFights.entrySet())
+        {
+            FightEntry fe = e.getValue();
+            if (fe == null) continue;
+            long v = fe.damageReceived.get();
+            if (v > bestDmg)
+            {
+                bestDmg = v;
+                killer = e.getKey();
+            }
         }
         return killer;
     }
@@ -1115,35 +1213,311 @@ public class FightMonitor
         final boolean wasInMulti;
         volatile long lastActivityMs;
         volatile boolean finalized = false;
+        
+        // Per-fight damage tracking for multi-combat accuracy
+        final AtomicLong damageDealt = new AtomicLong(0);    // Damage we dealt TO this opponent
+        final AtomicLong damageReceived = new AtomicLong(0); // Damage we received FROM this opponent
+        
         FightEntry(long ts, int sb, boolean multi) {
             startTs = ts;
             startSpellbook = sb;
             wasInMulti = multi;
             lastActivityMs = System.currentTimeMillis();
         }
+        
+        void addDamageDealt(long amount) {
+            damageDealt.addAndGet(amount);
+            lastActivityMs = System.currentTimeMillis();
+        }
+        
+        void addDamageReceived(long amount) {
+            damageReceived.addAndGet(amount);
+            lastActivityMs = System.currentTimeMillis();
+        }
     }
 }
+
+package com.pvp.leaderboard.game;
+
+import lombok.Value;
+
+/**
+ * Event fired when a player's rank is updated from the API.
+ * Used to communicate rank updates to the overlay system.
+ */
+@Value
+public class PlayerRankEvent
+{
+    String playerName;
+    String bucket;
+    String tier;
+}
+
 
 package com.pvp.leaderboard.config;
 
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
 
 @ConfigGroup("PvPLeaderboard")
 public interface PvPLeaderboardConfig extends Config
 {
+	// ==================== Sections ====================
+
+	@ConfigSection(
+		name = "Overlay Settings",
+		description = "Settings for the rank overlay display",
+		position = 0
+	)
+	String overlaySection = "overlay";
+
+	@ConfigSection(
+		name = "Visual Settings",
+		description = "Settings for overlay appearance",
+		position = 1
+	)
+	String visualSection = "visual";
+
+	@ConfigSection(
+		name = "Notifications",
+		description = "Settings for notifications",
+		position = 2
+	)
+	String notificationSection = "notifications";
+
+	@ConfigSection(
+		name = "Other",
+		description = "Other settings",
+		position = 3
+	)
+	String otherSection = "other";
+
+	// ==================== Enums ====================
+
+	enum RankDisplayMode
+	{
+		TEXT
+		{
+			@Override
+			public String toString()
+			{
+				return "Text";
+			}
+		},
+		RANK_NUMBER
+		{
+			@Override
+			public String toString()
+			{
+				return "Rank #";
+			}
+		}
+	}
+
+	enum RankBucket
+	{
+		OVERALL
+		{
+			@Override
+			public String toString()
+			{
+				return "Overall";
+			}
+		},
+		NH
+		{
+			@Override
+			public String toString()
+			{
+				return "NH";
+			}
+		},
+		VENG
+		{
+			@Override
+			public String toString()
+			{
+				return "Veng";
+			}
+		},
+		MULTI
+		{
+			@Override
+			public String toString()
+			{
+				return "Multi";
+			}
+		},
+		DMM
+		{
+			@Override
+			public String toString()
+			{
+				return "DMM";
+			}
+		}
+	}
+
+	// ==================== Overlay Settings ====================
+
+	@ConfigItem(
+		keyName = "showOwnRank",
+		name = "Show your own rank",
+		description = "Display your rank above your character",
+		section = overlaySection,
+		position = 0
+	)
+	default boolean showOwnRank()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "rankDisplayMode",
+		name = "Display rank as",
+		description = "How to display ranks above players",
+		section = overlaySection,
+		position = 1
+	)
+	default RankDisplayMode rankDisplayMode()
+	{
+		return RankDisplayMode.TEXT;
+	}
+
+	@ConfigItem(
+		keyName = "rankBucket",
+		name = "Rank Bucket",
+		description = "Which rank bucket to display",
+		section = overlaySection,
+		position = 2
+	)
+	default RankBucket rankBucket()
+	{
+		return RankBucket.OVERALL;
+	}
+
+	// ==================== Visual Settings ====================
+
+	@ConfigItem(
+		keyName = "rankTextSize",
+		name = "Rank Text Size",
+		description = "Text size for rank display",
+		section = visualSection,
+		position = 0
+	)
+	@Range(min = 10, max = 48)
+	default int rankTextSize()
+	{
+		return 10;
+	}
+
+	@ConfigItem(
+		keyName = "rankOffsetX",
+		name = "Rank Offset X",
+		description = "Horizontal offset for rank display (pixels)",
+		section = visualSection,
+		position = 1
+	)
+	@Range(min = -100, max = 100)
+	default int rankOffsetX()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "rankOffsetY",
+		name = "Rank Offset Y",
+		description = "Vertical offset for rank display (pixels)",
+		section = visualSection,
+		position = 2
+	)
+	@Range(min = -100, max = 100)
+	default int rankOffsetY()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "colorblindMode",
+		name = "Colorblind Mode",
+		description = "Makes all rank text white for better visibility",
+		section = visualSection,
+		position = 3
+	)
+	default boolean colorblindMode()
+	{
+		return false;
+	}
+
+	// ==================== Notifications ====================
+
+	@ConfigItem(
+		keyName = "showMmrChangeNotification",
+		name = "Show MMR Change",
+		description = "Display MMR gained/lost after fights (XP drop style)",
+		section = notificationSection,
+		position = 0
+	)
+	default boolean showMmrChangeNotification()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+		keyName = "mmrOffsetX",
+		name = "MMR Offset X",
+		description = "Horizontal offset for MMR notification (0 = XP drop position)",
+		section = notificationSection,
+		position = 1
+	)
+	@Range(min = -500, max = 500)
+	default int mmrOffsetX()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "mmrOffsetY",
+		name = "MMR Offset Y",
+		description = "Vertical offset for MMR notification (0 = XP drop position)",
+		section = notificationSection,
+		position = 2
+	)
+	@Range(min = -500, max = 500)
+	default int mmrOffsetY()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "mmrDuration",
+		name = "MMR Duration",
+		description = "How long the MMR notification stays on screen (seconds)",
+		section = notificationSection,
+		position = 3
+	)
+	@Range(min = 1, max = 10)
+	default int mmrDuration()
+	{
+		return 3;
+	}
+
+	// ==================== Other Settings ====================
 
 	@ConfigItem(
 		keyName = "enablePvpLookupMenu",
 		name = "Enable 'pvp lookup' right-click",
-		description = "Adds the 'pvp lookup' option to player right-click menu"
+		description = "Adds the 'pvp lookup' option to player right-click menu",
+		section = otherSection,
+		position = 0
 	)
 	default boolean enablePvpLookupMenu()
 	{
-		return false; 
+		return true;
 	}
-
 }
 
 package com.pvp.leaderboard;
@@ -1152,6 +1526,7 @@ import com.google.inject.Provides;
 import com.pvp.leaderboard.config.PvPLeaderboardConfig;
 import com.pvp.leaderboard.game.FightMonitor;
 import com.pvp.leaderboard.game.MenuHandler;
+import com.pvp.leaderboard.overlay.RankOverlay;
 import com.pvp.leaderboard.service.ClientIdentityService;
 import com.pvp.leaderboard.service.CognitoAuthService;
 import com.pvp.leaderboard.service.PvPDataService;
@@ -1166,6 +1541,7 @@ import net.runelite.api.events.GameTick;
 import net.runelite.api.events.HitsplatApplied;
 import net.runelite.api.events.MenuOptionClicked;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.game.SpriteManager;
@@ -1173,6 +1549,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.ui.overlay.OverlayManager;
 import java.awt.image.BufferedImage;
 import net.runelite.client.util.ImageUtil;
 
@@ -1193,45 +1570,61 @@ public class PvPLeaderboardPlugin extends Plugin
 	@Inject
 	private ClientToolbar clientToolbar;
 
-    @Inject
-    private SpriteManager spriteManager;
+	@Inject
+	private OverlayManager overlayManager;
 
-    @Inject
-    private PvPDataService pvpDataService;
+	@Inject
+	private RankOverlay rankOverlay;
 
-    @Inject
-    private CognitoAuthService cognitoAuthService;
-    
-    @Inject
-    private ClientIdentityService clientIdentityService;
+	@Inject
+	private EventBus eventBus;
 
-    @Inject
-    private MenuHandler menuHandler;
-    
-    @Inject
-    private FightMonitor fightMonitor;
+	@Inject
+	private SpriteManager spriteManager;
+
+	@Inject
+	private PvPDataService pvpDataService;
+
+	@Inject
+	private CognitoAuthService cognitoAuthService;
+
+	@Inject
+	private ClientIdentityService clientIdentityService;
+
+	@Inject
+	private MenuHandler menuHandler;
+
+	@Inject
+	private FightMonitor fightMonitor;
 
 	private DashboardPanel dashboardPanel;
 	private NavigationButton navButton;
+	private int pendingSelfRankLookupTicks = -1;
 
-    public String getClientUniqueId()
-    {
-        return clientIdentityService.getClientUniqueId();
-    }
-    
-    // Accessor for DashboardPanel to get local player name for debug logs
-    public String getLocalPlayerName()
-    {
-        try { return client != null && client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : null; } catch (Exception ignore) { return null; }
-    }
+	public String getClientUniqueId()
+	{
+		return clientIdentityService.getClientUniqueId();
+	}
+
+	// Accessor for DashboardPanel to get local player name for debug logs
+	public String getLocalPlayerName()
+	{
+		try { return client != null && client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : null; } catch (Exception ignore) { return null; }
+	}
+
+	// Helper for overlays to get displayed rank from overlay cache
+	public String getDisplayedRankFor(String playerName)
+	{
+		return rankOverlay != null ? rankOverlay.getCachedRankFor(playerName) : null;
+	}
 
 	@Override
 	protected void startUp() throws Exception
 	{
-        dashboardPanel = new DashboardPanel(config, this, pvpDataService, cognitoAuthService);
-        
-        // Initialize identity
-        clientIdentityService.loadOrGenerateId();
+		dashboardPanel = new DashboardPanel(config, this, pvpDataService, cognitoAuthService);
+
+		// Initialize identity
+		clientIdentityService.loadOrGenerateId();
 
 		navButton = NavigationButton.builder()
 			.tooltip("PvP Leaderboard")
@@ -1240,41 +1633,66 @@ public class PvPLeaderboardPlugin extends Plugin
 			.panel(dashboardPanel)
 			.build();
 		clientToolbar.addNavigation(navButton);
-        
-        // Init menu handler
-        menuHandler.init(dashboardPanel, navButton);
+
+		// Register overlay
+		overlayManager.add(rankOverlay);
+
+		// Register RankOverlay with EventBus to receive PlayerRankEvent
+		eventBus.register(rankOverlay);
+
+		// Init menu handler with RankOverlay
+		menuHandler.init(dashboardPanel, rankOverlay, navButton);
+
+		// Init fight monitor with RankOverlay for MMR notifications
+		fightMonitor.init(rankOverlay);
+
+		log.debug("PvP Leaderboard started!");
 	}
 
 	@Override
 	protected void shutDown() throws Exception
 	{
 		menuHandler.shutdown();
+		eventBus.unregister(rankOverlay);
 		clientToolbar.removeNavigation(navButton);
-    }
+		overlayManager.remove(rankOverlay);
+		log.debug("PvP Leaderboard stopped!");
+	}
 
-    @Subscribe
-    public void onConfigChanged(ConfigChanged event)
-    {
-        try
-        {
-            if (event == null) return;
-            if (!"PvPLeaderboard".equals(event.getGroup())) return;
-            if ("enablePvpLookupMenu".equals(event.getKey()))
-            {
-                menuHandler.refreshMenuOption();
-            }
-        }
-        catch (Exception e)
-        {
-            log.error("Uncaught exception in onConfigChanged", e);
-        }
-    }
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		try
+		{
+			if (event == null) return;
+			if (!"PvPLeaderboard".equals(event.getGroup())) return;
 
-    @Subscribe
-    public void onMenuOptionClicked(MenuOptionClicked event)
-    {
-        menuHandler.handleMenuOptionClicked(event);
-    }
+			if ("enablePvpLookupMenu".equals(event.getKey()))
+			{
+				menuHandler.refreshMenuOption();
+				return;
+			}
+
+			// Ensure self rank refreshes when bucket or display mode changes
+			if ("rankBucket".equals(event.getKey()) || "rankDisplayMode".equals(event.getKey()))
+			{
+				if (rankOverlay != null)
+				{
+					rankOverlay.scheduleSelfRankRefresh(0L);
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			log.error("Uncaught exception in onConfigChanged", e);
+		}
+	}
+
+	@Subscribe
+	public void onMenuOptionClicked(MenuOptionClicked event)
+	{
+		menuHandler.handleMenuOptionClicked(event);
+	}
 
 	@Subscribe
 	public void onGameStateChanged(GameStateChanged gameStateChanged)
@@ -1293,6 +1711,9 @@ public class PvPLeaderboardPlugin extends Plugin
 							dashboardPanel.loadMatchHistory(self);
 						}
 					}
+
+					// Use tick-based scheduling: wait 10 ticks (approx 6.0s) for initial load/sync
+					pendingSelfRankLookupTicks = 10;
 				}
 				catch (Exception ignore) {}
 			}
@@ -1301,37 +1722,83 @@ public class PvPLeaderboardPlugin extends Plugin
 				// Fully clear fight state on logout
 				fightMonitor.resetFightState();
 			}
+			else if (gameStateChanged.getGameState() == GameState.HOPPING || gameStateChanged.getGameState() == GameState.LOADING)
+			{
+				try
+				{
+					if (rankOverlay != null)
+					{
+						rankOverlay.resetLookupStateOnWorldHop();
+					}
+					// Nudge self rank refresh after a short delay so overlay repopulates post-hop
+					// Use tick-based scheduling: wait 3 ticks (approx 1.8s)
+					pendingSelfRankLookupTicks = 3;
+				}
+				catch (Exception ignore) {}
+			}
 		}
 		catch (Exception e)
 		{
-			// log.debug("Uncaught exception in onGameStateChanged", e);
+			log.debug("Uncaught exception in onGameStateChanged", e);
 		}
 	}
 
-    @Subscribe
-    public void onGameTick(GameTick tick)
-    {
-        try
-        {
-            // Delegate logic to FightMonitor
-            fightMonitor.handleGameTick(tick);
-        }
-        catch (Exception e)
-        {
-            // log.error("Uncaught exception in onGameTick", e);
-        }
-    }
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		try
+		{
+			// Delegate logic to FightMonitor
+			fightMonitor.handleGameTick(tick);
+
+			// Handle pending self-rank lookups (tick-based delay logic)
+			if (pendingSelfRankLookupTicks > 0)
+			{
+				pendingSelfRankLookupTicks--;
+				if (pendingSelfRankLookupTicks == 0)
+				{
+					pendingSelfRankLookupTicks = -1;
+					if (rankOverlay != null)
+					{
+						// Check if local player is ready before scheduling, otherwise retry briefly
+						if (client.getLocalPlayer() != null)
+						{
+							rankOverlay.scheduleSelfRankRefresh(0L);
+							// Also refresh dashboard if needed
+							if (dashboardPanel != null)
+							{
+								String self = client.getLocalPlayer().getName();
+								if (self != null)
+								{
+									dashboardPanel.loadMatchHistory(self);
+								}
+							}
+						}
+						else
+						{
+							// Not ready yet, retry in 5 ticks
+							pendingSelfRankLookupTicks = 5;
+						}
+					}
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("Uncaught exception in onGameTick", e);
+		}
+	}
 
 	@Subscribe
 	public void onHitsplatApplied(HitsplatApplied hitsplatApplied)
 	{
-        fightMonitor.handleHitsplatApplied(hitsplatApplied);
+		fightMonitor.handleHitsplatApplied(hitsplatApplied);
 	}
 
 	@Subscribe
 	public void onActorDeath(ActorDeath actorDeath)
 	{
-        fightMonitor.handleActorDeath(actorDeath);
+		fightMonitor.handleActorDeath(actorDeath);
 	}
 
 	@Provides
@@ -1340,10 +1807,10 @@ public class PvPLeaderboardPlugin extends Plugin
 		return configManager.getConfig(PvPLeaderboardConfig.class);
 	}
 
-    public Client getClient()
-    {
-        return client;
-    }
+	public Client getClient()
+	{
+		return client;
+	}
 }
 
 package com.pvp.leaderboard.ui;
@@ -2654,7 +3121,6 @@ package com.pvp.leaderboard.ui;
 import com.pvp.leaderboard.service.CognitoAuthService;
 import javax.swing.*;
 import java.awt.*;
-import java.net.URI;
 import java.net.URLEncoder;
 import java.util.function.Consumer;
 import net.runelite.client.util.LinkBrowser;
@@ -2765,14 +3231,15 @@ public class LoginPanel extends JPanel
         String username = websiteSearchField.getText();
         if (username == null || username.trim().isEmpty())
         {
-            try { LinkBrowser.browse("https://devsecopsautomated.com/index.html"); } catch (Exception ignore) {}
+            LinkBrowser.browse("https://devsecopsautomated.com/index.html");
             return;
         }
         if (!isValidUsername(username)) return;
         try
         {
             String normalizedUsername = normalizeUsername(username);
-            String url = "https://devsecopsautomated.com/profile.html?player=" + normalizedUsername;
+            String encodedUsername = URLEncoder.encode(normalizedUsername, "UTF-8");
+            String url = "https://devsecopsautomated.com/profile.html?player=" + encodedUsername;
             LinkBrowser.browse(url);
         }
         catch (Exception ignore) {}
@@ -2921,6 +3388,451 @@ public class LoginPanel extends JPanel
 }
 
 
+package com.pvp.leaderboard.overlay;
+
+import com.pvp.leaderboard.config.PvPLeaderboardConfig;
+import com.pvp.leaderboard.game.PlayerRankEvent;
+import com.pvp.leaderboard.service.PvPDataService;
+import com.pvp.leaderboard.util.NameUtils;
+import com.pvp.leaderboard.util.RankUtils;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Player;
+import net.runelite.api.Point;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+@Slf4j
+public class RankOverlay extends Overlay
+{
+    private final Client client;
+    private final PvPLeaderboardConfig config;
+    private final PvPDataService pvpDataService;
+
+    // Displayed ranks cache
+    private final ConcurrentHashMap<String, String> displayedRanks = new ConcurrentHashMap<>();
+    private final Map<String, Long> displayedRanksTimestamp = new ConcurrentHashMap<>();
+
+    // Config change tracking
+    private String lastBucketKey = null;
+    private PvPLeaderboardConfig.RankDisplayMode lastDisplayMode = null;
+
+    // Self-rank scheduling
+    private volatile long selfRefreshRequestedAtMs = 0L;
+    private volatile boolean selfRankAttempted = false;
+    private volatile long nextSelfRankAllowedAtMs = 0L;
+
+    // MMR change notification
+    private volatile Double previousMmr = null;
+    private volatile Double currentMmrDelta = null;
+    private volatile long mmrNotificationStartMs = 0L;
+
+    @Inject
+    public RankOverlay(Client client, PvPLeaderboardConfig config, PvPDataService pvpDataService)
+    {
+        this.client = client;
+        this.config = config;
+        this.pvpDataService = pvpDataService;
+        setPosition(OverlayPosition.DYNAMIC);
+        setLayer(OverlayLayer.ABOVE_SCENE);
+        setPriority(Overlay.PRIORITY_HIGHEST);
+    }
+
+    @Subscribe
+    public void onPlayerRankEvent(PlayerRankEvent event)
+    {
+        if (event == null || event.getPlayerName() == null || event.getTier() == null)
+        {
+            return;
+        }
+        log.debug("[Overlay] onPlayerRankEvent: player={} tier={} bucket={}",
+            event.getPlayerName(), event.getTier(), event.getBucket());
+        setRankFromApi(event.getPlayerName(), event.getTier());
+    }
+
+    /**
+     * Schedule a self-rank refresh after the given delay.
+     */
+    public void scheduleSelfRankRefresh(long delayMs)
+    {
+        long now = System.currentTimeMillis();
+        nextSelfRankAllowedAtMs = now + Math.max(0L, delayMs);
+        selfRankAttempted = false;
+        selfRefreshRequestedAtMs = nextSelfRankAllowedAtMs;
+    }
+
+    /**
+     * Reset lookup state on world hop.
+     */
+    public void resetLookupStateOnWorldHop()
+    {
+        selfRankAttempted = false;
+        nextSelfRankAllowedAtMs = 0L;
+    }
+
+    /**
+     * Get cached rank for a player.
+     */
+    public String getCachedRankFor(String playerName)
+    {
+        return displayedRanks.get(NameUtils.canonicalKey(playerName));
+    }
+
+    /**
+     * Set rank from API response.
+     */
+    public void setRankFromApi(String playerName, String rank)
+    {
+        if (playerName == null || playerName.trim().isEmpty() || rank == null || rank.trim().isEmpty())
+        {
+            return;
+        }
+        String key = NameUtils.canonicalKey(playerName);
+        displayedRanks.put(key, rank);
+        displayedRanksTimestamp.put(key, System.currentTimeMillis());
+        pvpDataService.clearShardNegativeCache(playerName);
+        log.debug("[Overlay] setRankFromApi: key={} rank={}", key, rank);
+    }
+
+    /**
+     * Store the previous MMR value before a fight for delta calculation.
+     */
+    public void storePreviousMmr(double mmr)
+    {
+        this.previousMmr = mmr;
+        log.debug("[Overlay] Stored previous MMR: {}", mmr);
+    }
+
+    /**
+     * Called after fight when new MMR is fetched.
+     * Calculates delta and triggers notification.
+     */
+    public void onMmrUpdated(double newMmr, double oldMmr)
+    {
+        if (!config.showMmrChangeNotification())
+        {
+            return;
+        }
+        this.currentMmrDelta = newMmr - oldMmr;
+        this.mmrNotificationStartMs = System.currentTimeMillis();
+        this.previousMmr = null;
+        log.debug("[Overlay] MMR updated: old={} new={} delta={}", oldMmr, newMmr, currentMmrDelta);
+    }
+
+    /**
+     * Get the stored previous MMR (for FightMonitor to check).
+     */
+    public Double getPreviousMmr()
+    {
+        return previousMmr;
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        if (config == null || client == null)
+        {
+            return new Dimension(0, 0);
+        }
+
+        // Handle config changes
+        String currentBucket = bucketKey(config.rankBucket());
+        PvPLeaderboardConfig.RankDisplayMode currentMode = config.rankDisplayMode();
+
+        if (lastBucketKey == null || !lastBucketKey.equals(currentBucket) || lastDisplayMode != currentMode)
+        {
+            displayedRanks.clear();
+            displayedRanksTimestamp.clear();
+            lastBucketKey = currentBucket;
+            lastDisplayMode = currentMode;
+            selfRankAttempted = false;
+            nextSelfRankAllowedAtMs = 0L;
+        }
+
+        // Get local player
+        Player localPlayer = client.getLocalPlayer();
+        if (localPlayer == null)
+        {
+            return new Dimension(0, 0);
+        }
+
+        String localName = localPlayer.getName();
+
+        // Handle self-rank refresh scheduling
+        if (config.showOwnRank() && localName != null && selfRefreshRequestedAtMs > 0L)
+        {
+            long now = System.currentTimeMillis();
+            if (now >= selfRefreshRequestedAtMs && !selfRankAttempted && now >= nextSelfRankAllowedAtMs)
+            {
+                selfRankAttempted = true;
+                selfRefreshRequestedAtMs = 0L;
+                fetchRankForSelf(localName);
+            }
+        }
+
+        // Only render self in Phase 1
+        if (!config.showOwnRank())
+        {
+            // Still render MMR notification even if rank is hidden
+            renderMmrChangeNotification(graphics, localPlayer);
+            return new Dimension(0, 0);
+        }
+
+        String nameKey = NameUtils.canonicalKey(localName);
+        String cachedRank = displayedRanks.get(nameKey);
+
+        // Render rank above local player
+        Point nameLocation = localPlayer.getCanvasTextLocation(graphics, localName, localPlayer.getLogicalHeight() + 40);
+        if (nameLocation != null && cachedRank != null)
+        {
+            FontMetrics fm = graphics.getFontMetrics();
+
+            Point headLoc = localPlayer.getCanvasTextLocation(graphics, "", localPlayer.getLogicalHeight() + 40);
+            int x, y;
+            if (headLoc != null)
+            {
+                x = headLoc.getX() + config.rankOffsetX();
+                y = headLoc.getY() - fm.getAscent() - 2 + config.rankOffsetY();
+            }
+            else
+            {
+                x = nameLocation.getX() + config.rankOffsetX();
+                y = nameLocation.getY() - fm.getAscent() - 2 + config.rankOffsetY();
+            }
+
+            renderRankText(graphics, cachedRank, x, y, Math.max(10, config.rankTextSize()));
+        }
+
+        // Render MMR change notification
+        renderMmrChangeNotification(graphics, localPlayer);
+
+        return new Dimension(0, 0);
+    }
+
+    private void fetchRankForSelf(String selfName)
+    {
+        String bucket = bucketKey(config.rankBucket());
+        PvPLeaderboardConfig.RankDisplayMode mode = config.rankDisplayMode();
+
+        pvpDataService.getShardRankByName(selfName, bucket)
+            .thenAccept(sr -> {
+                if (sr == null)
+                {
+                    log.debug("[Overlay] No shard rank found for self: {}", selfName);
+                    return;
+                }
+
+                String rank;
+                if (mode == PvPLeaderboardConfig.RankDisplayMode.RANK_NUMBER)
+                {
+                    rank = sr.rank > 0 ? "Rank " + sr.rank : null;
+                }
+                else
+                {
+                    rank = sr.tier;
+                }
+
+                if (rank != null)
+                {
+                    String key = NameUtils.canonicalKey(selfName);
+                    displayedRanks.put(key, rank);
+                    displayedRanksTimestamp.put(key, System.currentTimeMillis());
+                    nextSelfRankAllowedAtMs = System.currentTimeMillis() + 60_000L;
+                    log.debug("[Overlay] Self rank fetched: {} = {}", selfName, rank);
+                }
+            })
+            .exceptionally(ex -> {
+                log.debug("[Overlay] Error fetching self rank: {}", ex.getMessage());
+                nextSelfRankAllowedAtMs = System.currentTimeMillis() + 60_000L;
+                return null;
+            });
+    }
+
+    private void renderRankText(Graphics2D g, String fullRank, int x, int y, int size)
+    {
+        if (fullRank == null || fullRank.trim().isEmpty())
+        {
+            return;
+        }
+
+        String[] parts = fullRank.split(" ");
+        String rankName = parts[0];
+        String division = parts.length > 1 ? parts[1] : "";
+        String text = division.isEmpty() ? rankName : (rankName + " " + division);
+
+        g.setFont(new Font(Font.DIALOG, Font.BOLD, size));
+        FontMetrics fm = g.getFontMetrics();
+        int textW = fm.stringWidth(text);
+        int textH = fm.getAscent();
+        int centerX = x - textW / 2;
+        int baseY = y + textH;
+
+        // Check for 3rd Age - special glow effect
+        boolean isThirdAge = rankName.equals("3rd") || fullRank.startsWith("3rd");
+
+        if (isThirdAge && !config.colorblindMode())
+        {
+            // Glowing white effect: multiple layers with decreasing alpha
+            int[][] glowLayers = {
+                {3, 25},   // offset 3px, alpha 25
+                {2, 50},   // offset 2px, alpha 50
+                {1, 100},  // offset 1px, alpha 100
+            };
+
+            for (int[] layer : glowLayers)
+            {
+                int offset = layer[0];
+                int alpha = layer[1];
+                g.setColor(new Color(255, 255, 255, alpha));
+                for (int dy = -offset; dy <= offset; dy++)
+                {
+                    for (int dx = -offset; dx <= offset; dx++)
+                    {
+                        if (dx == 0 && dy == 0) continue;
+                        g.drawString(text, centerX + dx, baseY + dy);
+                    }
+                }
+            }
+
+            // Core white text
+            g.setColor(Color.WHITE);
+            g.drawString(text, centerX, baseY);
+        }
+        else
+        {
+            // Standard rendering: black outline + colored text
+            g.setColor(new Color(0, 0, 0, 180));
+            for (int dy = -1; dy <= 1; dy++)
+            {
+                for (int dx = -1; dx <= 1; dx++)
+                {
+                    if (dx == 0 && dy == 0) continue;
+                    g.drawString(text, centerX + dx, baseY + dy);
+                }
+            }
+
+            // Determine text color
+            if (config.colorblindMode() || fullRank.startsWith("Rank "))
+            {
+                g.setColor(Color.WHITE);
+            }
+            else
+            {
+                g.setColor(RankUtils.getRankColor(rankName));
+            }
+            g.drawString(text, centerX, baseY);
+        }
+    }
+
+    private void renderMmrChangeNotification(Graphics2D g, Player localPlayer)
+    {
+        if (currentMmrDelta == null || mmrNotificationStartMs == 0L)
+        {
+            return;
+        }
+        if (!config.showMmrChangeNotification())
+        {
+            return;
+        }
+
+        long durationMs = config.mmrDuration() * 1000L;
+        long elapsed = System.currentTimeMillis() - mmrNotificationStartMs;
+        if (elapsed > durationMs)
+        {
+            // Clear notification after duration
+            currentMmrDelta = null;
+            mmrNotificationStartMs = 0L;
+            return;
+        }
+
+        // Get position above player
+        Point headLoc = localPlayer.getCanvasTextLocation(g, "", localPlayer.getLogicalHeight() + 80);
+        if (headLoc == null)
+        {
+            return;
+        }
+
+        // Calculate fade alpha (255 -> 0 over duration)
+        float progress = (float) elapsed / durationMs;
+        int alpha = (int) (255 * (1.0f - progress));
+
+        // Format text: +100.9 MMR or -3.2 MMR
+        String sign = currentMmrDelta >= 0 ? "+" : "";
+        String text = String.format("%s%.1f MMR", sign, currentMmrDelta);
+
+        // Determine color
+        Color baseColor;
+        if (config.colorblindMode())
+        {
+            baseColor = Color.WHITE;
+        }
+        else if (currentMmrDelta >= 0)
+        {
+            baseColor = new Color(0, 200, 0); // Green for gain
+        }
+        else
+        {
+            baseColor = new Color(229, 57, 53); // Red for loss
+        }
+        Color color = new Color(baseColor.getRed(), baseColor.getGreen(), baseColor.getBlue(), alpha);
+
+        // Render with black outline
+        g.setFont(new Font(Font.DIALOG, Font.BOLD, Math.max(12, config.rankTextSize() + 2)));
+        FontMetrics fm = g.getFontMetrics();
+        int textW = fm.stringWidth(text);
+        int centerX = headLoc.getX() - textW / 2 + config.mmrOffsetX();
+
+        // Float upward as it fades
+        int floatOffset = (int) (progress * 30); // Float up 30 pixels
+        int drawY = headLoc.getY() - floatOffset + config.mmrOffsetY();
+
+        // Black outline with alpha
+        Color outlineColor = new Color(0, 0, 0, (int) (180 * (1.0f - progress)));
+        g.setColor(outlineColor);
+        for (int dy = -1; dy <= 1; dy++)
+        {
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                if (dx == 0 && dy == 0) continue;
+                g.drawString(text, centerX + dx, drawY + dy);
+            }
+        }
+
+        // Main colored text
+        g.setColor(color);
+        g.drawString(text, centerX, drawY);
+    }
+
+    private static String bucketKey(PvPLeaderboardConfig.RankBucket bucket)
+    {
+        if (bucket == null)
+        {
+            return "overall";
+        }
+        switch (bucket)
+        {
+            case NH:
+                return "nh";
+            case VENG:
+                return "veng";
+            case MULTI:
+                return "multi";
+            case DMM:
+                return "dmm";
+            case OVERALL:
+            default:
+                return "overall";
+        }
+    }
+}
+
 package com.pvp.leaderboard.service;
 
 import com.google.gson.Gson;
@@ -2999,7 +3911,8 @@ public class MatchResultService
                 String pLower = match.getPlayerId().trim().replaceAll("\\s+", " ").toLowerCase(java.util.Locale.ROOT);
                 String oLower = match.getOpponentId().trim().replaceAll("\\s+", " ").toLowerCase(java.util.Locale.ROOT);
                 boolean notSelf = !pLower.equals(oLower);
-                boolean timeOk = match.getFightStartTs() > 0 && match.getFightEndTs() > 0 && match.getFightEndTs() >= match.getFightStartTs();
+                // Allow fight_start_ts = 0 when fight was already in progress (backend handles duration validation only when startTs > 0)
+                boolean timeOk = match.getFightEndTs() > 0 && (match.getFightStartTs() == 0 || match.getFightEndTs() >= match.getFightStartTs());
                 boolean worldOk = match.getWorld() > 0;
                 // log.debug("[Submit] preflight notSelf={} timeOk={} worldOk={} player='{}' opponent='{}' startTs={} endTs={} world={} multi={} dmgOut={}",
                 //     notSelf, timeOk, worldOk, match.getPlayerId(), match.getOpponentId(), match.getFightStartTs(), match.getFightEndTs(), match.getWorld(), match.isWasInMulti(), match.getDamageToOpponent());
