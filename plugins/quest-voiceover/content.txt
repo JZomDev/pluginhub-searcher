@@ -1,16 +1,864 @@
+package com.quest.voiceover.features;
+
+import com.quest.voiceover.QuestVoiceoverConfig;
+import net.runelite.api.Client;
+import net.runelite.api.Point;
+import net.runelite.api.widgets.InterfaceID;
+import net.runelite.api.widgets.Widget;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.awt.*;
+import java.util.HashSet;
+import java.util.Set;
+
+@Singleton
+public class QuestListIndicatorHandler {
+
+    private static final int QUEST_LIST_CONTAINER_COMPONENT = 7;
+    private static final int WIDGET_TYPE_TEXT = 4;
+    private static final int TICKS_BEFORE_ADDING_INDICATORS = 2;
+    private static final String SHORT_PREFIX = "[V] ";
+    private static final String LONG_PREFIX = "[Voiced] ";
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private QuestVoiceoverConfig config;
+
+    private Set<String> voicedQuests = new HashSet<>();
+    private boolean isQuestListVisible;
+    private int ticksSinceOpened;
+
+    public void setVoicedQuests(Set<String> voicedQuests) {
+        this.voicedQuests = voicedQuests;
+    }
+
+    public void onQuestListOpened() {
+        isQuestListVisible = true;
+        ticksSinceOpened = 0;
+    }
+
+    public void onQuestListClosed() {
+        isQuestListVisible = false;
+    }
+
+    public void onGameTick() {
+        if (!isQuestListVisible) {
+            return;
+        }
+
+        ticksSinceOpened++;
+
+        if (ticksSinceOpened >= TICKS_BEFORE_ADDING_INDICATORS) {
+            if (config.showVoicedIndicator()) {
+                updateVoiceIndicators();
+            } else {
+                removeVoiceIndicators();
+            }
+        }
+    }
+
+    private void updateVoiceIndicators() {
+        if (voicedQuests.isEmpty() || !isQuestListActuallyVisible()) {
+            return;
+        }
+
+        Widget questListContainer = client.getWidget(InterfaceID.QUEST_LIST, QUEST_LIST_CONTAINER_COMPONENT);
+        if (questListContainer == null || questListContainer.getChildren() == null) {
+            return;
+        }
+
+        Point mousePosition = client.getMouseCanvasPosition();
+        updateQuestWidgets(questListContainer.getChildren(), mousePosition);
+    }
+
+    private void removeVoiceIndicators() {
+        if (!isQuestListActuallyVisible()) {
+            return;
+        }
+
+        Widget questListContainer = client.getWidget(InterfaceID.QUEST_LIST, QUEST_LIST_CONTAINER_COMPONENT);
+        if (questListContainer == null || questListContainer.getChildren() == null) {
+            return;
+        }
+
+        for (Widget questWidget : questListContainer.getChildren()) {
+            if (!isTextWidget(questWidget)) {
+                continue;
+            }
+
+            String currentText = questWidget.getText();
+            if (hasVoicePrefix(currentText)) {
+                questWidget.setText(extractQuestName(currentText));
+                questWidget.revalidate();
+            }
+        }
+    }
+
+    private boolean hasVoicePrefix(String text) {
+        return text != null && (text.startsWith(SHORT_PREFIX) || text.startsWith(LONG_PREFIX));
+    }
+
+    private boolean isQuestListActuallyVisible() {
+        Widget questListPanel = client.getWidget(InterfaceID.QUEST_LIST, 0);
+
+        if (questListPanel == null || questListPanel.isHidden()) {
+            return false;
+        }
+
+        return questListPanel.getCanvasLocation() != null && questListPanel.getWidth() > 0;
+    }
+
+    private void updateQuestWidgets(Widget[] questWidgets, Point mousePosition) {
+        for (Widget questWidget : questWidgets) {
+            if (!isTextWidget(questWidget)) {
+                continue;
+            }
+
+            String currentText = questWidget.getText();
+            String questName = extractQuestName(currentText);
+
+            if (!isVoicedQuest(questName)) {
+                continue;
+            }
+
+            boolean isHovered = isMouseOverWidget(questWidget, mousePosition);
+            String expectedPrefix = isHovered ? LONG_PREFIX : SHORT_PREFIX;
+            String expectedText = expectedPrefix + questName;
+
+            if (!currentText.equals(expectedText)) {
+                questWidget.setText(expectedText);
+                questWidget.revalidate();
+            }
+        }
+    }
+
+    private String extractQuestName(String text) {
+        if (text == null) {
+            return null;
+        }
+        if (text.startsWith(LONG_PREFIX)) {
+            return text.substring(LONG_PREFIX.length());
+        }
+        if (text.startsWith(SHORT_PREFIX)) {
+            return text.substring(SHORT_PREFIX.length());
+        }
+        return text;
+    }
+
+    private boolean isVoicedQuest(String questName) {
+        return questName != null && voicedQuests.contains(questName);
+    }
+
+    private boolean isMouseOverWidget(Widget widget, Point mousePosition) {
+        Rectangle bounds = widget.getBounds();
+        if (bounds == null || mousePosition == null) {
+            return false;
+        }
+        return bounds.contains(mousePosition.getX(), mousePosition.getY());
+    }
+
+    private boolean isTextWidget(Widget widget) {
+        return widget != null && widget.getType() == WIDGET_TYPE_TEXT;
+    }
+}
+
+package com.quest.voiceover.features;
+
+import com.quest.voiceover.modules.audio.SoundEngine;
+import com.quest.voiceover.modules.database.DatabaseManager;
+import com.quest.voiceover.modules.dialog.DialogManager;
+import com.quest.voiceover.utility.MessageParser;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.widgets.Widget;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+
+@Slf4j
+@Singleton
+public class VoiceoverHandler {
+
+    private static final String VOICEOVER_QUERY =
+        "SELECT quest, uri FROM dialogs WHERE character = ? AND text MATCH ?";
+
+    @Inject
+    private DatabaseManager databaseManager;
+
+    @Inject
+    private SoundEngine soundEngine;
+
+    @Inject
+    private DialogManager dialogManager;
+
+    @Getter
+    private boolean activeVoiceover;
+
+    @Getter
+    private String currentQuestName;
+
+    public void handleDialogMessage(String rawMessage, String playerName) {
+        MessageParser message = new MessageParser(rawMessage, playerName);
+        playVoiceoverIfAvailable(message);
+    }
+
+    public void handleDialogOpened() {
+        if (!dialogManager.isPlayerOrNpcDialogOpen() || !activeVoiceover) {
+            return;
+        }
+
+        Widget dialogWidget = dialogManager.getActiveDialogWidget();
+        if (dialogWidget == null) {
+            return;
+        }
+
+        dialogManager.addMuteButton(dialogWidget);
+
+        if (currentQuestName != null) {
+            dialogManager.addQuestNameLabel(dialogWidget, currentQuestName);
+        }
+    }
+
+    public void stopVoiceover() {
+        soundEngine.stop();
+    }
+
+    private void playVoiceoverIfAvailable(MessageParser message) {
+        try (PreparedStatement statement = databaseManager.prepareStatement(VOICEOVER_QUERY)) {
+            statement.setString(1, escapeQuotes(message.getCharacterName()));
+            statement.setString(2, escapeQuotes(message.getDialogText()));
+
+            try (ResultSet resultSet = statement.executeQuery()) {
+                if (resultSet.next()) {
+                    String audioUri = resultSet.getString("uri");
+                    currentQuestName = resultSet.getString("quest");
+
+                    if (audioUri != null || currentQuestName != null) {
+                        activeVoiceover = true;
+                        soundEngine.play(audioUri);
+                        return;
+                    }
+                }
+            }
+
+            activeVoiceover = false;
+        } catch (SQLException e) {
+            log.error("Failed to query voiceover database", e);
+        }
+    }
+
+    private String escapeQuotes(String input) {
+        return input.replace("'", "''");
+    }
+}
+
+package com.quest.voiceover.modules.database;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.RuneLite;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import java.io.*;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
+
+@Slf4j
+public class DatabaseVersionManager {
+
+    private static final String DATABASE_FILENAME = "quest_voiceover.db";
+    private static final String VERSION_FILENAME = ".version";
+
+    private static final HttpUrl RAW_GITHUB_DATABASE_URL =
+        HttpUrl.parse("https://github.com/KevinEdry/runelite-quest-voiceover/raw/database");
+
+    private static final Path DOWNLOAD_DIR =
+        Path.of(RuneLite.RUNELITE_DIR.getPath(), "quest-voiceover");
+
+    private static final Path VERSION_FILE = DOWNLOAD_DIR.resolve(VERSION_FILENAME);
+    private static final Path DATABASE_FILE = DOWNLOAD_DIR.resolve(DATABASE_FILENAME);
+
+    public static void prepareDatabaseSource(OkHttpClient okHttpClient) {
+        ensureDownloadDirectoryExists();
+        downloadOrUpdateDatabase(okHttpClient);
+    }
+
+    public static String getDatabasePath() throws FileNotFoundException {
+        if (!Files.exists(DATABASE_FILE)) {
+            throw new FileNotFoundException("Database file not found: " + DATABASE_FILE);
+        }
+        return DATABASE_FILE.toString();
+    }
+
+    private static void ensureDownloadDirectoryExists() {
+        try {
+            Files.createDirectories(DOWNLOAD_DIR);
+        } catch (IOException e) {
+            log.error("Failed to create download directory", e);
+        }
+    }
+
+    private static void downloadOrUpdateDatabase(OkHttpClient okHttpClient) {
+        try {
+            String currentVersion = readVersionFile();
+            HttpUrl downloadUrl = buildDownloadUrl();
+
+            Request headRequest = new Request.Builder()
+                .url(downloadUrl)
+                .header("If-None-Match", currentVersion)
+                .head()
+                .build();
+
+            try (Response headResponse = okHttpClient.newCall(headRequest).execute()) {
+                if (headResponse.code() == 304) {
+                    return;
+                }
+
+                String remoteEtag = headResponse.header("ETag");
+                if (remoteEtag == null) {
+                    log.warn("No ETag header in remote response");
+                    return;
+                }
+
+                if (shouldDownload(remoteEtag, currentVersion)) {
+                    downloadDatabase(okHttpClient, downloadUrl, remoteEtag);
+                }
+            }
+        } catch (IOException e) {
+            log.error("Failed to download or update database", e);
+        }
+    }
+
+    private static boolean shouldDownload(String remoteEtag, String currentVersion) {
+        return !Files.exists(DATABASE_FILE) || !remoteEtag.equals(currentVersion);
+    }
+
+    private static void downloadDatabase(OkHttpClient client, HttpUrl url, String version) throws IOException {
+        log.info("Downloading new database version: {}", version);
+
+        Request request = new Request.Builder().url(url).build();
+
+        try (Response response = client.newCall(request).execute()) {
+            if (!response.isSuccessful() || response.body() == null) {
+                log.error("Failed to download database: {}", response.message());
+                return;
+            }
+
+            try (InputStream inputStream = response.body().byteStream()) {
+                Files.copy(inputStream, DATABASE_FILE, StandardCopyOption.REPLACE_EXISTING);
+                writeVersionFile(version);
+                log.info("Database updated successfully");
+            }
+        }
+    }
+
+    private static HttpUrl buildDownloadUrl() {
+        return RAW_GITHUB_DATABASE_URL.newBuilder()
+            .addPathSegment(DATABASE_FILENAME)
+            .build();
+    }
+
+    private static String readVersionFile() {
+        try {
+            if (Files.exists(VERSION_FILE)) {
+                return Files.readString(VERSION_FILE).trim();
+            }
+        } catch (IOException e) {
+            log.error("Failed to read version file", e);
+        }
+        return "";
+    }
+
+    private static void writeVersionFile(String version) {
+        try {
+            Files.writeString(VERSION_FILE, version,
+                StandardOpenOption.CREATE,
+                StandardOpenOption.WRITE,
+                StandardOpenOption.TRUNCATE_EXISTING);
+        } catch (IOException e) {
+            log.error("Failed to write version file", e);
+        }
+    }
+}
+
+package com.quest.voiceover.modules.database;
+
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Singleton;
+import java.io.FileNotFoundException;
+import java.sql.*;
+import java.util.HashSet;
+import java.util.Set;
+
+@Slf4j
+@Singleton
+public class DatabaseManager {
+
+    private static final String SQL_PATH_PREFIX = "jdbc:sqlite:";
+
+    private Connection connection;
+
+    public void initializeConnection() {
+        getConnection();
+    }
+
+    public void closeConnection() throws SQLException {
+        if (connection != null) {
+            connection.close();
+        }
+    }
+
+    public PreparedStatement prepareStatement(String query) throws SQLException {
+        return getConnection().prepareStatement(query);
+    }
+
+    public Set<String> getVoicedQuests() {
+        Set<String> voicedQuests = new HashSet<>();
+
+        try (PreparedStatement statement = prepareStatement("SELECT DISTINCT quest FROM dialogs");
+             ResultSet resultSet = statement.executeQuery()) {
+
+            while (resultSet.next()) {
+                voicedQuests.add(resultSet.getString("quest"));
+            }
+        } catch (SQLException e) {
+            log.error("Failed to query voiced quests", e);
+        }
+
+        return voicedQuests;
+    }
+
+    private Connection getConnection() {
+        if (connection != null) {
+            return connection;
+        }
+
+        try {
+            Class.forName("org.sqlite.JDBC");
+            String databasePath = DatabaseVersionManager.getDatabasePath();
+            connection = DriverManager.getConnection(SQL_PATH_PREFIX + databasePath);
+            log.info("Established connection to voiceover database");
+        } catch (FileNotFoundException e) {
+            log.error("Database file not found", e);
+        } catch (SQLException e) {
+            log.error("Failed to connect to database", e);
+        } catch (ClassNotFoundException e) {
+            log.error("SQLite JDBC driver not found", e);
+            throw new RuntimeException(e);
+        }
+
+        return connection;
+    }
+}
+
+package com.quest.voiceover.modules.audio;
+
+import com.quest.voiceover.QuestVoiceoverConfig;
+import jaco.mp3.player.MP3Player;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.eventbus.Subscribe;
+import okhttp3.HttpUrl;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.net.URL;
+
+@Slf4j
+@Singleton
+public class SoundEngine {
+
+    private static final HttpUrl RAW_GITHUB_SOUND_BRANCH_URL =
+        HttpUrl.parse("https://github.com/KevinEdry/runelite-quest-voiceover/raw/sounds");
+    private static final int PLAYBACK_GRACE_PERIOD_TICKS = 1;
+
+    @Inject
+    private QuestVoiceoverConfig config;
+
+    @Inject
+    private Client client;
+
+    private volatile MP3Player player;
+    private volatile boolean soundPlaying;
+    private int playbackStartTick;
+
+    public void play(String fileName) {
+        stopPlayback();
+
+        URL soundUrl = buildSoundUrl(fileName);
+        MP3Player currentPlayer = getOrCreatePlayer();
+
+        currentPlayer.setVolume(config.mute() ? 0 : config.volume());
+        currentPlayer.add(soundUrl);
+        currentPlayer.play();
+
+        soundPlaying = true;
+        playbackStartTick = client.getTickCount();
+    }
+
+    public void stop() {
+        boolean pastGracePeriod = client.getTickCount() > playbackStartTick + PLAYBACK_GRACE_PERIOD_TICKS;
+        if (pastGracePeriod) {
+            stopPlayback();
+        }
+    }
+
+    public void setVolume(int volume) {
+        getOrCreatePlayer().setVolume(volume);
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick event) {
+        if (player != null && player.isStopped() && soundPlaying) {
+            soundPlaying = false;
+        }
+    }
+
+    private void stopPlayback() {
+        if (player == null) {
+            return;
+        }
+
+        soundPlaying = false;
+        player.clearPlayList();
+
+        if (player.isPlaying()) {
+            player.stop();
+        }
+    }
+
+    private URL buildSoundUrl(String fileName) {
+        return RAW_GITHUB_SOUND_BRANCH_URL.newBuilder()
+            .addPathSegment(fileName)
+            .build()
+            .url();
+    }
+
+    private MP3Player getOrCreatePlayer() {
+        if (player == null) {
+            synchronized (this) {
+                if (player == null) {
+                    player = new MP3Player();
+                }
+            }
+        }
+        return player;
+    }
+}
+
+package com.quest.voiceover.modules.dialog;
+
+import com.quest.voiceover.QuestVoiceoverConfig;
+import com.quest.voiceover.modules.audio.SoundEngine;
+import net.runelite.api.Client;
+import net.runelite.api.SpriteID;
+import net.runelite.api.widgets.*;
+import net.runelite.client.config.ConfigManager;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Singleton
+public class DialogManager {
+
+    private static final String TOGGLE_MUTE_ACTION = "Toggle mute ";
+    private static final String PLUGIN_CONFIG_GROUP = "quest.voiceover";
+    private static final int FONT_ID = 494;
+    private static final int TEXT_COLOR_WHITE = 0xFFFFFF;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private QuestVoiceoverConfig config;
+
+    @Inject
+    private ConfigManager configManager;
+
+    @Inject
+    private SoundEngine soundEngine;
+
+    public boolean isPlayerOrNpcDialogOpen() {
+        return getPlayerDialogWidget() != null || getNpcDialogWidget() != null;
+    }
+
+    public Widget getActiveDialogWidget() {
+        if (!isPlayerOrNpcDialogOpen()) {
+            return null;
+        }
+
+        Widget playerWidget = getPlayerDialogWidget();
+        return playerWidget != null ? playerWidget : getNpcDialogWidget();
+    }
+
+    public void addQuestNameLabel(Widget dialogWidget, String questName) {
+        Widget label = dialogWidget.createChild(-1, WidgetType.TEXT);
+
+        label.setText("Quest: " + questName);
+        label.setFontId(FONT_ID);
+        label.setTextColor(TEXT_COLOR_WHITE);
+        label.setTextShadowed(true);
+        label.setXPositionMode(WidgetPositionMode.ABSOLUTE_LEFT);
+        label.setOriginalX(10);
+        label.setOriginalY(5);
+        label.setOriginalHeight(20);
+        label.setOriginalWidth(200);
+        label.revalidate();
+    }
+
+    public void addMuteButton(Widget dialogWidget) {
+        Widget muteButton = dialogWidget.createChild(-1, WidgetType.GRAPHIC);
+
+        muteButton.setSpriteId(getMuteSpriteId());
+        muteButton.setOriginalWidth(32);
+        muteButton.setOriginalHeight(32);
+        muteButton.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT);
+        muteButton.setOriginalX(5);
+        muteButton.setOriginalY(5);
+        muteButton.setHasListener(true);
+        muteButton.setAction(1, TOGGLE_MUTE_ACTION);
+        muteButton.setOnOpListener((JavaScriptCallback) e -> toggleMute(muteButton));
+        muteButton.revalidate();
+    }
+
+    private Widget getPlayerDialogWidget() {
+        return client.getWidget(InterfaceID.DIALOG_PLAYER, 0);
+    }
+
+    private Widget getNpcDialogWidget() {
+        return client.getWidget(InterfaceID.DIALOG_NPC, 0);
+    }
+
+    private void toggleMute(Widget muteButton) {
+        configManager.setConfiguration(PLUGIN_CONFIG_GROUP, "mute", !config.mute());
+        soundEngine.setVolume(config.mute() ? 0 : config.volume());
+        muteButton.setSpriteId(getMuteSpriteId());
+        muteButton.revalidate();
+    }
+
+    private int getMuteSpriteId() {
+        return config.mute() ? SpriteID.OPTIONS_MUSIC_DISABLED : SpriteID.OPTIONS_MUSIC_VOLUME;
+    }
+}
+
 package com.quest.voiceover;
 
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
+import com.google.inject.Provides;
+import com.quest.voiceover.features.QuestListIndicatorHandler;
+import com.quest.voiceover.features.VoiceoverHandler;
+import com.quest.voiceover.modules.audio.SoundEngine;
+import com.quest.voiceover.modules.database.DatabaseManager;
+import com.quest.voiceover.modules.database.DatabaseVersionManager;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.events.*;
+import net.runelite.api.widgets.InterfaceID;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import okhttp3.OkHttpClient;
 
-public class QuestVoiceoverPluginTest
-{
-	public static void main(String[] args) throws Exception
-	{
-		ExternalPluginManager.loadBuiltin(QuestVoiceoverPlugin.class);
-		RuneLite.main(args);
-	}
+import javax.inject.Inject;
+import java.util.concurrent.ScheduledExecutorService;
+
+@Slf4j
+@PluginDescriptor(name = "Quest Voiceover")
+public class QuestVoiceoverPlugin extends Plugin {
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private EventBus eventBus;
+
+    @Inject
+    private OkHttpClient okHttpClient;
+
+    @Inject
+    private ScheduledExecutorService executor;
+
+    @Inject
+    private DatabaseManager databaseManager;
+
+    @Inject
+    private SoundEngine soundEngine;
+
+    @Inject
+    private VoiceoverHandler voiceoverHandler;
+
+    @Inject
+    private QuestListIndicatorHandler questListIndicatorHandler;
+
+    private String playerName;
+
+    @Override
+    protected void startUp() {
+        eventBus.register(soundEngine);
+        executor.submit(this::initializeDatabase);
+        log.info("Quest Voiceover plugin started");
+    }
+
+    @Override
+    protected void shutDown() throws Exception {
+        eventBus.unregister(soundEngine);
+        databaseManager.closeConnection();
+        log.info("Quest Voiceover plugin stopped");
+    }
+
+    @Subscribe
+    public void onChatMessage(ChatMessage event) {
+        if (event.getType() != ChatMessageType.DIALOG) {
+            return;
+        }
+
+        initializePlayerNameIfNeeded();
+        voiceoverHandler.handleDialogMessage(event.getMessage(), playerName);
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked event) {
+        if (event.getMenuOption().equals("Continue")) {
+            voiceoverHandler.stopVoiceover();
+        }
+    }
+
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded event) {
+        if (isDialogWidget(event.getGroupId())) {
+            voiceoverHandler.handleDialogOpened();
+        }
+
+        if (event.getGroupId() == InterfaceID.QUEST_LIST) {
+            questListIndicatorHandler.onQuestListOpened();
+        }
+    }
+
+    @Subscribe
+    public void onWidgetClosed(WidgetClosed event) {
+        if (isDialogWidget(event.getGroupId())) {
+            voiceoverHandler.stopVoiceover();
+        }
+
+        if (event.getGroupId() == InterfaceID.QUEST_LIST) {
+            questListIndicatorHandler.onQuestListClosed();
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick event) {
+        questListIndicatorHandler.onGameTick();
+    }
+
+    @Provides
+    QuestVoiceoverConfig provideConfig(ConfigManager configManager) {
+        return configManager.getConfig(QuestVoiceoverConfig.class);
+    }
+
+    private void initializeDatabase() {
+        DatabaseVersionManager.prepareDatabaseSource(okHttpClient);
+        databaseManager.initializeConnection();
+        questListIndicatorHandler.setVoicedQuests(databaseManager.getVoicedQuests());
+        log.info("Database initialized");
+    }
+
+    private void initializePlayerNameIfNeeded() {
+        if (playerName == null) {
+            playerName = client.getLocalPlayer().getName();
+        }
+    }
+
+    private boolean isDialogWidget(int groupId) {
+        return groupId == InterfaceID.DIALOG_NPC
+            || groupId == InterfaceID.DIALOG_PLAYER
+            || groupId == InterfaceID.DIALOG_OPTION;
+    }
 }
+
+package com.quest.voiceover.utility;
+
+public class MessageParser {
+
+    private static final String PLAYER_NAME_PLACEHOLDER = "Player";
+
+    private final String characterName;
+    private final String dialogText;
+    private final String messageId;
+
+    public MessageParser(String rawMessage, String playerName) {
+        String[] parts = rawMessage.split("\\|", 2);
+
+        this.characterName = normalizeCharacterName(parts[0], playerName);
+        this.dialogText = parts[1].trim();
+        this.messageId = HashUtil.toMD5(this.characterName + "|" + this.dialogText);
+    }
+
+    public String getCharacterName() {
+        return characterName;
+    }
+
+    public String getDialogText() {
+        return dialogText;
+    }
+
+    public String getMessageId() {
+        return messageId;
+    }
+
+    private String normalizeCharacterName(String name, String playerName) {
+        return name.equals(playerName) ? PLAYER_NAME_PLACEHOLDER : name;
+    }
+}
+
+package com.quest.voiceover.utility;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+
+public class HashUtil {
+
+    public static String toMD5(String input) {
+        return hash(input, "MD5");
+    }
+
+    public static String toSHA256(String input) {
+        return hash(input, "SHA-256");
+    }
+
+    private static String hash(String input, String algorithm) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance(algorithm);
+            byte[] hashBytes = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            return bytesToHex(hashBytes);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("Hash algorithm not available: " + algorithm, e);
+        }
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder(2 * bytes.length);
+        for (byte b : bytes) {
+            hexString.append(String.format("%02x", b));
+        }
+        return hexString.toString();
+    }
+}
+
 package com.quest.voiceover;
 
 import net.runelite.client.config.*;
@@ -52,594 +900,30 @@ public interface QuestVoiceoverConfig extends Config
 	{
 		return false;
 	}
-}
 
-package com.quest.voiceover;
-
-import lombok.Getter;
-import lombok.Setter;
-import net.runelite.api.Client;
-import net.runelite.api.SpriteID;
-import net.runelite.api.widgets.*;
-import net.runelite.client.config.ConfigManager;
-
-import javax.inject.Inject;
-
-public class DialogEngine {
-    @Inject
-    private Client client;
-
-    @Inject
-    private QuestVoiceoverConfig config;
-
-    @Inject
-    private ConfigManager configManager;
-
-    @Inject
-    private SoundEngine soundEngine;
-
-    private static final String TOGGLE_MUTE = "Toggle mute ";
-    private static final String PLUGIN_GROUP = "quest.voiceover";
-
-    public boolean isDialogOpen()
-    {
-        return client.getWidget(InterfaceID.DIALOG_NPC, 0) != null ||
-                client.getWidget(InterfaceID.DIALOG_PLAYER, 0) != null ||
-                client.getWidget(InterfaceID.DIALOG_OPTION, 0) != null;
-    }
-
-    public boolean isPlayerOrNpcDialogOpen()
-    {
-        return client.getWidget(InterfaceID.DIALOG_NPC, 0) != null ||
-                client.getWidget(InterfaceID.DIALOG_PLAYER, 0) != null;
-    }
-
-    public void addQuestNameText(Widget widget, String questName) {
-        Widget questNameText = widget.createChild(-1, WidgetType.TEXT);
-
-        questNameText.setText("Quest: " + questName);
-        questNameText.setFontId(494);
-        questNameText.setTextColor(0xFFFFFF);
-        questNameText.setTextShadowed(true);
-        questNameText.setXPositionMode(WidgetPositionMode.ABSOLUTE_LEFT);
-        questNameText.setOriginalX(10);
-        questNameText.setOriginalY(5);
-        questNameText.setOriginalHeight(20);
-        questNameText.setOriginalWidth(200);
-        questNameText.revalidate();
-    }
-
-    public void addMuteButton(Widget widget) {
-        Widget muteButton = widget.createChild(-1, WidgetType.GRAPHIC);
-        int musicSprite = config.mute() ? SpriteID.OPTIONS_MUSIC_DISABLED : SpriteID.OPTIONS_MUSIC_VOLUME;
-
-        muteButton.setSpriteId(musicSprite);
-        muteButton.setOriginalWidth(32);
-        muteButton.setOriginalHeight(32);
-        muteButton.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT);
-        muteButton.setOriginalX(5);
-        muteButton.setOriginalY(5);
-        muteButton.setHasListener(true);
-        muteButton.setAction(1, TOGGLE_MUTE);
-        muteButton.setOnOpListener((JavaScriptCallback) e -> this.toggleMute(muteButton));
-        muteButton.revalidate();
-    }
-
-    public Widget getPlayerOrNpcWidget() {
-        if(!isPlayerOrNpcDialogOpen()){
-            return null;
-        }
-        Widget playerWidget = client.getWidget(InterfaceID.DIALOG_PLAYER, 0);
-        Widget npcWidget = client.getWidget(InterfaceID.DIALOG_NPC, 0);
-        return playerWidget != null ? playerWidget : npcWidget;
-    }
-
-    private void toggleMute(Widget muteButton)
-    {
-        configManager.setConfiguration(PLUGIN_GROUP, "mute", !config.mute());
-        soundEngine.setVolume(config.mute() ? 0 : config.volume());
-        int musicSprite = config.mute() ? SpriteID.OPTIONS_MUSIC_DISABLED : SpriteID.OPTIONS_MUSIC_VOLUME;
-        muteButton.setSpriteId(musicSprite);
-        muteButton.revalidate();
-    }
-
-}
-
-package com.quest.voiceover;
-
-import javax.inject.Inject;
-
-public class MessageUtils {
-
-    private static final String PLAYER = "Player";
-
-    @Inject
-    private HashUtil hashUtil;
-
-    String name;
-    String text;
-    String id;
-
-    public MessageUtils(String message, String playerName) {
-        String[] messageArray = message.split("\\|", 2);
-        this.name = messageArray[0].equals(playerName) ? PLAYER : messageArray[0];
-        this.text = messageArray[1].trim();
-        this.id = HashUtil.convertToMD5(this.name + "|" + this.text);
-    }
-}
-
-package com.quest.voiceover;
-
-import com.google.inject.Provides;
-import javax.inject.Inject;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.plugins.PluginDescriptor;
-
-import com.quest.voiceover.database.*;
-import net.runelite.api.*;
-import net.runelite.api.events.*;
-import net.runelite.api.widgets.InterfaceID;
-import net.runelite.api.widgets.Widget;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.eventbus.EventBus;
-import okhttp3.OkHttpClient;
-
-import java.sql.PreparedStatement;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.util.concurrent.ScheduledExecutorService;
-
-@Slf4j
-@PluginDescriptor(
-	name = "Quest Voiceover"
-)
-public class QuestVoiceoverPlugin extends Plugin
-{
-	@Inject
-	private Client client;
-
-	@Inject
-	private DatabaseManager databaseManager;
-
-	@Inject
-	private EventBus eventBus;
-
-	@Inject
-	private SoundEngine soundEngine;
-
-	@Inject
-	private DialogEngine dialogEngine;
-
-	@Inject
-	private OkHttpClient okHttpClient;
-
-	@Inject
-	private ScheduledExecutorService executor;
-
-	private String playerName = null;
-	private Boolean isQuestDialog = false;
-	private String questName = null;
-
-	@Override
-	protected void startUp() throws Exception
+	@ConfigItem(
+			keyName = "showVoicedIndicator",
+			name = "Show [Voiced] Indicator",
+			description = "Shows [Voiced] prefix next to quests with voice acting in the quest list.",
+			section = generalSettings,
+			position = 23
+	)
+	default boolean showVoicedIndicator()
 	{
-		eventBus.register(soundEngine);
-		log.info("Quest Voiceover plugin started!");
-
-		executor.submit(() -> {
-			DatabaseVersionManager.prepareDatabaseSource(okHttpClient);
-			this.databaseManager.initializeConnection();
-		});
-	}
-
-	@Override
-	protected void shutDown() throws Exception
-	{
-		eventBus.unregister(soundEngine);
-		log.info("Quest Voiceover plugin stopped!");
-
-		databaseManager.closeConnection();
-	}
-
-	@Subscribe
-	public void onChatMessage(ChatMessage chatMessage) {
-		if (chatMessage.getType().equals(ChatMessageType.DIALOG)) {
-			if (this.playerName == null) {
-				this.playerName = this.client.getLocalPlayer().getName();
-			}
-
-			MessageUtils message = new MessageUtils(chatMessage.getMessage(), this.playerName);
-
-			try (PreparedStatement statement = databaseManager.prepareStatement("SELECT quest, uri FROM dialogs WHERE character = ? AND text MATCH ?")) {
-				statement.setString(1, message.name.replace("'", "''"));
-				statement.setString(2, message.text.replace("'", "''"));
-
-				try (ResultSet resultSet = statement.executeQuery()) {
-					if (resultSet.next()) {
-						String fileName = resultSet.getString("uri");
-						String questName = resultSet.getString("quest");
-
-						this.questName = questName;
-
-						if (fileName != null || questName != null) {
-							isQuestDialog = true;
-							soundEngine.play(fileName);
-							return;
-						}
-					}
-				}
-				isQuestDialog = false;
-			} catch (SQLException e) {
-				log.error("Encountered an SQL error", e);
-			}
-		}
-	}
-
-	@Subscribe
-	public void onMenuOptionClicked(MenuOptionClicked event)
-	{
-		if (event.getMenuOption().equals("Continue"))
-		{
-			soundEngine.stop();
-		}
-	}
-
-	@Subscribe
-	public void onWidgetLoaded(WidgetLoaded widgetLoaded)
-	{
-		// Check if the loaded widget is the dialog widget
-		if (widgetLoaded.getGroupId() == InterfaceID.DIALOG_NPC || widgetLoaded.getGroupId() == InterfaceID.DIALOG_PLAYER || widgetLoaded.getGroupId() == InterfaceID.DIALOG_OPTION)
-		{
-			if(dialogEngine.isPlayerOrNpcDialogOpen() && isQuestDialog) {
-				Widget dialogWidget = dialogEngine.getPlayerOrNpcWidget();
-				dialogEngine.addMuteButton(dialogWidget);
-				if(questName != null) {
-					dialogEngine.addQuestNameText(dialogWidget, this.questName);
-				}
-			}
-		}
-	}
-
-	@Subscribe
-	public void onWidgetClosed(WidgetClosed widgetClosed)
-	{
-		if (widgetClosed.getGroupId() == InterfaceID.DIALOG_NPC ||
-				widgetClosed.getGroupId() == InterfaceID.DIALOG_PLAYER ||
-				widgetClosed.getGroupId() == InterfaceID.DIALOG_OPTION)
-		{
-			soundEngine.stop();
-		}
-	}
-
-	@Provides
-	QuestVoiceoverConfig provideConfig(ConfigManager configManager)
-	{
-		return configManager.getConfig(QuestVoiceoverConfig.class);
+		return true;
 	}
 }
 
 package com.quest.voiceover;
 
-import jaco.mp3.player.MP3Player;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.api.events.GameTick;
-import net.runelite.client.eventbus.Subscribe;
-
-import okhttp3.HttpUrl;
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.net.URL;
-import java.time.Instant;
-import java.time.Duration;
-
-@Slf4j
-@Singleton
-public class SoundEngine {
-
-    @Inject
-    private QuestVoiceoverConfig config;
-
-    @Inject
-    private Client client;
-
-    private volatile MP3Player player;
-    private volatile boolean soundPlaying = false;
-    private int playbackStartTime = 0;
-    private static final int PLAYBACK_GRACE_PERIOD = 1; // Adjust as needed
-    public static final HttpUrl RAW_GITHUB_SOUND_BRANCH_URL = HttpUrl.parse("https://github.com/KevinEdry/runelite-quest-voiceover/raw/sounds");
-
-    public void play(String fileName) {
-        stopPlayback();
-        MP3Player player = getPlayer();
-
-        assert RAW_GITHUB_SOUND_BRANCH_URL != null;
-        HttpUrl httpUrl = RAW_GITHUB_SOUND_BRANCH_URL.newBuilder().addPathSegment(fileName).build();
-        URL soundUrl = httpUrl.url();
-
-        player.setVolume(config.mute() ? 0 : config.volume());
-        player.addToPlayList(soundUrl);
-
-        player.play();
-        soundPlaying = true;
-        playbackStartTime = client.getTickCount();
-    }
-
-    public void stop() {
-        if (client.getTickCount() > playbackStartTime + PLAYBACK_GRACE_PERIOD ) {
-            stopPlayback();
-        }
-    }
-
-    private void stopPlayback() {
-        if( player != null && !player.getPlayList().isEmpty() && player.isPlaying() ) {
-            soundPlaying = false;
-            player.getPlayList().clear();
-            player.stop();
-        }
-    }
-
-    public void setVolume(int volume) {
-        getPlayer().setVolume(volume);
-    }
-
-    public boolean isSoundPlaying() {
-        return player != null && player.isPlaying();
-    }
-
-    private MP3Player getPlayer() {
-        MP3Player player = this.player;
-        if (player == null) {
-            synchronized (this) {
-                player = this.player;
-                if (player == null) {
-                    player = this.player = new MP3Player();
-                }
-            }
-        }
-        return player;
-    }
-
-    @Subscribe
-    private void onGameTick(GameTick event)
-    {
-        if(this.player != null && this.player.isStopped() && soundPlaying) {
-            // Detects when a sound have stopped playing.
-            soundPlaying = false;
-        }
-    }
-}
-package com.quest.voiceover.database;
-
-import lombok.extern.slf4j.Slf4j;
-import javax.inject.Singleton;
-
-import java.io.FileNotFoundException;
-import java.sql.Connection;
-import java.sql.PreparedStatement;
-import java.sql.SQLException;
-import java.sql.DriverManager;
-
-@Slf4j
-@Singleton
-public class DatabaseManager {
-
-    private static final String SQL_PATH_PREFIX = "jdbc:sqlite:";
-    private Connection connection;
-
-    public PreparedStatement prepareStatement(String query) throws SQLException {
-        return getDatabaseConnection().prepareStatement(query);
-    }
-
-    public void closeConnection() throws SQLException {
-        connection.close();
-    }
-
-    public void initializeConnection(){
-        getDatabaseConnection();
-    }
-
-    private Connection getDatabaseConnection() {
-        if (connection == null) {
-            try {
-                Class.forName("org.sqlite.JDBC");
-                String databaseSourceUrl = DatabaseVersionManager.getDatabasePath();
-                connection = DriverManager.getConnection(SQL_PATH_PREFIX + databaseSourceUrl);
-                log.info("Quest Voiceover plugin established connection to database.");
-            } catch (FileNotFoundException e) {
-                log.error("Could not get database source path.", e);
-            } catch (SQLException e) {
-                log.error("Could not connect to database.", e);
-            } catch (ClassNotFoundException e) {
-                log.error("Could not load database driver.", e);
-                throw new RuntimeException(e);
-            }
-        }
-        return connection;
-    }
-}
-
-package com.quest.voiceover.database;
-
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
-import okhttp3.HttpUrl;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
+import net.runelite.client.externalplugins.ExternalPluginManager;
 
-import java.io.*;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.StandardCopyOption;
-import java.nio.file.StandardOpenOption;
-
-@Slf4j
-public class DatabaseVersionManager {
-
-    private static final String resourceName = "quest_voiceover.db";
-
-    private static final HttpUrl RAW_GITHUB_DATABASE_BRANCH_URL = HttpUrl.parse("https://github.com/KevinEdry/runelite-quest-voiceover/raw/database");
-    private static final Path DOWNLOAD_DIR = Path.of(RuneLite.RUNELITE_DIR.getPath(), "quest-voiceover");
-
-    private static final String VERSION_FILENAME = ".version";
-
-    private static final Path VERSION_FILE = DOWNLOAD_DIR.resolve(VERSION_FILENAME);
-
-    public static Path getResourcePath() {
-        return DOWNLOAD_DIR.resolve(resourceName);
-    }
-
-    private static HttpUrl getResourceDownloadUrl() {
-        assert RAW_GITHUB_DATABASE_BRANCH_URL != null;
-        return RAW_GITHUB_DATABASE_BRANCH_URL.newBuilder().addPathSegment(resourceName).build();
-    }
-
-    private static void setResourceVersion(String version) {
-        try {
-            Files.createDirectories(VERSION_FILE.getParent());
-
-            Files.writeString(VERSION_FILE, version,
-                    StandardOpenOption.CREATE,
-                    StandardOpenOption.WRITE,
-                    StandardOpenOption.TRUNCATE_EXISTING);
-
-        } catch (IOException e) {
-            log.error("Failed to save database version.", e);
-        }
-    }
-
-    public static void prepareDatabaseSource(OkHttpClient okHttpClient) {
-        ensureDownloadDirectoryExists();
-        downloadOrUpdateDatabase(okHttpClient);
-    }
-
-    private static String getDatabaseVersion() {
-        try {
-            if (Files.exists(VERSION_FILE)) {
-                return Files.readString(VERSION_FILE).trim();
-            }
-        } catch (IOException e) {
-            log.error("Failed to load database version.", e);
-        }
-        return "";
-    }
-
-    private static void updateDatabaseSource(InputStream data, String version) throws IOException {
-        Path databasePath = getResourcePath();
-        Files.copy(data, databasePath, StandardCopyOption.REPLACE_EXISTING);
-        setResourceVersion(version);
-    }
-
-    public static String getDatabasePath() throws FileNotFoundException {
-        Path databasePath = getResourcePath();
-        if (!Files.exists(databasePath)) {
-            throw new FileNotFoundException("Database file not found: " + databasePath);
-        }
-        return databasePath.toString();
-    }
-
-    private static void ensureDownloadDirectoryExists() {
-        try {
-            Files.createDirectories(getResourcePath().getParent());
-        } catch (IOException e) {
-            log.error("Could not create download directory", e);
-        }
-    }
-
-    /**
-     * We perform a HEAD request with the `If-None-Match` header to check if the etag has changed and the version with it.
-     * If not, we get a `304 - Not Modified` response from the remote resource
-     * If it did, we perform a GET request to get the actual data and persistently save the etag and the database on the local machine.
-     */
-    private static void downloadOrUpdateDatabase(OkHttpClient okHttpClient) {
-        try {
-            String resourceVersion = getDatabaseVersion();
-            Request headRequest = new Request.Builder()
-                    .url(getResourceDownloadUrl())
-                    .header("If-None-Match", resourceVersion)
-                    .head()
-                    .build();
-
-            try (Response headResponse = okHttpClient.newCall(headRequest).execute()) {
-                if (headResponse.code() == 304) {
-                    return;
-                }
-
-                String remoteEtag = headResponse.header("ETag");
-                if (remoteEtag == null) {
-                    log.warn("No ETag header is present in the remote response. {}", headResponse);
-                    return;
-                }
-
-                if (!Files.exists(getResourcePath()) || !remoteEtag.equals(resourceVersion)) {
-                    log.info("New database version found in remote: {}", remoteEtag);
-
-                    // Perform GET request to download the file
-                    Request getRequest = new Request.Builder().url(getResourceDownloadUrl()).build();
-                    try (Response getResponse = okHttpClient.newCall(getRequest).execute()) {
-                        if (!getResponse.isSuccessful()) {
-                            log.error("Failed to download database: {}", getResponse.message());
-                            return;
-                        }
-
-                        assert getResponse.body() != null;
-                        try (InputStream in = getResponse.body().byteStream()) {
-                            updateDatabaseSource(in, remoteEtag);
-                        }
-
-                        log.info("Database updated successfully!");
-                    }
-                }
-            }
-        } catch (IOException e) {
-            log.error("Quest Voiceover plugin could not download or update database: {}", resourceName, e);
-        } catch (NullPointerException e) {
-            log.error("Null pointer exception occurred while downloading or updating database", e);
-        }
-    }
+public class QuestVoiceoverPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(QuestVoiceoverPlugin.class);
+		RuneLite.main(args);
+	}
 }
-package com.quest.voiceover;
-
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
-
-public class HashUtil {
-    public static String convertToMD5(String input) {
-        try {
-            MessageDigest md = MessageDigest.getInstance("MD5");
-            byte[] messageDigest = md.digest(input.getBytes());
-            StringBuilder hexString = new StringBuilder();
-            for (byte b : messageDigest) {
-                hexString.append(String.format("%02x", b));
-            }
-             return hexString.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
-        }
-    }
-
-    public static String convertToSHA(String message) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance("SHA-256");
-            byte[] hash = digest.digest(message.getBytes(StandardCharsets.UTF_8));
-            StringBuilder hexString = new StringBuilder(2 * hash.length);
-            for (byte b : hash) {
-                String hex = Integer.toHexString(0xff & b);
-                if (hex.length() == 1) {
-                    hexString.append('0');
-                }
-                hexString.append(hex);
-            }
-            return hexString.toString();
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException(e);
-        }
-    }
-}
-
