@@ -52,6 +52,7 @@ import net.runelite.client.util.QuantityFormatter;
 public class ItemLinkOverlay extends Overlay
 {
 	private static final int MAX_CACHED_ITEMS = 50;
+	private static final int MOUSE_MOVE_THRESHOLD = 2; // Minimum pixels to trigger re-scan
 
 	// Pattern to detect colored item names in chat: <col=XXXXXX>[ItemName]</col> or <col=XXXXXX>[ItemName x123]</col>
 	private static final Pattern COLORED_ITEM_PATTERN = Pattern.compile("<col=[0-9a-fA-F]+>\\[([^\\]]+?)(?:\\s+x(\\d+))?\\]</col>");
@@ -71,6 +72,14 @@ public class ItemLinkOverlay extends Overlay
 	private static final String COLOR_GOLD = "ffd700";
 	private static final String COLOR_ALCH = "ff9040";
 	private static final String COLOR_SEPARATOR = "444444";
+
+	// Mouse position caching to avoid re-scanning every frame
+	private int lastMouseX = -1;
+	private int lastMouseY = -1;
+	private Widget cachedHoveredWidget = null;
+	private String cachedWidgetText = null;
+	private List<ItemLinkInfo> cachedFoundItems = null;
+	private String cachedTooltipText = null;
 
 	// Cache of item info by item ID
 	private final Map<Integer, ItemLinkInfo> recentItems = new LinkedHashMap<Integer, ItemLinkInfo>()
@@ -125,18 +134,61 @@ public class ItemLinkOverlay extends Overlay
 			return null;
 		}
 
-		// Check multiple possible chat widgets
+		int mouseX = mousePos.getX();
+		int mouseY = mousePos.getY();
+
+		// Check if mouse has moved significantly
+		boolean mouseMovedSignificantly = Math.abs(mouseX - lastMouseX) > MOUSE_MOVE_THRESHOLD ||
+										  Math.abs(mouseY - lastMouseY) > MOUSE_MOVE_THRESHOLD;
+
+		// Fast path: if mouse hasn't moved and we have a cached tooltip, just show it
+		if (!mouseMovedSignificantly && cachedTooltipText != null)
+		{
+			// Quick bounds check on cached widget
+			if (cachedHoveredWidget != null)
+			{
+				Rectangle bounds = cachedHoveredWidget.getBounds();
+				if (bounds != null && bounds.contains(mouseX, mouseY))
+				{
+					tooltipManager.add(new Tooltip(cachedTooltipText));
+					return null;
+				}
+			}
+			// Bounds check failed, clear cache
+			clearTooltipCache();
+			return null;
+		}
+
+		// Mouse moved - update position
+		lastMouseX = mouseX;
+		lastMouseY = mouseY;
+
+		// Find hovered widget
 		Widget hoveredChatLine = findHoveredChatLine(mousePos);
 		if (hoveredChatLine == null)
 		{
+			clearTooltipCache();
 			return null;
 		}
 
 		String text = hoveredChatLine.getText();
 		if (text == null || !text.contains("<col="))
 		{
+			clearTooltipCache();
 			return null;
 		}
+
+		// Check if text changed - if not, reuse cached tooltip
+		if (text.equals(cachedWidgetText) && cachedTooltipText != null)
+		{
+			cachedHoveredWidget = hoveredChatLine;
+			tooltipManager.add(new Tooltip(cachedTooltipText));
+			return null;
+		}
+
+		// Text changed, need to rebuild tooltip
+		cachedHoveredWidget = hoveredChatLine;
+		cachedWidgetText = text;
 
 		// Find colored item names in the text
 		List<ItemLinkInfo> foundItems = new ArrayList<>();
@@ -148,161 +200,102 @@ public class ItemLinkOverlay extends Overlay
 			String quantityStr = matcher.group(2);
 			int quantity = quantityStr != null ? Integer.parseInt(quantityStr) : 1;
 
-			// Lookup using lowercase for case-insensitive matching
 			ItemLinkInfo info = itemsByName.get(itemName.toLowerCase());
 			if (info != null)
 			{
-				// Create copy with the correct quantity from this specific link
 				foundItems.add(copyWithQuantity(info, quantity));
 			}
 		}
 
 		if (!foundItems.isEmpty())
 		{
-			showItemsTooltipFromList(foundItems);
+			cachedFoundItems = foundItems;
+			cachedTooltipText = buildTooltipText(foundItems);
+			tooltipManager.add(new Tooltip(cachedTooltipText));
+		}
+		else
+		{
+			clearTooltipCache();
 		}
 
 		return null;
+	}
+
+	private void clearTooltipCache()
+	{
+		cachedHoveredWidget = null;
+		cachedWidgetText = null;
+		cachedFoundItems = null;
+		cachedTooltipText = null;
 	}
 
 	/**
 	 * Find the chat line widget the mouse is hovering over.
+	 * Optimized to check bounds FIRST before running expensive regex.
 	 */
 	private Widget findHoveredChatLine(Point mousePos)
 	{
-		Widget found;
+		int mx = mousePos.getX();
+		int my = mousePos.getY();
 
-		// CHATBOX group is 162
-		// Chat lines are individual widgets: LINE0 starts at child 58 (0x3a), goes up to LINE46+ at child 104+
-		// SCROLLAREA is child 57 (0x39) - contains the chat lines for opaque chatbox
-		// CHATDISPLAY is child 55 (0x37) - for transparent chatbox
-
-		// First, directly check individual chat line widgets (most reliable)
-		// LINE0 = child 58, LINE1 = child 59, etc.
+		// Check chat line widgets (162, 58-149) - bounds first
 		for (int lineId = 58; lineId < 150; lineId++)
 		{
 			Widget lineWidget = client.getWidget(162, lineId);
-			if (lineWidget == null)
-			{
-				continue;
-			}
-
-			String text = lineWidget.getText();
-			// Must check for actual item link pattern: <col=XXXXXX>[ItemName]</col>
-			// Not just any [bracket] with color (like friends chat channel names)
-			if (text != null && COLORED_ITEM_PATTERN.matcher(text).find())
-			{
-				Rectangle bounds = lineWidget.getBounds();
-				if (bounds != null && bounds.contains(mousePos.getX(), mousePos.getY()))
-				{
-					return lineWidget;
-				}
-			}
-
-			// Also check dynamic children of each line widget
-			Widget[] children = lineWidget.getDynamicChildren();
-			if (children != null)
-			{
-				for (Widget child : children)
-				{
-					if (child == null) continue;
-					String childText = child.getText();
-					if (childText != null && COLORED_ITEM_PATTERN.matcher(childText).find())
-					{
-						Rectangle childBounds = child.getBounds();
-						if (childBounds != null && childBounds.contains(mousePos.getX(), mousePos.getY()))
-						{
-							return child;
-						}
-					}
-				}
-			}
+			Widget found = checkWidgetForItemLink(lineWidget, mx, my);
+			if (found != null) return found;
 		}
 
-		// Try the SCROLLAREA (child 57) and its children
+		// Try scroll area children (162, 57)
 		Widget scrollArea = client.getWidget(162, 57);
-		if (scrollArea != null)
+		if (scrollArea != null && !scrollArea.isHidden())
 		{
-			found = checkWidgetChildren(scrollArea, mousePos);
+			Widget found = checkChildrenForItemLink(scrollArea, mx, my);
 			if (found != null) return found;
 		}
 
-		// Try the CHATDISPLAY (child 55) for transparent chatbox
+		// Try chat display for transparent chatbox (162, 55)
 		Widget chatDisplay = client.getWidget(162, 55);
-		if (chatDisplay != null)
+		if (chatDisplay != null && !chatDisplay.isHidden())
 		{
-			found = checkWidgetChildren(chatDisplay, mousePos);
+			Widget found = checkChildrenForItemLink(chatDisplay, mx, my);
 			if (found != null) return found;
-		}
-
-		// Last resort: search all children of chatbox groups
-		int[] chatGroups = {162, 163, 7};
-		for (int groupId : chatGroups)
-		{
-			for (int childId = 0; childId < 200; childId++)
-			{
-				Widget widget = client.getWidget(groupId, childId);
-				if (widget == null)
-				{
-					continue;
-				}
-
-				found = recursiveWidgetSearch(widget, mousePos, true);
-				if (found != null) return found;
-			}
 		}
 
 		return null;
 	}
 
 	/**
-	 * Recursively search widget and its children for hover.
+	 * Check if a widget contains an item link and mouse is over it.
+	 * Returns the widget if found, null otherwise.
 	 */
-	private Widget recursiveWidgetSearch(Widget widget, Point mousePos, boolean searchAllChildren)
+	private Widget checkWidgetForItemLink(Widget widget, int mx, int my)
 	{
-		if (widget == null)
+		if (widget == null || widget.isHidden())
 		{
 			return null;
 		}
 
-		// Check this widget - only if it has actual item link pattern and mouse is within bounds
-		String text = widget.getText();
-		if (text != null && !text.isEmpty() && COLORED_ITEM_PATTERN.matcher(text).find())
+		Rectangle bounds = widget.getBounds();
+		if (bounds == null || !bounds.contains(mx, my))
 		{
-			Rectangle bounds = widget.getBounds();
-			if (bounds != null && bounds.contains(mousePos.getX(), mousePos.getY()))
-			{
-				return widget;
-			}
+			return null;
 		}
 
-		// Always search children - the item link text might be in a nested widget
+		// Mouse is over this widget - check if it has item links
+		String text = widget.getText();
+		if (text != null && text.contains("[") && COLORED_ITEM_PATTERN.matcher(text).find())
+		{
+			return widget;
+		}
+
+		// Check dynamic children
 		Widget[] children = widget.getDynamicChildren();
 		if (children != null)
 		{
 			for (Widget child : children)
 			{
-				Widget found = recursiveWidgetSearch(child, mousePos, searchAllChildren);
-				if (found != null) return found;
-			}
-		}
-
-		children = widget.getStaticChildren();
-		if (children != null)
-		{
-			for (Widget child : children)
-			{
-				Widget found = recursiveWidgetSearch(child, mousePos, searchAllChildren);
-				if (found != null) return found;
-			}
-		}
-
-		children = widget.getNestedChildren();
-		if (children != null)
-		{
-			for (Widget child : children)
-			{
-				Widget found = recursiveWidgetSearch(child, mousePos, searchAllChildren);
+				Widget found = checkWidgetForItemLink(child, mx, my);
 				if (found != null) return found;
 			}
 		}
@@ -311,46 +304,42 @@ public class ItemLinkOverlay extends Overlay
 	}
 
 	/**
-	 * Check widget's children for mouse hover.
+	 * Check children of a container widget for item links.
 	 */
-	private Widget checkWidgetChildren(Widget parent, Point mousePos)
+	private Widget checkChildrenForItemLink(Widget parent, int mx, int my)
 	{
 		if (parent == null || parent.isHidden())
 		{
 			return null;
 		}
 
-		Widget[][] childArrays = {
-			parent.getDynamicChildren(),
-			parent.getStaticChildren(),
-			parent.getNestedChildren()
-		};
-
-		for (Widget[] children : childArrays)
+		Widget[] children = parent.getDynamicChildren();
+		if (children != null)
 		{
-			if (children != null)
+			for (Widget child : children)
 			{
-				for (Widget child : children)
-				{
-					if (child != null && !child.isHidden())
-					{
-						Rectangle bounds = child.getBounds();
-						if (bounds != null && bounds.contains(mousePos.getX(), mousePos.getY()))
-						{
-							String text = child.getText();
-							if (text != null && COLORED_ITEM_PATTERN.matcher(text).find())
-							{
-								return child;
-							}
+				Widget found = checkWidgetForItemLink(child, mx, my);
+				if (found != null) return found;
+			}
+		}
 
-							Widget found = checkWidgetChildren(child, mousePos);
-							if (found != null)
-							{
-								return found;
-							}
-						}
-					}
-				}
+		children = parent.getStaticChildren();
+		if (children != null)
+		{
+			for (Widget child : children)
+			{
+				Widget found = checkWidgetForItemLink(child, mx, my);
+				if (found != null) return found;
+			}
+		}
+
+		children = parent.getNestedChildren();
+		if (children != null)
+		{
+			for (Widget child : children)
+			{
+				Widget found = checkWidgetForItemLink(child, mx, my);
+				if (found != null) return found;
 			}
 		}
 
@@ -453,9 +442,12 @@ public class ItemLinkOverlay extends Overlay
 	{
 		recentItems.clear();
 		itemsByName.clear();
+		clearTooltipCache();
+		lastMouseX = -1;
+		lastMouseY = -1;
 	}
 
-	private void showItemsTooltipFromList(List<ItemLinkInfo> items)
+	private String buildTooltipText(List<ItemLinkInfo> items)
 	{
 		StringBuilder tooltip = new StringBuilder();
 		boolean first = true;
@@ -471,10 +463,7 @@ public class ItemLinkOverlay extends Overlay
 			appendItemTooltip(tooltip, info);
 		}
 
-		if (tooltip.length() > 0)
-		{
-			tooltipManager.add(new Tooltip(tooltip.toString()));
-		}
+		return tooltip.toString();
 	}
 
 	private ItemLinkInfo copyWithQuantity(ItemLinkInfo original, int newQuantity)
@@ -657,18 +646,21 @@ package com.itemlink;
 import com.google.inject.Provides;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Actor;
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.ItemComposition;
 import net.runelite.api.Player;
+import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.OverheadTextChanged;
-import net.runelite.api.events.ScriptCallbackEvent;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.Subscribe;
@@ -721,6 +713,12 @@ public class ItemLinkPlugin extends Plugin
 	// List of item names sorted by length (longest first) for matching
 	private final List<String> sortedItemNames = new ArrayList<>();
 
+	// Set of all single-word item names for O(1) lookup
+	private final Set<String> singleWordItems = new HashSet<>();
+
+	// Map of first word -> list of multi-word item names starting with that word (sorted by length, longest first)
+	private final Map<String, List<String>> multiWordItemsByFirstWord = new HashMap<>();
+
 	private boolean itemsLoaded = false;
 
 	@Inject
@@ -767,6 +765,8 @@ public class ItemLinkPlugin extends Plugin
 		itemLinkOverlay.clearRecentItems();
 		itemNameToId.clear();
 		sortedItemNames.clear();
+		singleWordItems.clear();
+		multiWordItemsByFirstWord.clear();
 		itemsLoaded = false;
 	}
 
@@ -779,17 +779,35 @@ public class ItemLinkPlugin extends Plugin
 		}
 	}
 
+	// Number of items to process per chunk to avoid blocking the game
+	private static final int ITEMS_PER_CHUNK = 2000;
+	private static final int MAX_ITEM_ID = 30000;
+
 	/**
 	 * Load all item names into the lookup map.
+	 * Uses chunked loading to avoid blocking the game client.
 	 */
 	private void loadItemNames()
 	{
+		itemNameToId.clear();
+		sortedItemNames.clear();
+		singleWordItems.clear();
+		multiWordItemsByFirstWord.clear();
+
+		// Start loading from the first chunk
+		loadItemChunk(0);
+	}
+
+	/**
+	 * Load a chunk of items starting at the given ID.
+	 */
+	private void loadItemChunk(final int startId)
+	{
 		clientThread.invokeLater(() ->
 		{
-			itemNameToId.clear();
-			sortedItemNames.clear();
+			int endId = Math.min(startId + ITEMS_PER_CHUNK, MAX_ITEM_ID);
 
-			for (int itemId = 0; itemId < 30000; itemId++)
+			for (int itemId = startId; itemId < endId; itemId++)
 			{
 				try
 				{
@@ -831,27 +849,84 @@ public class ItemLinkPlugin extends Plugin
 				}
 			}
 
-			// Sort item names by length (longest first) for greedy matching
-			sortedItemNames.addAll(itemNameToId.keySet());
-			sortedItemNames.sort((a, b) -> Integer.compare(b.length(), a.length()));
-
-			itemsLoaded = true;
-			log.info("Loaded {} item names for Item Link", itemNameToId.size());
+			if (endId < MAX_ITEM_ID)
+			{
+				// Schedule next chunk
+				loadItemChunk(endId);
+			}
+			else
+			{
+				// All chunks loaded, finalize
+				finalizeItemLoading();
+			}
 		});
 	}
 
-	@Subscribe
-	public void onScriptCallbackEvent(ScriptCallbackEvent event)
+	/**
+	 * Finalize item loading by building optimized lookup structures.
+	 */
+	private void finalizeItemLoading()
 	{
-		if (!itemsLoaded || !"chatFilterCheck".equals(event.getEventName()))
+		// Sort item names by length (longest first) for greedy matching
+		sortedItemNames.addAll(itemNameToId.keySet());
+		sortedItemNames.sort((a, b) -> Integer.compare(b.length(), a.length()));
+
+		// Build optimized lookup structures
+		for (String itemName : sortedItemNames)
+		{
+			int spaceIndex = itemName.indexOf(' ');
+			if (spaceIndex == -1)
+			{
+				// Single-word item
+				singleWordItems.add(itemName);
+			}
+			else
+			{
+				// Multi-word item - index by first word
+				String firstWord = itemName.substring(0, spaceIndex);
+				multiWordItemsByFirstWord
+					.computeIfAbsent(firstWord, k -> new ArrayList<>())
+					.add(itemName);
+			}
+		}
+
+		itemsLoaded = true;
+		log.info("Loaded {} item names for Item Link ({} single-word, {} multi-word prefixes)",
+			itemNameToId.size(), singleWordItems.size(), multiWordItemsByFirstWord.size());
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+		if (!itemsLoaded)
 		{
 			return;
 		}
 
-		Object[] objectStack = client.getObjectStack();
-		int objectStackSize = client.getObjectStackSize();
+		// Only process player chat messages, not system/game messages
+		ChatMessageType type = event.getType();
+		switch (type)
+		{
+			case PUBLICCHAT:
+			case MODCHAT:
+			case PRIVATECHAT:
+			case PRIVATECHATOUT:
+			case FRIENDSCHAT:
+			case CLAN_CHAT:
+			case CLAN_GUEST_CHAT:
+			case CLAN_GIM_CHAT:
+			case AUTOTYPER:
+			case MODAUTOTYPER:
+			case TRADEREQ:
+			case CHALREQ_TRADE:
+				// These are player messages - process them
+				break;
+			default:
+				// Skip system messages, examine text, NPC dialogue, etc.
+				return;
+		}
 
-		String message = (String) objectStack[objectStackSize - 1];
+		String message = event.getMessage();
 		if (message == null || message.isEmpty())
 		{
 			return;
@@ -860,7 +935,7 @@ public class ItemLinkPlugin extends Plugin
 		String processed = highlightItemNames(message);
 		if (!processed.equals(message))
 		{
-			objectStack[objectStackSize - 1] = processed;
+			event.getMessageNode().setValue(processed);
 		}
 	}
 
@@ -893,7 +968,7 @@ public class ItemLinkPlugin extends Plugin
 
 	/**
 	 * Scan message for item names and highlight them.
-	 * Uses longest-match-first greedy algorithm.
+	 * Uses optimized word-boundary scanning with HashSet lookups.
 	 */
 	private String highlightItemNames(String message)
 	{
@@ -903,35 +978,66 @@ public class ItemLinkPlugin extends Plugin
 		int i = 0;
 		while (i < message.length())
 		{
-			boolean matched = false;
+			// Only check at word boundaries (start of message or after non-letter/digit)
+			boolean atWordBoundary = (i == 0 || !Character.isLetterOrDigit(lowerMessage.charAt(i - 1)));
 
-			// Try to match item names starting at position i (longest first)
-			for (String itemName : sortedItemNames)
+			if (!atWordBoundary || !Character.isLetterOrDigit(lowerMessage.charAt(i)))
 			{
-				if (i + itemName.length() > lowerMessage.length())
+				result.append(message.charAt(i));
+				i++;
+				continue;
+			}
+
+			// Extract the current word
+			int wordEnd = i;
+			while (wordEnd < lowerMessage.length() && Character.isLetterOrDigit(lowerMessage.charAt(wordEnd)))
+			{
+				wordEnd++;
+			}
+			String currentWord = lowerMessage.substring(i, wordEnd);
+
+			String matchedItemName = null;
+
+			// First, check for multi-word items starting with this word (longest first)
+			List<String> multiWordCandidates = multiWordItemsByFirstWord.get(currentWord);
+			if (multiWordCandidates != null)
+			{
+				for (String candidate : multiWordCandidates)
 				{
-					continue;
+					if (i + candidate.length() > lowerMessage.length())
+					{
+						continue;
+					}
+
+					// Check if full item name matches
+					if (!lowerMessage.regionMatches(i, candidate, 0, candidate.length()))
+					{
+						continue;
+					}
+
+					// Check end boundary
+					int endPos = i + candidate.length();
+					if (endPos < lowerMessage.length() && Character.isLetterOrDigit(lowerMessage.charAt(endPos)))
+					{
+						continue;
+					}
+
+					matchedItemName = candidate;
+					break; // Multi-word candidates are already sorted longest-first
 				}
+			}
 
-				// Check if the item name matches at this position
-				if (!lowerMessage.regionMatches(i, itemName, 0, itemName.length()))
-				{
-					continue;
-				}
+			// If no multi-word match, check for single-word item
+			if (matchedItemName == null && singleWordItems.contains(currentWord))
+			{
+				matchedItemName = currentWord;
+			}
 
-				// Check word boundaries
-				boolean validStart = (i == 0 || !Character.isLetterOrDigit(lowerMessage.charAt(i - 1)));
-				boolean validEnd = (i + itemName.length() >= lowerMessage.length() ||
-					!Character.isLetterOrDigit(lowerMessage.charAt(i + itemName.length())));
-
-				if (!validStart || !validEnd)
-				{
-					continue;
-				}
-
+			if (matchedItemName != null)
+			{
 				// Found a match! Get original case from message
-				String originalName = message.substring(i, i + itemName.length());
-				int itemId = itemNameToId.get(itemName);
+				String originalName = message.substring(i, i + matchedItemName.length());
+				int itemId = itemNameToId.get(matchedItemName);
 				String color = getItemColor(itemId);
 
 				result.append(String.format("<col=%s>[%s]</col><col=%s>", color, originalName, COLOR_PUBLIC_CHAT));
@@ -939,12 +1045,9 @@ public class ItemLinkPlugin extends Plugin
 				// Add to overlay for tooltip
 				itemLinkOverlay.addRecentItem(itemId, 1);
 
-				i += itemName.length();
-				matched = true;
-				break;
+				i += matchedItemName.length();
 			}
-
-			if (!matched)
+			else
 			{
 				result.append(message.charAt(i));
 				i++;
