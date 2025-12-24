@@ -498,7 +498,9 @@ public class MenuHandler
             cleaned = cleaned.replaceAll("\\s*\\(level-\\d+\\)$", "");
             // Remove any parenthetical annotation like (Skill 1234)
             cleaned = cleaned.replaceAll("\\([^)]*\\)", "");
-            String playerName = Text.toJagexName(cleaned).replace('\u00A0',' ').trim().replaceAll("\\s+"," ");
+            // Normalize without converting underscores/hyphens to spaces
+            // (RuneScape treats space, underscore, hyphen as equivalent, but we preserve original format)
+            String playerName = cleaned.replace('\u00A0', ' ').trim().replaceAll("\\s+", " ");
 
             if (dashboardPanel != null) {
                 dashboardPanel.loadMatchHistory(playerName);
@@ -529,6 +531,7 @@ import com.pvp.leaderboard.service.PvPDataService;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.atomic.AtomicLong;
@@ -542,6 +545,7 @@ import net.runelite.api.Varbits;
 import net.runelite.api.events.ActorDeath;
 import net.runelite.api.events.GameTick;
 import net.runelite.api.events.HitsplatApplied;
+import net.runelite.client.config.ConfigManager;
 
 @Slf4j
 @Singleton
@@ -550,6 +554,7 @@ public class FightMonitor
 {
     private final Client client;
     private final PvPLeaderboardConfig config;
+    private final ConfigManager configManager;
     private final ScheduledExecutorService scheduler;
     private final MatchResultService matchResultService;
     private final PvPDataService pvpDataService;
@@ -585,6 +590,7 @@ public class FightMonitor
     public FightMonitor(
         Client client,
         PvPLeaderboardConfig config,
+        ConfigManager configManager,
         ScheduledExecutorService scheduler,
         MatchResultService matchResultService,
         PvPDataService pvpDataService,
@@ -593,6 +599,7 @@ public class FightMonitor
     {
         this.client = client;
         this.config = config;
+        this.configManager = configManager;
         this.scheduler = scheduler;
         this.matchResultService = matchResultService;
         this.pvpDataService = pvpDataService;
@@ -719,6 +726,9 @@ public class FightMonitor
             boolean isMine = hs.isMine();
             String hitPlayerName = hitPlayer.getName();
             String localPlayerName = localPlayer.getName();
+            
+            // Get hitsplat type name for logging
+            String hitsplatTypeName = getHitsplatTypeName(hitsplatType);
 
             // Only process relevant damage hitsplat types
             if (amt > 0)
@@ -731,39 +741,68 @@ public class FightMonitor
                     return;
                 }
             }
-
+            
             // Determine if this should start/continue a fight
-            boolean startFromThisHit = (amt > 0) && 
+            // For inbound damage (on us): any damage from opponent starts the fight
+            // For outbound damage (on them): only OUR hitsplats count
+            boolean isDamageHitsplat = (amt > 0) && 
                 (hitsplatType == HitsplatID.DAMAGE_ME || hitsplatType == HitsplatID.DAMAGE_OTHER);
+            
+            // Check if this is OUR damage - either isMine is true OR hitsplatType is DAMAGE_ME
+            // DAMAGE_ME is the red hitsplat type shown specifically for YOUR damage on others
+            // We check both because isMine can sometimes be incorrectly false
+            boolean isOurDamage = isMine || (hitsplatType == HitsplatID.DAMAGE_ME);
+
+            // Debug log every hitsplat on players (commented out - enable for debugging)
+            // boolean isOnUs = (hitPlayer == localPlayer);
+            // if (amt > 0) {
+            //     log.debug("[Hitsplat] {} on={} amt={} type={} isMine={} isOurDmg={}", 
+            //         isOnUs ? "INBOUND" : "OUTBOUND",
+            //         hitPlayerName,
+            //         amt,
+            //         hitsplatTypeName,
+            //         isMine,
+            //         isOurDamage);
+            // }
 
             String opponentName = null;
             boolean startNow = false;
 
             if (hitPlayer == localPlayer)
             {
-                // Hitsplat on us = opponent dealt damage to us
+                // Hitsplat on us = opponent dealt damage to us (inbound)
                 opponentName = resolveInboundAttacker(localPlayer);
                 if (opponentName != null)
                 {
                     lastExactOpponentName = opponentName;
-                    if (startFromThisHit) startNow = true;
+                    if (isDamageHitsplat) startNow = true;
                 }
             }
             else
             {
-                // Hitsplat on another player
+                // Hitsplat on another player (outbound)
                 if (hitPlayerName == null) return;
 
-                boolean isActiveOpponent = activeFights.containsKey(hitPlayerName);
-                Player interacting = (Player) localPlayer.getInteracting();
-                boolean isCurrentTarget = interacting != null && interacting == hitPlayer;
-                Player theirTarget = (Player) hitPlayer.getInteracting();
-                boolean isTargetingUs = theirTarget != null && theirTarget == localPlayer;
-
-                if (isActiveOpponent || isCurrentTarget || isTargetingUs)
+                // If this is OUR damage (DAMAGE_ME type), this player is definitely our opponent
+                // Don't rely on getInteracting() which can be unreliable in chaotic multi-combat
+                if (isOurDamage && isDamageHitsplat)
                 {
                     opponentName = hitPlayerName;
-                    if (startFromThisHit) startNow = true;
+                    startNow = true;
+                }
+                else
+                {
+                    // For non-damage hitsplats or other players' damage, use targeting checks
+                    boolean isActiveOpponent = activeFights.containsKey(hitPlayerName);
+                    Player interacting = (Player) localPlayer.getInteracting();
+                    boolean isCurrentTarget = interacting != null && interacting == hitPlayer;
+                    Player theirTarget = (Player) hitPlayer.getInteracting();
+                    boolean isTargetingUs = theirTarget != null && theirTarget == localPlayer;
+
+                    if (isActiveOpponent || isCurrentTarget || isTargetingUs)
+                    {
+                        opponentName = hitPlayerName;
+                    }
                 }
             }
 
@@ -772,22 +811,45 @@ public class FightMonitor
             if (startNow && opponentName != null && validOpp)
             {
                 int tickNow = client.getTickCount();
-                
-                // Check for combat window reset FIRST - clear stale fights after long idle
-                if (tickNow - lastCombatActivityTick > OUT_OF_COMBAT_TICKS)
-                {
-                    activeFights.clear();
-                }
-                lastCombatActivityTick = tickNow;
 
                 if (opponentName.equals(localPlayer.getName())) return;
                 if (suppressFightStartTicks > 0) return;
                 if (perOpponentSuppressUntilTicks.containsKey(opponentName)) return;
 
+                // Check if THIS opponent's fight is stale (no activity for 16+ ticks)
+                // If stale, remove only this opponent's fight entry so a fresh one is created
+                FightEntry existingFight = activeFights.get(opponentName);
+                if (existingFight != null && existingFight.isStale(tickNow, OUT_OF_COMBAT_TICKS))
+                {
+                    // log.debug("[FightStale] Clearing stale fight for {} (lastTick={} currentTick={} gap={})", 
+                    //     opponentName, existingFight.lastActivityTick, tickNow, 
+                    //     tickNow - existingFight.lastActivityTick);
+                    activeFights.remove(opponentName);
+                    existingFight = null;
+                }
+
+                boolean isNewFight = (existingFight == null);
                 touchFight(opponentName);
                 inFight = true;
                 if (!inFight) startFight(opponentName);
-                if (client.getVarbitValue(Varbits.MULTICOMBAT_AREA) == 1) wasInMulti = true;
+                
+                // Check if LOCAL player is in multi - if so, mark this fight as multi
+                // This ensures if YOU ever enter multi during the fight, it counts as multi
+                // But if opponent dies in multi while you stayed in singles, it's a singles kill
+                boolean localPlayerInMulti = client.getVarbitValue(Varbits.MULTICOMBAT_AREA) == 1;
+                if (localPlayerInMulti) {
+                    wasInMulti = true;
+                    // Also update the per-opponent FightEntry
+                    FightEntry fe = activeFights.get(opponentName);
+                    if (fe != null) {
+                        fe.markMultiIfNeeded(true);
+                    }
+                }
+                
+                // if (isNewFight)
+                // {
+                //     log.debug("[FightStart] NEW fight with opponent={}", opponentName);
+                // }
             }
 
             // Add the damage to per-fight tracking in FightEntry
@@ -796,16 +858,42 @@ public class FightMonitor
                 FightEntry fe = activeFights.get(opponentName);
                 if (fe != null)
                 {
+                    int currentTick = client.getTickCount();
+                    
                     if (hitPlayer == localPlayer)
                     {
-                        fe.addDamageReceived(amt);
+                        // Damage received from opponent
+                        fe.addDamageReceived(amt, currentTick);
+                        // log.debug("[DmgTrack] RECEIVED {} from {} (total received: {})", 
+                        //     amt, opponentName, fe.damageReceived.get());
                     }
-                    else
+                    else if (isOurDamage)
                     {
-                        fe.addDamageDealt(amt);
+                        // Count damage dealt if it's OUR damage (isMine=true OR type=DAMAGE_ME)
+                        fe.addDamageDealt(amt, currentTick);
+                        // log.debug("[DmgTrack] DEALT {} to {} (total dealt: {}) [isMine={} type={}]", 
+                        //     amt, opponentName, fe.damageDealt.get(), isMine, hitsplatTypeName);
                     }
+                    // else
+                    // {
+                    //     // Not our damage - log why we're NOT counting it
+                    //     log.debug("[DmgTrack] SKIPPED {} on {} - not our damage (isMine={} type={})", 
+                    //         amt, opponentName, isMine, hitsplatTypeName);
+                    // }
                 }
+                // else
+                // {
+                //     // No FightEntry yet
+                //     log.debug("[DmgTrack] NO_ENTRY {} on {} - FightEntry doesn't exist yet", 
+                //         amt, hitPlayerName);
+                // }
             }
+            // else if (amt > 0 && opponentName == null)
+            // {
+            //     // Hitsplat on player but no opponent resolved
+            //     log.debug("[DmgTrack] NO_OPPONENT {} on {} - couldn't resolve as opponent", 
+            //         amt, hitPlayerName);
+            // }
         }
         catch (Exception e)
         {
@@ -824,12 +912,18 @@ public class FightMonitor
             if (player == localPlayer)
             {
                 // Self death - find who killed us
-                String killer = findActualKiller(localPlayer);
-                if (killer != null) opponent = killer;
-
-                if (killer == null) killer = findKillerByDamage();
+                // Priority: whoever dealt the most damage to us gets the kill credit
+                // This is the best approximation since the actual killer might have the plugin
+                // and would submit the correct result from their side
+                String killer = findKillerByDamage();
+                
+                // Fallbacks if no damage was tracked
+                if (killer == null) killer = findActualKiller(localPlayer);
                 if (killer == null) killer = opponent;
                 if (killer == null) killer = mostRecentActiveOpponent();
+
+                // Log the killer determination for debugging
+                // log.debug("[Death] Self death - killer={} (determined by most damage received)", killer);
 
                 // Submit loss against the killer
                 if (killer != null)
@@ -852,8 +946,10 @@ public class FightMonitor
                 String name = player.getName();
                 if (name != null)
                 {
-                    boolean isEngagedWithLocal = (player.getInteracting() == localPlayer) || (localPlayer.getInteracting() == player);
-                    if (activeFights.containsKey(name) || isEngagedWithLocal)
+                    FightEntry fe = activeFights.get(name);
+                    // Only count as a win if we have an active fight AND dealt actual damage
+                    // This prevents counting kills where we just clicked on someone but didn't attack
+                    if (fe != null && fe.damageDealt.get() > 0)
                     {
                         endFightFor(name, "win");
                     }
@@ -880,6 +976,10 @@ public class FightMonitor
         FightEntry fe = activeFights.get(opponentName);
         if (fe == null || fe.finalized) return;
         
+        // Log final damage totals before finalizing
+        // log.debug("[FightEnd] opponent={} result={} FINAL_DMG_DEALT={} FINAL_DMG_RECEIVED={}", 
+        //     opponentName, result, fe.damageDealt.get(), fe.damageReceived.get());
+        
         fe.finalized = true;
         finalizeFight(opponentName, result, fe);
         clearFightFor(opponentName);  // Use targeted clear instead of resetFightState
@@ -895,14 +995,32 @@ public class FightMonitor
         final String selfName = getLocalPlayerName();
         final String idTokenSafe = cognitoAuthService.getStoredIdToken();
 
-        final long startTs = entry.startTs;
+        // Ensure valid timestamps - never send 0
+        // If start wasn't captured, set it to 60 seconds before end
+        // If end is somehow 0, set it to 60 seconds after start
+        long startTs = entry.startTs;
+        long endTs = now;
         
-        // Skip submission if start timestamp wasn't captured (fight was already in progress)
-        if (startTs <= 0)
+        if (startTs <= 0 && endTs > 0)
         {
-            log.debug("[MatchSubmit] Skipping - fight start not captured (startTs={}). Plugin likely started tracking mid-fight.", startTs);
-            return;
+            startTs = endTs - 60;
+            log.debug("[MatchSubmit] Start timestamp missing, using endTs-60: startTs={}", startTs);
         }
+        else if (endTs <= 0 && startTs > 0)
+        {
+            endTs = startTs + 60;
+            log.debug("[MatchSubmit] End timestamp missing, using startTs+60: endTs={}", endTs);
+        }
+        else if (startTs <= 0 && endTs <= 0)
+        {
+            // Both missing - use current time and 60 seconds ago
+            endTs = System.currentTimeMillis() / 1000;
+            startTs = endTs - 60;
+            log.debug("[MatchSubmit] Both timestamps missing, using now and now-60: startTs={} endTs={}", startTs, endTs);
+        }
+        
+        final long finalStartTs = startTs;
+        final long finalEndTs = endTs;
         final int startSb = entry.startSpellbook;
         final boolean wasMulti = entry.wasInMulti;
 
@@ -917,17 +1035,72 @@ public class FightMonitor
         log.debug("[MatchSubmit] Determined bucket: {} (world={} multi={} startSb={} endSb={})", 
             fightBucket, world, wasMulti, startSpellbookName, endSpellbookName);
 
+        // Determine which bucket to use for API calls
+        // If auto-switch is enabled, use the fight bucket; otherwise use the user's manual selection
+        final String apiRefreshBucket;
+        boolean showBucketInMmr = false;  // Show bucket label in MMR notification when bucket differs
+        
+        // Check if fight bucket differs from user's current selection
+        PvPLeaderboardConfig.RankBucket currentBucket = config.rankBucket();
+        PvPLeaderboardConfig.RankBucket fightBucketEnum = bucketStringToEnum(fightBucket);
+        boolean fightBucketDiffers = (fightBucketEnum != null && currentBucket != fightBucketEnum);
+        
+        // Auto-switch leaderboard if enabled - always switch to match fight style
+        if (config.autoSwitchBucket())
+        {
+            log.debug("[AutoSwitch] Check: fightBucket={} currentBucket={} newBucket={}", 
+                fightBucket, currentBucket, fightBucketEnum);
+            
+            if (fightBucketEnum != null)
+            {
+                // Always switch to the fight bucket, even if user manually changed it
+                // This ensures the leaderboard always reflects the current fight style
+                if (fightBucketDiffers)
+                {
+                    log.debug("[AutoSwitch] Switching leaderboard from {} to {}", currentBucket, fightBucketEnum);
+                    configManager.setConfiguration("PvPLeaderboard", "rankBucket", fightBucketEnum.name());
+                    showBucketInMmr = true;  // Show bucket label since we switched
+                }
+                else
+                {
+                    log.debug("[AutoSwitch] Already on correct leaderboard: {}", fightBucketEnum);
+                }
+            }
+            else
+            {
+                log.debug("[AutoSwitch] Could not map fightBucket '{}' to enum", fightBucket);
+            }
+            
+            // Use fight bucket for API refresh when auto-switch is enabled
+            apiRefreshBucket = fightBucket;
+        }
+        else
+        {
+            log.debug("[AutoSwitch] Disabled - keeping manual selection: {}", currentBucket);
+            // Use user's manual selection for API refresh
+            apiRefreshBucket = getConfigBucketKey();
+            
+            // Show bucket label if fight was in a different bucket than user's selection
+            // This informs the user which bucket the MMR change applies to
+            if (fightBucketDiffers)
+            {
+                showBucketInMmr = true;
+            }
+        }
+
         // Async Submission
         java.util.concurrent.CompletableFuture.runAsync(() -> {
             try {
-                submitMatchResult(result, now, selfName, resolvedOpponent, world, startTs, startSb, currentSpellbook, wasMulti, idTokenSafe, dmgOut);
+                submitMatchResult(result, finalEndTs, selfName, resolvedOpponent, world, finalStartTs, startSb, currentSpellbook, wasMulti, idTokenSafe, dmgOut);
             } catch (Exception e) {
                 log.debug("[MatchSubmit] EXCEPTION in async submission: {}", e.getMessage(), e);
             }
         }, scheduler);
 
-        // Schedule API refreshes (includes MMR notification) - pass the fight bucket
-        scheduleApiRefreshes(resolvedOpponent, fightBucket);
+        // Schedule API refreshes in 5s (gives backend time to process the match)
+        // Uses the determined bucket (fight bucket if auto-switch, manual selection otherwise)
+        // Show bucket label in MMR notification when fight bucket differs from user's selection
+        scheduleApiRefreshes(resolvedOpponent, apiRefreshBucket, showBucketInMmr);
     }
 
     private void submitMatchResult(String result, long fightEndTime, String playerId, String opponentId, int world,
@@ -961,36 +1134,40 @@ public class FightMonitor
         });
     }
 
-    private void scheduleApiRefreshes(String opponentName, String fightBucket) {
-        log.debug("[PostFight] Scheduling API refresh in 5s for self and opponent={} fightBucket={}", opponentName, fightBucket);
-        
-        // Get the user's configured display bucket for rank display
-        final String displayBucket = getConfigBucketKey();
+    private void scheduleApiRefreshes(String opponentName, String displayBucket, boolean showBucketInMmr) {
+        log.debug("[PostFight] Scheduling API refresh in 5s for self and opponent={} bucket={} showBucket={}", 
+            opponentName, displayBucket, showBucketInMmr);
         
         scheduler.schedule(() -> {
             try {
                 String selfName = getLocalPlayerName();
-                log.debug("[PostFight] Executing API refresh: self={} opponent={} displayBucket={} fightBucket={}", 
-                    selfName, opponentName, displayBucket, fightBucket);
+                log.debug("[PostFight] Executing API refresh: self={} opponent={} bucket={}", 
+                    selfName, opponentName, displayBucket);
                 
                 if (selfName != null) {
-                    // Refresh rank display using the user's configured bucket
+                    // Refresh rank display using the specified bucket
                     fetchTierWithRetry(selfName, displayBucket, 3);
                     
                     // Get MMR delta from match history (more accurate than profile diff)
                     // First attempt at 5s, second attempt at 15s if first fails (1 retry with 10s delay)
+                    // Only show bucket label in notification if we auto-switched
                     if (config.showMmrChangeNotification() && opponentName != null) {
-                        fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, 1);
+                        fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, showBucketInMmr, 1);
                     }
                 } else {
                     log.debug("[PostFight] selfName is null, skipping self refresh");
                 }
                 
-                // Refresh opponent rank using the user's display bucket
+                // Refresh opponent rank using the same bucket
                 if (opponentName != null) {
                     fetchTierWithRetry(opponentName, displayBucket, 3);
                 } else {
                     log.debug("[PostFight] opponentName is null, skipping opponent refresh");
+                }
+                
+                // Trigger overlay refresh after API calls complete
+                if (rankOverlay != null) {
+                    rankOverlay.scheduleSelfRankRefresh(0L);
                 }
             } catch(Exception e){
                 log.debug("[PostFight] API refresh exception: {}", e.getMessage());
@@ -1001,15 +1178,32 @@ public class FightMonitor
     /**
      * Fetch MMR delta from match history API.
      * This is more accurate than calculating from profile differences.
+     * Uses account SHA (UUID hash) to ensure ALL matches are returned even after name changes.
      * First attempt at ~5s after fight, second (final) attempt at ~15s if first fails.
+     * 
+     * @param showBucketLabel If true, include bucket name in MMR notification (used when auto-switch occurred)
      */
-    private void fetchMmrDeltaFromMatchHistory(String selfName, String opponentName, String displayBucket, int retriesLeft) {
-        log.debug("[PostFight] Fetching MMR delta from match history: self={} opponent={} retriesLeft={}", 
-            selfName, opponentName, retriesLeft);
+    private void fetchMmrDeltaFromMatchHistory(String selfName, String opponentName, String displayBucket, boolean showBucketLabel, int retriesLeft) {
+        log.debug("[PostFight] Fetching MMR delta from match history: self={} opponent={} showBucket={} retriesLeft={}", 
+            selfName, opponentName, showBucketLabel, retriesLeft);
+        
+        // Use account SHA for accurate match history across name changes
+        // This ensures MMR delta is correct even if the player changed their name
+        String selfAcctSha = pvpDataService.getSelfAcctSha();
         
         // Fetch more matches to handle multi-kill scenarios (up to 10 kills in quick succession)
         // Bypass cache to ensure we get fresh data with the new match
-        pvpDataService.getPlayerMatches(selfName, null, 15, true).thenAccept(response -> {
+        // Prefer acct-based lookup if available, fallback to name-based
+        CompletableFuture<JsonObject> matchesFuture;
+        if (selfAcctSha != null && !selfAcctSha.isEmpty()) {
+            log.debug("[PostFight] Using acct-based match lookup: acct={}", selfAcctSha.substring(0, 8) + "...");
+            matchesFuture = pvpDataService.getPlayerMatchesByAcct(selfAcctSha, null, 15, true);
+        } else {
+            log.debug("[PostFight] Falling back to name-based match lookup: name={}", selfName);
+            matchesFuture = pvpDataService.getPlayerMatches(selfName, null, 15, true);
+        }
+        
+        matchesFuture.thenAccept(response -> {
             if (response != null && response.has("matches") && response.get("matches").isJsonArray()) {
                 var matches = response.getAsJsonArray("matches");
                 
@@ -1034,11 +1228,8 @@ public class FightMonitor
                                 String matchBucket = match.has("bucket") && !match.get("bucket").isJsonNull()
                                     ? match.get("bucket").getAsString() : "nh";
                                 
-                                // Determine if we should show bucket label
-                                String bucketLabel = null;
-                                if (!matchBucket.equalsIgnoreCase(displayBucket) || "overall".equalsIgnoreCase(displayBucket)) {
-                                    bucketLabel = getBucketDisplayName(matchBucket);
-                                }
+                                // Only show bucket label if we auto-switched to a different bucket
+                                String bucketLabel = showBucketLabel ? getBucketDisplayName(matchBucket) : null;
                                 
                                 // Check result to determine if delta should be negative
                                 String result = match.has("result") && !match.get("result").isJsonNull()
@@ -1066,14 +1257,14 @@ public class FightMonitor
                 // Match not found yet - retry if we have retries left (retry after 10s so total is ~15s)
                 if (retriesLeft > 0) {
                     log.debug("[PostFight] Match not found in history, retrying in 10s ({} left)", retriesLeft - 1);
-                    scheduler.schedule(() -> fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, retriesLeft - 1),
+                    scheduler.schedule(() -> fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, showBucketLabel, retriesLeft - 1),
                         10L, java.util.concurrent.TimeUnit.SECONDS);
                 } else {
                     log.debug("[PostFight] Match not found in history after all retries, skipping MMR notification");
                 }
             } else if (retriesLeft > 0) {
                 log.debug("[PostFight] No matches in response, retrying in 10s ({} left)", retriesLeft - 1);
-                scheduler.schedule(() -> fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, retriesLeft - 1),
+                scheduler.schedule(() -> fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, showBucketLabel, retriesLeft - 1),
                     10L, java.util.concurrent.TimeUnit.SECONDS);
             } else {
                 log.debug("[PostFight] Failed to get matches after all retries");
@@ -1081,7 +1272,7 @@ public class FightMonitor
         }).exceptionally(ex -> {
             if (retriesLeft > 0) {
                 log.debug("[PostFight] Match history exception: {}, retrying in 10s ({} left)", ex.getMessage(), retriesLeft - 1);
-                scheduler.schedule(() -> fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, retriesLeft - 1),
+                scheduler.schedule(() -> fetchMmrDeltaFromMatchHistory(selfName, opponentName, displayBucket, showBucketLabel, retriesLeft - 1),
                     10L, java.util.concurrent.TimeUnit.SECONDS);
             } else {
                 log.debug("[PostFight] Match history failed after all retries: {}", ex.getMessage());
@@ -1225,10 +1416,16 @@ public class FightMonitor
         if (opponentName == null || opponentName.isEmpty()) return;
         long ts = System.currentTimeMillis() / 1000;
         int sb = client.getVarbitValue(Varbits.SPELLBOOK);
-        boolean multi = client.getVarbitValue(Varbits.MULTICOMBAT_AREA) == 1;
+        boolean localPlayerInMulti = client.getVarbitValue(Varbits.MULTICOMBAT_AREA) == 1;
+        int currentTick = client.getTickCount();
         activeFights.compute(opponentName, (k, v) -> {
-            if (v == null) return new FightEntry(ts, sb, multi);
+            if (v == null) return new FightEntry(ts, sb, localPlayerInMulti, currentTick);
+            // Update activity timestamps
             v.lastActivityMs = System.currentTimeMillis();
+            v.lastActivityTick = currentTick;
+            // If LOCAL player is now in multi, mark this fight as multi
+            // (only tracks if WE enter multi, not if opponent enters multi)
+            v.markMultiIfNeeded(localPlayerInMulti);
             return v;
         });
 
@@ -1281,18 +1478,27 @@ public class FightMonitor
     private String findKillerByDamage()
     {
         String killer = null;
-        long bestDmg = -1L;
+        long bestDmg = 0L;  // Must have dealt at least some damage
+        
+        // Find opponent who dealt most damage to us
         for (Map.Entry<String, FightEntry> e : activeFights.entrySet())
         {
             FightEntry fe = e.getValue();
             if (fe == null) continue;
-            long v = fe.damageReceived.get();
-            if (v > bestDmg)
+            long dmgReceived = fe.damageReceived.get();
+            // log.debug("[KillerSearch] Candidate: {} dealt {} damage to us", e.getKey(), dmgReceived);
+            
+            if (dmgReceived > bestDmg)
             {
-                bestDmg = v;
+                bestDmg = dmgReceived;
                 killer = e.getKey();
             }
         }
+        
+        // if (killer != null)
+        // {
+        //     log.debug("[KillerSearch] Winner: {} with {} damage", killer, bestDmg);
+        // }
         return killer;
     }
 
@@ -1353,11 +1559,32 @@ public class FightMonitor
     }
 
     /**
+     * Get readable name for hitsplat type for debug logging.
+     */
+    private String getHitsplatTypeName(int type)
+    {
+        switch (type) {
+            case HitsplatID.DAMAGE_ME: return "DAMAGE_ME";
+            case HitsplatID.DAMAGE_OTHER: return "DAMAGE_OTHER";
+            case HitsplatID.POISON: return "POISON";
+            case HitsplatID.VENOM: return "VENOM";
+            case HitsplatID.BLOCK_ME: return "BLOCK_ME";
+            case HitsplatID.BLOCK_OTHER: return "BLOCK_OTHER";
+            case HitsplatID.HEAL: return "HEAL";
+            default: return "TYPE_" + type;
+        }
+    }
+
+    /**
      * Determine the bucket for a fight based on server-side logic.
      * Priority: DMM > Multi > Veng > NH
      * 
+     * Multi-combat classification:
+     * - If YOU (local player) ever entered multi during the fight, it's a "multi" fight
+     * - If you stayed in singles but opponent died in multi, it's still a "singles" kill (NH/Veng)
+     * 
      * @param world The world number
-     * @param wasInMulti Whether the fight was in multi-combat
+     * @param wasInMulti Whether the LOCAL player was ever in multi-combat during this fight
      * @param startSpellbook The spellbook name at fight start
      * @param endSpellbook The spellbook name at fight end
      * @return The bucket name: "dmm", "multi", "veng", or "nh"
@@ -1387,6 +1614,22 @@ public class FightMonitor
     }
 
     /**
+     * Convert bucket string to RankBucket enum for config updates.
+     */
+    private PvPLeaderboardConfig.RankBucket bucketStringToEnum(String bucket)
+    {
+        if (bucket == null) return null;
+        switch (bucket.toLowerCase())
+        {
+            case "nh": return PvPLeaderboardConfig.RankBucket.NH;
+            case "veng": return PvPLeaderboardConfig.RankBucket.VENG;
+            case "multi": return PvPLeaderboardConfig.RankBucket.MULTI;
+            case "dmm": return PvPLeaderboardConfig.RankBucket.DMM;
+            default: return null;
+        }
+    }
+
+    /**
      * Get the display name for a bucket (capitalized for UI).
      */
     private String getBucketDisplayName(String bucket)
@@ -1406,29 +1649,47 @@ public class FightMonitor
     private static class FightEntry {
         final long startTs;
         final int startSpellbook;
-        final boolean wasInMulti;
+        volatile boolean wasInMulti;  // Mutable: set true if LOCAL player ever enters multi during this fight
         volatile long lastActivityMs;
+        volatile int lastActivityTick;  // Track per-opponent combat activity in game ticks
         volatile boolean finalized = false;
         
         // Per-fight damage tracking for multi-combat accuracy
         final AtomicLong damageDealt = new AtomicLong(0);    // Damage we dealt TO this opponent
         final AtomicLong damageReceived = new AtomicLong(0); // Damage we received FROM this opponent
         
-        FightEntry(long ts, int sb, boolean multi) {
+        FightEntry(long ts, int sb, boolean multi, int currentTick) {
             startTs = ts;
             startSpellbook = sb;
             wasInMulti = multi;
             lastActivityMs = System.currentTimeMillis();
+            lastActivityTick = currentTick;
         }
         
-        void addDamageDealt(long amount) {
+        /**
+         * Mark this fight as multi if the local player entered multi-combat area.
+         * Only updates to true (never reverts to singles once multi is flagged).
+         */
+        void markMultiIfNeeded(boolean isInMulti) {
+            if (isInMulti && !wasInMulti) {
+                wasInMulti = true;
+            }
+        }
+        
+        void addDamageDealt(long amount, int currentTick) {
             damageDealt.addAndGet(amount);
             lastActivityMs = System.currentTimeMillis();
+            lastActivityTick = currentTick;
         }
         
-        void addDamageReceived(long amount) {
+        void addDamageReceived(long amount, int currentTick) {
             damageReceived.addAndGet(amount);
             lastActivityMs = System.currentTimeMillis();
+            lastActivityTick = currentTick;
+        }
+        
+        boolean isStale(int currentTick, int timeout) {
+            return (currentTick - lastActivityTick) > timeout;
         }
     }
 }
@@ -1593,6 +1854,18 @@ public interface PvPLeaderboardConfig extends Config
 	default RankBucket rankBucket()
 	{
 		return RankBucket.OVERALL;
+	}
+
+	@ConfigItem(
+		keyName = "autoSwitchBucket",
+		name = "Auto-switch Leaderboard",
+		description = "Automatically switch leaderboard to match your last fight style (overrides manual selection)",
+		section = overlaySection,
+		position = 3
+	)
+	default boolean autoSwitchBucket()
+	{
+		return true;
 	}
 
 	// ==================== Visual Settings ====================
@@ -1944,9 +2217,9 @@ public class PvPLeaderboardPlugin extends Plugin
 					{
 						rankOverlay.resetLookupStateOnWorldHop();
 					}
-					// Nudge self rank refresh after a short delay so overlay repopulates post-hop
-					// Use tick-based scheduling: wait 3 ticks (approx 1.8s)
-					pendingSelfRankLookupTicks = 3;
+					// Nudge self rank refresh after delay to sync with post-match API updates
+					// Use tick-based scheduling: wait 8 ticks (approx 5s) to match scheduleApiRefreshes timing
+					pendingSelfRankLookupTicks = 8;
 				}
 				catch (Exception ignore) {}
 			}
@@ -2043,6 +2316,7 @@ import net.runelite.client.util.LinkBrowser;
 
 import javax.swing.*;
 import java.awt.*;
+import java.util.concurrent.CompletableFuture;
 
 public class DashboardPanel extends PluginPanel
 {
@@ -2237,13 +2511,34 @@ public class DashboardPanel extends PluginPanel
             String normalizedId = currentMatchesPlayerId;
             loadPlayerStats(normalizedId);
 
-            pvpDataService.getPlayerMatches(normalizedId, null, MATCHES_PAGE_SIZE).thenAccept(jsonResponse -> {
+            // Determine if this is "self" lookup - use acct-based query for accurate match history
+            // across name changes; use name-based query for searching other players
+            String selfName = plugin != null ? plugin.getLocalPlayerName() : null;
+            String selfNameNormalized = normalizePlayerId(selfName);
+            boolean isSelf = selfNameNormalized != null && selfNameNormalized.equalsIgnoreCase(normalizedId);
+            
+            CompletableFuture<JsonObject> matchesFuture;
+            if (isSelf) {
+                // Self lookup - use acct SHA for accurate history across name changes
+                String selfAcctSha = pvpDataService.getSelfAcctSha();
+                if (selfAcctSha != null && !selfAcctSha.isEmpty()) {
+                    matchesFuture = pvpDataService.getPlayerMatchesByAcct(selfAcctSha, null, MATCHES_PAGE_SIZE, false);
+                } else {
+                    // Fallback to name-based if acct SHA not available
+                    matchesFuture = pvpDataService.getPlayerMatches(normalizedId, null, MATCHES_PAGE_SIZE);
+                }
+            } else {
+                // Other player lookup - use name-based query
+                matchesFuture = pvpDataService.getPlayerMatches(normalizedId, null, MATCHES_PAGE_SIZE);
+            }
+
+            matchesFuture.thenAccept(jsonResponse -> {
                 if (jsonResponse == null) return;
                 
-                        JsonArray matches = jsonResponse.has("matches") && jsonResponse.get("matches").isJsonArray() ? jsonResponse.getAsJsonArray("matches") : new JsonArray();
+                JsonArray matches = jsonResponse.has("matches") && jsonResponse.get("matches").isJsonArray() ? jsonResponse.getAsJsonArray("matches") : new JsonArray();
                 // String nextToken = jsonResponse.has("next_token") && !jsonResponse.get("next_token").isJsonNull() ? jsonResponse.get("next_token").getAsString() : null;
 
-                        SwingUtilities.invokeLater(() -> {
+                SwingUtilities.invokeLater(() -> {
                     updateUiWithMatches(matches);
                 });
             });
@@ -3633,6 +3928,9 @@ public class RankOverlay extends Overlay
     // Displayed ranks cache
     private final ConcurrentHashMap<String, String> displayedRanks = new ConcurrentHashMap<>();
     private final Map<String, Long> displayedRanksTimestamp = new ConcurrentHashMap<>();
+    
+    // API-set ranks that should persist until shard cache refreshes with matching data
+    private final ConcurrentHashMap<String, String> apiSetRanks = new ConcurrentHashMap<>();
 
     // Config change tracking
     private String lastBucketKey = null;
@@ -3718,6 +4016,7 @@ public class RankOverlay extends Overlay
 
     /**
      * Set rank from API response.
+     * This rank will persist until the shard cache refreshes with matching data.
      */
     public void setRankFromApi(String playerName, String rank)
     {
@@ -3728,8 +4027,10 @@ public class RankOverlay extends Overlay
         String key = NameUtils.canonicalKey(playerName);
         displayedRanks.put(key, rank);
         displayedRanksTimestamp.put(key, System.currentTimeMillis());
+        // Track this as an API-set rank - persists until shard cache confirms with same rank
+        apiSetRanks.put(key, rank);
         pvpDataService.clearShardNegativeCache(playerName);
-        log.debug("[Overlay] setRankFromApi: key={} rank={}", key, rank);
+        log.debug("[Overlay] setRankFromApi: key={} rank={} (will persist until shard confirms)", key, rank);
     }
 
     /**
@@ -3834,6 +4135,7 @@ public class RankOverlay extends Overlay
         {
             displayedRanks.clear();
             displayedRanksTimestamp.clear();
+            apiSetRanks.clear();  // Clear API overrides when config changes
             lastBucketKey = currentBucket;
             lastDisplayMode = currentMode;
             selfRankAttempted = false;
@@ -3904,6 +4206,7 @@ public class RankOverlay extends Overlay
     {
         String bucket = bucketKey(config.rankBucket());
         PvPLeaderboardConfig.RankDisplayMode mode = config.rankDisplayMode();
+        String key = NameUtils.canonicalKey(selfName);
 
         pvpDataService.getShardRankByName(selfName, bucket)
             .thenAccept(sr -> {
@@ -3913,23 +4216,47 @@ public class RankOverlay extends Overlay
                     return;
                 }
 
-                String rank;
+                String shardRank;
                 if (mode == PvPLeaderboardConfig.RankDisplayMode.RANK_NUMBER)
                 {
-                    rank = sr.rank > 0 ? "Rank " + sr.rank : null;
+                    shardRank = sr.rank > 0 ? "Rank " + sr.rank : null;
                 }
                 else
                 {
-                    rank = sr.tier;
+                    shardRank = sr.tier;
                 }
 
-                if (rank != null)
+                if (shardRank != null)
                 {
-                    String key = NameUtils.canonicalKey(selfName);
-                    displayedRanks.put(key, rank);
-                    displayedRanksTimestamp.put(key, System.currentTimeMillis());
-                    nextSelfRankAllowedAtMs = System.currentTimeMillis() + 60_000L;
-                    log.debug("[Overlay] Self rank fetched: {} = {}", selfName, rank);
+                    long fetchCompletedAt = System.currentTimeMillis();
+                    
+                    // Check if there's an API-set rank that should persist
+                    String apiRank = apiSetRanks.get(key);
+                    if (apiRank != null)
+                    {
+                        if (apiRank.equals(shardRank))
+                        {
+                            // Shard cache has refreshed with matching data - clear the API override
+                            apiSetRanks.remove(key);
+                            displayedRanks.put(key, shardRank);
+                            displayedRanksTimestamp.put(key, fetchCompletedAt);
+                            log.debug("[Overlay] Shard cache refreshed for {}: {} (API override cleared)", selfName, shardRank);
+                        }
+                        else
+                        {
+                            // Shard has stale data - preserve the API-set rank
+                            log.debug("[Overlay] Preserving API rank for {}: {} (shard has stale: {})", 
+                                selfName, apiRank, shardRank);
+                        }
+                    }
+                    else
+                    {
+                        // No API override - use shard data
+                        displayedRanks.put(key, shardRank);
+                        displayedRanksTimestamp.put(key, fetchCompletedAt);
+                        log.debug("[Overlay] Self rank fetched: {} = {}", selfName, shardRank);
+                    }
+                    nextSelfRankAllowedAtMs = fetchCompletedAt + 60_000L;
                 }
             })
             .exceptionally(ex -> {
@@ -4070,13 +4397,13 @@ public class RankOverlay extends Overlay
         int alpha = (int) (255 * (1.0f - progress));
         int floatOffset = (int) (progress * 30); // Float up 30 pixels
 
-        // Format text: +1.3 (Multi) or -3.2 (NH) when bucket label present
+        // Format text: +1.3 MMR (NH) when bucket label present (auto-switched)
         // Otherwise: +1.3 MMR
         String sign = mmrDelta >= 0 ? "+" : "";
         String text;
         if (bucketLabel != null && !bucketLabel.isEmpty())
         {
-            text = String.format("%s%.1f (%s)", sign, mmrDelta, bucketLabel);
+            text = String.format("%s%.1f MMR (%s)", sign, mmrDelta, bucketLabel);
         }
         else
         {
@@ -4220,12 +4547,12 @@ public class MatchResultService
             }
 
             // Preflight diagnostics to understand why server might reject
+            // Note: FightMonitor now ensures valid timestamps (non-zero, 60s apart if one was missing)
             try {
                 String pLower = match.getPlayerId().trim().replaceAll("\\s+", " ").toLowerCase(java.util.Locale.ROOT);
                 String oLower = match.getOpponentId().trim().replaceAll("\\s+", " ").toLowerCase(java.util.Locale.ROOT);
                 boolean notSelf = !pLower.equals(oLower);
-                // Allow fight_start_ts = 0 when fight was already in progress (backend handles duration validation only when startTs > 0)
-                boolean timeOk = match.getFightEndTs() > 0 && (match.getFightStartTs() == 0 || match.getFightEndTs() >= match.getFightStartTs());
+                boolean timeOk = match.getFightStartTs() > 0 && match.getFightEndTs() > 0 && match.getFightEndTs() >= match.getFightStartTs();
                 boolean worldOk = match.getWorld() > 0;
                 // log.debug("[Submit] preflight notSelf={} timeOk={} worldOk={} player='{}' opponent='{}' startTs={} endTs={} world={} multi={} dmgOut={}",
                 //     notSelf, timeOk, worldOk, match.getPlayerId(), match.getOpponentId(), match.getFightStartTs(), match.getFightEndTs(), match.getWorld(), match.isWasInMulti(), match.getDamageToOpponent());
@@ -4771,6 +5098,153 @@ public class PvPDataService
 		});
 
 		return future;
+	}
+
+	/**
+	 * Fetch match history by account SHA256 hash (derived from UUID).
+	 * This returns ALL matches across ALL account names for this identity.
+	 * Use this for accurate MMR delta lookups even after name changes.
+	 * 
+	 * @param acctSha SHA256 hash of the player's UUID
+	 * @param nextToken Pagination token (null for first page)
+	 * @param limit Max matches to return
+	 * @param bypassCache If true, skip cache and always fetch fresh data
+	 */
+	public CompletableFuture<JsonObject> getPlayerMatchesByAcct(String acctSha, String nextToken, int limit, boolean bypassCache)
+	{
+		CompletableFuture<JsonObject> future = new CompletableFuture<>();
+
+		if (acctSha == null || acctSha.isEmpty()) {
+			future.complete(new JsonObject());
+			return future;
+		}
+
+		String acctShaLower = acctSha.toLowerCase();
+
+		// Check cache (only for first page, i.e. no nextToken, and if not bypassing)
+		if (!bypassCache && (nextToken == null || nextToken.isEmpty())) {
+			String cacheKey = "matches:acct:" + acctShaLower + ":" + limit;
+			MatchesCacheEntry cached = matchesCache.get(cacheKey);
+			if (cached != null && System.currentTimeMillis() - cached.getTimestamp() <= MATCHES_CACHE_TTL_MS) {
+				future.complete(cached.getResponse().deepCopy());
+				return future;
+			}
+		}
+
+		HttpUrl urlObj = HttpUrl.parse(API_BASE_URL + "/matches");
+		if (urlObj == null) {
+			future.completeExceptionally(new IOException("Invalid base URL"));
+			return future;
+		}
+		
+		// Use 'acct' parameter instead of 'player_id' for SHA256-based lookup
+		HttpUrl.Builder urlBuilder = urlObj.newBuilder()
+			.addQueryParameter("acct", acctShaLower)
+			.addQueryParameter("limit", String.valueOf(limit));
+
+		if (nextToken != null && !nextToken.isEmpty()) {
+			urlBuilder.addQueryParameter("next_token", nextToken);
+		}
+
+		Request.Builder requestBuilder = new Request.Builder()
+			.url(urlBuilder.build())
+			.get();
+
+		// Add client UUID header for API authentication/tracking
+		String clientUuid = clientIdentityService.getClientUniqueId();
+		if (clientUuid != null && !clientUuid.isEmpty()) {
+			requestBuilder.addHeader("X-Client-Unique-Id", clientUuid);
+		}
+
+		Request request = requestBuilder.build();
+		log.debug("[API] Fetching matches by acct: {}", acctShaLower);
+
+		okHttpClient.newCall(request).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				// Try serving stale cache if available
+				if (nextToken == null || nextToken.isEmpty()) {
+					String cacheKey = "matches:acct:" + acctShaLower + ":" + limit;
+					MatchesCacheEntry cached = matchesCache.get(cacheKey);
+					if (cached != null) {
+						future.complete(cached.getResponse().deepCopy());
+						return;
+					}
+				}
+				future.completeExceptionally(e);
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
+			{
+				try (Response res = response)
+				{
+					if (!res.isSuccessful())
+					{
+						// Try serving stale cache if available
+						if (nextToken == null || nextToken.isEmpty()) {
+							String cacheKey = "matches:acct:" + acctShaLower + ":" + limit;
+							MatchesCacheEntry cached = matchesCache.get(cacheKey);
+							if (cached != null) {
+								future.complete(cached.getResponse().deepCopy());
+								return;
+							}
+						}
+						future.completeExceptionally(new IOException("API call failed with status: " + res.code()));
+						return;
+					}
+
+					ResponseBody body = res.body();
+					if (body == null)
+					{
+						future.complete(new JsonObject());
+						return;
+					}
+
+					try
+					{
+						String bodyString;
+						try {
+							bodyString = body.string();
+						} catch (IOException cacheEx) {
+							future.complete(new JsonObject());
+							return;
+						}
+						JsonObject json = gson.fromJson(bodyString, JsonObject.class);
+						if (nextToken == null || nextToken.isEmpty()) {
+							String cacheKey = "matches:acct:" + acctShaLower + ":" + limit;
+							matchesCache.put(cacheKey, new MatchesCacheEntry(json.deepCopy(), System.currentTimeMillis()));
+						}
+						future.complete(json);
+					}
+					catch (JsonSyntaxException e)
+					{
+						future.completeExceptionally(e);
+					}
+				}
+			}
+		});
+
+		return future;
+	}
+
+	/**
+	 * Get the account SHA256 hash for the current client's UUID.
+	 * Returns null if UUID is not available.
+	 */
+	public String getSelfAcctSha()
+	{
+		try {
+			String uuid = clientIdentityService.getClientUniqueId();
+			if (uuid != null && !uuid.isEmpty()) {
+				return generateAcctSha(uuid);
+			}
+		} catch (Exception e) {
+			log.debug("[API] Failed to generate self acct SHA: {}", e.getMessage());
+		}
+		return null;
 	}
 
 	public CompletableFuture<JsonObject> getUserProfile(String playerName, String clientUniqueId)
