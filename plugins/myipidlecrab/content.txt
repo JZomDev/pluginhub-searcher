@@ -1,0 +1,799 @@
+package com.sandcrabcombatnotifier;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import java.awt.Toolkit;
+import java.util.List;
+
+import lombok.extern.slf4j.Slf4j;
+
+import net.runelite.api.Actor;
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.HitsplatApplied;
+
+import net.runelite.client.Notifier;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+@Slf4j
+@PluginDescriptor(
+        name = "Sand Crab Combat Notifier",
+        description = "Shows sand crab aggro time left and alarms when you go out of combat.",
+        tags = {"sand", "crab", "aggro", "afk", "combat"}
+)
+public class SandCrabCombatNotifierPlugin extends Plugin
+{
+    private static final String SAND_CRAB_NAME = "Sand Crab";
+    private static final String SANDY_ROCK_NAME = "Sandy rock";
+
+    private static final int AGGRO_TOTAL_TICKS = 1000;
+
+    private static final String CONFIG_GROUP = "sandcrabcombatnotifier";
+    private static final String CONFIG_PERSISTED_START_MS = "persistedAggroStartMs";
+
+    private static final int ALARM_BEEP_EVERY_TICKS = 2;
+    private static final int ALARM_NOTIFY_EVERY_TICKS = 4;
+
+    // Debounce timer reset when crab context temporarily disappears
+    private static final int CRAB_CONTEXT_RESET_GRACE_TICKS = 10; // ~6 seconds
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private Notifier notifier;
+
+    @Inject
+    private SandCrabCombatNotifierConfig config;
+
+    @Inject
+    private ConfigManager configManager;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private SandCrabCombatNotifierOverlay overlay;
+
+    private int tick;
+    private int lastCombatTick;
+
+    private boolean outOfCombatNotified;
+    private boolean alarmActive;
+    private int alarmBeepCooldownTicks;
+    private int alarmNotifyCooldownTicks;
+
+    private Integer aggroStartTick;
+    private boolean aggroWarned;
+
+    private Long aggroStartMs;
+
+    private int expireFlashTicksRemaining = 0;
+
+    private WorldPoint aggroStartWorldPoint;
+
+    // Stabilizers
+    private boolean engagedWithCrabLastTick = false;
+    private int crabContextMissingTicks = 0;
+
+    @Provides
+    SandCrabCombatNotifierConfig provideConfig(ConfigManager configManager)
+    {
+        return configManager.getConfig(SandCrabCombatNotifierConfig.class);
+    }
+
+    @Override
+    protected void startUp()
+    {
+        log.info("SandCrabCombatNotifierPlugin STARTED");
+
+        tick = 0;
+        lastCombatTick = -10_000;
+
+        outOfCombatNotified = false;
+        alarmActive = false;
+        alarmBeepCooldownTicks = 0;
+        alarmNotifyCooldownTicks = 0;
+
+        aggroStartTick = null;
+        aggroWarned = false;
+        expireFlashTicksRemaining = 0;
+
+        aggroStartWorldPoint = null;
+
+        engagedWithCrabLastTick = false;
+        crabContextMissingTicks = 0;
+
+        aggroStartMs = null;
+        if (config.persistAggroTimer())
+        {
+            Long persisted = getPersistedAggroStartMs();
+            if (persisted != null)
+            {
+                long now = System.currentTimeMillis();
+                long ageMs = now - persisted;
+
+                long maxAgeMs = (long) ((AGGRO_TOTAL_TICKS * 600L) + 30_000L);
+                if (ageMs >= 0 && ageMs <= maxAgeMs)
+                {
+                    aggroStartMs = persisted;
+                }
+            }
+        }
+
+        overlayManager.add(overlay);
+    }
+
+    @Override
+    protected void shutDown()
+    {
+        overlayManager.remove(overlay);
+
+        if (config.persistAggroTimer())
+        {
+            persistAggroStartMs(aggroStartMs);
+        }
+        else
+        {
+            persistAggroStartMs(null);
+        }
+
+        log.info("SandCrabCombatNotifierPlugin STOPPED");
+    }
+
+    @Subscribe
+    public void onHitsplatApplied(HitsplatApplied event)
+    {
+        Player player = client.getLocalPlayer();
+        if (player == null)
+        {
+            return;
+        }
+
+        if (event.getActor() == player)
+        {
+            markCombatActivity();
+
+            // Only start if not already started
+            if (aggroStartTick == null && isSandCrabContext() && isSandCrabEngagedNow(player))
+            {
+                setAggroStartNow(player);
+            }
+        }
+    }
+
+    @Subscribe
+    public void onGameTick(GameTick event)
+    {
+        tick++;
+
+        Player player = client.getLocalPlayer();
+        if (player == null)
+        {
+            return;
+        }
+
+        if (expireFlashTicksRemaining > 0)
+        {
+            expireFlashTicksRemaining--;
+        }
+
+        if (alarmBeepCooldownTicks > 0)
+        {
+            alarmBeepCooldownTicks--;
+        }
+        if (alarmNotifyCooldownTicks > 0)
+        {
+            alarmNotifyCooldownTicks--;
+        }
+
+        boolean inCrabContext = isSandCrabContext();
+
+        // Track consecutive missing context ticks
+        if (!inCrabContext)
+        {
+            crabContextMissingTicks++;
+        }
+        else
+        {
+            crabContextMissingTicks = 0;
+        }
+
+        // Optional: reset timer after moving away from start point
+        if (config.resetDistanceTiles() > 0 && aggroStartWorldPoint != null)
+        {
+            WorldPoint now = player.getWorldLocation();
+            if (now != null && now.distanceTo(aggroStartWorldPoint) >= config.resetDistanceTiles())
+            {
+                clearAggroTimer();
+            }
+        }
+
+        // If configured to only operate near crabs, we still do NOT instantly clear timer.
+        if (config.onlyWhenSandCrabsNearby() && !inCrabContext)
+        {
+            resetAlarm();
+            outOfCombatNotified = false;
+            lastCombatTick = -10_000;
+            aggroWarned = false;
+
+            if (config.resetTimerWhenLeavingCrabArea()
+                    && crabContextMissingTicks >= CRAB_CONTEXT_RESET_GRACE_TICKS)
+            {
+                clearAggroTimer();
+            }
+
+            // Do not update engagedWithCrabLastTick here, since we are returning early.
+            // This prevents a one-tick flicker from causing a "rising edge" restart.
+            return;
+        }
+
+        boolean engagedWithCrab = isSandCrabEngagedNow(player);
+
+        if (engagedWithCrab)
+        {
+            markCombatActivity();
+
+            // Start only on engagement "rising edge"
+            if (!engagedWithCrabLastTick && aggroStartTick == null)
+            {
+                setAggroStartNow(player);
+            }
+        }
+
+        int ticksSinceCombat = tick - lastCombatTick;
+
+        boolean outOfCombat = !engagedWithCrab && ticksSinceCombat >= config.outOfCombatAfterTicks();
+
+        if (outOfCombat)
+        {
+            if (!outOfCombatNotified)
+            {
+                notifier.notify("OUT OF COMBAT. Wake up.");
+                outOfCombatNotified = true;
+            }
+
+            alarmActive = true;
+
+            if (alarmBeepCooldownTicks == 0)
+            {
+                Toolkit.getDefaultToolkit().beep();
+                Toolkit.getDefaultToolkit().beep();
+                alarmBeepCooldownTicks = ALARM_BEEP_EVERY_TICKS;
+            }
+
+            if (alarmNotifyCooldownTicks == 0)
+            {
+                notifier.notify("OUT OF COMBAT. Reset aggro or attack a crab.");
+                alarmNotifyCooldownTicks = ALARM_NOTIFY_EVERY_TICKS;
+            }
+        }
+        else
+        {
+            outOfCombatNotified = false;
+            resetAlarm();
+        }
+
+        if (config.enableAggroWarning())
+        {
+            int elapsed = getAggroElapsedTicks();
+            int warnElapsed = config.aggroWarnMinutes() * 100;
+
+            if (elapsed >= 0 && !aggroWarned && elapsed >= warnElapsed)
+            {
+                notifier.notify("Sand crab aggro expiring soon. Reset recommended.");
+                aggroWarned = true;
+            }
+        }
+
+        if (config.flashOnExpire())
+        {
+            int remaining = getAggroRemainingTicks();
+            if (remaining >= 0 && remaining <= 0 && expireFlashTicksRemaining == 0)
+            {
+                expireFlashTicksRemaining = 10;
+            }
+        }
+
+        // If timer expired and you re-engage, restart timer
+        int remaining = getAggroRemainingTicks();
+        if (remaining >= 0 && remaining <= 0 && engagedWithCrab)
+        {
+            setAggroStartNow(player);
+            aggroWarned = false;
+        }
+
+        engagedWithCrabLastTick = engagedWithCrab;
+    }
+
+    private void markCombatActivity()
+    {
+        lastCombatTick = tick;
+        outOfCombatNotified = false;
+
+        if (alarmActive)
+        {
+            resetAlarm();
+        }
+    }
+
+    private void resetAlarm()
+    {
+        alarmActive = false;
+        alarmBeepCooldownTicks = 0;
+        alarmNotifyCooldownTicks = 0;
+    }
+
+    private void setAggroStartNow(Player player)
+    {
+        aggroStartTick = tick;
+        aggroStartMs = System.currentTimeMillis();
+        aggroWarned = false;
+
+        aggroStartWorldPoint = player != null ? player.getWorldLocation() : null;
+
+        if (config.persistAggroTimer())
+        {
+            persistAggroStartMs(aggroStartMs);
+        }
+    }
+
+    private void clearAggroTimer()
+    {
+        aggroStartTick = null;
+        aggroStartMs = null;
+        aggroStartWorldPoint = null;
+        aggroWarned = false;
+        expireFlashTicksRemaining = 0;
+        engagedWithCrabLastTick = false;
+
+        if (config.persistAggroTimer())
+        {
+            persistAggroStartMs(null);
+        }
+    }
+
+    private boolean isSandCrabContext()
+    {
+        List<NPC> npcs = client.getNpcs();
+        if (npcs == null)
+        {
+            return false;
+        }
+
+        for (NPC npc : npcs)
+        {
+            if (isSandCrabNpc(npc))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private boolean isSandCrabEngagedNow(Player player)
+    {
+        Actor a = player.getInteracting();
+        if (a instanceof NPC)
+        {
+            NPC n = (NPC) a;
+            if (isSandCrabNpc(n))
+            {
+                return true;
+            }
+        }
+
+        List<NPC> npcs = client.getNpcs();
+        if (npcs == null)
+        {
+            return false;
+        }
+
+        for (NPC npc : npcs)
+        {
+            if (!isSandCrabNpc(npc))
+            {
+                continue;
+            }
+            if (npc.getInteracting() == player)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static boolean isSandCrabNpc(NPC npc)
+    {
+        if (npc == null)
+        {
+            return false;
+        }
+        String name = npc.getName();
+        if (name == null)
+        {
+            return false;
+        }
+        return SAND_CRAB_NAME.equals(name) || SANDY_ROCK_NAME.equals(name);
+    }
+
+    // Overlay helpers
+
+    public boolean isOverlayRelevant()
+    {
+        // Never hide overlay during alarm
+        if (alarmActive)
+        {
+            return true;
+        }
+
+        // Keep overlay visible if timer is running and you are still near the start point
+        if (getAggroElapsedTicks() >= 0 && isInAggroStartArea())
+        {
+            return true;
+        }
+
+        if (config.onlyWhenSandCrabsNearby())
+        {
+            return isSandCrabContext();
+        }
+
+        return true;
+    }
+
+    public boolean isInAggroStartArea()
+    {
+        Player p = client.getLocalPlayer();
+        if (p == null || aggroStartWorldPoint == null)
+        {
+            return false;
+        }
+
+        int radius = Math.max(0, config.resetDistanceTiles());
+        if (radius == 0)
+        {
+            return true;
+        }
+
+        WorldPoint now = p.getWorldLocation();
+        return now != null && now.distanceTo(aggroStartWorldPoint) <= radius;
+    }
+
+    public boolean showProgressBar()
+    {
+        return config.showProgressBar();
+    }
+
+    public int getAggroTotalTicks()
+    {
+        return AGGRO_TOTAL_TICKS;
+    }
+
+    public int getAggroElapsedTicks()
+    {
+        if (aggroStartTick != null)
+        {
+            return tick - aggroStartTick;
+        }
+
+        if (aggroStartMs != null)
+        {
+            long now = System.currentTimeMillis();
+            long elapsedMs = Math.max(0L, now - aggroStartMs);
+            return (int) Math.min(Integer.MAX_VALUE, elapsedMs / 600L);
+        }
+
+        return -1;
+    }
+
+    public int getAggroRemainingTicks()
+    {
+        int elapsed = getAggroElapsedTicks();
+        if (elapsed < 0)
+        {
+            return -1;
+        }
+        return AGGRO_TOTAL_TICKS - elapsed;
+    }
+
+    public boolean isExpireFlashing()
+    {
+        return expireFlashTicksRemaining > 0;
+    }
+
+    public boolean isFlashOnTick()
+    {
+        return (expireFlashTicksRemaining % 2) == 0;
+    }
+
+    public boolean isOutOfCombatAlarmActive()
+    {
+        return alarmActive;
+    }
+
+    private Long getPersistedAggroStartMs()
+    {
+        try
+        {
+            String v = configManager.getConfiguration(CONFIG_GROUP, CONFIG_PERSISTED_START_MS);
+            if (v == null || v.trim().isEmpty())
+            {
+                return null;
+            }
+            return Long.parseLong(v.trim());
+        }
+        catch (Exception e)
+        {
+            return null;
+        }
+    }
+
+    private void persistAggroStartMs(Long startMs)
+    {
+        if (startMs == null)
+        {
+            configManager.unsetConfiguration(CONFIG_GROUP, CONFIG_PERSISTED_START_MS);
+        }
+        else
+        {
+            configManager.setConfiguration(CONFIG_GROUP, CONFIG_PERSISTED_START_MS, Long.toString(startMs));
+        }
+    }
+}
+
+package com.sandcrabcombatnotifier;
+
+import javax.inject.Inject;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.ProgressBarComponent;
+
+public class SandCrabCombatNotifierOverlay extends Overlay
+{
+    private final SandCrabCombatNotifierPlugin plugin;
+    private final PanelComponent panel = new PanelComponent();
+
+    @Inject
+    SandCrabCombatNotifierOverlay(SandCrabCombatNotifierPlugin plugin)
+    {
+        this.plugin = plugin;
+        setPosition(OverlayPosition.TOP_LEFT);
+        setLayer(OverlayLayer.ABOVE_WIDGETS);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        panel.getChildren().clear();
+
+        if (!plugin.isOverlayRelevant())
+        {
+            return null;
+        }
+
+        panel.getChildren().add(LineComponent.builder()
+                .left("Idle Crab")
+                .build());
+
+        int totalTicks = plugin.getAggroTotalTicks();
+        int remainingTicks = plugin.getAggroRemainingTicks();
+
+        if (remainingTicks < 0)
+        {
+            panel.getChildren().add(LineComponent.builder()
+                    .left("Aggro left")
+                    .right("Waiting")
+                    .build());
+            return panel.render(graphics);
+        }
+
+        String remaining = formatTicks(Math.max(0, remainingTicks));
+        Color remainingColor = gradientColorByRemaining(remainingTicks, totalTicks);
+
+        if (remainingTicks <= 0 && plugin.isExpireFlashing())
+        {
+            remainingColor = plugin.isFlashOnTick()
+                    ? Color.WHITE
+                    : new Color(220, 40, 40);
+        }
+
+        if (plugin.isOutOfCombatAlarmActive())
+        {
+            // Make the overlay visually obnoxious when out of combat
+            remainingColor = plugin.isFlashOnTick() ? Color.WHITE : new Color(220, 40, 40);
+
+            panel.getChildren().add(LineComponent.builder()
+                    .left("OUT OF COMBAT")
+                    .leftColor(remainingColor)
+                    .build());
+        }
+
+        panel.getChildren().add(LineComponent.builder()
+                .left("Aggro left")
+                .right(remaining)
+                .rightColor(remainingColor)
+                .build());
+
+        if (plugin.showProgressBar())
+        {
+            ProgressBarComponent bar = new ProgressBarComponent();
+            bar.setMaximum(totalTicks);
+            bar.setValue(Math.max(0, remainingTicks));
+            bar.setForegroundColor(remainingColor);
+            bar.setBackgroundColor(new Color(0, 0, 0, 120));
+            panel.getChildren().add(bar);
+        }
+
+        return panel.render(graphics);
+    }
+
+    private static String formatTicks(int ticks)
+    {
+        int seconds = (ticks * 6) / 10;
+        int mm = seconds / 60;
+        int ss = seconds % 60;
+        return String.format("%d:%02d", mm, ss);
+    }
+
+    private static Color gradientColorByRemaining(int remainingTicks, int totalTicks)
+    {
+        if (totalTicks <= 0)
+        {
+            return Color.WHITE;
+        }
+
+        double t = clamp01(remainingTicks / (double) totalTicks);
+
+        Color green = new Color(0, 200, 0);
+        Color yellow = new Color(220, 180, 0);
+        Color red = new Color(220, 40, 40);
+
+        if (t >= 0.5)
+        {
+            double u = (t - 0.5) / 0.5;
+            return lerp(yellow, green, u);
+        }
+
+        double u = t / 0.5;
+        return lerp(red, yellow, u);
+    }
+
+    private static Color lerp(Color a, Color b, double t)
+    {
+        t = clamp01(t);
+        int r = (int) Math.round(a.getRed() + (b.getRed() - a.getRed()) * t);
+        int g = (int) Math.round(a.getGreen() + (b.getGreen() - a.getGreen()) * t);
+        int bl = (int) Math.round(a.getBlue() + (b.getBlue() - a.getBlue()) * t);
+        return new Color(r, g, bl);
+    }
+
+    private static double clamp01(double v)
+    {
+        if (v < 0.0)
+        {
+            return 0.0;
+        }
+        if (v > 1.0)
+        {
+            return 1.0;
+        }
+        return v;
+    }
+}
+
+package com.sandcrabcombatnotifier;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("sandcrabcombatnotifier")
+public interface SandCrabCombatNotifierConfig extends Config
+{
+    @ConfigItem(
+            keyName = "onlyWhenSandCrabsNearby",
+            name = "Only when sand crabs nearby",
+            description = "Only run and show overlay when a Sand Crab or Sandy rock is nearby."
+    )
+    default boolean onlyWhenSandCrabsNearby()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "outOfCombatAfterTicks",
+            name = "Out of combat after (ticks)",
+            description = "Notify after this many ticks without combat activity. One tick is 0.6 seconds."
+    )
+    default int outOfCombatAfterTicks()
+    {
+        return 8;
+    }
+
+    @ConfigItem(
+            keyName = "enableAggroWarning",
+            name = "Enable aggro warning",
+            description = "Send a notification when approaching the crab aggro timeout."
+    )
+    default boolean enableAggroWarning()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "aggroWarnMinutes",
+            name = "Aggro warning (minutes)",
+            description = "Warn this many minutes after aggro starts."
+    )
+    default int aggroWarnMinutes()
+    {
+        return 9;
+    }
+
+    @ConfigItem(
+            keyName = "showProgressBar",
+            name = "Show progress bar",
+            description = "Show a small progress bar for remaining aggro time."
+    )
+    default boolean showProgressBar()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "flashOnExpire",
+            name = "Flash on expire",
+            description = "Briefly flash the overlay when aggro reaches 0."
+    )
+    default boolean flashOnExpire()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "persistAggroTimer",
+            name = "Persist aggro timer",
+            description = "Attempt to keep the aggro timer across quick logout or world hop using wall clock time."
+    )
+    default boolean persistAggroTimer()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "resetTimerWhenLeavingCrabArea",
+            name = "Reset timer when leaving crab area",
+            description = "Resets the aggro timer when no sand crabs are detected nearby."
+    )
+    default boolean resetTimerWhenLeavingCrabArea()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+            keyName = "resetDistanceTiles",
+            name = "Reset distance (tiles)",
+            description = "If you move this many tiles away from where the aggro timer started, reset the timer."
+    )
+    default int resetDistanceTiles()
+    {
+        return 12;
+    }
+}
+
