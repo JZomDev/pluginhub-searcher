@@ -51,12 +51,14 @@ public class QuestListIndicatorHandler {
 
         ticksSinceOpened++;
 
-        if (ticksSinceOpened >= TICKS_BEFORE_ADDING_INDICATORS) {
-            if (config.showVoicedIndicator()) {
-                updateVoiceIndicators();
-            } else {
-                removeVoiceIndicators();
-            }
+        if (ticksSinceOpened < TICKS_BEFORE_ADDING_INDICATORS) {
+            return;
+        }
+
+        if (config.showVoicedIndicator()) {
+            updateVoiceIndicators();
+        } else {
+            removeVoiceIndicators();
         }
     }
 
@@ -168,10 +170,10 @@ public class QuestListIndicatorHandler {
 package com.quest.voiceover.features;
 
 import com.quest.voiceover.QuestVoiceoverConfig;
-import com.quest.voiceover.modules.audio.SoundEngine;
+import com.quest.voiceover.modules.audio.AudioManager;
 import com.quest.voiceover.modules.database.DatabaseManager;
 import com.quest.voiceover.modules.dialog.DialogManager;
-import com.quest.voiceover.utility.MessageParser;
+import com.quest.voiceover.utility.MessageUtility;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.widgets.Widget;
@@ -204,13 +206,16 @@ public class VoiceoverHandler {
     private DatabaseManager databaseManager;
 
     @Inject
-    private SoundEngine soundEngine;
+    private AudioManager audioManager;
 
     @Inject
     private DialogManager dialogManager;
 
     @Inject
     private QuestVoiceoverConfig config;
+
+    @Inject
+    private DialogSpeechHighlightHandler dialogSpeechHighlightHandler;
 
     @Getter
     private boolean activeVoiceover;
@@ -220,32 +225,45 @@ public class VoiceoverHandler {
 
     private String pendingCharacter;
     private String pendingPlayerName;
+    private String pendingOriginalText;
 
+    /**
+     * Chat messages serve as a reliable trigger event, while the dialog widget provides
+     * the complete text. Widget-only detection is unreliable because there's no single
+     * "dialog changed" event and widget population timing is unpredictable. The chat
+     * message signals "dialog happened", then we fetch the full content from the widget.
+     */
     public void handleDialogMessage(String rawMessage, String playerName) {
-        MessageParser chatMessage = new MessageParser(rawMessage, playerName);
-        String chatText = chatMessage.getDialogText();
-        String chatCharacter = chatMessage.getCharacterName();
+        MessageUtility.ParsedMessage chatMessage = MessageUtility.parseRawMessage(rawMessage, playerName);
+        String chatText = chatMessage.dialogText();
+        String chatCharacter = chatMessage.characterName();
 
         String widgetText = dialogManager.getDialogText();
-        String widgetCharacter = dialogManager.getDialogCharacterName(playerName);
+        String widgetCharacter = dialogManager.getDialogCharacterName();
 
-        if (widgetText != null && widgetCharacter != null) {
-            String cleanedWidgetText = cleanWidgetText(widgetText, playerName);
-
-            if (cleanedWidgetText.startsWith(chatText) || chatText.startsWith(cleanedWidgetText)) {
-                playVoiceoverIfAvailable(widgetCharacter, cleanedWidgetText);
-            } else {
-                log.debug("Widget text mismatch, scheduling retry");
-                pendingCharacter = chatCharacter;
-                pendingPlayerName = playerName;
-                clientThread.invokeLater(this::retryWithWidget);
-            }
-        } else {
+        if (widgetText == null || widgetCharacter == null) {
             log.debug("Widget not available, scheduling retry");
-            pendingCharacter = chatCharacter;
-            pendingPlayerName = playerName;
-            clientThread.invokeLater(this::retryWithWidget);
+            scheduleRetry(chatCharacter, playerName, null);
+            return;
         }
+
+        String cleanedWidgetText = MessageUtility.cleanWidgetText(widgetText, playerName);
+        boolean textMatches = cleanedWidgetText.startsWith(chatText) || chatText.startsWith(cleanedWidgetText);
+
+        if (!textMatches) {
+            log.debug("Widget text mismatch, scheduling retry");
+            scheduleRetry(chatCharacter, playerName, widgetText);
+            return;
+        }
+
+        playVoiceoverIfAvailable(widgetCharacter, cleanedWidgetText, widgetText);
+    }
+
+    private void scheduleRetry(String character, String playerName, String originalText) {
+        pendingCharacter = character;
+        pendingPlayerName = playerName;
+        pendingOriginalText = originalText;
+        clientThread.invokeLater(this::retryWithWidget);
     }
 
     private void retryWithWidget() {
@@ -254,31 +272,23 @@ public class VoiceoverHandler {
         }
 
         String widgetText = dialogManager.getDialogText();
-        String widgetCharacter = dialogManager.getDialogCharacterName(pendingPlayerName);
+        String widgetCharacter = dialogManager.getDialogCharacterName();
 
-        if (widgetText != null && widgetCharacter != null) {
-            String cleanedWidgetText = cleanWidgetText(widgetText, pendingPlayerName);
-            playVoiceoverIfAvailable(widgetCharacter, cleanedWidgetText);
-        } else {
+        if (widgetText == null || widgetCharacter == null) {
             log.debug("Widget retry failed");
+            clearPendingState();
+            return;
         }
 
-        pendingCharacter = null;
-        pendingPlayerName = null;
+        String cleanedWidgetText = MessageUtility.cleanWidgetText(widgetText, pendingPlayerName);
+        playVoiceoverIfAvailable(widgetCharacter, cleanedWidgetText, widgetText);
+        clearPendingState();
     }
 
-    private String cleanWidgetText(String text, String playerName) {
-        String cleaned = text
-            .replaceAll("<br>", " ")
-            .replaceAll("<col=[^>]*>", "")
-            .replaceAll("</col>", "")
-            .trim();
-
-        if (playerName != null && !playerName.isEmpty()) {
-            cleaned = cleaned.replace(playerName, "");
-        }
-
-        return cleaned;
+    private void clearPendingState() {
+        pendingCharacter = null;
+        pendingPlayerName = null;
+        pendingOriginalText = null;
     }
 
     public void handleDialogOpened() {
@@ -305,7 +315,8 @@ public class VoiceoverHandler {
 
     public void stopVoiceover() {
         activeVoiceover = false;
-        soundEngine.stop();
+        audioManager.stop();
+        dialogSpeechHighlightHandler.stop();
     }
 
     /**
@@ -314,31 +325,30 @@ public class VoiceoverHandler {
      * 2. Levenshtein similarity - handles word substitutions (e.g., "called" vs "named")
      *    where wiki transcript differs from actual in-game text
      */
-    private void playVoiceoverIfAvailable(String characterName, String dialogText) {
-        String escapedCharacter = escapeQuotes(characterName);
-        String escapedText = escapeQuotes(dialogText);
-
-        if (tryExactQuery(escapedCharacter, escapedText, characterName, dialogText)) {
+    private void playVoiceoverIfAvailable(String characterName, String dialogText, String originalText) {
+        if (tryExactQuery(characterName, dialogText, originalText)) {
             return;
         }
 
-        if (tryLevenshteinQuery(escapedCharacter, escapedText, characterName, dialogText)) {
+        if (tryLevenshteinQuery(characterName, dialogText, originalText)) {
             return;
         }
 
         log.info("No voiceover found for {} - '{}'", characterName, dialogText);
         activeVoiceover = false;
+        dialogSpeechHighlightHandler.stop();
+        audioManager.stopImmediately();
     }
 
-    private boolean tryExactQuery(String escapedCharacter, String escapedText, String characterName, String dialogText) {
+    private boolean tryExactQuery(String characterName, String dialogText, String originalText) {
         try (PreparedStatement statement = databaseManager.prepareStatement(EXACT_QUERY)) {
-            statement.setString(1, escapedCharacter);
-            statement.setString(2, escapedText);
+            statement.setString(1, characterName);
+            statement.setString(2, dialogText);
 
             try (ResultSet resultSet = statement.executeQuery()) {
                 if (resultSet.next()) {
                     log.debug("Match type: exact");
-                    return playVoiceoverFromResult(resultSet, characterName, dialogText);
+                    return playVoiceoverFromResult(resultSet, characterName, dialogText, originalText);
                 }
             }
         } catch (SQLException e) {
@@ -347,22 +357,26 @@ public class VoiceoverHandler {
         return false;
     }
 
-    private boolean tryLevenshteinQuery(String escapedCharacter, String escapedText, String characterName, String dialogText) {
+    private boolean tryLevenshteinQuery(String characterName, String dialogText, String originalText) {
         try (PreparedStatement statement = databaseManager.prepareStatement(LEVENSHTEIN_QUERY)) {
-            statement.setString(1, escapedText);
-            statement.setString(2, escapedCharacter);
+            statement.setString(1, dialogText);
+            statement.setString(2, characterName);
 
             try (ResultSet resultSet = statement.executeQuery()) {
-                if (resultSet.next()) {
-                    double similarity = resultSet.getDouble("similarity");
-                    if (similarity >= LEVENSHTEIN_THRESHOLD) {
-                        log.debug("Match type: levenshtein ({}%)", String.format("%.1f", similarity * 100));
-                        return playVoiceoverFromResult(resultSet, characterName, dialogText);
-                    }
+                if (!resultSet.next()) {
+                    return false;
+                }
+
+                double similarity = resultSet.getDouble("similarity");
+                if (similarity < LEVENSHTEIN_THRESHOLD) {
                     String bestMatchText = resultSet.getString("text");
                     log.info("Levenshtein match below threshold ({}%) for {} - '{}' best match: '{}'",
                         String.format("%.1f", similarity * 100), characterName, dialogText, bestMatchText);
+                    return false;
                 }
+
+                log.debug("Match type: levenshtein ({}%)", String.format("%.1f", similarity * 100));
+                return playVoiceoverFromResult(resultSet, characterName, dialogText, originalText);
             }
         } catch (SQLException e) {
             log.error("Database query failed (Levenshtein)", e);
@@ -370,28 +384,244 @@ public class VoiceoverHandler {
         return false;
     }
 
-    private boolean playVoiceoverFromResult(ResultSet resultSet, String characterName, String dialogText) throws SQLException {
+    private boolean playVoiceoverFromResult(ResultSet resultSet, String characterName, String dialogText, String originalText) throws SQLException {
         String audioUri = resultSet.getString("uri");
         currentQuestName = resultSet.getString("quest");
         String matchedText = resultSet.getString("text");
         log.info("Playing voiceover: {} - {} - '{}' matched: '{}'", characterName, currentQuestName, dialogText, matchedText);
 
-        if (audioUri != null || currentQuestName != null) {
-            activeVoiceover = true;
-            soundEngine.play(audioUri);
-            addDialogOverlay();
-            return true;
+        if (audioUri == null && currentQuestName == null) {
+            return false;
         }
-        return false;
+
+        activeVoiceover = true;
+        audioManager.play(audioUri);
+        addDialogOverlay();
+        dialogSpeechHighlightHandler.startAsync(audioUri, originalText);
+        return true;
     }
 
-    private String escapeQuotes(String input) {
-        return input.replace("'", "''");
+}
+
+package com.quest.voiceover.features;
+
+import com.quest.voiceover.QuestVoiceoverConfig;
+import com.quest.voiceover.modules.dialog.DialogManager;
+import com.quest.voiceover.utility.ColorUtility;
+import com.quest.voiceover.Constants;
+import com.quest.voiceover.utility.TextUtility;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.callback.ClientThread;
+import okhttp3.HttpUrl;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@Slf4j
+@Singleton
+public class DialogSpeechHighlightHandler {
+
+    private static final double FALLBACK_WORDS_PER_SECOND = 2.5;
+    private static final Pattern WORD_PATTERN = Pattern.compile("\\S+");
+    private static final Pattern PUNCTUATION_PAUSE_PATTERN = Pattern.compile("[.!?]+$");
+    private static final int PUNCTUATION_PAUSE_WEIGHT = 7;
+
+    @Inject
+    private QuestVoiceoverConfig config;
+
+    @Inject
+    private DialogManager dialogManager;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private ScheduledExecutorService executor;
+
+    @Inject
+    private OkHttpClient okHttpClient;
+
+    private String originalText;
+    private List<WordPosition> wordPositions;
+    private volatile int currentWordIndex;
+    private final List<ScheduledFuture<?>> scheduledTasks = new ArrayList<>();
+
+    public void startAsync(String audioUri, String dialogText) {
+        if (!config.speechHighlighting()) {
+            return;
+        }
+
+        executor.submit(() -> {
+            long durationMs = estimateDurationMs(audioUri);
+            start(dialogText, durationMs);
+        });
+    }
+
+    private long estimateDurationMs(String fileName) {
+        if (fileName == null || fileName.isEmpty()) {
+            return 0;
+        }
+
+        HttpUrl url = Constants.RAW_GITHUB_SOUND_BRANCH_URL.newBuilder()
+            .addPathSegment(fileName)
+            .build();
+
+        Request request = new Request.Builder()
+            .url(url)
+            .head()
+            .build();
+
+        try (Response response = okHttpClient.newCall(request).execute()) {
+            String contentLength = response.header("Content-Length");
+            if (contentLength != null) {
+                long fileBytes = Long.parseLong(contentLength);
+                long bytesPerSecond = (Constants.MP3_BITRATE_KBPS * 1000L) / 8;
+                return (fileBytes * 1000) / bytesPerSecond;
+            }
+        } catch (IOException | NumberFormatException e) {
+            log.warn("Failed to estimate audio duration for {}", fileName, e);
+        }
+
+        return 0;
+    }
+
+    private void start(String dialogText, long durationMs) {
+        stop();
+
+        originalText = dialogText;
+        wordPositions = parseWordPositions(dialogText);
+        currentWordIndex = 0;
+
+        if (wordPositions.isEmpty()) {
+            return;
+        }
+
+        long effectiveDuration = durationMs > 0 ? durationMs : calculateFallbackDuration();
+        scheduleWordHighlights(effectiveDuration);
+    }
+
+    public void stop() {
+        for (ScheduledFuture<?> task : scheduledTasks) {
+            task.cancel(false);
+        }
+        reset();
+    }
+
+    private void reset() {
+        scheduledTasks.clear();
+        originalText = null;
+        wordPositions = null;
+        currentWordIndex = 0;
+    }
+
+    private List<WordPosition> parseWordPositions(String text) {
+        List<WordPosition> positions = new ArrayList<>();
+        Matcher matcher = WORD_PATTERN.matcher(text);
+
+        while (matcher.find()) {
+            String word = matcher.group();
+            String cleanWord = word.replaceAll("<[^>]+>", "");
+            int weight = cleanWord.length();
+
+            if (PUNCTUATION_PAUSE_PATTERN.matcher(cleanWord).find()) {
+                weight += PUNCTUATION_PAUSE_WEIGHT;
+            }
+
+            positions.add(new WordPosition(matcher.start(), matcher.end(), weight));
+        }
+
+        return positions;
+    }
+
+    private void scheduleWordHighlights(long totalDurationMs) {
+        int totalWeight = calculateTotalWeight();
+        long cumulativeTime = 0;
+
+        for (int wordIndex = 0; wordIndex < wordPositions.size(); wordIndex++) {
+            WordPosition pos = wordPositions.get(wordIndex);
+            long wordDuration = calculateWordDuration(pos.weight, totalWeight, totalDurationMs);
+
+            final int targetWordIndex = wordIndex + 1;
+            ScheduledFuture<?> task = executor.schedule(
+                () -> highlightUpToWord(targetWordIndex),
+                cumulativeTime,
+                TimeUnit.MILLISECONDS
+            );
+            scheduledTasks.add(task);
+            cumulativeTime += wordDuration;
+        }
+    }
+
+    private void highlightUpToWord(int wordIndex) {
+        if (wordPositions == null || originalText == null) {
+            return;
+        }
+
+        currentWordIndex = wordIndex;
+        String highlightedText = buildHighlightedText();
+        clientThread.invokeLater(() -> dialogManager.setDialogText(highlightedText));
+    }
+
+    private int calculateTotalWeight() {
+        int total = 0;
+        for (WordPosition pos : wordPositions) {
+            total += pos.weight;
+        }
+        return Math.max(total, 1);
+    }
+
+    private long calculateWordDuration(int weight, int totalWeight, long totalDurationMs) {
+        double proportion = (double) weight / totalWeight;
+        return (long) (proportion * totalDurationMs);
+    }
+
+    private long calculateFallbackDuration() {
+        return (long) ((wordPositions.size() / FALLBACK_WORDS_PER_SECOND) * 1000);
+    }
+
+    private String buildHighlightedText() {
+        if (currentWordIndex <= 0 || wordPositions.isEmpty()) {
+            return originalText;
+        }
+
+        String colorTag = ColorUtility.toOsrsColorTag(config.speechHighlightColor());
+        int highlightEnd = wordPositions.get(Math.min(currentWordIndex, wordPositions.size()) - 1).end;
+
+        String highlightedPortion = originalText.substring(0, highlightEnd);
+        String remainingPortion = originalText.substring(highlightEnd);
+
+        highlightedPortion = TextUtility.reapplyColorAfterLineBreaks(highlightedPortion, colorTag);
+
+        return colorTag + highlightedPortion + "</col>" + remainingPortion;
+    }
+
+    private static class WordPosition {
+        final int start;
+        final int end;
+        final int weight;
+
+        WordPosition(int start, int end, int weight) {
+            this.start = start;
+            this.end = end;
+            this.weight = weight;
+        }
     }
 }
 
 package com.quest.voiceover.modules.database;
 
+import com.quest.voiceover.Constants;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.client.RuneLite;
 import okhttp3.HttpUrl;
@@ -410,9 +640,6 @@ public class DatabaseVersionManager {
 
     private static final String DATABASE_FILENAME = "quest_voiceover.db";
     private static final String VERSION_FILENAME = ".version";
-
-    private static final HttpUrl RAW_GITHUB_DATABASE_URL =
-        HttpUrl.parse("https://github.com/KevinEdry/runelite-quest-voiceover/raw/database");
 
     private static final Path DOWNLOAD_DIR =
         Path.of(RuneLite.RUNELITE_DIR.getPath(), "quest-voiceover");
@@ -503,20 +730,22 @@ public class DatabaseVersionManager {
     }
 
     private static HttpUrl buildDownloadUrl() {
-        return RAW_GITHUB_DATABASE_URL.newBuilder()
+        return Constants.RAW_GITHUB_DATABASE_BRANCH_URL.newBuilder()
             .addPathSegment(DATABASE_FILENAME)
             .build();
     }
 
     private static String readVersionFile() {
+        if (!Files.exists(VERSION_FILE)) {
+            return "";
+        }
+
         try {
-            if (Files.exists(VERSION_FILE)) {
-                return Files.readString(VERSION_FILE).trim();
-            }
+            return Files.readString(VERSION_FILE).trim();
         } catch (IOException e) {
             log.error("Failed to read version file", e);
+            return "";
         }
-        return "";
     }
 
     private static void writeVersionFile(String version) {
@@ -662,12 +891,12 @@ public class DatabaseManager {
 package com.quest.voiceover.modules.audio;
 
 import com.quest.voiceover.QuestVoiceoverConfig;
+import com.quest.voiceover.Constants;
 import jaco.mp3.player.MP3Player;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.events.GameTick;
 import net.runelite.client.eventbus.Subscribe;
-import okhttp3.HttpUrl;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -675,10 +904,8 @@ import java.net.URL;
 
 @Slf4j
 @Singleton
-public class SoundEngine {
+public class AudioManager {
 
-    private static final HttpUrl RAW_GITHUB_SOUND_BRANCH_URL =
-        HttpUrl.parse("https://github.com/KevinEdry/runelite-quest-voiceover/raw/sounds");
     private static final int PLAYBACK_GRACE_PERIOD_TICKS = 1;
 
     @Inject
@@ -686,6 +913,9 @@ public class SoundEngine {
 
     @Inject
     private Client client;
+
+    @Inject
+    private AudioDuckingManager audioDuckingManager;
 
     private volatile MP3Player player;
     private volatile boolean soundPlaying;
@@ -707,6 +937,7 @@ public class SoundEngine {
         currentPlayer.add(soundUrl);
         currentPlayer.play();
 
+        audioDuckingManager.duck();
         soundPlaying = true;
         playbackStartTick = client.getTickCount();
         log.debug("Playing audio: {}", fileName);
@@ -736,6 +967,7 @@ public class SoundEngine {
     public void onGameTick(GameTick event) {
         if (player != null && soundPlaying && player.isStopped()) {
             soundPlaying = false;
+            audioDuckingManager.restore();
         }
     }
 
@@ -750,11 +982,12 @@ public class SoundEngine {
 
         if (wasPlaying) {
             player.stop();
+            audioDuckingManager.restore();
         }
     }
 
     private URL buildSoundUrl(String fileName) {
-        return RAW_GITHUB_SOUND_BRANCH_URL.newBuilder()
+        return Constants.RAW_GITHUB_SOUND_BRANCH_URL.newBuilder()
             .addPathSegment(fileName)
             .build()
             .url();
@@ -772,10 +1005,147 @@ public class SoundEngine {
     }
 }
 
+package com.quest.voiceover.modules.audio;
+
+import net.runelite.api.Client;
+import net.runelite.api.VarPlayer;
+import net.runelite.client.callback.ClientThread;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Singleton
+public class AudioChannelsManager {
+
+    // VarPlayer returns 0-100 percentage, but setters expect absolute values
+    private static final int MUSIC_MAX = 255;
+    private static final int SOUND_EFFECT_MAX = 127;
+    private static final int AREA_SOUND_MAX = 127;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private ClientThread clientThread;
+
+    public int getMusicVolume() {
+        return client.getVarpValue(VarPlayer.MUSIC_VOLUME);
+    }
+
+    public int getSoundEffectVolume() {
+        return client.getVarpValue(VarPlayer.SOUND_EFFECT_VOLUME);
+    }
+
+    public int getAreaEffectVolume() {
+        return client.getVarpValue(VarPlayer.AREA_EFFECT_VOLUME);
+    }
+
+    public void setMusicVolume(int percentage) {
+        int absolute = percentage * MUSIC_MAX / 100;
+        clientThread.invokeLater(() -> {
+            client.setMusicVolume(absolute);
+            return true;
+        });
+    }
+
+    public void setSoundEffectVolume(int percentage) {
+        int absolute = percentage * SOUND_EFFECT_MAX / 100;
+        clientThread.invokeLater(() -> {
+            client.getPreferences().setSoundEffectVolume(absolute);
+            return true;
+        });
+    }
+
+    public void setAreaEffectVolume(int percentage) {
+        int absolute = percentage * AREA_SOUND_MAX / 100;
+        clientThread.invokeLater(() -> {
+            client.getPreferences().setAreaSoundEffectVolume(absolute);
+            return true;
+        });
+    }
+
+    public void setAllVolumes(int musicPercentage, int soundEffectPercentage, int areaEffectPercentage) {
+        int musicAbsolute = musicPercentage * MUSIC_MAX / 100;
+        int soundAbsolute = soundEffectPercentage * SOUND_EFFECT_MAX / 100;
+        int areaAbsolute = areaEffectPercentage * AREA_SOUND_MAX / 100;
+
+        clientThread.invokeLater(() -> {
+            client.setMusicVolume(musicAbsolute);
+            client.getPreferences().setSoundEffectVolume(soundAbsolute);
+            client.getPreferences().setAreaSoundEffectVolume(areaAbsolute);
+            return true;
+        });
+    }
+}
+
+package com.quest.voiceover.modules.audio;
+
+import com.quest.voiceover.QuestVoiceoverConfig;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Singleton
+public class AudioDuckingManager {
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private AudioChannelsManager audioChannelsManager;
+
+    @Inject
+    private QuestVoiceoverConfig config;
+
+    private int originalMusicVolume = -1;
+    private int originalSoundEffectVolume = -1;
+    private int originalAreaEffectVolume = -1;
+    private boolean isDucked = false;
+
+    public void duck() {
+        if (!config.audioDucking() || isDucked) {
+            return;
+        }
+
+        if (client.getGameState() != GameState.LOGGED_IN) {
+            return;
+        }
+
+        originalMusicVolume = audioChannelsManager.getMusicVolume();
+        originalSoundEffectVolume = audioChannelsManager.getSoundEffectVolume();
+        originalAreaEffectVolume = audioChannelsManager.getAreaEffectVolume();
+
+        int duckPercent = config.audioDuckingAmount();
+        int duckedMusic = Math.max(1, originalMusicVolume * duckPercent / 100);
+        int duckedSound = Math.max(1, originalSoundEffectVolume * duckPercent / 100);
+        int duckedArea = Math.max(1, originalAreaEffectVolume * duckPercent / 100);
+
+        audioChannelsManager.setAllVolumes(duckedMusic, duckedSound, duckedArea);
+        isDucked = true;
+    }
+
+    public void restore() {
+        if (!isDucked) {
+            return;
+        }
+
+        audioChannelsManager.setAllVolumes(originalMusicVolume, originalSoundEffectVolume, originalAreaEffectVolume);
+
+        originalMusicVolume = -1;
+        originalSoundEffectVolume = -1;
+        originalAreaEffectVolume = -1;
+        isDucked = false;
+    }
+}
+
 package com.quest.voiceover.modules.dialog;
 
 import com.quest.voiceover.QuestVoiceoverConfig;
-import com.quest.voiceover.modules.audio.SoundEngine;
+import com.quest.voiceover.modules.audio.AudioManager;
+import com.quest.voiceover.utility.ColorUtility;
+import com.quest.voiceover.Constants;
 import net.runelite.api.Client;
 import net.runelite.api.SpriteID;
 import net.runelite.api.widgets.*;
@@ -788,9 +1158,7 @@ import javax.inject.Singleton;
 public class DialogManager {
 
     private static final String TOGGLE_MUTE_ACTION = "Toggle mute ";
-    private static final String PLUGIN_CONFIG_GROUP = "quest.voiceover";
     private static final int FONT_ID = 494;
-    private static final int TEXT_COLOR_WHITE = 0xFFFFFF;
 
     private static final int DIALOG_NPC_TEXT_CHILD = 6;
     private static final int DIALOG_NPC_NAME_CHILD = 4;
@@ -806,7 +1174,7 @@ public class DialogManager {
     private ConfigManager configManager;
 
     @Inject
-    private SoundEngine soundEngine;
+    private AudioManager audioManager;
 
     public boolean isPlayerOrNpcDialogOpen() {
         Widget playerWidget = getPlayerDialogWidget();
@@ -832,7 +1200,7 @@ public class DialogManager {
 
         label.setText("Quest: " + questName);
         label.setFontId(FONT_ID);
-        label.setTextColor(TEXT_COLOR_WHITE);
+        label.setTextColor(ColorUtility.WHITE);
         label.setTextShadowed(true);
         label.setXPositionMode(WidgetPositionMode.ABSOLUTE_LEFT);
         label.setOriginalX(10);
@@ -871,7 +1239,27 @@ public class DialogManager {
         return null;
     }
 
-    public String getDialogCharacterName(String playerName) {
+    public void setDialogText(String text) {
+        try {
+            Widget npcTextWidget = client.getWidget(InterfaceID.DIALOG_NPC, DIALOG_NPC_TEXT_CHILD);
+            Widget playerTextWidget = client.getWidget(InterfaceID.DIALOG_PLAYER, DIALOG_PLAYER_TEXT_CHILD);
+
+            boolean npcVisible = npcTextWidget != null && !npcTextWidget.isHidden();
+            boolean playerVisible = playerTextWidget != null && !playerTextWidget.isHidden();
+
+            if (npcVisible) {
+                npcTextWidget.setText(text);
+                return;
+            }
+
+            if (playerVisible) {
+                playerTextWidget.setText(text);
+            }
+        } catch (NullPointerException ignored) {
+        }
+    }
+
+    public String getDialogCharacterName() {
         Widget npcNameWidget = client.getWidget(InterfaceID.DIALOG_NPC, DIALOG_NPC_NAME_CHILD);
         if (npcNameWidget != null) {
             return npcNameWidget.getText();
@@ -894,8 +1282,8 @@ public class DialogManager {
     }
 
     private void toggleMute(Widget muteButton) {
-        configManager.setConfiguration(PLUGIN_CONFIG_GROUP, "mute", !config.mute());
-        soundEngine.setVolume(config.mute() ? 0 : config.volume());
+        configManager.setConfiguration(Constants.PLUGIN_CONFIG_GROUP, "mute", !config.mute());
+        audioManager.setVolume(config.mute() ? 0 : config.volume());
         muteButton.setSpriteId(getMuteSpriteId());
         muteButton.revalidate();
     }
@@ -907,10 +1295,31 @@ public class DialogManager {
 
 package com.quest.voiceover;
 
+import okhttp3.HttpUrl;
+
+public final class Constants {
+
+    public static final String PLUGIN_CONFIG_GROUP = "quest.voiceover";
+    public static final String PLAYER_NAME_PLACEHOLDER = "Player";
+
+    public static final HttpUrl RAW_GITHUB_SOUND_BRANCH_URL =
+        HttpUrl.get("https://github.com/KevinEdry/runelite-quest-voiceover/raw/sounds");
+
+    public static final HttpUrl RAW_GITHUB_DATABASE_BRANCH_URL =
+        HttpUrl.get("https://github.com/KevinEdry/runelite-quest-voiceover/raw/database");
+
+    public static final int MP3_BITRATE_KBPS = 96;
+
+    private Constants() {}
+}
+
+package com.quest.voiceover;
+
 import com.google.inject.Provides;
 import com.quest.voiceover.features.QuestListIndicatorHandler;
 import com.quest.voiceover.features.VoiceoverHandler;
-import com.quest.voiceover.modules.audio.SoundEngine;
+import com.quest.voiceover.modules.audio.AudioDuckingManager;
+import com.quest.voiceover.modules.audio.AudioManager;
 import com.quest.voiceover.modules.database.DatabaseManager;
 import com.quest.voiceover.modules.database.DatabaseVersionManager;
 import com.quest.voiceover.modules.dialog.DialogManager;
@@ -955,7 +1364,10 @@ public class QuestVoiceoverPlugin extends Plugin {
     private DatabaseManager databaseManager;
 
     @Inject
-    private SoundEngine soundEngine;
+    private AudioManager audioManager;
+
+    @Inject
+    private AudioDuckingManager audioDuckingManager;
 
     @Inject
     private VoiceoverHandler voiceoverHandler;
@@ -975,7 +1387,7 @@ public class QuestVoiceoverPlugin extends Plugin {
 
     @Override
     protected void startUp() {
-        eventBus.register(soundEngine);
+        eventBus.register(audioManager);
 
         panel = new QuestVoiceoverPanel();
         final BufferedImage icon = ImageUtil.loadImageResource(getClass(), "icon.png");
@@ -993,7 +1405,8 @@ public class QuestVoiceoverPlugin extends Plugin {
 
     @Override
     protected void shutDown() throws Exception {
-        eventBus.unregister(soundEngine);
+        eventBus.unregister(audioManager);
+        audioDuckingManager.restore();
         databaseManager.closeConnection();
         clientToolbar.removeNavigation(navigationButton);
         log.info("Quest Voiceover plugin stopped");
@@ -1042,13 +1455,13 @@ public class QuestVoiceoverPlugin extends Plugin {
     public void onGameTick(GameTick event) {
         questListIndicatorHandler.onGameTick();
 
-        boolean audioPlaying = soundEngine.isPlaying();
+        boolean audioPlaying = audioManager.isPlaying();
         boolean playerMoving = isPlayerMoving();
         boolean dialogOpen = dialogManager.isPlayerOrNpcDialogOpen();
 
         if (audioPlaying && !dialogOpen) {
             log.debug("Stopping voiceover - dialog closed");
-            soundEngine.stopImmediately();
+            audioManager.stopImmediately();
         }
     }
 
@@ -1091,71 +1504,127 @@ public class QuestVoiceoverPlugin extends Plugin {
 
 package com.quest.voiceover.utility;
 
-public class MessageParser {
+public final class TextUtility {
 
-    private static final String PLAYER_NAME_PLACEHOLDER = "Player";
+    private static final String OSRS_COLOR_TAG_PATTERN = "<col=[^>]*>";
+    private static final String OSRS_COLOR_CLOSE_TAG = "</col>";
+    private static final String OSRS_LINE_BREAK = "<br>";
 
-    private final String characterName;
-    private final String dialogText;
-    private final String messageId;
+    private TextUtility() {}
 
-    public MessageParser(String rawMessage, String playerName) {
-        String[] parts = rawMessage.split("\\|", 2);
-
-        this.characterName = normalizeCharacterName(parts[0], playerName);
-        this.dialogText = parts[1].trim();
-        this.messageId = HashUtil.toMD5(this.characterName + "|" + this.dialogText);
+    public static String stripColorTags(String text) {
+        return text
+            .replaceAll(OSRS_COLOR_TAG_PATTERN, "")
+            .replace(OSRS_COLOR_CLOSE_TAG, "");
     }
 
-    public String getCharacterName() {
-        return characterName;
+    public static String stripLineBreaks(String text) {
+        return text.replace(OSRS_LINE_BREAK, " ");
     }
 
-    public String getDialogText() {
-        return dialogText;
+    public static String stripAllTags(String text) {
+        return text.replaceAll("<[^>]+>", "");
     }
 
-    public String getMessageId() {
-        return messageId;
+    public static String normalizeWhitespace(String text) {
+        return text.replaceAll("\\s+", " ").trim();
     }
 
-    private String normalizeCharacterName(String name, String playerName) {
-        return name.equals(playerName) ? PLAYER_NAME_PLACEHOLDER : name;
+    public static String cleanForMatching(String text) {
+        return normalizeWhitespace(stripAllTags(text));
+    }
+
+    public static String reapplyColorAfterLineBreaks(String text, String colorTag) {
+        return text.replace(OSRS_LINE_BREAK, OSRS_COLOR_CLOSE_TAG + OSRS_LINE_BREAK + colorTag);
     }
 }
 
 package com.quest.voiceover.utility;
 
-import java.nio.charset.StandardCharsets;
-import java.security.MessageDigest;
-import java.security.NoSuchAlgorithmException;
+import com.quest.voiceover.Constants;
 
-public class HashUtil {
+public final class MessageUtility {
 
-    public static String toMD5(String input) {
-        return hash(input, "MD5");
-    }
+    private MessageUtility() {}
 
-    public static String toSHA256(String input) {
-        return hash(input, "SHA-256");
-    }
+    public static final class ParsedMessage {
+        private final String characterName;
+        private final String dialogText;
+        private final String messageId;
 
-    private static String hash(String input, String algorithm) {
-        try {
-            MessageDigest digest = MessageDigest.getInstance(algorithm);
-            byte[] hashBytes = digest.digest(input.getBytes(StandardCharsets.UTF_8));
-            return bytesToHex(hashBytes);
-        } catch (NoSuchAlgorithmException e) {
-            throw new RuntimeException("Hash algorithm not available: " + algorithm, e);
+        private ParsedMessage(String characterName, String dialogText, String messageId) {
+            this.characterName = characterName;
+            this.dialogText = dialogText;
+            this.messageId = messageId;
+        }
+
+        public String characterName() {
+            return characterName;
+        }
+
+        public String dialogText() {
+            return dialogText;
+        }
+
+        public String messageId() {
+            return messageId;
         }
     }
 
-    private static String bytesToHex(byte[] bytes) {
-        StringBuilder hexString = new StringBuilder(2 * bytes.length);
-        for (byte b : bytes) {
-            hexString.append(String.format("%02x", b));
+    public static ParsedMessage parseRawMessage(String rawMessage, String playerName) {
+        String[] parts = rawMessage.split("\\|", 2);
+
+        String characterName = normalizeCharacterName(parts[0], playerName);
+        String dialogText = parts[1].trim();
+        String messageId = HashUtility.toMD5(characterName + "|" + dialogText);
+
+        return new ParsedMessage(characterName, dialogText, messageId);
+    }
+
+    public static String cleanWidgetText(String text, String playerName) {
+        String cleaned = TextUtility.cleanForMatching(text);
+
+        if (playerName != null && !playerName.isEmpty()) {
+            cleaned = cleaned.replace(playerName, "");
         }
-        return hexString.toString();
+
+        return cleaned;
+    }
+
+    private static String normalizeCharacterName(String name, String playerName) {
+        return name.equals(playerName) ? Constants.PLAYER_NAME_PLACEHOLDER : name;
+    }
+}
+
+package com.quest.voiceover.utility;
+
+import java.awt.Color;
+
+public final class ColorUtility {
+
+    public static final int WHITE = 0xFFFFFF;
+    public static final int BLACK = 0x000000;
+
+    private ColorUtility() {}
+
+    public static String toHex(Color color) {
+        return String.format("%02x%02x%02x", color.getRed(), color.getGreen(), color.getBlue());
+    }
+
+    public static String toOsrsColorTag(Color color) {
+        return "<col=" + toHex(color) + ">";
+    }
+
+    public static String toOsrsColorTag(String hexColor) {
+        return "<col=" + hexColor + ">";
+    }
+
+    public static String wrapWithColor(String text, Color color) {
+        return toOsrsColorTag(color) + text + "</col>";
+    }
+
+    public static String wrapWithColor(String text, String hexColor) {
+        return toOsrsColorTag(hexColor) + text + "</col>";
     }
 }
 
@@ -1198,6 +1667,43 @@ public class LevenshteinUtility {
         int distance = distance(source, target);
         int maxLength = Math.max(source.length(), target.length());
         return maxLength == 0 ? 1.0 : 1.0 - ((double) distance / maxLength);
+    }
+}
+
+package com.quest.voiceover.utility;
+
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
+import java.security.NoSuchAlgorithmException;
+
+public final class HashUtility {
+
+    private HashUtility() {}
+
+    public static String toMD5(String input) {
+        return hash(input, "MD5");
+    }
+
+    public static String toSHA256(String input) {
+        return hash(input, "SHA-256");
+    }
+
+    private static String hash(String input, String algorithm) {
+        try {
+            MessageDigest digest = MessageDigest.getInstance(algorithm);
+            byte[] hashBytes = digest.digest(input.getBytes(StandardCharsets.UTF_8));
+            return bytesToHex(hashBytes);
+        } catch (NoSuchAlgorithmException e) {
+            throw new RuntimeException("Hash algorithm not available: " + algorithm, e);
+        }
+    }
+
+    private static String bytesToHex(byte[] bytes) {
+        StringBuilder hexString = new StringBuilder(2 * bytes.length);
+        for (byte b : bytes) {
+            hexString.append(String.format("%02x", b));
+        }
+        return hexString.toString();
     }
 }
 
@@ -1512,6 +2018,31 @@ public interface QuestVoiceoverConfig extends Config
 	}
 
 	@ConfigItem(
+			keyName = "audioDucking",
+			name = "Audio Ducking",
+			description = "Lowers game audio while voiceover plays.",
+			section = generalSettings,
+			position = 13
+	)
+	default boolean audioDucking()
+	{
+		return true;
+	}
+
+	@Range(min = 0, max = 100)
+	@ConfigItem(
+			keyName = "audioDuckingAmount",
+			name = "Ducking Amount",
+			description = "How much to lower game audio (0 = mute, 100 = no change).",
+			section = generalSettings,
+			position = 14
+	)
+	default int audioDuckingAmount()
+	{
+		return 25;
+	}
+
+	@ConfigItem(
 			keyName = "showMuteButton",
 			name = "Toggle Mute Button",
 			description = "Shows the mute button on the quest dialog.",
@@ -1528,11 +2059,36 @@ public interface QuestVoiceoverConfig extends Config
 			name = "Toggle Quest Name",
 			description = "Shows the quest name on the quest dialog.",
 			section = questDialogSettings,
-			position = 22
+			position = 23
 	)
 	default boolean showQuestName()
 	{
 		return true;
+	}
+
+	@ConfigItem(
+			keyName = "speechHighlighting",
+			name = "Speech Highlighting",
+			description = "Highlights dialog text word-by-word as it is spoken.",
+			section = questDialogSettings,
+			position = 24
+	)
+	default boolean speechHighlighting()
+	{
+		return false;
+	}
+
+	@Alpha
+	@ConfigItem(
+			keyName = "speechHighlightColor",
+			name = "Speech Highlight Color",
+			description = "Color used to highlight words that have been spoken.",
+			section = questDialogSettings,
+			position = 25
+	)
+	default java.awt.Color speechHighlightColor()
+	{
+		return new java.awt.Color(0, 255, 0);
 	}
 
 	@ConfigItem(
