@@ -1448,19 +1448,56 @@ public class FightMonitor
     
     // --- Helpers ---
 
+    /**
+     * Resolve who attacked us when we receive inbound damage.
+     * 
+     * CRITICAL: This method should ONLY return existing fight opponents.
+     * We do NOT start new fights from inbound damage because:
+     * - getInteracting() returns true for non-combat actions (trading, item use, following)
+     * - We cannot distinguish player damage from NPC damage by hitsplat alone
+     * - If someone attacks us first, THEY will track the fight from their side
+     * 
+     * New fights are ONLY started via outbound damage (when we attack someone).
+     * This ensures we only track fights where we actually participated in combat.
+     * 
+     * @param localPlayer The local player who received damage
+     * @return The name of an existing fight opponent, or null if none found
+     */
     private String resolveInboundAttacker(Player localPlayer)
     {
         List<Player> players = client.getPlayers();
-        if (players != null) {
-            for (Player other : players) {
-                if (other != null && other != localPlayer && other.getInteracting() == localPlayer) {
-                    return other.getName();
-                }
+        if (players == null) {
+            return existingFightAttacker();
+        }
+
+        // Only return players we already have an active fight with
+        // This ensures inbound damage is only tracked for fights WE initiated via outbound damage
+        for (Player other : players) {
+            if (other == null || other == localPlayer) continue;
+            
+            String otherName = other.getName();
+            if (otherName != null && activeFights.containsKey(otherName)) {
+                // Existing fight opponent - track their damage to us
+                return otherName;
             }
         }
+        
+        // No existing fight opponent found
+        // DO NOT identify new attackers from inbound damage - this causes false positives:
+        // - Trading partner identified as attacker when we take NPC damage
+        // - Player using items on us identified as attacker
+        // - Nearby player in multi-combat identified incorrectly
+        return null;
+    }
+    
+    /**
+     * Get an existing fight attacker from the most recent active fight.
+     * Only returns names of players we already have active fights with.
+     */
+    private String existingFightAttacker()
+    {
         String recent = mostRecentActiveOpponent();
-        if (recent != null) return recent;
-        return lastExactOpponentName;
+        return recent;  // Returns null if no active fights, which is correct
     }
 
     private String mostRecentActiveOpponent()
@@ -2188,18 +2225,21 @@ public class PvPLeaderboardPlugin extends Plugin
 		{
 			if (gameStateChanged.getGameState() == GameState.LOGGED_IN)
 			{
-				// Default lookup to local player and populate panel
+				// Only load self data if panel is NOT already viewing someone else
+				// This prevents overwriting user's search when they login/hop worlds
 				try
 				{
 					if (client.getLocalPlayer() != null && dashboardPanel != null)
 					{
 						String self = client.getLocalPlayer().getName();
 						if (self != null && !self.trim().isEmpty()) {
-							dashboardPanel.loadMatchHistory(self);
+							// Only load self if no one is currently being viewed
+							// If user searched for another player, don't overwrite it
+							dashboardPanel.loadMatchHistoryIfNotViewing(self);
 						}
 					}
 
-					// Use tick-based scheduling: wait 10 ticks (approx 6.0s) for initial load/sync
+					// Use tick-based scheduling: wait 10 ticks (approx 6.0s) for initial rank overlay sync
 					pendingSelfRankLookupTicks = 10;
 				}
 				catch (Exception ignore) {}
@@ -2217,8 +2257,7 @@ public class PvPLeaderboardPlugin extends Plugin
 					{
 						rankOverlay.resetLookupStateOnWorldHop();
 					}
-					// Nudge self rank refresh after delay to sync with post-match API updates
-					// Use tick-based scheduling: wait 8 ticks (approx 5s) to match scheduleApiRefreshes timing
+					// Schedule self rank overlay refresh only - don't refresh panel
 					pendingSelfRankLookupTicks = 8;
 				}
 				catch (Exception ignore) {}
@@ -2238,7 +2277,7 @@ public class PvPLeaderboardPlugin extends Plugin
 			// Delegate logic to FightMonitor
 			fightMonitor.handleGameTick(tick);
 
-			// Handle pending self-rank lookups (tick-based delay logic)
+			// Handle pending self-rank lookups (tick-based delay logic) - for overlay only
 			if (pendingSelfRankLookupTicks > 0)
 			{
 				pendingSelfRankLookupTicks--;
@@ -2251,15 +2290,7 @@ public class PvPLeaderboardPlugin extends Plugin
 						if (client.getLocalPlayer() != null)
 						{
 							rankOverlay.scheduleSelfRankRefresh(0L);
-							// Also refresh dashboard if needed
-							if (dashboardPanel != null)
-							{
-								String self = client.getLocalPlayer().getName();
-								if (self != null)
-								{
-									dashboardPanel.loadMatchHistory(self);
-								}
-							}
+							// Don't refresh dashboard on tick - only refreshes on explicit search or after 1 hour
 						}
 						else
 						{
@@ -2340,8 +2371,10 @@ public class DashboardPanel extends PluginPanel
     // State
     private String currentMatchesPlayerId = null;
     private JsonArray allMatches = null;
+    private long lastRefreshTimestamp = 0;
     
     private static final int MATCHES_PAGE_SIZE = 100;
+    private static final long STALE_DATA_THRESHOLD_MS = 60L * 60L * 1000L; // 1 hour
     
     public DashboardPanel(PvPLeaderboardConfig config, PvPLeaderboardPlugin plugin, PvPDataService pvpDataService, CognitoAuthService cognitoAuthService)
     {
@@ -2495,10 +2528,48 @@ public class DashboardPanel extends PluginPanel
 
     // --- Data Loading ---
     
+    /**
+     * Loads match history only if this is a new player search or data is stale (>1 hour old).
+     * Called from game events - will skip refresh if data is fresh.
+     */
+    public void loadMatchHistoryIfNeeded(String playerId)
+    {
+        String normalizedId = normalizePlayerId(playerId);
+        boolean isSamePlayer = normalizedId != null && normalizedId.equalsIgnoreCase(currentMatchesPlayerId);
+        boolean isDataFresh = (System.currentTimeMillis() - lastRefreshTimestamp) < STALE_DATA_THRESHOLD_MS;
+        
+        // Skip if same player and data is fresh
+        if (isSamePlayer && isDataFresh) {
+            return;
+        }
+        
+        loadMatchHistory(playerId);
+    }
+    
+    /**
+     * Loads match history only if NO player is currently being viewed.
+     * This prevents game events from overwriting a user's active search.
+     * Called on login/world hop - will not switch away from user's search.
+     */
+    public void loadMatchHistoryIfNotViewing(String playerId)
+    {
+        // If user is already viewing someone (searched for a player), don't overwrite
+        if (currentMatchesPlayerId != null && !currentMatchesPlayerId.isEmpty()) {
+            return;
+        }
+        
+        // No one currently viewed - load the requested player (usually self)
+        loadMatchHistory(playerId);
+    }
+    
+    /**
+     * Forces a full refresh of match history. Called from explicit user actions (search, refresh button).
+     */
     public void loadMatchHistory(String playerId)
     {
         currentMatchesPlayerId = normalizePlayerId(playerId);
         playerNameLabel.setText(playerId); // Update header immediately
+        lastRefreshTimestamp = System.currentTimeMillis();
         
         // Update the search box (needed for pvp lookup right-click menu)
         if (loginPanel != null) {
