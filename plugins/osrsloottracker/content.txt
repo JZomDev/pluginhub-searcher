@@ -1,0 +1,3038 @@
+package com.osrsloottracker;
+
+import lombok.Data;
+
+/**
+ * Data class representing a loot drop to be submitted
+ */
+@Data
+public class LootDropData
+{
+    private String username;
+    private String itemName;
+    private int quantity;
+    private int value;
+    private String sourceName; // Monster, raid, etc.
+    private String dropType;   // NPC, PLAYER, EVENT, COLLECTION_LOG, PET
+    private String screenshotUrl; // Optional screenshot URL
+    private long timestamp; // When the drop occurred
+    
+    // Constructor without screenshot
+    public LootDropData(String username, String itemName, int quantity, int value, 
+                        String sourceName, String dropType)
+    {
+        this.username = username;
+        this.itemName = itemName;
+        this.quantity = quantity;
+        this.value = value;
+        this.sourceName = sourceName;
+        this.dropType = dropType;
+        this.screenshotUrl = null;
+        this.timestamp = System.currentTimeMillis();
+    }
+    
+    // Constructor with screenshot
+    public LootDropData(String username, String itemName, int quantity, int value, 
+                        String sourceName, String dropType, String screenshotUrl)
+    {
+        this.username = username;
+        this.itemName = itemName;
+        this.quantity = quantity;
+        this.value = value;
+        this.sourceName = sourceName;
+        this.dropType = dropType;
+        this.screenshotUrl = screenshotUrl;
+        this.timestamp = System.currentTimeMillis();
+    }
+}
+
+
+package com.osrsloottracker;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.reflect.TypeToken;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * API client for communicating with the OSRS Loot Tracker backend
+ */
+@Slf4j
+@Singleton
+public class LootTrackerApiClient
+{
+    private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
+    
+    @Inject
+    private Gson gson;
+    
+    @Inject
+    private OkHttpClient okHttpClient;
+    
+    @Inject
+    private OSRSLootTrackerConfig config;
+    
+    @Inject
+    private AuthenticationManager authManager;
+    
+    /**
+     * Submit a loot drop to the server(s)
+     * Uses the configured destinations (servers + channels)
+     */
+    public void submitDrop(LootDropData drop) throws IOException
+    {
+        if (!authManager.isAuthenticated())
+        {
+            throw new IllegalStateException("Not authenticated");
+        }
+        
+        // Get configured destinations from config
+        String destinationsJson = config.dropDestinations();
+        
+        JsonObject body = new JsonObject();
+        body.addProperty("username", drop.getUsername());
+        body.addProperty("item_name", drop.getItemName());
+        body.addProperty("quantity", drop.getQuantity());
+        body.addProperty("item_value", drop.getValue());
+        body.addProperty("monster_name", drop.getSourceName());
+        body.addProperty("drop_type", drop.getDropType());
+        
+        // Include screenshot URL if available
+        if (drop.getScreenshotUrl() != null && !drop.getScreenshotUrl().isEmpty())
+        {
+            body.addProperty("screenshot_url", drop.getScreenshotUrl());
+        }
+        
+        // If we have destinations configured, use them
+        if (destinationsJson != null && !destinationsJson.isEmpty() && !destinationsJson.equals("[]"))
+        {
+            // Parse and convert field names to match backend (guildId -> guild_id, channelIds -> channel_ids)
+            JsonArray rawDestinations = gson.fromJson(destinationsJson, JsonArray.class);
+            JsonArray formattedDestinations = new JsonArray();
+            
+            for (JsonElement elem : rawDestinations)
+            {
+                JsonObject rawDest = elem.getAsJsonObject();
+                JsonObject formattedDest = new JsonObject();
+                
+                formattedDest.addProperty("guild_id", rawDest.get("guildId").getAsString());
+                
+                if (rawDest.has("channelIds") && !rawDest.get("channelIds").isJsonNull())
+                {
+                    formattedDest.add("channel_ids", rawDest.getAsJsonArray("channelIds"));
+                }
+                
+                if (rawDest.has("eventId") && !rawDest.get("eventId").isJsonNull())
+                {
+                    formattedDest.addProperty("event_id", rawDest.get("eventId").getAsString());
+                }
+                
+                formattedDestinations.add(formattedDest);
+            }
+            
+            body.add("destinations", formattedDestinations);
+            log.info("Submitting drop to {} destinations", formattedDestinations.size());
+        }
+        else
+        {
+            // Fall back to legacy single-server mode
+            String serverId = config.selectedServerId();
+            if (serverId == null || serverId.isEmpty())
+            {
+                throw new IllegalStateException("No destinations configured");
+            }
+            body.addProperty("guild_id", serverId);
+            
+            if (!config.selectedEventId().isEmpty())
+            {
+                body.addProperty("event_id", config.selectedEventId());
+            }
+        }
+        
+        String response = post("/plugin/drops", body.toString());
+        log.debug("Drop submission response: {}", response);
+    }
+    
+    /**
+     * Submit multiple items from the same drop as a batch
+     * This sends one Discord message with all items instead of separate messages
+     */
+    public void submitDropBatch(List<OSRSLootTrackerPlugin.ProcessedItem> items, String rsn, 
+                                 String sourceName, String dropType, String screenshotUrl) throws IOException
+    {
+        if (!authManager.isAuthenticated())
+        {
+            throw new IllegalStateException("Not authenticated");
+        }
+        
+        // Get configured destinations from config
+        String destinationsJson = config.dropDestinations();
+        
+        JsonObject body = new JsonObject();
+        body.addProperty("username", rsn);
+        body.addProperty("monster_name", sourceName);
+        body.addProperty("drop_type", dropType);
+        
+        // Build items array
+        JsonArray itemsArray = new JsonArray();
+        int totalValue = 0;
+        for (OSRSLootTrackerPlugin.ProcessedItem item : items)
+        {
+            JsonObject itemObj = new JsonObject();
+            itemObj.addProperty("item_name", item.name);
+            itemObj.addProperty("quantity", item.quantity);
+            itemObj.addProperty("item_value", item.value);
+            itemsArray.add(itemObj);
+            totalValue += item.value;
+        }
+        body.add("items", itemsArray);
+        body.addProperty("total_value", totalValue);
+        
+        // Include screenshot URL if available
+        if (screenshotUrl != null && !screenshotUrl.isEmpty())
+        {
+            body.addProperty("screenshot_url", screenshotUrl);
+        }
+        
+        // Add destinations
+        if (destinationsJson != null && !destinationsJson.isEmpty() && !destinationsJson.equals("[]"))
+        {
+            JsonArray rawDestinations = gson.fromJson(destinationsJson, JsonArray.class);
+            JsonArray formattedDestinations = new JsonArray();
+            
+            for (JsonElement elem : rawDestinations)
+            {
+                JsonObject rawDest = elem.getAsJsonObject();
+                JsonObject formattedDest = new JsonObject();
+                
+                formattedDest.addProperty("guild_id", rawDest.get("guildId").getAsString());
+                
+                if (rawDest.has("channelIds") && !rawDest.get("channelIds").isJsonNull())
+                {
+                    formattedDest.add("channel_ids", rawDest.getAsJsonArray("channelIds"));
+                }
+                
+                if (rawDest.has("eventId") && !rawDest.get("eventId").isJsonNull())
+                {
+                    formattedDest.addProperty("event_id", rawDest.get("eventId").getAsString());
+                }
+                
+                formattedDestinations.add(formattedDest);
+            }
+            
+            body.add("destinations", formattedDestinations);
+            log.info("Submitting batch drop ({} items) to {} destinations", items.size(), formattedDestinations.size());
+        }
+        else
+        {
+            String serverId = config.selectedServerId();
+            if (serverId == null || serverId.isEmpty())
+            {
+                throw new IllegalStateException("No destinations configured");
+            }
+            body.addProperty("guild_id", serverId);
+        }
+        
+        String response = post("/plugin/drops/batch", body.toString());
+        log.debug("Batch drop submission response: {}", response);
+    }
+    
+    /**
+     * Upload a screenshot to the server
+     * @param imageBytes PNG image bytes
+     * @param guildId The guild ID to save the screenshot under
+     * @return URL of the uploaded image
+     */
+    public String uploadScreenshot(byte[] imageBytes, String guildId) throws IOException
+    {
+        if (!authManager.isAuthenticated())
+        {
+            throw new IllegalStateException("Not authenticated");
+        }
+        
+        if (guildId == null || guildId.isEmpty())
+        {
+            throw new IllegalArgumentException("Guild ID is required for screenshot upload");
+        }
+        
+        // Convert to base64 for JSON upload
+        String base64Image = java.util.Base64.getEncoder().encodeToString(imageBytes);
+        
+        JsonObject body = new JsonObject();
+        body.addProperty("image", base64Image);
+        body.addProperty("guild_id", guildId);
+        
+        String response = post("/plugin/upload-screenshot", body.toString());
+        JsonObject responseJson = gson.fromJson(response, JsonObject.class);
+        
+        if (responseJson.has("url"))
+        {
+            return responseJson.get("url").getAsString();
+        }
+        
+        throw new IOException("No URL returned from screenshot upload");
+    }
+    
+    /**
+     * Get the first configured guild ID from destinations
+     * @return The first guild ID, or null if none configured
+     */
+    public String getFirstConfiguredGuildId()
+    {
+        String destinationsJson = config.dropDestinations();
+        if (destinationsJson != null && !destinationsJson.isEmpty() && !destinationsJson.equals("[]"))
+        {
+            try
+            {
+                JsonArray rawDestinations = gson.fromJson(destinationsJson, JsonArray.class);
+                if (rawDestinations.size() > 0)
+                {
+                    JsonObject firstDest = rawDestinations.get(0).getAsJsonObject();
+                    return firstDest.get("guildId").getAsString();
+                }
+            }
+            catch (Exception e)
+            {
+                log.error("Error parsing destinations JSON", e);
+            }
+        }
+        // Fall back to legacy single-server mode
+        return config.selectedServerId();
+    }
+    
+    /**
+     * Submit a collection log entry
+     */
+    public void submitCollectionLogEntry(LootDropData drop) throws IOException
+    {
+        if (!authManager.isAuthenticated())
+        {
+            throw new IllegalStateException("Not authenticated");
+        }
+        
+        // Get configured destinations
+        String destinationsJson = config.dropDestinations();
+        
+        JsonObject body = new JsonObject();
+        body.addProperty("username", drop.getUsername());
+        body.addProperty("item_name", drop.getItemName());
+        
+        // Use first destination's guild_id for collection log (or legacy mode)
+        if (destinationsJson != null && !destinationsJson.isEmpty() && !destinationsJson.equals("[]"))
+        {
+            JsonArray rawDestinations = gson.fromJson(destinationsJson, JsonArray.class);
+            if (rawDestinations.size() > 0)
+            {
+                JsonObject firstDest = rawDestinations.get(0).getAsJsonObject();
+                body.addProperty("guild_id", firstDest.get("guildId").getAsString());
+                
+                if (firstDest.has("eventId") && !firstDest.get("eventId").isJsonNull())
+                {
+                    body.addProperty("event_id", firstDest.get("eventId").getAsString());
+                }
+            }
+        }
+        else
+        {
+            body.addProperty("guild_id", config.selectedServerId());
+            if (!config.selectedEventId().isEmpty())
+            {
+                body.addProperty("event_id", config.selectedEventId());
+            }
+        }
+        
+        post("/plugin/collection-log", body.toString());
+    }
+    
+    /**
+     * Submit a pet drop
+     */
+    public void submitPetDrop(LootDropData drop, String message) throws IOException
+    {
+        if (!authManager.isAuthenticated())
+        {
+            throw new IllegalStateException("Not authenticated");
+        }
+        
+        JsonObject body = new JsonObject();
+        body.addProperty("username", drop.getUsername());
+        body.addProperty("message", message);
+        body.addProperty("guild_id", config.selectedServerId());
+        
+        if (!config.selectedEventId().isEmpty())
+        {
+            body.addProperty("event_id", config.selectedEventId());
+        }
+        
+        post("/plugin/pets", body.toString());
+    }
+    
+    /**
+     * Get list of servers the user has access to
+     */
+    public CompletableFuture<List<ServerInfo>> getServers()
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                log.info("Fetching servers from API...");
+                String response = get("/plugin/servers");
+                log.info("Server response: {}", response);
+                List<ServerInfo> servers = gson.fromJson(response, new TypeToken<List<ServerInfo>>(){}.getType());
+                log.info("Parsed {} servers", servers != null ? servers.size() : 0);
+                return servers;
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to get servers: {} - {}", e.getClass().getSimpleName(), e.getMessage());
+                return List.of();
+            }
+        });
+    }
+    
+    /**
+     * Get list of text channels for a server
+     */
+    public CompletableFuture<List<ChannelInfo>> getServerChannels(String serverId)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                log.info("Fetching channels for server {}...", serverId);
+                String response = get("/plugin/servers/" + serverId + "/channels");
+                List<ChannelInfo> channels = gson.fromJson(response, new TypeToken<List<ChannelInfo>>(){}.getType());
+                log.info("Found {} channels", channels != null ? channels.size() : 0);
+                return channels;
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to get channels for server {}: {}", serverId, e.getMessage());
+                return List.of();
+            }
+        });
+    }
+    
+    /**
+     * Get list of active events for a server
+     */
+    public CompletableFuture<List<EventInfo>> getServerEvents(String serverId)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                String response = get("/plugin/servers/" + serverId + "/events");
+                return gson.fromJson(response, new TypeToken<List<EventInfo>>(){}.getType());
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to get events for server {}", serverId, e);
+                return List.of();
+            }
+        });
+    }
+    
+    /**
+     * Get event details including tile requirements
+     */
+    public CompletableFuture<EventDetails> getEventDetails(String eventId)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                String response = get("/plugin/events/" + eventId);
+                return gson.fromJson(response, EventDetails.class);
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to get event details for {}", eventId, e);
+                return null;
+            }
+        });
+    }
+    
+    /**
+     * Get user's team progress for an event
+     */
+    public CompletableFuture<TeamProgress> getTeamProgress(String eventId)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                String response = get("/plugin/events/" + eventId + "/progress");
+                return gson.fromJson(response, TeamProgress.class);
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to get team progress for event {}", eventId, e);
+                return null;
+            }
+        });
+    }
+    
+    /**
+     * Get recent drops for the user
+     */
+    public CompletableFuture<List<RecentDrop>> getRecentDrops(int limit)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                String response = get("/plugin/drops/recent?limit=" + limit);
+                return gson.fromJson(response, new TypeToken<List<RecentDrop>>(){}.getType());
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to get recent drops", e);
+                return List.of();
+            }
+        });
+    }
+    
+    /**
+     * Get user loot statistics for a specific RSN
+     */
+    public CompletableFuture<UserStats> getUserStats(String rsn)
+    {
+        return CompletableFuture.supplyAsync(() -> {
+            try
+            {
+                String endpoint = "/plugin/stats";
+                if (rsn != null && !rsn.isEmpty())
+                {
+                    endpoint += "?rsn=" + java.net.URLEncoder.encode(rsn, java.nio.charset.StandardCharsets.UTF_8);
+                }
+                log.info("Fetching user stats for RSN: {}", rsn);
+                String response = get(endpoint);
+                log.info("Stats response: {}", response.length() > 200 ? response.substring(0, 200) + "..." : response);
+                UserStats stats = gson.fromJson(response, UserStats.class);
+                log.info("Parsed stats: {} total drops, {} total value", 
+                    stats != null ? stats.total_drops : "null", 
+                    stats != null ? stats.total_value : "null");
+                return stats;
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to get user stats: {}", e.getMessage());
+                return null;
+            }
+        });
+    }
+    
+    /**
+     * Get the current API endpoint (prioritizes system property, defaults to production)
+     */
+    private String getApiEndpoint()
+    {
+        String apiEndpoint = System.getProperty("osrsloottracker.api");
+        // Always default to production - don't use config (which might have stale persisted data)
+        return (apiEndpoint != null && !apiEndpoint.isEmpty()) 
+            ? apiEndpoint 
+            : "https://osrsloottracker.com/api";
+    }
+    
+    private String get(String endpoint) throws IOException
+    {
+        String fullUrl = getApiEndpoint() + endpoint;
+        log.debug("GET request to: {}", fullUrl);
+        
+        Request request = new Request.Builder()
+            .url(fullUrl)
+            .header("Authorization", "Bearer " + authManager.getAuthToken())
+            .header("Content-Type", "application/json")
+            .get()
+            .build();
+        
+        try (Response response = okHttpClient.newCall(request).execute())
+        {
+            int responseCode = response.code();
+            log.debug("Response code: {}", responseCode);
+            
+            String responseBody = response.body() != null ? response.body().string() : "";
+            
+            if (response.isSuccessful())
+            {
+                return responseBody;
+            }
+            else
+            {
+                log.error("GET {} failed with status {}: {}", endpoint, responseCode, responseBody);
+                throw new IOException("Request failed with status: " + responseCode + " - " + responseBody);
+            }
+        }
+    }
+    
+    /**
+     * Perform a POST request
+     */
+    private String post(String endpoint, String body) throws IOException
+    {
+        String fullUrl = getApiEndpoint() + endpoint;
+        
+        RequestBody requestBody = RequestBody.create(JSON, body);
+        
+        Request request = new Request.Builder()
+            .url(fullUrl)
+            .header("Authorization", "Bearer " + authManager.getAuthToken())
+            .header("Content-Type", "application/json")
+            .post(requestBody)
+            .build();
+        
+        try (Response response = okHttpClient.newCall(request).execute())
+        {
+            int responseCode = response.code();
+            String responseBody = response.body() != null ? response.body().string() : "";
+            
+            if (response.isSuccessful())
+            {
+                return responseBody;
+            }
+            else
+            {
+                throw new IOException("Request failed with status: " + responseCode + " - " + responseBody);
+            }
+        }
+    }
+    
+    // === Data classes ===
+    
+    public static class ServerInfo
+    {
+        public String id;
+        public String name;
+        public String icon;
+        public boolean hasBot;
+    }
+    
+    public static class ChannelInfo
+    {
+        public String id;
+        public String name;
+        public String type; // "text" or "announcement"
+        public String category; // Category name, if any
+        
+        @Override
+        public String toString()
+        {
+            return (category != null ? "[" + category + "] " : "") + "#" + name;
+        }
+    }
+    
+    public static class EventInfo
+    {
+        public String id;
+        public String name;
+        public String type; // "bingo" or "snakes_ladders"
+        public String status;
+        public String startDate;
+        public String endDate;
+    }
+    
+    public static class EventDetails
+    {
+        public String id;
+        public String name;
+        public String type;
+        public List<TileInfo> tiles;
+        public TeamInfo team;
+    }
+    
+    public static class TileInfo
+    {
+        public int id;
+        public int position;
+        public String name;
+        public List<RequirementInfo> requirements;
+        public String status; // "locked", "pending", "completed"
+    }
+    
+    public static class RequirementInfo
+    {
+        public int id;
+        public String itemName;
+        public int requiredQuantity;
+        public int currentQuantity;
+    }
+    
+    public static class TeamInfo
+    {
+        public String id;
+        public String name;
+        public int points;
+        public List<TeamMember> members;
+    }
+    
+    public static class TeamMember
+    {
+        public String discordId;
+        public String runescapeName;
+    }
+    
+    public static class TeamProgress
+    {
+        public int totalTiles;
+        public int completedTiles;
+        public int pendingTiles;
+        public int points;
+        public List<TileProgress> tiles;
+    }
+    
+    public static class TileProgress
+    {
+        public int tileId;
+        public String status;
+        public List<RequirementProgress> requirements;
+    }
+    
+    public static class RequirementProgress
+    {
+        public int requirementId;
+        public String itemName;
+        public int required;
+        public int current;
+    }
+    
+    public static class RecentDrop
+    {
+        public String id;
+        public String itemName;
+        public int quantity;
+        public long value;
+        public String monsterName;
+        public String createdAt;
+    }
+    
+    public static class UserStats
+    {
+        public int total_drops;
+        public long total_value;
+        public List<TopItem> top_items;
+        public List<TopItem> recent_activity;
+        public List<String> rsns;
+        public PeriodStats periods;
+    }
+    
+    public static class TopItem
+    {
+        public String item_name;
+        public int quantity;
+        public long value;
+        public String source;
+        public String date;
+    }
+    
+    public static class PeriodStats
+    {
+        public PeriodData today;
+        public PeriodData week;
+        public PeriodData month;
+    }
+    
+    public static class PeriodData
+    {
+        public int drops;
+        public long value;
+    }
+}
+
+
+package com.osrsloottracker;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.ui.ColorScheme;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.LinkBrowser;
+import net.runelite.client.util.QuantityFormatter;
+
+import javax.inject.Inject;
+import javax.swing.*;
+import javax.swing.border.EmptyBorder;
+import java.awt.*;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+/**
+ * Side panel for the OSRS Loot Tracker plugin
+ */
+@Slf4j
+public class OSRSLootTrackerPanel extends PluginPanel
+{
+    private static final Color BRAND_COLOR = new Color(88, 101, 242); // Discord blurple
+    private static final Color SUCCESS_COLOR = new Color(87, 242, 135);
+    private static final Color WARNING_COLOR = new Color(254, 231, 92);
+    private static final Color ERROR_COLOR = new Color(237, 66, 69);
+    
+    private final AuthenticationManager authManager;
+    private final LootTrackerApiClient apiClient;
+    private final OSRSLootTrackerConfig config;
+    private final ConfigManager configManager;
+    private final Gson gson;
+    
+    // UI Components
+    private JPanel authPanel;
+    private JPanel mainPanel;
+    private JPanel recentDropsPanel;
+    private JPanel destinationsPanel;
+    private JPanel statsPanel;
+    private JLabel statusLabel;
+    private JLabel usernameLabel;
+    
+    // Stats labels
+    private JLabel totalDropsLabel;
+    private JLabel totalValueLabel;
+    private JLabel todayDropsLabel;
+    private JLabel weekDropsLabel;
+    
+    // Tracking status labels (for live updates)
+    private JLabel lootDropsStatusLabel;
+    private JLabel collectionLogStatusLabel;
+    private JLabel petDropsStatusLabel;
+    
+    // Cached data
+    private List<LootTrackerApiClient.ServerInfo> availableServers = new ArrayList<>();
+    private Map<String, List<LootTrackerApiClient.ChannelInfo>> serverChannelsCache = new HashMap<>();
+    
+    private final List<LootDropData> recentDrops = new ArrayList<>();
+    private static final int MAX_RECENT_DROPS = 10;
+    
+    // Callback to get current RSN from the plugin (on client thread)
+    private java.util.function.Supplier<String> rsnSupplier = () -> null;
+    
+    @Inject
+    public OSRSLootTrackerPanel(AuthenticationManager authManager, LootTrackerApiClient apiClient, OSRSLootTrackerConfig config, ConfigManager configManager, Gson gson)
+    {
+        super(false); // Don't wrap in scroll pane - we handle our own scrolling
+        this.authManager = authManager;
+        this.apiClient = apiClient;
+        this.config = config;
+        this.configManager = configManager;
+        this.gson = gson;
+    }
+    
+    public void init()
+    {
+        setLayout(new BorderLayout());
+        setBackground(ColorScheme.DARK_GRAY_COLOR);
+        setBorder(new EmptyBorder(10, 10, 10, 10));
+        
+        buildPanel(this);
+        
+        updateAuthState();
+    }
+    
+    private void buildPanel(JPanel wrapper)
+    {
+        wrapper.removeAll();
+        
+        // Header
+        JPanel headerPanel = buildHeader();
+        wrapper.add(headerPanel, BorderLayout.NORTH);
+        
+        // Main content
+        JPanel contentPanel = new JPanel();
+        contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
+        contentPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        
+        // Auth panel (shown when not logged in)
+        authPanel = buildAuthPanel();
+        contentPanel.add(authPanel);
+        
+        // Main panel (shown when logged in)
+        mainPanel = buildMainPanel();
+        contentPanel.add(mainPanel);
+        
+        wrapper.add(contentPanel, BorderLayout.CENTER);
+        
+        revalidate();
+        repaint();
+    }
+    
+    private JPanel buildHeader()
+    {
+        JPanel header = new JPanel(new BorderLayout());
+        header.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        header.setBorder(new EmptyBorder(0, 0, 10, 0));
+        
+        // Title
+        JLabel title = new JLabel("OSRS Loot Tracker");
+        title.setFont(FontManager.getRunescapeBoldFont());
+        title.setForeground(BRAND_COLOR);
+        header.add(title, BorderLayout.WEST);
+        
+        // Settings button
+        JButton settingsBtn = new JButton("⚙");
+        settingsBtn.setToolTipText("Open website");
+        settingsBtn.addActionListener(e -> LinkBrowser.browse("https://osrsloottracker.com"));
+        header.add(settingsBtn, BorderLayout.EAST);
+        
+        return header;
+    }
+    
+    private JPanel buildAuthPanel()
+    {
+        JPanel panel = new JPanel();
+        panel.setLayout(new GridBagLayout());
+        panel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        panel.setBorder(new EmptyBorder(30, 20, 30, 20));
+        
+        GridBagConstraints gbc = new GridBagConstraints();
+        gbc.gridx = 0;
+        gbc.fill = GridBagConstraints.HORIZONTAL;
+        gbc.anchor = GridBagConstraints.CENTER;
+        
+        // Content wrapper for vertical centering
+        JPanel contentPanel = new JPanel();
+        contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
+        contentPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        
+        // Discord-style icon
+        JPanel iconWrapper = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        iconWrapper.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        JLabel iconLabel = new JLabel("🎮");
+        iconLabel.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 56));
+        iconLabel.setForeground(new Color(88, 101, 242));
+        iconWrapper.add(iconLabel);
+        contentPanel.add(iconWrapper);
+        
+        contentPanel.add(Box.createVerticalStrut(20));
+        
+        // Welcome text - line 1
+        JPanel textWrapper1 = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        textWrapper1.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        JLabel welcomeLabel1 = new JLabel("Connect with Discord to");
+        welcomeLabel1.setForeground(Color.WHITE);
+        welcomeLabel1.setFont(FontManager.getRunescapeSmallFont());
+        textWrapper1.add(welcomeLabel1);
+        contentPanel.add(textWrapper1);
+        
+        // Welcome text - line 2
+        JPanel textWrapper2 = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        textWrapper2.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        JLabel welcomeLabel2 = new JLabel("track your loot!");
+        welcomeLabel2.setForeground(Color.WHITE);
+        welcomeLabel2.setFont(FontManager.getRunescapeSmallFont());
+        textWrapper2.add(welcomeLabel2);
+        contentPanel.add(textWrapper2);
+        
+        contentPanel.add(Box.createVerticalStrut(20));
+        
+        // Login button wrapper for centering
+        JPanel buttonWrapper = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        buttonWrapper.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        
+        JButton loginBtn = new JButton("Login with Discord");
+        loginBtn.setBackground(BRAND_COLOR);
+        loginBtn.setForeground(Color.WHITE);
+        loginBtn.setFocusPainted(false);
+        loginBtn.setBorderPainted(false);
+        loginBtn.setFont(FontManager.getRunescapeSmallFont());
+        loginBtn.setCursor(new Cursor(Cursor.HAND_CURSOR));
+        loginBtn.setPreferredSize(new Dimension(160, 32));
+        loginBtn.addActionListener(e -> startLogin());
+        
+        // Hover effect
+        loginBtn.addMouseListener(new MouseAdapter() {
+            @Override
+            public void mouseEntered(MouseEvent e) {
+                loginBtn.setBackground(new Color(71, 82, 196)); // Darker on hover
+            }
+            @Override
+            public void mouseExited(MouseEvent e) {
+                loginBtn.setBackground(BRAND_COLOR);
+            }
+        });
+        
+        buttonWrapper.add(loginBtn);
+        contentPanel.add(buttonWrapper);
+        
+        contentPanel.add(Box.createVerticalStrut(15));
+        
+        // Status label wrapper
+        JPanel statusWrapper = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        statusWrapper.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        statusLabel = new JLabel(" ");
+        statusLabel.setForeground(new Color(130, 130, 130));
+        statusLabel.setFont(FontManager.getRunescapeSmallFont());
+        statusWrapper.add(statusLabel);
+        contentPanel.add(statusWrapper);
+        
+        gbc.gridy = 0;
+        panel.add(contentPanel, gbc);
+        
+        return panel;
+    }
+    
+    private JPanel buildMainPanel()
+    {
+        JPanel panel = new JPanel();
+        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+        panel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        
+        // User info section
+        JPanel userPanel = new JPanel(new BorderLayout());
+        userPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        userPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        
+        usernameLabel = new JLabel("Not logged in");
+        usernameLabel.setForeground(Color.WHITE);
+        usernameLabel.setFont(FontManager.getRunescapeSmallFont());
+        userPanel.add(usernameLabel, BorderLayout.WEST);
+        
+        JButton logoutBtn = new JButton("Logout");
+        logoutBtn.setFont(FontManager.getRunescapeSmallFont());
+        logoutBtn.addActionListener(e -> logout());
+        userPanel.add(logoutBtn, BorderLayout.EAST);
+        
+        panel.add(userPanel);
+        panel.add(Box.createVerticalStrut(10));
+        
+        // Stats section
+        statsPanel = buildStatsPanel();
+        panel.add(statsPanel);
+        panel.add(Box.createVerticalStrut(10));
+        
+        // Recent drops section
+        JPanel recentSection = buildRecentDropsSection();
+        panel.add(recentSection);
+        panel.add(Box.createVerticalStrut(15));
+        
+        // Tracking status
+        JPanel trackingPanel = buildTrackingStatusPanel();
+        panel.add(trackingPanel);
+        panel.add(Box.createVerticalStrut(15));
+        
+        // Destinations section header (at bottom)
+        JPanel destHeader = new JPanel(new BorderLayout());
+        destHeader.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        
+        JLabel destLabel = new JLabel("Drop Destinations");
+        destLabel.setForeground(BRAND_COLOR);
+        destLabel.setFont(FontManager.getRunescapeBoldFont());
+        destHeader.add(destLabel, BorderLayout.WEST);
+        
+        JButton configureBtn = new JButton("Configure");
+        configureBtn.setFont(FontManager.getRunescapeSmallFont());
+        configureBtn.addActionListener(e -> openDestinationsDialog());
+        destHeader.add(configureBtn, BorderLayout.EAST);
+        
+        panel.add(destHeader);
+        panel.add(Box.createVerticalStrut(5));
+        
+        // Current destinations display
+        destinationsPanel = new JPanel();
+        destinationsPanel.setLayout(new BoxLayout(destinationsPanel, BoxLayout.Y_AXIS));
+        destinationsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        destinationsPanel.setBorder(new EmptyBorder(8, 8, 8, 8));
+        
+        panel.add(destinationsPanel);
+        
+        // Open dashboard button
+        panel.add(Box.createVerticalStrut(10));
+        JButton dashboardBtn = new JButton("Open Dashboard");
+        dashboardBtn.setAlignmentX(Component.CENTER_ALIGNMENT);
+        dashboardBtn.addActionListener(e -> LinkBrowser.browse("https://osrsloottracker.com/dashboard"));
+        panel.add(dashboardBtn);
+        
+        return panel;
+    }
+    
+    private JPanel buildStatsPanel()
+    {
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        
+        // Header
+        JLabel headerLabel = new JLabel("📊 Your Loot Stats");
+        headerLabel.setForeground(BRAND_COLOR);
+        headerLabel.setFont(FontManager.getRunescapeBoldFont());
+        panel.add(headerLabel, BorderLayout.NORTH);
+        
+        // Stats grid - use GridLayout for equal sizing
+        JPanel statsGrid = new JPanel(new GridLayout(2, 2, 8, 8));
+        statsGrid.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        statsGrid.setBorder(new EmptyBorder(8, 0, 0, 0));
+        
+        // Total drops
+        JPanel totalDropsBox = createStatBox("Total Drops", "0");
+        totalDropsLabel = (JLabel) ((JPanel) totalDropsBox.getComponent(1)).getComponent(0);
+        statsGrid.add(totalDropsBox);
+        
+        // Total value
+        JPanel totalValueBox = createStatBox("Total Value", "0 GP");
+        totalValueLabel = (JLabel) ((JPanel) totalValueBox.getComponent(1)).getComponent(0);
+        statsGrid.add(totalValueBox);
+        
+        // Today's drops
+        JPanel todayBox = createStatBox("Today", "0 drops");
+        todayDropsLabel = (JLabel) ((JPanel) todayBox.getComponent(1)).getComponent(0);
+        statsGrid.add(todayBox);
+        
+        // This week
+        JPanel weekBox = createStatBox("This Week", "0 drops");
+        weekDropsLabel = (JLabel) ((JPanel) weekBox.getComponent(1)).getComponent(0);
+        statsGrid.add(weekBox);
+        
+        panel.add(statsGrid, BorderLayout.CENTER);
+        
+        return panel;
+    }
+    
+    private JPanel createStatBox(String title, String value)
+    {
+        JPanel box = new JPanel();
+        box.setLayout(new BoxLayout(box, BoxLayout.Y_AXIS));
+        box.setBackground(new Color(30, 30, 30));
+        box.setBorder(new EmptyBorder(5, 8, 5, 8));
+        
+        JLabel titleLabel = new JLabel(title);
+        titleLabel.setForeground(new Color(150, 150, 150));
+        titleLabel.setFont(FontManager.getRunescapeSmallFont());
+        box.add(titleLabel);
+        
+        JPanel valueWrapper = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+        valueWrapper.setBackground(new Color(30, 30, 30));
+        JLabel valueLabel = new JLabel(value);
+        valueLabel.setForeground(Color.WHITE);
+        valueLabel.setFont(FontManager.getRunescapeSmallFont());
+        valueWrapper.add(valueLabel);
+        box.add(valueWrapper);
+        
+        return box;
+    }
+    
+    /**
+     * Set the RSN supplier callback (called from main plugin)
+     */
+    public void setRsnSupplier(java.util.function.Supplier<String> supplier)
+    {
+        this.rsnSupplier = supplier;
+    }
+    
+    /**
+     * Get the current RSN using the supplier
+     */
+    public String getCurrentRsn()
+    {
+        return rsnSupplier.get();
+    }
+    
+    /**
+     * Refresh the stats display
+     */
+    public void refreshStats()
+    {
+        if (authManager.isAuthenticated())
+        {
+            loadUserStats();
+        }
+    }
+    
+    private void loadUserStats()
+    {
+        String rsn = getCurrentRsn();
+        log.info("Loading user stats for RSN: {}", rsn);
+        apiClient.getUserStats(rsn).thenAccept(stats -> {
+            SwingUtilities.invokeLater(() -> {
+                if (stats != null)
+                {
+                    log.info("Received stats: {} drops, {} GP value", stats.total_drops, stats.total_value);
+                    
+                    // Format total drops
+                    totalDropsLabel.setText(formatNumber(stats.total_drops));
+                    
+                    // Format total value
+                    totalValueLabel.setText(formatValue(stats.total_value) + " GP");
+                    totalValueLabel.setForeground(getValueColor(stats.total_value));
+                    
+                    // Today's stats
+                    if (stats.periods != null && stats.periods.today != null)
+                    {
+                        todayDropsLabel.setText(stats.periods.today.drops + " drops");
+                    }
+                    
+                    // Week stats
+                    if (stats.periods != null && stats.periods.week != null)
+                    {
+                        weekDropsLabel.setText(stats.periods.week.drops + " drops");
+                    }
+                }
+                else
+                {
+                    log.warn("Stats returned null - check if RSN is linked to your account");
+                }
+            });
+        });
+    }
+    
+    private String formatNumber(long number)
+    {
+        if (number >= 1_000_000_000)
+        {
+            return String.format("%.1fB", number / 1_000_000_000.0);
+        }
+        else if (number >= 1_000_000)
+        {
+            return String.format("%.1fM", number / 1_000_000.0);
+        }
+        else if (number >= 1_000)
+        {
+            return String.format("%.1fK", number / 1_000.0);
+        }
+        return String.valueOf(number);
+    }
+    
+    private String formatValue(long value)
+    {
+        if (value >= 1_000_000_000)
+        {
+            return String.format("%.2fB", value / 1_000_000_000.0);
+        }
+        else if (value >= 1_000_000)
+        {
+            return String.format("%.2fM", value / 1_000_000.0);
+        }
+        else if (value >= 1_000)
+        {
+            return String.format("%.1fK", value / 1_000.0);
+        }
+        return String.valueOf(value);
+    }
+    
+    private Color getValueColor(long value)
+    {
+        if (value >= 1_000_000_000) // 1B+
+        {
+            return new Color(255, 128, 0); // Orange
+        }
+        else if (value >= 100_000_000) // 100M+
+        {
+            return new Color(255, 215, 0); // Gold
+        }
+        else if (value >= 10_000_000) // 10M+
+        {
+            return Color.YELLOW;
+        }
+        return Color.WHITE;
+    }
+    
+    private JPanel buildTrackingStatusPanel()
+    {
+        JPanel panel = new JPanel(new GridLayout(3, 2, 5, 5));
+        panel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        panel.setBorder(new EmptyBorder(10, 10, 10, 10));
+        
+        // Loot Drops row
+        JLabel lootLabel = new JLabel("Valuable Drops");
+        lootLabel.setForeground(Color.WHITE);
+        panel.add(lootLabel);
+        lootDropsStatusLabel = new JLabel();
+        panel.add(lootDropsStatusLabel);
+        
+        // Collection Log row
+        JLabel collectionLabel = new JLabel("Collection Log");
+        collectionLabel.setForeground(Color.WHITE);
+        panel.add(collectionLabel);
+        collectionLogStatusLabel = new JLabel();
+        panel.add(collectionLogStatusLabel);
+        
+        // Pet Drops row
+        JLabel petLabel = new JLabel("Pets");
+        petLabel.setForeground(Color.WHITE);
+        panel.add(petLabel);
+        petDropsStatusLabel = new JLabel();
+        panel.add(petDropsStatusLabel);
+        
+        // Set initial values
+        updateTrackingStatus();
+        
+        return panel;
+    }
+    
+    private JPanel buildRecentDropsSection()
+    {
+        JPanel recentSection = new JPanel(new BorderLayout());
+        recentSection.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        recentSection.setBorder(new EmptyBorder(10, 0, 0, 0));
+        
+        JLabel recentLabel = new JLabel("Recent Drops");
+        recentLabel.setForeground(BRAND_COLOR);
+        recentLabel.setFont(FontManager.getRunescapeBoldFont());
+        recentSection.add(recentLabel, BorderLayout.NORTH);
+        
+        recentDropsPanel = new JPanel();
+        recentDropsPanel.setLayout(new BoxLayout(recentDropsPanel, BoxLayout.Y_AXIS));
+        recentDropsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        recentDropsPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+        
+        JLabel noDropsLabel = new JLabel("No drops yet...");
+        noDropsLabel.setForeground(Color.GRAY);
+        recentDropsPanel.add(noDropsLabel);
+        
+        JScrollPane scrollPane = new JScrollPane(recentDropsPanel);
+        scrollPane.setPreferredSize(new Dimension(0, 150));
+        scrollPane.setBorder(null);
+        recentSection.add(scrollPane, BorderLayout.CENTER);
+        
+        return recentSection;
+    }
+    
+    /**
+     * Update the tracking status labels to reflect current config.
+     * Can be called externally when config changes.
+     */
+    public void updateTrackingStatus()
+    {
+        updateStatusLabel(lootDropsStatusLabel, config.trackLoot());
+        updateStatusLabel(collectionLogStatusLabel, config.trackCollectionLog());
+        updateStatusLabel(petDropsStatusLabel, config.trackPets());
+    }
+    
+    private void updateStatusLabel(JLabel label, boolean enabled)
+    {
+        if (label != null)
+        {
+            label.setText(enabled ? "✓ Enabled" : "✗ Disabled");
+            label.setForeground(enabled ? SUCCESS_COLOR : Color.GRAY);
+        }
+    }
+    
+    private void updateAuthState()
+    {
+        boolean authenticated = authManager.isAuthenticated();
+        
+        authPanel.setVisible(!authenticated);
+        mainPanel.setVisible(authenticated);
+        
+        if (authenticated)
+        {
+            usernameLabel.setText("👤 " + authManager.getDiscordUsername());
+            loadServers();
+            updateDestinationsDisplay();
+            updateTrackingStatus(); // Refresh tracking status from config
+            loadUserStats(); // Load user loot statistics
+        }
+        
+        // Always update recent drops panel to show any existing drops
+        updateRecentDropsPanel();
+        
+        revalidate();
+        repaint();
+    }
+    
+    private void startLogin()
+    {
+        statusLabel.setText("Opening browser...");
+        statusLabel.setForeground(Color.YELLOW);
+        
+        authManager.startOAuthFlow(result -> {
+            SwingUtilities.invokeLater(() -> {
+                if (result.success)
+                {
+                    statusLabel.setText("Login successful!");
+                    statusLabel.setForeground(SUCCESS_COLOR);
+                    updateAuthState();
+                }
+                else
+                {
+                    statusLabel.setText(result.message);
+                    statusLabel.setForeground(ERROR_COLOR);
+                }
+            });
+        });
+    }
+    
+    private void logout()
+    {
+        authManager.logout();
+        updateAuthState();
+    }
+    
+    private void loadServers()
+    {
+        apiClient.getServers().thenAccept(servers -> {
+            SwingUtilities.invokeLater(() -> {
+                availableServers = servers;
+                log.info("Loaded {} servers", servers.size());
+                // Refresh destinations display now that we have server names
+                updateDestinationsDisplay();
+            });
+        });
+    }
+    
+    /**
+     * Update the destinations display panel
+     */
+    private void updateDestinationsDisplay()
+    {
+        destinationsPanel.removeAll();
+        
+        List<DestinationConfig> destinations = getDestinations();
+        
+        if (destinations.isEmpty())
+        {
+            JLabel noDestLabel = new JLabel("No destinations configured");
+            noDestLabel.setForeground(Color.GRAY);
+            noDestLabel.setFont(FontManager.getRunescapeSmallFont());
+            destinationsPanel.add(noDestLabel);
+            
+            JLabel hintLabel = new JLabel("Click 'Configure' to add servers");
+            hintLabel.setForeground(Color.GRAY);
+            hintLabel.setFont(FontManager.getRunescapeSmallFont());
+            destinationsPanel.add(hintLabel);
+        }
+        else
+        {
+            for (DestinationConfig dest : destinations)
+            {
+                JPanel destRow = new JPanel(new BorderLayout());
+                destRow.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+                destRow.setBorder(new EmptyBorder(2, 0, 2, 0));
+                
+                // Find server name
+                String serverName = dest.guildId;
+                for (LootTrackerApiClient.ServerInfo server : availableServers)
+                {
+                    if (server.id.equals(dest.guildId))
+                    {
+                        serverName = server.name;
+                        break;
+                    }
+                }
+                
+                JLabel serverLabel = new JLabel("📡 " + serverName);
+                serverLabel.setForeground(Color.WHITE);
+                serverLabel.setFont(FontManager.getRunescapeSmallFont());
+                destRow.add(serverLabel, BorderLayout.WEST);
+                
+                int channelCount = dest.channelIds != null ? dest.channelIds.size() : 0;
+                JLabel channelLabel = new JLabel(channelCount + " ch");
+                channelLabel.setForeground(channelCount > 0 ? SUCCESS_COLOR : WARNING_COLOR);
+                channelLabel.setFont(FontManager.getRunescapeSmallFont());
+                destRow.add(channelLabel, BorderLayout.EAST);
+                
+                destinationsPanel.add(destRow);
+            }
+        }
+        
+        destinationsPanel.revalidate();
+        destinationsPanel.repaint();
+    }
+    
+    /**
+     * Get the current destinations from config
+     */
+    private List<DestinationConfig> getDestinations()
+    {
+        String json = config.dropDestinations();
+        if (json == null || json.isEmpty() || json.equals("[]"))
+        {
+            return new ArrayList<>();
+        }
+        try
+        {
+            return gson.fromJson(json, new TypeToken<List<DestinationConfig>>(){}.getType());
+        }
+        catch (Exception e)
+        {
+            log.error("Error parsing destinations", e);
+            return new ArrayList<>();
+        }
+    }
+    
+    /**
+     * Save destinations to config
+     */
+    private void saveDestinations(List<DestinationConfig> destinations)
+    {
+        // Use ConfigManager for proper persistence
+        configManager.setConfiguration("osrsloottracker", "dropDestinations", gson.toJson(destinations));
+        updateDestinationsDisplay();
+    }
+    
+    /**
+     * Open the destinations configuration dialog
+     */
+    private void openDestinationsDialog()
+    {
+        // Create dialog
+        JDialog dialog = new JDialog();
+        dialog.setTitle("Configure Drop Destinations");
+        dialog.setModal(true);
+        dialog.setLayout(new BorderLayout(10, 10));
+        dialog.getContentPane().setBackground(ColorScheme.DARK_GRAY_COLOR);
+        
+        // Header panel with instructions
+        JPanel headerPanel = new JPanel();
+        headerPanel.setLayout(new BoxLayout(headerPanel, BoxLayout.Y_AXIS));
+        headerPanel.setBorder(new EmptyBorder(10, 10, 5, 10));
+        headerPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        
+        JLabel instructions = new JLabel("<html>Select servers and channels where your drops will be sent.</html>");
+        instructions.setForeground(Color.WHITE);
+        instructions.setAlignmentX(Component.LEFT_ALIGNMENT);
+        headerPanel.add(instructions);
+        
+        dialog.add(headerPanel, BorderLayout.NORTH);
+        
+        // Server list panel
+        JPanel serversContainer = new JPanel();
+        serversContainer.setLayout(new BoxLayout(serversContainer, BoxLayout.Y_AXIS));
+        serversContainer.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        serversContainer.setBorder(new EmptyBorder(5, 10, 5, 10));
+        
+        // Get current destinations
+        List<DestinationConfig> currentDestinations = getDestinations();
+        Map<String, DestinationConfig> destMap = new HashMap<>();
+        for (DestinationConfig d : currentDestinations)
+        {
+            destMap.put(d.guildId, d);
+        }
+        
+        // Track checkboxes and channel selections
+        Map<String, JCheckBox> serverCheckboxes = new HashMap<>();
+        Map<String, JScrollPane> channelScrollPanes = new HashMap<>();
+        Map<String, List<JCheckBox>> channelCheckboxes = new HashMap<>();
+        
+        for (LootTrackerApiClient.ServerInfo server : availableServers)
+        {
+            JPanel serverRow = new JPanel();
+            serverRow.setLayout(new BoxLayout(serverRow, BoxLayout.Y_AXIS));
+            serverRow.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            serverRow.setBorder(new EmptyBorder(8, 8, 8, 8));
+            serverRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+            
+            // Server checkbox header
+            JPanel headerRow = new JPanel(new BorderLayout());
+            headerRow.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            headerRow.setMaximumSize(new Dimension(Integer.MAX_VALUE, 30));
+            
+            JCheckBox serverCheck = new JCheckBox(server.name);
+            serverCheck.setForeground(Color.WHITE);
+            serverCheck.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+            serverCheck.setSelected(destMap.containsKey(server.id));
+            serverCheck.setFont(FontManager.getRunescapeBoldFont());
+            serverCheckboxes.put(server.id, serverCheck);
+            headerRow.add(serverCheck, BorderLayout.WEST);
+            
+            serverRow.add(headerRow);
+            
+            // Channel selection panel with its own scroll
+            JPanel channelPanel = new JPanel();
+            channelPanel.setLayout(new BoxLayout(channelPanel, BoxLayout.Y_AXIS));
+            channelPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+            
+            // Wrap channel panel in scroll pane with max height
+            JScrollPane channelScroll = new JScrollPane(channelPanel);
+            channelScroll.setBorder(new EmptyBorder(5, 15, 5, 0));
+            channelScroll.setBackground(ColorScheme.DARK_GRAY_COLOR);
+            channelScroll.getViewport().setBackground(ColorScheme.DARK_GRAY_COLOR);
+            channelScroll.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+            channelScroll.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+            channelScroll.setPreferredSize(new Dimension(350, 150)); // Fixed height for channel list
+            channelScroll.setMaximumSize(new Dimension(Integer.MAX_VALUE, 200));
+            channelScroll.setVisible(serverCheck.isSelected());
+            channelScrollPanes.put(server.id, channelScroll);
+            
+            // Add loading label initially
+            JLabel loadingLabel = new JLabel("Loading channels...");
+            loadingLabel.setForeground(Color.GRAY);
+            channelPanel.add(loadingLabel);
+            
+            serverRow.add(channelScroll);
+            serversContainer.add(serverRow);
+            serversContainer.add(Box.createVerticalStrut(8));
+            
+            // Load channels when server is checked
+            final JPanel finalChannelPanel = channelPanel;
+            serverCheck.addActionListener(e -> {
+                channelScroll.setVisible(serverCheck.isSelected());
+                if (serverCheck.isSelected() && !channelCheckboxes.containsKey(server.id))
+                {
+                    loadChannelsForDialog(server.id, finalChannelPanel, channelCheckboxes, destMap.get(server.id));
+                }
+                serversContainer.revalidate();
+                serversContainer.repaint();
+            });
+            
+            // If already selected, load channels
+            if (serverCheck.isSelected())
+            {
+                loadChannelsForDialog(server.id, channelPanel, channelCheckboxes, destMap.get(server.id));
+            }
+        }
+        
+        // Main scroll pane for all servers
+        JScrollPane mainScrollPane = new JScrollPane(serversContainer);
+        mainScrollPane.setBorder(null);
+        mainScrollPane.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        mainScrollPane.getViewport().setBackground(ColorScheme.DARK_GRAY_COLOR);
+        mainScrollPane.setHorizontalScrollBarPolicy(JScrollPane.HORIZONTAL_SCROLLBAR_NEVER);
+        mainScrollPane.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED);
+        
+        dialog.add(mainScrollPane, BorderLayout.CENTER);
+        
+        // Buttons panel
+        JPanel buttonPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT));
+        buttonPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        buttonPanel.setBorder(new EmptyBorder(5, 10, 10, 10));
+        
+        JButton cancelBtn = new JButton("Cancel");
+        cancelBtn.addActionListener(e -> dialog.dispose());
+        buttonPanel.add(cancelBtn);
+        
+        JButton saveBtn = new JButton("Save");
+        saveBtn.setBackground(BRAND_COLOR);
+        saveBtn.setForeground(Color.WHITE);
+        saveBtn.addActionListener(e -> {
+            // Build destinations from selections
+            List<DestinationConfig> newDestinations = new ArrayList<>();
+            
+            for (LootTrackerApiClient.ServerInfo server : availableServers)
+            {
+                JCheckBox serverCheck = serverCheckboxes.get(server.id);
+                if (serverCheck != null && serverCheck.isSelected())
+                {
+                    DestinationConfig dest = new DestinationConfig();
+                    dest.guildId = server.id;
+                    dest.channelIds = new ArrayList<>();
+                    
+                    List<JCheckBox> chBoxes = channelCheckboxes.get(server.id);
+                    if (chBoxes != null)
+                    {
+                        for (JCheckBox chBox : chBoxes)
+                        {
+                            if (chBox.isSelected())
+                            {
+                                // Channel ID is stored in the checkbox name
+                                dest.channelIds.add(chBox.getName());
+                            }
+                        }
+                    }
+                    
+                    newDestinations.add(dest);
+                }
+            }
+            
+            saveDestinations(newDestinations);
+            dialog.dispose();
+        });
+        buttonPanel.add(saveBtn);
+        
+        dialog.add(buttonPanel, BorderLayout.SOUTH);
+        
+        // Set dialog size and show
+        dialog.setPreferredSize(new Dimension(420, 500));
+        dialog.setMinimumSize(new Dimension(350, 300));
+        dialog.pack();
+        dialog.setLocationRelativeTo(this);
+        dialog.setVisible(true);
+    }
+    
+    /**
+     * Load channels for a server in the config dialog
+     */
+    private void loadChannelsForDialog(String serverId, JPanel channelPanel, 
+                                        Map<String, List<JCheckBox>> channelCheckboxes,
+                                        DestinationConfig existingConfig)
+    {
+        apiClient.getServerChannels(serverId).thenAccept(channels -> {
+            SwingUtilities.invokeLater(() -> {
+                channelPanel.removeAll();
+                
+                if (channels == null || channels.isEmpty())
+                {
+                    JLabel noChannels = new JLabel("No text channels found");
+                    noChannels.setForeground(Color.GRAY);
+                    noChannels.setAlignmentX(Component.LEFT_ALIGNMENT);
+                    channelPanel.add(noChannels);
+                }
+                else
+                {
+                    List<JCheckBox> checkboxes = new ArrayList<>();
+                    List<String> existingChannelIds = existingConfig != null && existingConfig.channelIds != null 
+                        ? existingConfig.channelIds 
+                        : new ArrayList<>();
+                    
+                    // Group by category, putting uncategorized channels first
+                    Map<String, List<LootTrackerApiClient.ChannelInfo>> byCategory = new java.util.LinkedHashMap<>();
+                    
+                    // First add uncategorized channels
+                    List<LootTrackerApiClient.ChannelInfo> uncategorized = channels.stream()
+                        .filter(ch -> ch.category == null || ch.category.isEmpty())
+                        .collect(Collectors.toList());
+                    if (!uncategorized.isEmpty())
+                    {
+                        byCategory.put("", uncategorized);
+                    }
+                    
+                    // Then add categorized channels
+                    channels.stream()
+                        .filter(ch -> ch.category != null && !ch.category.isEmpty())
+                        .collect(Collectors.groupingBy(ch -> ch.category))
+                        .forEach(byCategory::put);
+                    
+                    for (Map.Entry<String, List<LootTrackerApiClient.ChannelInfo>> entry : byCategory.entrySet())
+                    {
+                        // Add category label if not empty
+                        if (!entry.getKey().isEmpty())
+                        {
+                            channelPanel.add(Box.createVerticalStrut(5));
+                            JLabel catLabel = new JLabel(entry.getKey());
+                            catLabel.setForeground(new Color(150, 150, 150));
+                            catLabel.setFont(FontManager.getRunescapeSmallFont());
+                            catLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+                            channelPanel.add(catLabel);
+                        }
+                        
+                        for (LootTrackerApiClient.ChannelInfo channel : entry.getValue())
+                        {
+                            JCheckBox chBox = new JCheckBox("#" + channel.name);
+                            chBox.setName(channel.id); // Store ID in name for retrieval
+                            chBox.setForeground(Color.WHITE);
+                            chBox.setBackground(ColorScheme.DARK_GRAY_COLOR);
+                            chBox.setOpaque(false);
+                            chBox.setSelected(existingChannelIds.contains(channel.id));
+                            chBox.setFont(FontManager.getRunescapeSmallFont());
+                            chBox.setAlignmentX(Component.LEFT_ALIGNMENT);
+                            chBox.setMaximumSize(new Dimension(Integer.MAX_VALUE, 22));
+                            channelPanel.add(chBox);
+                            checkboxes.add(chBox);
+                        }
+                    }
+                    
+                    channelCheckboxes.put(serverId, checkboxes);
+                    log.info("Loaded {} channels for server {}", checkboxes.size(), serverId);
+                }
+                
+                channelPanel.revalidate();
+                channelPanel.repaint();
+                
+                // Also update parent scroll pane
+                if (channelPanel.getParent() != null)
+                {
+                    channelPanel.getParent().revalidate();
+                    channelPanel.getParent().repaint();
+                }
+            });
+        });
+    }
+    
+    /**
+     * Add a recent drop to the panel
+     */
+    public void addRecentDrop(LootDropData drop)
+    {
+        recentDrops.add(0, drop);
+        while (recentDrops.size() > MAX_RECENT_DROPS)
+        {
+            recentDrops.remove(recentDrops.size() - 1);
+        }
+        
+        updateRecentDropsPanel();
+    }
+    
+    private void updateRecentDropsPanel()
+    {
+        recentDropsPanel.removeAll();
+        
+        if (recentDrops.isEmpty())
+        {
+            JLabel noDropsLabel = new JLabel("No drops yet...");
+            noDropsLabel.setForeground(Color.GRAY);
+            noDropsLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+            recentDropsPanel.add(noDropsLabel);
+        }
+        else
+        {
+            int index = 0;
+            for (LootDropData drop : recentDrops)
+            {
+                // Alternating row colors
+                Color rowColor = (index % 2 == 0) 
+                    ? ColorScheme.DARKER_GRAY_COLOR 
+                    : new Color(40, 40, 40);
+                
+                JPanel dropPanel = new JPanel();
+                dropPanel.setLayout(new BoxLayout(dropPanel, BoxLayout.Y_AXIS));
+                dropPanel.setBackground(rowColor);
+                dropPanel.setBorder(new EmptyBorder(6, 8, 6, 8));
+                dropPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
+                dropPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, 50));
+                
+                // Top row: Item name + value
+                JPanel topRow = new JPanel(new BorderLayout());
+                topRow.setBackground(rowColor);
+                topRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+                
+                // Item name with quantity
+                String itemText = drop.getItemName();
+                if (drop.getQuantity() > 1)
+                {
+                    itemText += " x" + drop.getQuantity();
+                }
+                
+                JLabel itemLabel = new JLabel(itemText);
+                itemLabel.setForeground(Color.WHITE);
+                itemLabel.setFont(FontManager.getRunescapeSmallFont());
+                topRow.add(itemLabel, BorderLayout.WEST);
+                
+                // Value with color coding
+                if (drop.getValue() > 0)
+                {
+                    JLabel valueLabel = new JLabel(QuantityFormatter.formatNumber(drop.getValue()) + " GP");
+                    valueLabel.setFont(FontManager.getRunescapeSmallFont());
+                    
+                    // Color code based on value
+                    if (drop.getValue() >= 1000000) // 1M+
+                    {
+                        valueLabel.setForeground(new Color(255, 128, 0)); // Orange for mega drops
+                    }
+                    else if (drop.getValue() >= 100000) // 100K+
+                    {
+                        valueLabel.setForeground(new Color(255, 215, 0)); // Gold
+                    }
+                    else if (drop.getValue() >= 10000) // 10K+
+                    {
+                        valueLabel.setForeground(Color.YELLOW);
+                    }
+                    else
+                    {
+                        valueLabel.setForeground(new Color(180, 180, 180)); // Light gray for low value
+                    }
+                    
+                    topRow.add(valueLabel, BorderLayout.EAST);
+                }
+                
+                dropPanel.add(topRow);
+                
+                // Bottom row: Source + time ago
+                JPanel bottomRow = new JPanel(new BorderLayout());
+                bottomRow.setBackground(rowColor);
+                bottomRow.setAlignmentX(Component.LEFT_ALIGNMENT);
+                
+                // Source/monster name
+                String sourceText = drop.getSourceName() != null ? drop.getSourceName() : "";
+                JLabel sourceLabel = new JLabel(sourceText);
+                sourceLabel.setForeground(new Color(130, 130, 130));
+                sourceLabel.setFont(FontManager.getRunescapeSmallFont());
+                bottomRow.add(sourceLabel, BorderLayout.WEST);
+                
+                // Time ago
+                String timeAgo = formatTimeAgo(drop.getTimestamp());
+                JLabel timeLabel = new JLabel(timeAgo);
+                timeLabel.setForeground(new Color(100, 100, 100));
+                timeLabel.setFont(FontManager.getRunescapeSmallFont());
+                bottomRow.add(timeLabel, BorderLayout.EAST);
+                
+                dropPanel.add(bottomRow);
+                
+                // Add separator line (except for last item)
+                if (index < recentDrops.size() - 1)
+                {
+                    JSeparator separator = new JSeparator();
+                    separator.setForeground(new Color(60, 60, 60));
+                    separator.setMaximumSize(new Dimension(Integer.MAX_VALUE, 1));
+                    dropPanel.add(Box.createVerticalStrut(2));
+                }
+                
+                recentDropsPanel.add(dropPanel);
+                index++;
+            }
+        }
+        
+        recentDropsPanel.revalidate();
+        recentDropsPanel.repaint();
+    }
+    
+    /**
+     * Format a timestamp as "time ago" string
+     */
+    private String formatTimeAgo(long timestamp)
+    {
+        if (timestamp == 0)
+        {
+            return "";
+        }
+        
+        long diff = System.currentTimeMillis() - timestamp;
+        long seconds = diff / 1000;
+        long minutes = seconds / 60;
+        long hours = minutes / 60;
+        
+        if (seconds < 60)
+        {
+            return "just now";
+        }
+        else if (minutes < 60)
+        {
+            return minutes + "m ago";
+        }
+        else if (hours < 24)
+        {
+            return hours + "h ago";
+        }
+        else
+        {
+            long days = hours / 24;
+            return days + "d ago";
+        }
+    }
+    
+    /**
+     * Destination configuration - a server with selected channels
+     */
+    public static class DestinationConfig
+    {
+        public String guildId;
+        public List<String> channelIds;
+        public String eventId; // Optional event ID
+        
+        public DestinationConfig()
+        {
+            this.channelIds = new ArrayList<>();
+        }
+    }
+}
+
+
+package com.osrsloottracker;
+
+import com.google.inject.AbstractModule;
+import com.google.inject.Provides;
+import javax.inject.Singleton;
+
+/**
+ * Guice module for dependency injection bindings
+ */
+public class OSRSLootTrackerModule extends AbstractModule
+{
+    @Override
+    protected void configure()
+    {
+        bind(AuthenticationManager.class).in(Singleton.class);
+        bind(LootTrackerApiClient.class).in(Singleton.class);
+    }
+}
+
+
+package com.osrsloottracker;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonObject;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import net.runelite.client.config.ConfigManager;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.awt.*;
+import java.io.IOException;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.UUID;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+/**
+ * Manages Discord OAuth authentication flow for the plugin.
+ * Uses web-based callback with polling instead of localhost server.
+ */
+@Slf4j
+@Singleton
+public class AuthenticationManager
+{
+    // Default Discord Client ID (PRODUCTION) - can be overridden via system property for dev
+    private static final String DEFAULT_DISCORD_CLIENT_ID = "1339214146356383744";
+    private static final String DISCORD_OAUTH_URL = "https://discord.com/api/oauth2/authorize";
+    private static final String OAUTH_SCOPES = "identify guilds";
+    
+    private static String getDiscordClientId()
+    {
+        String envClientId = System.getProperty("osrsloottracker.discord.clientId");
+        return envClientId != null ? envClientId : DEFAULT_DISCORD_CLIENT_ID;
+    }
+    
+    // Polling settings
+    private static final int POLL_INTERVAL_MS = 2000; // Poll every 2 seconds
+    private static final int POLL_TIMEOUT_MS = 120000; // Give up after 2 minutes
+    
+    private final ScheduledExecutorService pollExecutor = Executors.newSingleThreadScheduledExecutor();
+    
+    @Inject
+    private Gson gson;
+    
+    @Inject
+    private OkHttpClient okHttpClient;
+    
+    @Inject
+    private ConfigManager configManager;
+    
+    @Inject
+    private OSRSLootTrackerConfig config;
+    
+    @Getter
+    private boolean authenticated = false;
+    
+    @Getter
+    private String discordId;
+    
+    @Getter
+    private String discordUsername;
+    
+    @Getter
+    private String authToken;
+    
+    private ScheduledFuture<?> pollTask;
+    private Consumer<AuthResult> authCallback;
+    private long pollStartTime;
+    
+    /**
+     * Check if we have stored authentication and restore it.
+     * We skip validation on startup - if the token is invalid/expired,
+     * API calls will fail with 401 and the user can re-login.
+     */
+    public void checkStoredAuth()
+    {
+        String storedToken = config.authToken();
+        String storedDiscordId = config.discordId();
+        String storedUsername = config.discordUsername();
+        
+        if (storedToken != null && !storedToken.isEmpty())
+        {
+            // Trust the stored token without validation
+            // If it's invalid, API calls will fail and user can re-login
+            this.authToken = storedToken;
+            this.discordId = storedDiscordId;
+            this.discordUsername = storedUsername;
+            this.authenticated = true;
+            log.info("Restored authentication for user: {}", discordUsername);
+        }
+        else
+        {
+            log.info("No stored authentication found");
+        }
+    }
+    
+    /**
+     * Start the Discord OAuth flow using web-based callback
+     * @param callback Called when authentication completes or fails
+     */
+    public void startOAuthFlow(Consumer<AuthResult> callback)
+    {
+        this.authCallback = callback;
+        
+        try
+        {
+            // Generate unique session ID for this auth attempt
+            String sessionId = UUID.randomUUID().toString();
+            
+            // Build OAuth URL - redirects to our web server, not localhost
+            String redirectUri = getCallbackUrl();
+            
+            String authUrl = DISCORD_OAUTH_URL + 
+                "?client_id=" + getDiscordClientId() +
+                "&redirect_uri=" + URLEncoder.encode(redirectUri, StandardCharsets.UTF_8) +
+                "&response_type=code" +
+                "&scope=" + URLEncoder.encode(OAUTH_SCOPES, StandardCharsets.UTF_8) +
+                "&state=" + sessionId;
+            
+            log.info("Starting OAuth flow with session: {}", sessionId);
+            log.info("Redirect URI: {}", redirectUri);
+            
+            // Open browser
+            if (Desktop.isDesktopSupported())
+            {
+                Desktop.getDesktop().browse(new URI(authUrl));
+                log.info("Opened browser for Discord authentication");
+                
+                // Start polling for auth result
+                startPolling(sessionId);
+            }
+            else
+            {
+                log.error("Desktop not supported, cannot open browser");
+                callback.accept(AuthResult.error("Cannot open browser for authentication"));
+            }
+        }
+        catch (Exception e)
+        {
+            log.error("Error starting OAuth flow", e);
+            callback.accept(AuthResult.error("Failed to start authentication: " + e.getMessage()));
+        }
+    }
+    
+    /**
+     * Get the callback URL for OAuth
+     */
+    private String getCallbackUrl()
+    {
+        String apiEndpoint = getApiEndpoint();
+        log.info("Using API endpoint for callback: {}", apiEndpoint);
+        return apiEndpoint + "/auth/plugin-callback";
+    }
+    
+    /**
+     * Get the current API endpoint (prioritizes system property, defaults to production)
+     */
+    public String getApiEndpoint()
+    {
+        String apiEndpoint = System.getProperty("osrsloottracker.api");
+        // Always default to production - don't use config (which might have stale persisted data)
+        return (apiEndpoint != null && !apiEndpoint.isEmpty()) 
+            ? apiEndpoint 
+            : "https://osrsloottracker.com/api";
+    }
+    
+    /**
+     * Start polling the backend for auth completion
+     */
+    private void startPolling(String sessionId)
+    {
+        // Cancel any existing poll task
+        if (pollTask != null && !pollTask.isDone())
+        {
+            pollTask.cancel(false);
+        }
+        
+        pollStartTime = System.currentTimeMillis();
+        
+        pollTask = pollExecutor.scheduleAtFixedRate(() -> {
+            try
+            {
+                // Check for timeout
+                if (System.currentTimeMillis() - pollStartTime > POLL_TIMEOUT_MS)
+                {
+                    log.warn("Authentication polling timed out");
+                    pollTask.cancel(false);
+                    authCallback.accept(AuthResult.error("Authentication timed out. Please try again."));
+                    return;
+                }
+                
+                // Poll the session endpoint
+                String pollUrl = getApiEndpoint() + "/auth/plugin-session/" + sessionId;
+                
+                Request request = new Request.Builder()
+                    .url(pollUrl)
+                    .get()
+                    .build();
+                
+                try (Response response = okHttpClient.newCall(request).execute())
+                {
+                    int responseCode = response.code();
+                    
+                    if (responseCode == 200 && response.body() != null)
+                    {
+                        String responseBody = response.body().string();
+                        JsonObject json = gson.fromJson(responseBody, JsonObject.class);
+                        String status = json.get("status").getAsString();
+                        
+                        if ("complete".equals(status))
+                        {
+                            // Success! Extract token and user info
+                            pollTask.cancel(false);
+                            
+                            this.authToken = json.get("access_token").getAsString();
+                            JsonObject user = json.getAsJsonObject("user");
+                            this.discordId = user.get("discord_id").getAsString();
+                            this.discordUsername = user.get("discord_username").getAsString();
+                            this.authenticated = true;
+                            
+                            // Store in config using ConfigManager for proper persistence
+                            configManager.setConfiguration("osrsloottracker", "authToken", authToken);
+                            configManager.setConfiguration("osrsloottracker", "discordId", discordId);
+                            configManager.setConfiguration("osrsloottracker", "discordUsername", discordUsername);
+                            
+                            log.info("Authentication successful for user: {}", discordUsername);
+                            authCallback.accept(AuthResult.success(discordUsername));
+                        }
+                        else if ("error".equals(status))
+                        {
+                            // Auth failed
+                            pollTask.cancel(false);
+                            String error = json.has("error") ? json.get("error").getAsString() : "Unknown error";
+                            log.error("Authentication failed: {}", error);
+                            authCallback.accept(AuthResult.error(error));
+                        }
+                        // If status is "pending", continue polling
+                    }
+                    else
+                    {
+                        log.debug("Poll returned status {}, continuing...", responseCode);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                log.debug("Poll error (may be transient): {}", e.getMessage());
+            }
+        }, 0, POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+    }
+    
+    /**
+     * Clear authentication and log out
+     */
+    public void logout()
+    {
+        // Cancel any pending poll
+        if (pollTask != null && !pollTask.isDone())
+        {
+            pollTask.cancel(false);
+        }
+        
+        clearAuth();
+        log.info("User logged out");
+    }
+    
+    private void clearAuth()
+    {
+        this.authToken = null;
+        this.discordId = null;
+        this.discordUsername = null;
+        this.authenticated = false;
+        
+        // Clear from config using ConfigManager for proper persistence
+        configManager.setConfiguration("osrsloottracker", "authToken", "");
+        configManager.setConfiguration("osrsloottracker", "discordId", "");
+        configManager.setConfiguration("osrsloottracker", "discordUsername", "");
+    }
+    
+    /**
+     * Result of authentication attempt
+     */
+    public static class AuthResult
+    {
+        public final boolean success;
+        public final String message;
+        public final String username;
+        
+        private AuthResult(boolean success, String message, String username)
+        {
+            this.success = success;
+            this.message = message;
+            this.username = username;
+        }
+        
+        public static AuthResult success(String username)
+        {
+            return new AuthResult(true, "Authentication successful", username);
+        }
+        
+        public static AuthResult error(String message)
+        {
+            return new AuthResult(false, message, null);
+        }
+    }
+}
+
+package com.osrsloottracker;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Range;
+
+@ConfigGroup("osrsloottracker")
+public interface OSRSLootTrackerConfig extends Config
+{
+    // Internal section keys (no visible UI - items are hidden)
+    String authSection = "authentication";
+    String eventsSection = "events";
+
+    @ConfigSection(
+        name = "Tracking",
+        description = "What to track",
+        position = 1
+    )
+    String trackingSection = "tracking";
+
+    @ConfigSection(
+        name = "Filters",
+        description = "Filter settings",
+        position = 2
+    )
+    String filtersSection = "filters";
+
+    // === Authentication Section (Hidden - internal use only) ===
+    
+    @ConfigItem(
+        keyName = "apiEndpoint",
+        name = "API Endpoint",
+        description = "The API endpoint for the loot tracker service",
+        section = authSection,
+        hidden = true,
+        position = 0
+    )
+    default String apiEndpoint()
+    {
+        // Read from system property if set (for dev/prod switching via Gradle)
+        // Otherwise defaults to production
+        String envApi = System.getProperty("osrsloottracker.api");
+        return envApi != null ? envApi : "https://osrsloottracker.com/api";
+    }
+
+    @ConfigItem(
+        keyName = "authToken",
+        name = "Auth Token",
+        description = "Your authentication token (set automatically after Discord login)",
+        section = authSection,
+        hidden = true,
+        secret = true,
+        position = 1
+    )
+    default String authToken()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "authToken",
+        name = "",
+        description = "",
+        hidden = true
+    )
+    void setAuthToken(String token);
+
+    @ConfigItem(
+        keyName = "discordId",
+        name = "Discord ID",
+        description = "Your Discord ID (set automatically after login)",
+        section = authSection,
+        hidden = true,
+        position = 2
+    )
+    default String discordId()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "discordId",
+        name = "",
+        description = "",
+        hidden = true
+    )
+    void setDiscordId(String id);
+
+    @ConfigItem(
+        keyName = "discordUsername",
+        name = "Discord Username",
+        description = "Your Discord username (set automatically after login)",
+        section = authSection,
+        hidden = true,
+        position = 3
+    )
+    default String discordUsername()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "discordUsername",
+        name = "",
+        description = "",
+        hidden = true
+    )
+    void setDiscordUsername(String username);
+
+    // === Tracking Section ===
+
+    @ConfigItem(
+        keyName = "trackLoot",
+        name = "Track Valuable Drops",
+        description = "Sends messages to Discord when valuable drops over the minimum value are received",
+        section = trackingSection,
+        position = 0
+    )
+    default boolean trackLoot()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "trackCollectionLog",
+        name = "Track Collection Log",
+        description = "Track new collection log entries",
+        section = trackingSection,
+        position = 1
+    )
+    default boolean trackCollectionLog()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "trackPets",
+        name = "Track Pets",
+        description = "Track pet drops",
+        section = trackingSection,
+        position = 2
+    )
+    default boolean trackPets()
+    {
+        return true;
+    }
+
+    @ConfigItem(
+        keyName = "trackRaidDrops",
+        name = "Track Raid Drops",
+        description = "Track drops from CoX, ToB, and ToA",
+        section = trackingSection,
+        position = 3
+    )
+    default boolean trackRaidDrops()
+    {
+        return true;
+    }
+    
+    @ConfigItem(
+        keyName = "captureScreenshots",
+        name = "Capture Screenshots",
+        description = "Take a screenshot when valuable loot is received and include it with the drop",
+        section = trackingSection,
+        position = 4
+    )
+    default boolean captureScreenshots()
+    {
+        return true;
+    }
+
+    // === Filters Section ===
+
+    @ConfigItem(
+        keyName = "minLootValue",
+        name = "Minimum Value",
+        description = "Minimum GP value to track a drop (0 = track all)",
+        section = filtersSection,
+        position = 0
+    )
+    @Range(min = 0, max = 100000000)
+    default int minLootValue()
+    {
+        return 100000; // 100k default
+    }
+
+    @ConfigItem(
+        keyName = "includeUntradeable",
+        name = "Include Untradeable",
+        description = "Include untradeable items (pets, uniques, etc.)",
+        section = filtersSection,
+        position = 1
+    )
+    default boolean includeUntradeable()
+    {
+        return true;
+    }
+
+    // === Events Section ===
+
+    // Server/Event selection is done through the panel UI, not config
+    @ConfigItem(
+        keyName = "selectedServerId",
+        name = "Selected Server",
+        description = "The Discord server ID to send drops to",
+        section = eventsSection,
+        hidden = true,
+        position = 0
+    )
+    default String selectedServerId()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "selectedServerId",
+        name = "",
+        description = "",
+        hidden = true
+    )
+    void setSelectedServerId(String serverId);
+
+    @ConfigItem(
+        keyName = "selectedEventId",
+        name = "Selected Event",
+        description = "The Bingo/Event ID to participate in",
+        section = eventsSection,
+        hidden = true,
+        position = 1
+    )
+    default String selectedEventId()
+    {
+        return "";
+    }
+
+    @ConfigItem(
+        keyName = "selectedEventId",
+        name = "",
+        description = "",
+        hidden = true
+    )
+    void setSelectedEventId(String eventId);
+
+    @ConfigItem(
+        keyName = "autoJoinEvents",
+        name = "Auto-Join Events",
+        description = "Automatically join active events on your selected server",
+        section = eventsSection,
+        hidden = true,
+        position = 2
+    )
+    default boolean autoJoinEvents()
+    {
+        return false;
+    }
+    
+    // Drop destinations - JSON array of { guild_id, channel_ids: [], event_id? }
+    @ConfigItem(
+        keyName = "dropDestinations",
+        name = "Drop Destinations",
+        description = "Configured servers and channels to send drops to (JSON)",
+        section = eventsSection,
+        hidden = true,
+        position = 3
+    )
+    default String dropDestinations()
+    {
+        return "[]";
+    }
+    
+    @ConfigItem(
+        keyName = "dropDestinations",
+        name = "",
+        description = "",
+        hidden = true
+    )
+    void setDropDestinations(String destinations);
+}
+
+
+package com.osrsloottracker;
+
+import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.events.NpcLootReceived;
+import net.runelite.client.events.PlayerLootReceived;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.loottracker.LootReceived;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.DrawManager;
+import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.ImageUtil;
+import net.runelite.http.api.loottracker.LootRecordType;
+
+import javax.imageio.ImageIO;
+import javax.inject.Inject;
+import javax.swing.*;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayOutputStream;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collection;
+import java.util.List;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+@Slf4j
+@PluginDescriptor(
+    name = "OSRS Loot Tracker",
+    description = "Track loot and send directly to your OSRS Loot Tracker dashboard. Supports Bingo events and Snakes & Ladders.",
+    tags = {"loot", "tracker", "bingo", "discord", "drops", "collection"}
+)
+public class OSRSLootTrackerPlugin extends Plugin
+{
+    @Inject
+    private Client client;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private OSRSLootTrackerConfig config;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private ClientToolbar clientToolbar;
+
+    @Inject
+    private ScheduledExecutorService executor;
+
+    @Inject
+    private LootTrackerApiClient apiClient;
+
+    @Inject
+    private AuthenticationManager authManager;
+
+    @Inject
+    private DrawManager drawManager;
+
+    @Inject
+    private OSRSLootTrackerPanel panel;
+    
+    private NavigationButton navButton;
+
+    @Override
+    protected void startUp() throws Exception
+    {
+        log.info("OSRS Loot Tracker plugin started!");
+
+        // Check for existing authentication BEFORE initializing the panel
+        // so the panel knows whether to show login or main view
+        authManager.checkStoredAuth();
+
+        // Initialize the injected panel
+        panel.init();
+        
+        // Set up RSN supplier - gets the current player name on demand
+        panel.setRsnSupplier(() -> {
+            if (client.getLocalPlayer() != null)
+            {
+                return client.getLocalPlayer().getName();
+            }
+            return null;
+        });
+        
+        // Use RuneLite's built-in loot icon
+        BufferedImage icon;
+        try
+        {
+            icon = ImageUtil.loadImageResource(getClass(), "/panel_icon.png");
+        }
+        catch (Exception e)
+        {
+            // Fallback to a simple colored square if icon not found
+            icon = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
+            java.awt.Graphics2D g = icon.createGraphics();
+            g.setColor(new java.awt.Color(88, 101, 242)); // Discord blurple
+            g.fillRect(0, 0, 16, 16);
+            g.setColor(java.awt.Color.WHITE);
+            g.drawString("L", 4, 12);
+            g.dispose();
+        }
+        
+        navButton = NavigationButton.builder()
+            .tooltip("OSRS Loot Tracker")
+            .icon(icon)
+            .priority(5)
+            .panel(panel)
+            .build();
+
+        clientToolbar.addNavigation(navButton);
+    }
+
+    @Override
+    protected void shutDown() throws Exception
+    {
+        log.info("OSRS Loot Tracker plugin stopped!");
+        clientToolbar.removeNavigation(navButton);
+    }
+
+    @Subscribe
+    public void onLootReceived(LootReceived event)
+    {
+        log.info("LootReceived event: {} items from {}", event.getItems().size(), event.getName());
+        
+        if (!authManager.isAuthenticated())
+        {
+            log.info("Not authenticated, skipping loot submission");
+            return;
+        }
+
+        if (!config.trackLoot())
+        {
+            log.info("Loot tracking disabled, skipping");
+            return;
+        }
+        
+        // Check if destinations are configured
+        String destinations = config.dropDestinations();
+        boolean hasDestinations = destinations != null && !destinations.isEmpty() && !destinations.equals("[]");
+        boolean hasLegacyServer = config.selectedServerId() != null && !config.selectedServerId().isEmpty();
+        
+        if (!hasDestinations && !hasLegacyServer)
+        {
+            log.info("No destinations configured, skipping loot submission");
+            return;
+        }
+
+        final String sourceName = event.getName();
+        final LootRecordType type = event.getType();
+
+        // Get the player's RSN
+        final String rsn = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : "Unknown";
+        
+        // IMPORTANT: Pre-process all item data on the client thread because ItemManager 
+        // methods must be called on the client thread. We store the processed data for 
+        // use in the async callback.
+        final List<ProcessedItem> processedItems = new ArrayList<>();
+        boolean hasValuableDrop = false;
+        
+        for (ItemStack item : event.getItems())
+        {
+            final int itemId = item.getId();
+            final int quantity = item.getQuantity();
+            final int value = itemManager.getItemPrice(itemId) * quantity;
+            final String itemName = itemManager.getItemComposition(itemId).getName();
+            
+            processedItems.add(new ProcessedItem(itemName, quantity, value));
+            
+            if (value >= config.minLootValue())
+            {
+                hasValuableDrop = true;
+            }
+        }
+        
+        log.info("Processing loot for RSN: {}, from: {}, items: {}", rsn, sourceName, processedItems.size());
+
+        if (!hasValuableDrop)
+        {
+            log.debug("No items above minimum value threshold");
+            return;
+        }
+
+        // Capture screenshot if enabled
+        if (config.captureScreenshots())
+        {
+            captureScreenshot(screenshot -> {
+                submitProcessedItems(processedItems, rsn, sourceName, type, screenshot);
+            });
+        }
+        else
+        {
+            submitProcessedItems(processedItems, rsn, sourceName, type, null);
+        }
+    }
+    
+    /**
+     * Simple data class to hold pre-processed item info
+     */
+    public static class ProcessedItem
+    {
+        public final String name;
+        public final int quantity;
+        public final int value;
+        
+        public ProcessedItem(String name, int quantity, int value)
+        {
+            this.name = name;
+            this.quantity = quantity;
+            this.value = value;
+        }
+    }
+    
+    /**
+     * Capture a screenshot and pass it to the callback
+     */
+    private void captureScreenshot(Consumer<String> callback)
+    {
+        // Get the first configured guild ID for screenshot storage
+        String guildId = apiClient.getFirstConfiguredGuildId();
+        if (guildId == null || guildId.isEmpty())
+        {
+            log.warn("No guild ID configured for screenshot upload");
+            callback.accept(null);
+            return;
+        }
+        
+        log.info("Capturing screenshot for guild {}", guildId);
+        
+        drawManager.requestNextFrameListener(image -> {
+            executor.execute(() -> {
+                try
+                {
+                    BufferedImage screenshot = (BufferedImage) image;
+                    log.info("Screenshot captured, uploading...");
+                    
+                    // Convert to PNG bytes
+                    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    ImageIO.write(screenshot, "png", baos);
+                    byte[] imageBytes = baos.toByteArray();
+                    
+                    // Upload to backend and get URL (saved to guild-specific directory)
+                    String imageUrl = apiClient.uploadScreenshot(imageBytes, guildId);
+                    log.info("Screenshot uploaded to guild_{}: {}", guildId, imageUrl);
+                    
+                    log.info("Invoking callback with screenshot URL");
+                    callback.accept(imageUrl);
+                    log.info("Callback completed");
+                }
+                catch (Exception e)
+                {
+                    log.error("Failed to capture/upload screenshot", e);
+                    callback.accept(null);
+                }
+            });
+        });
+    }
+    
+    /**
+     * Submit pre-processed items to the backend as a batch
+     */
+    private void submitProcessedItems(List<ProcessedItem> items, String rsn, String sourceName, 
+                                       LootRecordType type, String screenshotUrl)
+    {
+        log.info("submitProcessedItems called with {} items, rsn={}, source={}, screenshot={}", 
+            items.size(), rsn, sourceName, screenshotUrl != null ? "yes" : "no");
+        
+        // Filter items that meet the threshold
+        List<ProcessedItem> valuableItems = new ArrayList<>();
+        int totalValue = 0;
+        
+        for (ProcessedItem item : items)
+        {
+            log.info("Processing item: {} x{} = {}gp (min threshold: {})", 
+                item.name, item.quantity, item.value, config.minLootValue());
+
+            if (item.value >= config.minLootValue())
+            {
+                valuableItems.add(item);
+                totalValue += item.value;
+            }
+            else
+            {
+                log.info("Skipping {} - below minimum value threshold", item.name);
+            }
+        }
+        
+        if (valuableItems.isEmpty())
+        {
+            log.info("No valuable items to submit");
+            return;
+        }
+        
+        // Submit all valuable items as a batch
+        final int finalTotalValue = totalValue;
+        executor.execute(() -> {
+            try
+            {
+                log.info("Submitting {} items from {} (total: {}gp) with screenshot: {}", 
+                    valuableItems.size(), sourceName, finalTotalValue, screenshotUrl != null);
+                
+                apiClient.submitDropBatch(valuableItems, rsn, sourceName, type.name(), screenshotUrl);
+                log.info("Successfully submitted {} items", valuableItems.size());
+                
+                // Update panel with each drop
+                for (ProcessedItem item : valuableItems)
+                {
+                    LootDropData drop = new LootDropData(
+                        rsn, item.name, item.quantity, item.value, 
+                        sourceName, type.name(), screenshotUrl
+                    );
+                    SwingUtilities.invokeLater(() -> panel.addRecentDrop(drop));
+                }
+                
+                // Refresh stats after successful drop submission
+                SwingUtilities.invokeLater(() -> panel.refreshStats());
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to submit drops: {}", e.getMessage());
+            }
+        });
+    }
+
+    @Subscribe
+    public void onChatMessage(ChatMessage event)
+    {
+        if (event.getType() != ChatMessageType.GAMEMESSAGE)
+        {
+            return;
+        }
+
+        // Check for collection log messages
+        final String message = event.getMessage();
+        if (message.contains("New item added to your collection log:"))
+        {
+            if (!authManager.isAuthenticated() || !config.trackCollectionLog())
+            {
+                return;
+            }
+
+            // Extract item name from message
+            String itemName = extractCollectionLogItem(message);
+            if (itemName != null)
+            {
+                final String rsn = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : "Unknown";
+                
+                LootDropData drop = new LootDropData(
+                    rsn,
+                    itemName,
+                    1,
+                    0, // Value will be looked up on server
+                    "Collection Log",
+                    "COLLECTION_LOG"
+                );
+
+                executor.execute(() -> {
+                    try
+                    {
+                        apiClient.submitCollectionLogEntry(drop);
+                        log.info("Submitted collection log entry: {}", itemName);
+                        SwingUtilities.invokeLater(() -> panel.addRecentDrop(drop));
+                    }
+                    catch (Exception e)
+                    {
+                        log.error("Failed to submit collection log entry", e);
+                    }
+                });
+            }
+        }
+
+        // Check for pet messages
+        if (message.contains("You have a funny feeling") || message.contains("You feel something weird"))
+        {
+            if (!authManager.isAuthenticated() || !config.trackPets())
+            {
+                return;
+            }
+
+            final String rsn = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : "Unknown";
+            
+            LootDropData drop = new LootDropData(
+                rsn,
+                "Pet Drop",
+                1,
+                0,
+                "Pet",
+                "PET"
+            );
+
+            executor.execute(() -> {
+                try
+                {
+                    apiClient.submitPetDrop(drop, message);
+                    log.info("Submitted pet drop!");
+                    SwingUtilities.invokeLater(() -> panel.addRecentDrop(drop));
+                }
+                catch (Exception e)
+                {
+                    log.error("Failed to submit pet drop", e);
+                }
+            });
+        }
+    }
+
+    private String extractCollectionLogItem(String message)
+    {
+        // Format: "New item added to your collection log: <item name>"
+        int colonIndex = message.lastIndexOf(':');
+        if (colonIndex != -1 && colonIndex < message.length() - 1)
+        {
+            return message.substring(colonIndex + 1).trim();
+        }
+        return null;
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event)
+    {
+        if (event.getGroup().equals("osrsloottracker"))
+        {
+            // Update the panel's tracking status display when config changes
+            SwingUtilities.invokeLater(() -> {
+                if (panel != null)
+                {
+                    panel.updateTrackingStatus();
+                }
+            });
+        }
+    }
+
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged event)
+    {
+        if (event.getGameState() == GameState.LOGGED_IN)
+        {
+            log.info("LOGGED_IN detected, scheduling RSN check...");
+            
+            // Schedule a delayed check - RSN takes ~1-2 seconds to be available after login
+            executor.schedule(() -> {
+                // Now get the RSN on the client thread
+                clientThread.invoke(() -> {
+                    String rsn = null;
+                    if (client.getLocalPlayer() != null)
+                    {
+                        rsn = client.getLocalPlayer().getName();
+                    }
+                    log.info("Player RSN after delay: {}", rsn);
+                    
+                    if (rsn != null && !rsn.isEmpty())
+                    {
+                        SwingUtilities.invokeLater(() -> {
+                            if (panel != null)
+                            {
+                                panel.refreshStats();
+                            }
+                        });
+                    }
+                });
+            }, 2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Provides
+    OSRSLootTrackerConfig provideConfig(ConfigManager configManager)
+    {
+        return configManager.getConfig(OSRSLootTrackerConfig.class);
+    }
+}
+
+
+package com.osrsloottracker;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class OSRSLootTrackerPluginTest
+{
+    public static void main(String[] args) throws Exception
+    {
+        ExternalPluginManager.loadBuiltin(OSRSLootTrackerPlugin.class);
+        RuneLite.main(args);
+    }
+}
+
+
