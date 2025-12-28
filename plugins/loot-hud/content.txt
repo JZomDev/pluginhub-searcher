@@ -1,0 +1,1819 @@
+package com.LootHUD;
+
+import com.google.inject.Provides;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ItemComposition;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.input.KeyManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.loottracker.LootReceived;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.util.HotkeyListener;
+
+@Slf4j
+@PluginDescriptor(
+		name = "Loot HUD",
+		description = "Displays loot notifications in an in-game overlay",
+		tags = {"loot", "tracker", "overlay", "hud"}
+)
+public class LootHudPlugin extends Plugin
+{
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private LootHudConfig config;
+
+	@Inject
+	private LootHudOverlay overlay;
+
+	@Inject
+	private OverlayManager overlayManager;
+
+	@Inject
+	private KeyManager keyManager;
+
+	@Inject
+	private EventBus eventBus;
+
+	// All loot entries (both individual and grouped)
+	private final List<LootHudEntry> allEntries = new CopyOnWriteArrayList<>();
+
+	// Running totals for each monster (for when grouping is ON)
+	private final Map<String, RunningTotal> runningTotals = new HashMap<>();
+
+	// Store individual kills separately for persistence
+	private final Map<String, List<IndividualKill>> individualKills = new HashMap<>();
+
+	private final Set<String> rareItemNamesCache = new HashSet<>();
+	private final Set<String> ignoredItemNamesCache = new HashSet<>();
+
+	private boolean overlayVisible = true;
+
+	// Track the last processed event to avoid duplicates
+	private String lastProcessedEventHash = "";
+	private long lastProcessedEventTime = 0;
+
+	@Provides
+	LootHudConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(LootHudConfig.class);
+	}
+
+	@Override
+	protected void startUp()
+	{
+		log.info("Loot HUD started!");
+		overlayManager.add(overlay);
+		keyManager.registerKeyListener(hotkeyListener);
+		eventBus.register(this);
+		updateRareItemNamesCache();
+		updateIgnoredItemNamesCache();
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		log.info("Loot HUD stopped!");
+		overlayManager.remove(overlay);
+		keyManager.unregisterKeyListener(hotkeyListener);
+		eventBus.unregister(this);
+		allEntries.clear();
+		runningTotals.clear();
+		individualKills.clear();
+		rareItemNamesCache.clear();
+		ignoredItemNamesCache.clear();
+	}
+
+	private final HotkeyListener hotkeyListener = new HotkeyListener(() -> config.toggleKeybind())
+	{
+		@Override
+		public void hotkeyPressed()
+		{
+			overlayVisible = !overlayVisible;
+		}
+	};
+
+	@Subscribe
+	public void onLootReceived(LootReceived event)
+	{
+		log.info("Loot received from: {} (Type: {}, Amount: {}) - Items: {}",
+				event.getName(), event.getType(), event.getAmount(), event.getItems());
+
+		// Filter by source type if configured
+		if (!shouldShowLoot(event.getType())) {
+			return;
+		}
+
+		// Filter out ignored items
+		List<ItemStack> filteredItems = filterIgnoredItems(new ArrayList<>(event.getItems()));
+
+		if (filteredItems.isEmpty()) {
+			log.debug("All items from {} were ignored, skipping display", event.getName());
+			return;
+		}
+
+		// Calculate total value and check for rare items
+		long totalValue = 0;
+		boolean hasRareItem = false;
+		List<ItemStack> sortedItems = new ArrayList<>(filteredItems);
+
+		if (config.sortItemsByValue()) {
+			sortedItems.sort((a, b) -> {
+				int priceA = itemManager.getItemPrice(a.getId());
+				int priceB = itemManager.getItemPrice(b.getId());
+				return Integer.compare(priceB, priceA); // Descending
+			});
+		}
+
+		for (ItemStack item : sortedItems)
+		{
+			int price = itemManager.getItemPrice(item.getId());
+			if (price > 0) {
+				totalValue += (long) price * item.getQuantity();
+			}
+
+			// Check if this item is in our rare items list by name
+			if (!hasRareItem && !rareItemNamesCache.isEmpty()) {
+				try {
+					ItemComposition comp = itemManager.getItemComposition(item.getId());
+					String itemName = comp.getName().toLowerCase().trim();
+
+					// Check if the item name contains any of our rare item names
+					for (String rareName : rareItemNamesCache) {
+						if (itemName.contains(rareName)) {
+							hasRareItem = true;
+							log.debug("Rare item detected: {} (matches: {})", comp.getName(), rareName);
+							break;
+						}
+					}
+				} catch (Exception e) {
+					log.warn("Error checking item name for ID: {}", item.getId(), e);
+				}
+			}
+		}
+
+		// Apply minimum value filter
+		if (config.minValueToShow() > 0 && totalValue < config.minValueToShow()) {
+			log.debug("Skipping loot from {}: value {} below minimum {}",
+					event.getName(), totalValue, config.minValueToShow());
+			return;
+		}
+
+		// Check if loot exceeds rare value threshold
+		boolean exceedsRareValue = config.rareValueThreshold() > 0 && totalValue >= config.rareValueThreshold();
+		boolean isRare = hasRareItem || exceedsRareValue;
+
+		if (isRare) {
+			log.info("RARE LOOT DETECTED from {}: {} gp (Has rare item: {}, Exceeds threshold: {})",
+					event.getName(), totalValue, hasRareItem, exceedsRareValue);
+		}
+
+		// Determine expiration time
+		Instant expirationTime;
+		if (config.alwaysShowOverlay()) {
+			// When "Always Show Overlay" is enabled, entries never expire
+			expirationTime = Instant.MAX;
+		} else {
+			// Normal mode: use configured duration
+			expirationTime = Instant.now().plusSeconds(config.displayDuration());
+		}
+
+		// Process the loot
+		processLoot(event, sortedItems, totalValue, expirationTime, isRare);
+	}
+
+	private List<ItemStack> filterIgnoredItems(List<ItemStack> items) {
+		if (ignoredItemNamesCache.isEmpty()) {
+			return new ArrayList<>(items);
+		}
+
+		List<ItemStack> filtered = new ArrayList<>();
+		for (ItemStack item : items) {
+			try {
+				ItemComposition comp = itemManager.getItemComposition(item.getId());
+				String itemName = comp.getName().toLowerCase().trim();
+				boolean ignore = false;
+
+				// Check if this item should be ignored
+				for (String ignoredName : ignoredItemNamesCache) {
+					if (itemName.contains(ignoredName)) {
+						ignore = true;
+						log.debug("Ignoring item: {} (matches: {})", comp.getName(), ignoredName);
+						break;
+					}
+				}
+
+				if (!ignore) {
+					filtered.add(item);
+				}
+			} catch (Exception e) {
+				log.warn("Error checking item name for ID: {}", item.getId(), e);
+				// If we can't check the name, include the item
+				filtered.add(item);
+			}
+		}
+
+		return filtered;
+	}
+
+	private void processLoot(LootReceived event, List<ItemStack> sortedItems, long totalValue, Instant expirationTime, boolean isRare)
+	{
+		// Create a hash of this event to avoid processing duplicates
+		String eventHash = createEventHash(event, sortedItems, totalValue);
+		long currentTime = System.currentTimeMillis();
+
+		// Check if this is a duplicate event (same hash within 1 second)
+		if (eventHash.equals(lastProcessedEventHash) && (currentTime - lastProcessedEventTime) < 1000) {
+			log.debug("Skipping duplicate event for {}", event.getName());
+			return;
+		}
+
+		lastProcessedEventHash = eventHash;
+		lastProcessedEventTime = currentTime;
+
+		String monsterKey = event.getName() + "|" + event.getType();
+
+		// Always store the individual kill for persistence
+		storeIndividualKill(event, sortedItems, totalValue, expirationTime, isRare, monsterKey);
+
+		// Always update running totals (for when grouping is ON)
+		updateRunningTotal(event, sortedItems, totalValue, expirationTime, isRare, monsterKey);
+
+		// Now update the display based on current mode
+		if (config.groupLoot()) {
+			updateGroupedDisplay(event, monsterKey, expirationTime);
+		} else {
+			updateIndividualDisplay(event, monsterKey, expirationTime);
+		}
+
+		// Limit the total number of entries
+		while (allEntries.size() > config.maxNotifications() * 2) {
+			allEntries.remove(allEntries.size() - 1);
+		}
+
+		// Clean up expired data
+		cleanupExpiredData();
+	}
+
+	private void storeIndividualKill(LootReceived event, List<ItemStack> sortedItems, long totalValue,
+									 Instant expirationTime, boolean isRare, String monsterKey) {
+		// Create an individual kill record
+		IndividualKill kill = new IndividualKill(
+				event.getName(),
+				event.getType(),
+				new ArrayList<>(sortedItems),
+				event.getAmount(),
+				totalValue,
+				isRare,
+				expirationTime
+		);
+
+		// Get or create the list for this monster
+		List<IndividualKill> kills = individualKills.computeIfAbsent(monsterKey, k -> new ArrayList<>());
+
+		// Add the new kill at the beginning (so newest is first)
+		kills.add(0, kill);
+
+		// Limit the number of stored individual kills per monster
+		// We store more than maxNotifications to allow for multiple kills from same monster
+		while (kills.size() > config.maxNotifications() * 3) {
+			kills.remove(kills.size() - 1); // Remove oldest (last in list)
+		}
+	}
+
+	private void updateRunningTotal(LootReceived event, List<ItemStack> sortedItems, long totalValue,
+									Instant expirationTime, boolean isRare, String monsterKey) {
+		// Update the running total for this monster
+		RunningTotal runningTotal = runningTotals.get(monsterKey);
+		if (runningTotal == null) {
+			runningTotal = new RunningTotal(
+					event.getName(),
+					event.getType(),
+					new ArrayList<>(sortedItems),
+					event.getAmount(),
+					totalValue,
+					isRare,
+					expirationTime
+			);
+			runningTotals.put(monsterKey, runningTotal);
+		} else {
+			runningTotal.addKill(sortedItems, event.getAmount(), totalValue, isRare, expirationTime);
+		}
+	}
+
+	private void updateGroupedDisplay(LootReceived event, String monsterKey, Instant expirationTime) {
+		// Get the running total for this monster
+		RunningTotal runningTotal = runningTotals.get(monsterKey);
+		if (runningTotal == null) {
+			log.warn("No running total found for {} when in grouped mode", monsterKey);
+			return;
+		}
+
+		// Remove any existing individual entries for this monster
+		allEntries.removeIf(entry ->
+				entry.getSourceName().equals(event.getName()) &&
+						entry.getType() == event.getType() &&
+						!entry.isGrouped()
+		);
+
+		// Remove any existing grouped entry for this monster
+		allEntries.removeIf(entry ->
+				entry.getSourceName().equals(event.getName()) &&
+						entry.getType() == event.getType() &&
+						entry.isGrouped()
+		);
+
+		// Create a new grouped entry
+		LootHudEntry groupedEntry = new LootHudEntry(
+				event.getName(),
+				runningTotal.getItems(),
+				runningTotal.getKillCount(),
+				expirationTime,
+				runningTotal.getTotalValue(),
+				event.getType(),
+				runningTotal.isRare(),
+				true
+		);
+
+		// Add at the beginning (top of display)
+		allEntries.add(0, groupedEntry);
+	}
+
+	private void updateIndividualDisplay(LootReceived event, String monsterKey, Instant expirationTime) {
+		// First, collect ALL individual kills from ALL monsters
+		List<IndividualKill> allKills = new ArrayList<>();
+
+		// Process each monster's kills
+		for (Map.Entry<String, List<IndividualKill>> entry : individualKills.entrySet()) {
+			List<IndividualKill> monsterKills = entry.getValue();
+
+			for (IndividualKill kill : monsterKills) {
+				// Skip if expired (unless in always show mode)
+				if (!config.alwaysShowOverlay() && Instant.now().isAfter(kill.getExpirationTime())) {
+					continue;
+				}
+
+				allKills.add(kill);
+			}
+		}
+
+		// Sort all kills by expiration time (newest first)
+		allKills.sort((a, b) -> b.getExpirationTime().compareTo(a.getExpirationTime()));
+
+		// Remove any grouped entries (we're in individual mode)
+		allEntries.removeIf(entry -> entry.isGrouped());
+
+		// Now rebuild all individual entries
+		allEntries.clear();
+
+		// Add all kills as individual entries (newest first)
+		for (IndividualKill kill : allKills) {
+			LootHudEntry individualEntry = new LootHudEntry(
+					kill.getSourceName(),
+					kill.getItems(),
+					kill.getKillCount(),
+					kill.getExpirationTime(),
+					kill.getTotalValue(),
+					kill.getType(),
+					kill.isRare(),
+					false
+			);
+
+			allEntries.add(individualEntry);
+		}
+
+		// Limit to maxNotifications * 2 to prevent excessive growth
+		while (allEntries.size() > config.maxNotifications() * 2) {
+			allEntries.remove(allEntries.size() - 1);
+		}
+	}
+
+	private String createEventHash(LootReceived event, List<ItemStack> items, long totalValue) {
+		StringBuilder hash = new StringBuilder();
+		hash.append(event.getName()).append("|");
+		hash.append(event.getType()).append("|");
+		hash.append(event.getAmount()).append("|");
+		hash.append(totalValue).append("|");
+
+		for (ItemStack item : items) {
+			hash.append(item.getId()).append(":").append(item.getQuantity()).append(";");
+		}
+
+		return hash.toString();
+	}
+
+	private void cleanupExpiredData() {
+		Instant now = Instant.now();
+
+		// Clean up expired individual kills
+		if (!config.alwaysShowOverlay()) {
+			for (List<IndividualKill> kills : individualKills.values()) {
+				kills.removeIf(kill -> now.isAfter(kill.getExpirationTime()));
+			}
+
+			// Remove empty monster entries
+			individualKills.entrySet().removeIf(entry -> entry.getValue().isEmpty());
+
+			// Clean up expired running totals
+			runningTotals.entrySet().removeIf(entry -> now.isAfter(entry.getValue().getExpirationTime()));
+		}
+	}
+
+	private void updateRareItemNamesCache()
+	{
+		rareItemNamesCache.clear();
+		String rareItemNames = config.rareItemNames();
+		if (rareItemNames != null && !rareItemNames.trim().isEmpty()) {
+			String[] names = rareItemNames.split(",");
+			for (String name : names) {
+				name = name.trim().toLowerCase();
+				if (!name.isEmpty()) {
+					rareItemNamesCache.add(name);
+					log.debug("Added rare item name: {}", name);
+				}
+			}
+		}
+		log.info("Loaded {} rare item names from config", rareItemNamesCache.size());
+	}
+
+	private void updateIgnoredItemNamesCache()
+	{
+		ignoredItemNamesCache.clear();
+		String ignoredItemNames = config.ignoredItemNames();
+		if (ignoredItemNames != null && !ignoredItemNames.trim().isEmpty()) {
+			String[] names = ignoredItemNames.split(",");
+			for (String name : names) {
+				name = name.trim().toLowerCase();
+				if (!name.isEmpty()) {
+					ignoredItemNamesCache.add(name);
+					log.debug("Added ignored item name: {}", name);
+				}
+			}
+		}
+		log.info("Loaded {} ignored item names from config", ignoredItemNamesCache.size());
+	}
+
+	// Handle config changes
+	@Subscribe
+	private void onConfigChanged(net.runelite.client.events.ConfigChanged event)
+	{
+		if (!event.getGroup().equals("loothud")) {
+			return;
+		}
+
+		if (event.getKey().equals("rareItemNames")) {
+			updateRareItemNamesCache();
+		} else if (event.getKey().equals("ignoredItemNames")) {
+			updateIgnoredItemNamesCache();
+			// Rebuild all entries with new ignore filter
+			rebuildAllEntriesWithFilter();
+		} else if (event.getKey().equals("resetGroupOnLogout") && config.resetGroupOnLogout()) {
+			runningTotals.clear();
+			individualKills.clear();
+			log.info("Cleared all loot data due to config change");
+		} else if (event.getKey().equals("groupLoot")) {
+			// When grouping mode changes, rebuild the display from stored data
+			rebuildDisplay();
+		}
+	}
+
+	private void rebuildAllEntriesWithFilter() {
+		// Clear current entries and rebuild from stored data
+		allEntries.clear();
+		runningTotals.clear();
+
+		// We need to re-filter all stored individual kills
+		Map<String, List<IndividualKill>> newIndividualKills = new HashMap<>();
+
+		for (Map.Entry<String, List<IndividualKill>> entry : individualKills.entrySet()) {
+			String monsterKey = entry.getKey();
+			List<IndividualKill> oldKills = entry.getValue();
+			List<IndividualKill> newKills = new ArrayList<>();
+
+			for (IndividualKill oldKill : oldKills) {
+				// Filter ignored items from this kill
+				List<ItemStack> filteredItems = filterIgnoredItems(oldKill.getItems());
+
+				if (filteredItems.isEmpty()) {
+					// All items were ignored, skip this kill entirely
+					continue;
+				}
+
+				// Recalculate total value for filtered items
+				long filteredTotalValue = 0;
+				boolean filteredIsRare = false;
+
+				for (ItemStack item : filteredItems) {
+					int price = itemManager.getItemPrice(item.getId());
+					if (price > 0) {
+						filteredTotalValue += (long) price * item.getQuantity();
+					}
+
+					// Check if rare
+					if (!filteredIsRare && !rareItemNamesCache.isEmpty()) {
+						try {
+							ItemComposition comp = itemManager.getItemComposition(item.getId());
+							String itemName = comp.getName().toLowerCase().trim();
+							for (String rareName : rareItemNamesCache) {
+								if (itemName.contains(rareName)) {
+									filteredIsRare = true;
+									break;
+								}
+							}
+						} catch (Exception e) {
+							log.warn("Error re-checking rare status for item ID: {}", item.getId(), e);
+						}
+					}
+				}
+
+				// Check value threshold
+				boolean exceedsRareValue = config.rareValueThreshold() > 0 && filteredTotalValue >= config.rareValueThreshold();
+				filteredIsRare = filteredIsRare || exceedsRareValue;
+
+				// Create new kill with filtered items
+				IndividualKill newKill = new IndividualKill(
+						oldKill.getSourceName(),
+						oldKill.getType(),
+						filteredItems,
+						oldKill.getKillCount(),
+						filteredTotalValue,
+						filteredIsRare,
+						oldKill.getExpirationTime()
+				);
+
+				newKills.add(newKill);
+			}
+
+			if (!newKills.isEmpty()) {
+				newIndividualKills.put(monsterKey, newKills);
+			}
+		}
+
+		// Replace old individual kills with filtered ones
+		individualKills.clear();
+		individualKills.putAll(newIndividualKills);
+
+		// Rebuild display
+		rebuildDisplay();
+	}
+
+	private void rebuildDisplay()
+	{
+		// Clear current display
+		allEntries.clear();
+
+		if (config.groupLoot()) {
+			// Switch to grouping mode - show running totals
+			List<RunningTotal> sortedTotals = new ArrayList<>(runningTotals.values());
+
+			// Sort by expiration time (newest first)
+			sortedTotals.sort((a, b) -> b.getExpirationTime().compareTo(a.getExpirationTime()));
+
+			// Add to display in order
+			for (RunningTotal total : sortedTotals) {
+				// Skip if expired (unless in always show mode)
+				if (!config.alwaysShowOverlay() && Instant.now().isAfter(total.getExpirationTime())) {
+					continue;
+				}
+
+				LootHudEntry groupedEntry = new LootHudEntry(
+						total.getSourceName(),
+						total.getItems(),
+						total.getKillCount(),
+						total.getExpirationTime(),
+						total.getTotalValue(),
+						total.getType(),
+						total.isRare(),
+						true
+				);
+
+				allEntries.add(groupedEntry);
+			}
+		} else {
+			// Switch to individual mode - show all individual kills
+			List<IndividualKill> allKills = new ArrayList<>();
+
+			// Collect all individual kills from all monsters
+			for (Map.Entry<String, List<IndividualKill>> entry : individualKills.entrySet()) {
+				List<IndividualKill> kills = entry.getValue();
+
+				for (IndividualKill kill : kills) {
+					// Skip if expired (unless in always show mode)
+					if (!config.alwaysShowOverlay() && Instant.now().isAfter(kill.getExpirationTime())) {
+						continue;
+					}
+
+					allKills.add(kill);
+				}
+			}
+
+			// Sort by expiration time (newest first)
+			allKills.sort((a, b) -> b.getExpirationTime().compareTo(a.getExpirationTime()));
+
+			// Add to display in order
+			for (IndividualKill kill : allKills) {
+				LootHudEntry individualEntry = new LootHudEntry(
+						kill.getSourceName(),
+						kill.getItems(),
+						kill.getKillCount(),
+						kill.getExpirationTime(),
+						kill.getTotalValue(),
+						kill.getType(),
+						kill.isRare(),
+						false
+				);
+
+				allEntries.add(individualEntry);
+			}
+
+			log.info("Switched to ungrouped mode - showing {} individual kills", allEntries.size());
+		}
+	}
+
+	private boolean shouldShowLoot(net.runelite.http.api.loottracker.LootRecordType type)
+	{
+		switch (type)
+		{
+			case NPC:
+				return config.includeNPCKills();
+			case PLAYER:
+				return config.includePlayerKills();
+			case PICKPOCKET:
+				return config.includePickpocket();
+			case EVENT:
+				return config.includeEvents();
+			default:
+				return true;
+		}
+	}
+
+	List<LootHudEntry> getRecentLoot()
+	{
+		// Clean up expired entries if not in "always show" mode
+		if (!config.alwaysShowOverlay()) {
+			Instant now = Instant.now();
+			allEntries.removeIf(entry -> now.isAfter(entry.getExpirationTime()));
+		}
+
+		// Return up to maxNotifications entries
+		List<LootHudEntry> result = new ArrayList<>();
+		int count = 0;
+		for (LootHudEntry entry : allEntries) {
+			if (config.minValueToShow() > 0 && entry.getTotalValue() < config.minValueToShow()) {
+				continue;
+			}
+			if (count >= config.maxNotifications()) {
+				break;
+			}
+			result.add(entry);
+			count++;
+		}
+		return result;
+	}
+
+	boolean isOverlayVisible()
+	{
+		return overlayVisible;
+	}
+
+	// Class to track running totals for each monster
+	private static class RunningTotal {
+		private final String sourceName;
+		private final net.runelite.http.api.loottracker.LootRecordType type;
+		private List<ItemStack> items;
+		private int killCount;
+		private long totalValue;
+		private boolean isRare;
+		private Instant expirationTime;
+
+		public RunningTotal(String sourceName, net.runelite.http.api.loottracker.LootRecordType type,
+							List<ItemStack> items, int killCount, long totalValue,
+							boolean isRare, Instant expirationTime) {
+			this.sourceName = sourceName;
+			this.type = type;
+			this.items = new ArrayList<>(items);
+			this.killCount = killCount;
+			this.totalValue = totalValue;
+			this.isRare = isRare;
+			this.expirationTime = expirationTime;
+		}
+
+		public void addKill(List<ItemStack> newItems, int newKillCount, long newTotalValue,
+							boolean newIsRare, Instant newExpirationTime) {
+			// Merge items
+			Map<Integer, ItemStack> itemMap = new HashMap<>();
+
+			// Add existing items
+			for (ItemStack item : this.items) {
+				itemMap.put(item.getId(), new ItemStack(item.getId(), item.getQuantity()));
+			}
+
+			// Add new items
+			for (ItemStack newItem : newItems) {
+				int itemId = newItem.getId();
+				ItemStack existing = itemMap.get(itemId);
+				if (existing != null) {
+					itemMap.put(itemId, new ItemStack(itemId, existing.getQuantity() + newItem.getQuantity()));
+				} else {
+					itemMap.put(itemId, new ItemStack(itemId, newItem.getQuantity()));
+				}
+			}
+
+			// Convert back to list
+			this.items = new ArrayList<>(itemMap.values());
+
+			// Update other fields
+			this.killCount += newKillCount;
+			this.totalValue += newTotalValue;
+			this.isRare = this.isRare || newIsRare;
+
+			// Use the latest expiration time
+			if (newExpirationTime.isAfter(this.expirationTime)) {
+				this.expirationTime = newExpirationTime;
+			}
+		}
+
+		// Getters
+		public String getSourceName() { return sourceName; }
+		public net.runelite.http.api.loottracker.LootRecordType getType() { return type; }
+		public List<ItemStack> getItems() { return new ArrayList<>(items); } // Return copy
+		public int getKillCount() { return killCount; }
+		public long getTotalValue() { return totalValue; }
+		public boolean isRare() { return isRare; }
+		public Instant getExpirationTime() { return expirationTime; }
+	}
+
+	// Class to store individual kills for persistence
+	private static class IndividualKill {
+		private final String sourceName;
+		private final net.runelite.http.api.loottracker.LootRecordType type;
+		private final List<ItemStack> items;
+		private final int killCount;
+		private final long totalValue;
+		private final boolean isRare;
+		private final Instant expirationTime;
+
+		public IndividualKill(String sourceName, net.runelite.http.api.loottracker.LootRecordType type,
+							  List<ItemStack> items, int killCount, long totalValue,
+							  boolean isRare, Instant expirationTime) {
+			this.sourceName = sourceName;
+			this.type = type;
+			this.items = new ArrayList<>(items);
+			this.killCount = killCount;
+			this.totalValue = totalValue;
+			this.isRare = isRare;
+			this.expirationTime = expirationTime;
+		}
+
+		// Getters
+		public String getSourceName() { return sourceName; }
+		public net.runelite.http.api.loottracker.LootRecordType getType() { return type; }
+		public List<ItemStack> getItems() { return new ArrayList<>(items); }
+		public int getKillCount() { return killCount; }
+		public long getTotalValue() { return totalValue; }
+		public boolean isRare() { return isRare; }
+		public Instant getExpirationTime() { return expirationTime; }
+	}
+}
+package com.LootHUD;
+
+import java.awt.AlphaComposite;
+import java.awt.Color;
+import java.awt.Composite;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+import java.util.List;
+import javax.inject.Inject;
+import net.runelite.api.Constants;
+import net.runelite.api.Point;
+import net.runelite.api.ItemComposition;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.OverlayPriority;
+import net.runelite.client.ui.overlay.OverlayUtil;
+import net.runelite.client.util.QuantityFormatter;
+import net.runelite.http.api.loottracker.LootRecordType;
+
+class LootHudOverlay extends Overlay
+{
+    private final LootHudPlugin plugin;
+    private final LootHudConfig config;
+    private final ItemManager itemManager;
+
+    private static final int PADDING = 4;
+    private static final int ITEM_GAP = 2;
+    private static final int HEADER_HEIGHT = 20;
+    private static final int ITEM_SIZE = Constants.ITEM_SPRITE_WIDTH;
+    private static final int TYPE_ICON_SIZE = 12;
+
+    private long animationStartTime = System.currentTimeMillis();
+
+    @Inject
+    private LootHudOverlay(LootHudPlugin plugin, LootHudConfig config, ItemManager itemManager)
+    {
+        this.plugin = plugin;
+        this.config = config;
+        this.itemManager = itemManager;
+
+        // Make overlay movable and dynamic
+        setPosition(OverlayPosition.DYNAMIC);
+        setPriority(OverlayPriority.HIGH);
+        setMovable(true);
+        setResizable(config.allowResizing());
+        setSnappable(true); // Added: Enable snapping to screen edges
+        setPreferredSize(null);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics)
+    {
+        if (!plugin.isOverlayVisible())
+        {
+            return null;
+        }
+
+        List<LootHudEntry> entries = plugin.getRecentLoot();
+        if (entries.isEmpty())
+        {
+            return null;
+        }
+
+        // Calculate total size needed for all entries
+        int totalHeight = 0;
+        int maxWidth = 0;
+        int entriesCounted = 0;
+
+        for (LootHudEntry entry : entries)
+        {
+            if (config.minValueToShow() > 0 && entry.getTotalValue() < config.minValueToShow()) {
+                continue;
+            }
+
+            int iconsPerRow = Math.min(config.iconsPerRow(), 8);
+            int numIconsToShow = Math.min(entry.getItems().size(), config.maxIconsPerEntry());
+            int rows = (int) Math.ceil((double) numIconsToShow / iconsPerRow);
+
+            int entryWidth = (iconsPerRow * (ITEM_SIZE + ITEM_GAP)) - ITEM_GAP + (PADDING * 2);
+            int entryHeight = HEADER_HEIGHT + (rows * (ITEM_SIZE + ITEM_GAP)) - ITEM_GAP + (PADDING * 2);
+
+            maxWidth = Math.max(maxWidth, entryWidth);
+            totalHeight += entryHeight + 2; // 2px gap between entries
+            entriesCounted++;
+        }
+
+        // If no entries after filtering, don't render
+        if (maxWidth == 0) {
+            return null;
+        }
+
+        // Check if we should use fixed size or dynamic size
+        Dimension preferredSize = null;
+        if (config.allowResizing() && getPreferredSize() != null) {
+            // Use user's preferred size if resizing is allowed and set
+            preferredSize = getPreferredSize();
+
+            // Ensure minimum size
+            if (preferredSize.width < maxWidth) {
+                preferredSize.width = maxWidth;
+            }
+            if (preferredSize.height < totalHeight) {
+                preferredSize.height = totalHeight;
+            }
+        } else {
+            // Use calculated size
+            preferredSize = new Dimension(maxWidth, totalHeight);
+        }
+
+        // Update resizable property based on config
+        setResizable(config.allowResizing());
+
+        // Draw each entry
+        int yOffset = 0;
+        int entriesDrawn = 0;
+
+        for (int i = 0; i < entries.size(); i++)
+        {
+            LootHudEntry entry = entries.get(i);
+
+            if (config.minValueToShow() > 0 && entry.getTotalValue() < config.minValueToShow()) {
+                continue;
+            }
+
+            // Apply fade effect if enabled and there are multiple entries
+            Composite originalComposite = null;
+            if (config.fadeOlderEntries() && entries.size() > 1) {
+                originalComposite = graphics.getComposite();
+                float alpha = calculateAlphaForPosition(i, entries.size());
+                graphics.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, alpha));
+            }
+
+            yOffset += drawEntry(graphics, entry, yOffset, maxWidth, i);
+
+            // Restore original composite if we changed it
+            if (config.fadeOlderEntries() && entries.size() > 1) {
+                graphics.setComposite(originalComposite);
+            }
+
+            entriesDrawn++;
+
+            if (entriesDrawn >= config.maxNotifications()) {
+                break;
+            }
+        }
+
+        return preferredSize;
+    }
+
+    private float calculateAlphaForPosition(int position, int totalEntries)
+    {
+        float minAlpha = 0.4f;
+        float maxAlpha = 1.0f;
+
+        if (totalEntries <= 1) {
+            return maxAlpha;
+        }
+
+        float t = (float) position / (totalEntries - 1);
+        return maxAlpha - t * (maxAlpha - minAlpha);
+    }
+
+    private int drawEntry(Graphics2D graphics, LootHudEntry entry, int yOffset, int maxWidth, int position)
+    {
+        int iconsPerRow = Math.min(config.iconsPerRow(), 8);
+        int numIconsToShow = Math.min(entry.getItems().size(), config.maxIconsPerEntry());
+        int rows = (int) Math.ceil((double) numIconsToShow / iconsPerRow);
+
+        int entryHeight = HEADER_HEIGHT + (rows * (ITEM_SIZE + ITEM_GAP)) - ITEM_GAP + (PADDING * 2);
+
+        // Get base colors from config
+        Color backgroundColor = new Color(
+                config.backgroundColor().getRed(),
+                config.backgroundColor().getGreen(),
+                config.backgroundColor().getBlue(),
+                config.backgroundAlpha()
+        );
+
+        Color borderColor = new Color(
+                config.borderColor().getRed(),
+                config.borderColor().getGreen(),
+                config.borderColor().getBlue(),
+                config.borderAlpha()
+        );
+
+        // Check if this is a rare entry and which highlight mode is active
+        boolean isRare = entry.isRare();
+        LootHudConfig.RareItemHighlight highlightMode = config.rareItemHighlight();
+
+        // NEW: Only apply highlight to individual (non-grouped) entries
+        boolean shouldHighlight = isRare &&
+                highlightMode != LootHudConfig.RareItemHighlight.OFF &&
+                !entry.isGrouped();
+
+        // Apply highlight if rare and highlight mode is not OFF and entry is not grouped
+        if (shouldHighlight) {
+            if (highlightMode == LootHudConfig.RareItemHighlight.RAINBOW) {
+                // Create animated rainbow effect
+                Color rainbowColor = getRainbowColor(position);
+                backgroundColor = new Color(
+                        rainbowColor.getRed(),
+                        rainbowColor.getGreen(),
+                        rainbowColor.getBlue(),
+                        config.rainbowAlpha()
+                );
+
+                // Create slightly different color for border (brighter)
+                Color rainbowBorder = getRainbowColor(position + 2); // Offset for different hue
+                borderColor = new Color(
+                        rainbowBorder.getRed(),
+                        rainbowBorder.getGreen(),
+                        rainbowBorder.getBlue(),
+                        config.rainbowAlpha()
+                );
+            } else if (highlightMode == LootHudConfig.RareItemHighlight.STATIC) {
+                // Use static highlight color
+                Color highlightColor = config.staticHighlightColor();
+                backgroundColor = new Color(
+                        highlightColor.getRed(),
+                        highlightColor.getGreen(),
+                        highlightColor.getBlue(),
+                        config.staticHighlightAlpha()
+                );
+
+                // Create slightly brighter border color
+                borderColor = new Color(
+                        Math.min(255, highlightColor.getRed() + 30),
+                        Math.min(255, highlightColor.getGreen() + 30),
+                        Math.min(255, highlightColor.getBlue() + 30),
+                        config.staticHighlightAlpha()
+                );
+            } else if (highlightMode == LootHudConfig.RareItemHighlight.PULSE) {
+                // New pulse effect
+                Color highlightColor = config.staticHighlightColor();
+
+                // Calculate pulsing alpha
+                int pulseAlpha = getPulseAlpha(config.staticHighlightAlpha(), config.pulseAlphaRange(), position);
+
+                backgroundColor = new Color(
+                        highlightColor.getRed(),
+                        highlightColor.getGreen(),
+                        highlightColor.getBlue(),
+                        pulseAlpha
+                );
+
+                // Create slightly brighter border color with same pulse effect
+                borderColor = new Color(
+                        Math.min(255, highlightColor.getRed() + 30),
+                        Math.min(255, highlightColor.getGreen() + 30),
+                        Math.min(255, highlightColor.getBlue() + 30),
+                        pulseAlpha
+                );
+            }
+        }
+
+        // Draw background rectangle for the entire entry
+        graphics.setColor(backgroundColor);
+        graphics.fillRect(0, yOffset, maxWidth, entryHeight);
+
+        // Draw border
+        graphics.setColor(borderColor);
+        graphics.drawRect(0, yOffset, maxWidth - 1, entryHeight - 1);
+
+        // Draw loot type icon if enabled
+        int textXOffset = PADDING;
+        if (config.showLootTypeIcon()) {
+            Color typeColor = getColorForLootType(entry.getType());
+            graphics.setColor(typeColor);
+            graphics.fillRect(PADDING, yOffset + PADDING, TYPE_ICON_SIZE, TYPE_ICON_SIZE);
+            textXOffset += TYPE_ICON_SIZE + 4;
+        }
+
+        // Draw header text (monster name + value)
+        int textY = yOffset + PADDING + 14;
+
+        // Format kill count text
+        String killText = "";
+        if (entry.isGrouped()) {
+            // For grouped entries, show total kill count
+            killText = " (x" + entry.getKillCount() + ")";
+        } else if (config.groupLoot() && entry.getKillCount() > config.groupKillThreshold()) {
+            // For ungrouped entries in grouping mode, only show kill count if above threshold
+            killText = " (x" + entry.getKillCount() + ")";
+        } else if (!config.groupLoot() && entry.getKillCount() > 1) {
+            // For regular mode, show kill count if > 1
+            killText = " (x" + entry.getKillCount() + ")";
+        }
+
+        String displayName = entry.getSourceName();
+
+        // Truncate if too long
+        if (displayName.length() > 20) {
+            displayName = displayName.substring(0, 17) + "...";
+        }
+
+        // Draw monster name (always shown)
+        // NEW: Use highlight text color only for individual rare entries
+        Color textColor = shouldHighlight ? Color.WHITE : Color.YELLOW;
+
+        // If pulse mode, also pulse the text color slightly
+        if (shouldHighlight && highlightMode == LootHudConfig.RareItemHighlight.PULSE) {
+            // Create a slightly dimmed version of the text color that pulses
+            int pulseAlpha = getPulseAlpha(255, config.pulseAlphaRange() / 2, position);
+            textColor = new Color(255, 255, 255, pulseAlpha);
+        }
+
+        OverlayUtil.renderTextLocation(graphics,
+                new Point(textXOffset, textY),
+                displayName + killText,
+                textColor);
+
+        // Draw value on right if enabled
+        if (config.showTotalValue() && entry.getTotalValue() > 0) {
+            String valueText = QuantityFormatter.quantityToStackSize(entry.getTotalValue()) + " gp";
+            int textWidth = graphics.getFontMetrics().stringWidth(valueText);
+
+            // NEW: Use highlight value color only for individual rare entries
+            Color valueColor = shouldHighlight ? Color.WHITE : Color.GREEN;
+
+            // If pulse mode, also pulse the value color slightly
+            if (shouldHighlight && highlightMode == LootHudConfig.RareItemHighlight.PULSE) {
+                int pulseAlpha = getPulseAlpha(255, config.pulseAlphaRange() / 2, position);
+                valueColor = new Color(0, 255, 0, pulseAlpha);
+            }
+
+            OverlayUtil.renderTextLocation(graphics,
+                    new Point(maxWidth - PADDING - textWidth, textY),
+                    valueText,
+                    valueColor);
+        }
+
+        // Draw item icons in a grid
+        if (config.showItemIcons() && !entry.getItems().isEmpty()) {
+            int iconIndex = 0;
+
+            for (ItemStack item : entry.getItems()) {
+                if (iconIndex >= config.maxIconsPerEntry()) {
+                    break;
+                }
+
+                int row = iconIndex / iconsPerRow;
+                int col = iconIndex % iconsPerRow;
+
+                int x = PADDING + col * (ITEM_SIZE + ITEM_GAP);
+                int y = yOffset + HEADER_HEIGHT + PADDING + row * (ITEM_SIZE + ITEM_GAP);
+
+                BufferedImage itemImage = getItemImage(item);
+                if (itemImage != null) {
+                    graphics.drawImage(itemImage, x, y, null);
+                }
+
+                iconIndex++;
+            }
+
+            // Draw "+X" indicator if there are more items than we can show
+            if (entry.getItems().size() > config.maxIconsPerEntry()) {
+                int remaining = entry.getItems().size() - config.maxIconsPerEntry();
+                int lastRow = (int) Math.ceil((double) Math.min(entry.getItems().size(), config.maxIconsPerEntry()) / iconsPerRow) - 1;
+                int lastCol = Math.min(entry.getItems().size(), config.maxIconsPerEntry()) % iconsPerRow;
+                if (lastCol == 0) lastCol = iconsPerRow;
+
+                int x = PADDING + (lastCol) * (ITEM_SIZE + ITEM_GAP);
+                int y = yOffset + HEADER_HEIGHT + PADDING + lastRow * (ITEM_SIZE + ITEM_GAP);
+
+                graphics.setColor(new Color(60, 60, 60, 200));
+                graphics.fillRect(x, y, ITEM_SIZE, ITEM_SIZE);
+
+                graphics.setColor(Color.LIGHT_GRAY);
+                String plusText = "+" + remaining;
+                int textWidth = graphics.getFontMetrics().stringWidth(plusText);
+                OverlayUtil.renderTextLocation(graphics,
+                        new Point(x + (ITEM_SIZE - textWidth) / 2, y + 18),
+                        plusText,
+                        Color.LIGHT_GRAY);
+            }
+        }
+
+        return entryHeight + 2;
+    }
+
+    private Color getRainbowColor(int positionOffset)
+    {
+        // Calculate time-based hue for smooth rainbow animation
+        long currentTime = System.currentTimeMillis();
+        long elapsedTime = currentTime - animationStartTime;
+
+        // Use animation speed to control the cycle speed
+        float speed = config.rainbowAnimationSpeed() / 10.0f; // Convert to 0.1-1.0 range
+
+        // Calculate hue: cycle through 0.0 to 1.0 based on elapsed time and position offset
+        // Add positionOffset to create a wave effect across multiple entries
+        float hue = ((elapsedTime * 0.001f * speed) + (positionOffset * 0.2f)) % 1.0f;
+
+        // Fixed saturation and brightness for vibrant rainbow colors
+        float saturation = 0.8f;  // 80% saturation
+        float brightness = 0.9f;  // 90% brightness
+
+        // Convert HSB to RGB
+        int rgb = Color.HSBtoRGB(hue, saturation, brightness);
+        return new Color(rgb);
+    }
+
+    private int getPulseAlpha(int baseAlpha, int alphaRange, int positionOffset)
+    {
+        long currentTime = System.currentTimeMillis();
+        long elapsedTime = currentTime - animationStartTime;
+
+        // Calculate pulse period (2 seconds base, adjusted by speed)
+        float speedFactor = config.pulseAnimationSpeed() / 10.0f;
+        long pulsePeriod = (long) (2000 / speedFactor); // 2000ms = 2 seconds base
+
+        // Calculate where we are in the pulse cycle (0.0 to 1.0)
+        float cyclePosition = (elapsedTime % pulsePeriod) / (float) pulsePeriod;
+
+        // Create smooth pulse using sine of the cycle position
+        float sinePulse = (float) Math.sin(cyclePosition * Math.PI * 2);
+
+        // Map from [-1, 1] to alpha range
+        int pulseAlpha = (int) (baseAlpha + (sinePulse * alphaRange / 2));
+
+        // Clamp to valid range
+        return Math.max(0, Math.min(255, pulseAlpha));
+    }
+
+    private Color getColorForLootType(LootRecordType type)
+    {
+        switch (type)
+        {
+            case NPC:
+                return new Color(255, 100, 100, 200);
+            case PLAYER:
+                return new Color(100, 100, 255, 200);
+            case PICKPOCKET:
+                return new Color(255, 200, 100, 200);
+            case EVENT:
+                return new Color(100, 255, 100, 200);
+            default:
+                return new Color(200, 200, 200, 200);
+        }
+    }
+
+    private BufferedImage getItemImage(ItemStack item)
+    {
+        try
+        {
+            ItemComposition itemComposition = itemManager.getItemComposition(item.getId());
+            boolean showQuantity = itemComposition.isStackable() || item.getQuantity() > 1;
+            return itemManager.getImage(item.getId(), item.getQuantity(), showQuantity);
+        }
+        catch (Exception e)
+        {
+            return null;
+        }
+    }
+}
+package com.LootHUD;
+
+import java.time.Instant;
+import java.util.List;
+import lombok.Data;
+import net.runelite.client.game.ItemStack;
+import net.runelite.http.api.loottracker.LootRecordType;
+
+@Data
+class LootHudEntry
+{
+    private final String sourceName;
+    private final List<ItemStack> items;
+    private final int killCount;
+    private final Instant expirationTime;
+    private final long totalValue;
+    private final LootRecordType type;
+    private final boolean isRare;
+    private final boolean isGrouped;
+
+    public LootHudEntry(String sourceName, List<ItemStack> items, int killCount, Instant expirationTime, long totalValue, LootRecordType type, boolean isRare, boolean isGrouped)
+    {
+        this.sourceName = sourceName;
+        this.items = items;
+        this.killCount = killCount;
+        this.expirationTime = expirationTime;
+        this.totalValue = totalValue;
+        this.type = type;
+        this.isRare = isRare;
+        this.isGrouped = isGrouped;
+    }
+
+    /**
+     * Checks if this loot entry has expired.
+     * @return true if the current time is after the expiration time, false otherwise
+     */
+    public boolean isExpired()
+    {
+        return Instant.now().isAfter(expirationTime);
+    }
+}
+package com.LootHUD;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+import net.runelite.client.config.Keybind;
+import net.runelite.client.config.Range;
+
+@ConfigGroup("loothud")
+public interface LootHudConfig extends Config
+{
+	// ========== SECTION DEFINITIONS ==========
+	@ConfigSection(
+			name = "General",
+			description = "Basic overlay settings",
+			position = 0
+	)
+	String generalSection = "general";
+
+	@ConfigSection(
+			name = "Appearance",
+			description = "Colors, transparency, and borders",
+			position = 1
+	)
+	String appearanceSection = "appearance";
+
+	@ConfigSection(
+			name = "Display",
+			description = "How loot entries are displayed",
+			position = 2
+	)
+	String displaySection = "display";
+
+	@ConfigSection(
+			name = "Icons",
+			description = "Item icon display settings",
+			position = 3
+	)
+	String iconsSection = "icons";
+
+	@ConfigSection(
+			name = "Highlight Effects",
+			description = "Rare item highlight settings",
+			position = 4
+	)
+	String highlightSection = "highlight";
+
+	@ConfigSection(
+			name = "Filtering",
+			description = "Filter what loot is shown",
+			position = 5
+	)
+	String filterSection = "filters";
+
+	@ConfigSection(
+			name = "Grouping",
+			description = "Group multiple kills from same source",
+			position = 6
+	)
+	String groupingSection = "grouping";
+
+	// ========== GENERAL SECTION ==========
+	@ConfigItem(
+			keyName = "toggleKeybind",
+			name = "Toggle keybind",
+			description = "Key to show/hide the loot overlay",
+			position = 0,
+			section = generalSection
+	)
+	default Keybind toggleKeybind()
+	{
+		return Keybind.NOT_SET;
+	}
+
+	@ConfigItem(
+			keyName = "allowResizing",
+			name = "Allow resizing",
+			description = "Allow dragging edges to resize overlay",
+			position = 1,
+			section = generalSection
+	)
+	default boolean allowResizing()
+	{
+		return true;
+	}
+
+	// ========== APPEARANCE SECTION ==========
+	@ConfigItem(
+			keyName = "backgroundColor",
+			name = "Background color",
+			description = "Color for loot entry backgrounds",
+			position = 0,
+			section = appearanceSection
+	)
+	default java.awt.Color backgroundColor()
+	{
+		return new java.awt.Color(0, 0, 0);
+	}
+
+	@ConfigItem(
+			keyName = "backgroundAlpha",
+			name = "Background transparency",
+			description = "Transparency level for background (0=invisible, 255=opaque)",
+			position = 1,
+			section = appearanceSection
+	)
+	@Range(min = 0, max = 255)
+	default int backgroundAlpha()
+	{
+		return 180;
+	}
+
+	@ConfigItem(
+			keyName = "borderColor",
+			name = "Border color",
+			description = "Color for loot entry borders",
+			position = 2,
+			section = appearanceSection
+	)
+	default java.awt.Color borderColor()
+	{
+		return new java.awt.Color(100, 100, 100);
+	}
+
+	@ConfigItem(
+			keyName = "borderAlpha",
+			name = "Border transparency",
+			description = "Transparency level for borders (0=invisible, 255=opaque)",
+			position = 3,
+			section = appearanceSection
+	)
+	@Range(min = 0, max = 255)
+	default int borderAlpha()
+	{
+		return 150;
+	}
+
+	// ========== DISPLAY SECTION ==========
+	@ConfigItem(
+			keyName = "displayDuration",
+			name = "Display time",
+			description = "How long each loot notification stays visible (seconds)",
+			position = 0,
+			section = displaySection
+	)
+	@Range(min = 1, max = 60)
+	default int displayDuration()
+	{
+		return 10;
+	}
+
+	@ConfigItem(
+			keyName = "alwaysShowOverlay",
+			name = "Always show overlay",
+			description = "Keep overlay visible even when no new loot is received",
+			position = 1,
+			section = displaySection
+	)
+	default boolean alwaysShowOverlay()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "maxNotifications",
+			name = "Max entries",
+			description = "Maximum number of loot entries to show at once",
+			position = 2,
+			section = displaySection
+	)
+	@Range(min = 1, max = 10)
+	default int maxNotifications()
+	{
+		return 3;
+	}
+
+	@ConfigItem(
+			keyName = "fadeOlderEntries",
+			name = "Fade older entries",
+			description = "Gradually fade older entries for smooth transitions",
+			position = 3,
+			section = displaySection
+	)
+	default boolean fadeOlderEntries()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "showTotalValue",
+			name = "Show total value",
+			description = "Display total GE value of each loot pile",
+			position = 4,
+			section = displaySection
+	)
+	default boolean showTotalValue()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "showLootTypeIcon",
+			name = "Show source type icon",
+			description = "Show small icon for loot source (NPC, player, etc.)",
+			position = 5,
+			section = displaySection
+	)
+	default boolean showLootTypeIcon()
+	{
+		return false;
+	}
+
+	// ========== ICONS SECTION ==========
+	@ConfigItem(
+			keyName = "showItemIcons",
+			name = "Show item icons",
+			description = "Display item icons in loot entries",
+			position = 0,
+			section = iconsSection
+	)
+	default boolean showItemIcons()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "maxIconsPerEntry",
+			name = "Max icons per entry",
+			description = "Maximum number of item icons to show per loot entry",
+			position = 1,
+			section = iconsSection
+	)
+	@Range(min = 1, max = 28)
+	default int maxIconsPerEntry()
+	{
+		return 12;
+	}
+
+	@ConfigItem(
+			keyName = "iconsPerRow",
+			name = "Icons per row",
+			description = "Number of item icons per row",
+			position = 2,
+			section = iconsSection
+	)
+	@Range(min = 1, max = 8)
+	default int iconsPerRow()
+	{
+		return 4;
+	}
+
+	@ConfigItem(
+			keyName = "sortItemsByValue",
+			name = "Sort by value",
+			description = "Show most valuable items first",
+			position = 3,
+			section = iconsSection
+	)
+	default boolean sortItemsByValue()
+	{
+		return true;
+	}
+
+	// ========== HIGHLIGHT EFFECTS SECTION ==========
+	@ConfigItem(
+			keyName = "rareItemHighlight",
+			name = "Highlight style",
+			description = "How to highlight rare item drops",
+			position = 0,
+			section = highlightSection
+	)
+	default RareItemHighlight rareItemHighlight()
+	{
+		return RareItemHighlight.OFF;
+	}
+
+	@ConfigItem(
+			keyName = "rareItemNames",
+			name = "Rare item list",
+			description = "Comma-separated list of item names to highlight<br>Example: Twisted bow, Scythe of vitur, Tumeken's shadow",
+			position = 1,
+			section = highlightSection
+	)
+	default String rareItemNames()
+	{
+		return "Twisted bow, Scythe of vitur, Tumeken's shadow, Torva full helm, Masori body";
+	}
+
+	@ConfigItem(
+			keyName = "rareValueThreshold",
+			name = "Value threshold",
+			description = "Minimum loot value to trigger highlight (GP)",
+			position = 2,
+			section = highlightSection
+	)
+	@Range(min = 0, max = 100000000)
+	default int rareValueThreshold()
+	{
+		return 1000000;
+	}
+
+	@ConfigItem(
+			keyName = "staticHighlightColor",
+			name = "Highlight color",
+			description = "Color for highlighting rare items",
+			position = 3,
+			section = highlightSection
+	)
+	default java.awt.Color staticHighlightColor()
+	{
+		return new java.awt.Color(255, 215, 0); // Gold color
+	}
+
+	@ConfigItem(
+			keyName = "staticHighlightAlpha",
+			name = "Highlight transparency",
+			description = "Transparency for highlight color (0-255)",
+			position = 4,
+			section = highlightSection
+	)
+	@Range(min = 0, max = 255)
+	default int staticHighlightAlpha()
+	{
+		return 220;
+	}
+
+	// Rainbow effect settings
+	@ConfigItem(
+			keyName = "rainbowAnimationSpeed",
+			name = "Rainbow speed",
+			description = "Speed of rainbow color cycling",
+			position = 5,
+			section = highlightSection
+	)
+	@Range(min = 1, max = 10)
+	default int rainbowAnimationSpeed()
+	{
+		return 5;
+	}
+
+	@ConfigItem(
+			keyName = "rainbowAlpha",
+			name = "Rainbow transparency",
+			description = "Transparency for rainbow effect (0-255)",
+			position = 6,
+			section = highlightSection
+	)
+	@Range(min = 0, max = 255)
+	default int rainbowAlpha()
+	{
+		return 200;
+	}
+
+	// Pulse effect settings
+	@ConfigItem(
+			keyName = "pulseAnimationSpeed",
+			name = "Pulse speed",
+			description = "Speed of pulsing animation",
+			position = 7,
+			section = highlightSection
+	)
+	@Range(min = 1, max = 10)
+	default int pulseAnimationSpeed()
+	{
+		return 5;
+	}
+
+	@ConfigItem(
+			keyName = "pulseAlphaRange",
+			name = "Pulse intensity",
+			description = "How much transparency changes during pulse",
+			position = 8,
+			section = highlightSection
+	)
+	@Range(min = 0, max = 255)
+	default int pulseAlphaRange()
+	{
+		return 80;
+	}
+
+	// ========== FILTERING SECTION ==========
+	@ConfigItem(
+			keyName = "includeNPCKills",
+			name = "NPC kills",
+			description = "Show loot from killing NPCs",
+			position = 0,
+			section = filterSection
+	)
+	default boolean includeNPCKills()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "includePlayerKills",
+			name = "Player kills",
+			description = "Show loot from killing players",
+			position = 1,
+			section = filterSection
+	)
+	default boolean includePlayerKills()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "includePickpocket",
+			name = "Pickpocketing",
+			description = "Show loot from pickpocketing",
+			position = 2,
+			section = filterSection
+	)
+	default boolean includePickpocket()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "includeEvents",
+			name = "Events/minigames",
+			description = "Show loot from events, chests, and minigames",
+			position = 3,
+			section = filterSection
+	)
+	default boolean includeEvents()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "minValueToShow",
+			name = "Minimum value",
+			description = "Only show loot worth more than this amount",
+			position = 4,
+			section = filterSection
+	)
+	@Range(min = 0, max = 10000000)
+	default int minValueToShow()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+			keyName = "ignoredItemNames",
+			name = "Ignored items",
+			description = "Comma-separated list of item names to hide from display<br>Example: Bones, Hammer, Coins",
+			position = 5,
+			section = filterSection
+	)
+	default String ignoredItemNames()
+	{
+		return "";
+	}
+
+	// ========== GROUPING SECTION ==========
+	@ConfigItem(
+			keyName = "groupLoot",
+			name = "Group kills",
+			description = "Combine multiple kills from same source into one entry",
+			position = 0,
+			section = groupingSection
+	)
+	default boolean groupLoot()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "groupKillThreshold",
+			name = "Show kill count after",
+			description = "Minimum kills before showing kill count (0 = always show)",
+			position = 1,
+			section = groupingSection
+	)
+	@Range(min = 0, max = 100)
+	default int groupKillThreshold()
+	{
+		return 1;
+	}
+
+	@ConfigItem(
+			keyName = "resetGroupOnLogout",
+			name = "Reset on logout",
+			description = "Clear grouped loot when logging out",
+			position = 2,
+			section = groupingSection
+	)
+	default boolean resetGroupOnLogout()
+	{
+		return true;
+	}
+
+	// ========== ENUM DEFINITIONS ==========
+	enum RareItemHighlight
+	{
+		OFF("Off"),
+		STATIC("Static Color"),
+		PULSE("Pulse"),
+		RAINBOW("Rainbow");
+
+		private final String name;
+
+		RareItemHighlight(String name)
+		{
+			this.name = name;
+		}
+
+		@Override
+		public String toString()
+		{
+			return name;
+		}
+	}
+}
+package com.LootHUD;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ExamplePluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(LootHudPlugin.class);
+		RuneLite.main(args);
+	}
+}
