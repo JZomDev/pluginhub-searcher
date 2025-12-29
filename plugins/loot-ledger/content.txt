@@ -666,7 +666,7 @@ import java.util.concurrent.*;
 @Singleton
 public class DropFetcher
 {
-    private static final String USER_AGENT = "RuneLite-LootLedger/1.0.0";
+    private static final String USER_AGENT = "RuneLite-LootLedger/1.1.0";
 
     private final OkHttpClient httpClient;
     private final ItemManager itemManager;
@@ -1325,6 +1325,14 @@ public interface LootLedgerConfig extends Config
             position = 12
     )
     default boolean sortDropsByRarity() { return true; }
+
+    @ConfigItem(
+            keyName = "showDropsAlwaysOpen",
+            name = "Show Drops Always Open",
+            description = "Keep the Show Drops view active when switching away from the Music tab. Use the close button to exit.",
+            position = 13
+    )
+    default boolean showDropsAlwaysOpen() { return true; }
 }
 
 package com.lootledger.ui;
@@ -1338,11 +1346,13 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.ScriptEvent;
+import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.widgets.ItemQuantityMode;
 import net.runelite.api.widgets.JavaScriptCallback;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetType;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.Subscribe;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -1375,11 +1385,16 @@ public class MusicWidgetController
     private final NpcSearchService searchService;
 
     private NpcDropData currentDrops = null;
+    private List<Widget> backupRootStaticKids = null;
+    private List<Widget> backupRootDynamicKids = null;
     private List<Widget> backupJukeboxStaticKids = null;
     private List<Widget> backupJukeboxDynamicKids = null;
     private List<Widget> backupScrollStaticKids = null;
     private List<Widget> backupScrollDynamicKids = null;
+    private Integer originalRootType = null;
     private String originalTitleText = null;
+    private final List<Widget> overrideRootWidgets = new ArrayList<>();
+    private final List<Widget> overrideScrollWidgets = new ArrayList<>();
     @Getter private final Map<Widget, DropItem> iconItemMap = new LinkedHashMap<>();
     @Getter private boolean overrideActive = false;
     private boolean hideObtainedItems = false;
@@ -1408,12 +1423,43 @@ public class MusicWidgetController
     public boolean hasData() { return currentDrops != null; }
     public NpcDropData getCurrentData() { return currentDrops; }
 
+    /**
+     * If the music widget group reloads while we're overriding, re-apply the override.
+     * This prevents stale widget references / listeners.
+     */
+    @Subscribe
+    public void onWidgetLoaded(WidgetLoaded ev)
+    {
+        if (ev.getGroupId() != MUSIC_GROUP)
+        {
+            return;
+        }
+
+        if (!overrideActive || currentDrops == null)
+        {
+            return;
+        }
+
+        clientThread.invokeLater(() ->
+        {
+            // Chance Man hardening: re-check inside the runnable
+            if (!overrideActive || currentDrops == null)
+            {
+                return;
+            }
+
+            resetWidgetCaches();
+            applyOverride(currentDrops);
+        });
+    }
+
     /** Replace the music widget with a drop table view for the given NPC. */
     public void override(NpcDropData dropData)
     {
         if (dropData == null) { return; }
         currentDrops = dropData;
         hideObtainedItems = false;
+
         if (!overrideActive)
         {
             overrideActive = true;
@@ -1483,7 +1529,6 @@ public class MusicWidgetController
                 int y = MARGIN_Y + row * (ICON_SIZE + PADDING);
                 icon.setOriginalX(x);
                 icon.setOriginalY(y);
-                // When tracking is off, show everything fully opaque (no dimming)
                 icon.setOpacity(!isTracking() ? 0 : (obtained ? 0 : 150));
                 icon.revalidate();
                 displayIndex++;
@@ -1504,9 +1549,27 @@ public class MusicWidgetController
 
     private static List<Widget> copyChildren(Widget parent, boolean dynamic)
     {
-        if (parent == null) { return new ArrayList<>(); }
+        if (parent == null)
+        {
+            return new ArrayList<>();
+        }
+
         Widget[] kids = dynamic ? parent.getDynamicChildren() : parent.getChildren();
-        return kids != null ? new ArrayList<>(Arrays.asList(kids)) : new ArrayList<>();
+        if (kids == null || kids.length == 0)
+        {
+            return new ArrayList<>();
+        }
+
+        // filter nulls
+        List<Widget> out = new ArrayList<>(kids.length);
+        for (Widget w : kids)
+        {
+            if (w != null)
+            {
+                out.add(w);
+            }
+        }
+        return out;
     }
 
     private static void restoreChildren(Widget parent, List<Widget> staticKids, List<Widget> dynamicKids)
@@ -1516,22 +1579,28 @@ public class MusicWidgetController
         Widget[] currentStatic = parent.getChildren();
         if (currentStatic != null)
         {
-            for (Widget w : currentStatic) { w.setHidden(true); }
+            for (Widget w : currentStatic) { if (w != null) w.setHidden(true); }
         }
 
         Widget[] currentDyn = parent.getDynamicChildren();
         if (currentDyn != null)
         {
-            for (Widget w : currentDyn) { w.setHidden(true); }
+            for (Widget w : currentDyn) { if (w != null) w.setHidden(true); }
         }
 
         if (staticKids != null)
         {
-            for (Widget w : staticKids) { w.setHidden(false); }
+            for (Widget w : staticKids)
+            {
+                if (w != null && w.getType() != 0) { w.setHidden(false); }
+            }
         }
         if (dynamicKids != null)
         {
-            for (Widget w : dynamicKids) { w.setHidden(false); }
+            for (Widget w : dynamicKids)
+            {
+                if (w != null && w.getType() != 0) { w.setHidden(false); }
+            }
         }
 
         parent.revalidate();
@@ -1554,10 +1623,29 @@ public class MusicWidgetController
         int fontId = title != null ? title.getFontId() : 0;
         boolean shadowed = title != null && title.getTextShadowed();
 
+        final int CLOSE_SPRITE = 520;
+        final int CLOSE_SIZE = 10;
+        final int CLOSE_PAD = 4;
+
+        Widget close = root.createChild(-1);
+        overrideRootWidgets.add(close);
+        close.setHidden(false);
+        close.setType(WidgetType.GRAPHIC);
+        close.setOriginalX(CLOSE_PAD);
+        close.setOriginalY(CLOSE_PAD);
+        close.setOriginalWidth(CLOSE_SIZE);
+        close.setOriginalHeight(CLOSE_SIZE);
+        close.setSpriteId(CLOSE_SPRITE);
+        close.setAction(0, "Close");
+        close.setOnOpListener((JavaScriptCallback) (ScriptEvent ev) -> restore());
+        close.setHasListener(true);
+        close.revalidate();
+
         int lvlX = Objects.requireNonNull(title).getOriginalX() + title.getOriginalWidth() + 83;
         int lvlY = title.getOriginalY();
 
         Widget lvl = root.createChild(-1);
+        overrideRootWidgets.add(lvl);
         lvl.setHidden(false);
         lvl.setType(WidgetType.TEXT);
         lvl.setText(String.format("Lvl %d", dropData.getLevel()));
@@ -1571,7 +1659,11 @@ public class MusicWidgetController
         lvl.revalidate();
 
         Widget oldBar = client.getWidget(MUSIC_GROUP, 9);
-        if (oldBar == null) { return; }
+        if (oldBar == null)
+        {
+            return;
+        }
+
         int xOld = oldBar.getOriginalX();
         int yOld = oldBar.getOriginalY();
         int wOld = oldBar.getOriginalWidth();
@@ -1581,6 +1673,7 @@ public class MusicWidgetController
         int newY = yOld + (hOld - BAR_HEIGHT) / 2;
 
         Widget bg = root.createChild(-1);
+        overrideRootWidgets.add(bg);
         bg.setHidden(false);
         bg.setType(WidgetType.RECTANGLE);
         bg.setOriginalX(xOld);
@@ -1596,6 +1689,7 @@ public class MusicWidgetController
         int fillW = totalDrops > 0 ? Math.round(innerWidth * (float) obtainedCount / totalDrops) : 0;
 
         Widget fill = root.createChild(-1);
+        overrideRootWidgets.add(fill);
         fill.setHidden(false);
         fill.setType(WidgetType.RECTANGLE);
         fill.setOriginalX(xOld + border);
@@ -1608,6 +1702,7 @@ public class MusicWidgetController
 
         String txt = String.format("%d/%d", obtainedCount, totalDrops);
         Widget label = root.createChild(-1);
+        overrideRootWidgets.add(label);
         label.setHidden(false);
         label.setType(WidgetType.TEXT);
         label.setText(txt);
@@ -1624,6 +1719,7 @@ public class MusicWidgetController
         int eyeY = newY + (BAR_HEIGHT / 2) - (EYE_SIZE / 2);
 
         Widget eye = root.createChild(-1);
+        overrideRootWidgets.add(eye);
         eye.setHidden(false);
         eye.setType(WidgetType.GRAPHIC);
         eye.setOriginalX(eyeX);
@@ -1632,6 +1728,7 @@ public class MusicWidgetController
         eye.setOriginalHeight(EYE_SIZE);
         eye.setSpriteId(hideObtainedItems ? 2222 : 2221);
         eye.revalidate();
+
         if (isTracking())
         {
             eye.setAction(0, "Toggle obtained items");
@@ -1651,13 +1748,13 @@ public class MusicWidgetController
         }
 
         int searchX = eyeX + EYE_SIZE + PADDING;
-        int searchY = eyeY;
 
         Widget search = root.createChild(-1);
+        overrideRootWidgets.add(search);
         search.setHidden(false);
         search.setType(WidgetType.GRAPHIC);
         search.setOriginalX(searchX);
-        search.setOriginalY(searchY);
+        search.setOriginalY(eyeY);
         search.setOriginalWidth(EYE_SIZE);
         search.setOriginalHeight(EYE_SIZE);
         search.setSpriteId(SEARCH_SPRITE);
@@ -1684,10 +1781,13 @@ public class MusicWidgetController
 
             final String q = query.trim();
             if (q.isEmpty()) { return; }
-            Thread t = new Thread(() -> {
+
+            Thread t = new Thread(() ->
+            {
                 List<NpcDropData> results = searchService.search(q);
 
-                SwingUtilities.invokeLater(() -> {
+                SwingUtilities.invokeLater(() ->
+                {
                     if (results.isEmpty())
                     {
                         JOptionPane.showMessageDialog(
@@ -1703,6 +1803,7 @@ public class MusicWidgetController
                     String[] choices = limited.stream()
                             .map(n -> String.format("%s (ID %d, Lvl %d)", n.getName(), n.getNpcId(), n.getLevel()))
                             .toArray(String[]::new);
+
                     int idx = JOptionPane.showOptionDialog(
                             null,
                             "Select NPC:",
@@ -1713,12 +1814,14 @@ public class MusicWidgetController
                             choices,
                             choices[0]
                     );
+
                     if (idx >= 0 && idx < limited.size())
                     {
                         override(limited.get(idx));
                     }
                 });
-            },"lootledger-search");
+            }, "lootledger-search");
+
             t.setDaemon(true);
             t.start();
         });
@@ -1744,20 +1847,23 @@ public class MusicWidgetController
             final boolean isObt = obtainedIds.contains(itemId);
 
             Widget icon = scrollable.createChild(-1);
+            overrideScrollWidgets.add(icon);
+
             icon.setHidden(false);
             icon.setType(WidgetType.GRAPHIC);
+
             int spriteId = itemSpriteCache.getSpriteId(itemId);
             icon.setSpriteId(spriteId);
             icon.setItemQuantityMode(ItemQuantityMode.NEVER);
+
             icon.setOriginalX(MARGIN_X);
             icon.setOriginalY(MARGIN_Y);
             icon.setOriginalWidth(ICON_SIZE);
             icon.setOriginalHeight(ICON_SIZE);
-            // Only dim when tracking is enabled; otherwise show fully opaque.
+
             icon.setOpacity(trackingOn ? (isObt ? 0 : 150) : 0);
             icon.revalidate();
 
-            // Click/Context action to toggle obtained state when tracking is enabled
             if (trackingOn)
             {
                 icon.setAction(0, isObt ? "Mark as Unobtained" : "Mark as Obtained");
@@ -1786,6 +1892,7 @@ public class MusicWidgetController
         final ObtainedItemsManager.Scope scope = mapScope(config.obtainedScope());
         final String npcName = currentDrops.getName();
         boolean already = obtainedItemsManager.isObtained(account, npcName, itemId, scope);
+
         if (already)
         {
             obtainedItemsManager.unmarkObtained(account, npcName, itemId, scope);
@@ -1795,13 +1902,23 @@ public class MusicWidgetController
             obtainedItemsManager.markObtained(account, npcName, itemId, scope);
         }
 
-        // Re-render to update progress bar, opacity, and actions
         override(currentDrops);
     }
 
     private void applyOverride(NpcDropData dropData)
     {
+        purgeCreatedWidgets();
         iconItemMap.clear();
+
+        Widget root = client.getWidget(MUSIC_GROUP, 0);
+        Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
+        Widget jukebox = client.getWidget(MUSIC_GROUP, 6);
+        Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
+
+        if (backupRootStaticKids == null && root != null) { backupRootStaticKids = copyChildren(root, false); }
+        if (backupRootDynamicKids == null && root != null) { backupRootDynamicKids = copyChildren(root, true); }
+        if (originalRootType == null && root != null) { originalRootType = root.getType(); }
+
         int[] toHide = {9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19};
         for (int childId : toHide)
         {
@@ -1822,14 +1939,15 @@ public class MusicWidgetController
                 })
                 .flatMap(sec -> sec.getItems().stream())
                 .collect(Collectors.toList());
+
         drops = WidgetUtils.dedupeAndSort(drops, config.sortDropsByRarity());
 
         final Set<Integer> obtainedIds = getObtainedIdsForCurrent();
-
         int totalDrops = drops.size();
-        int obtainedCount = !isTracking() ? totalDrops : (int) drops.stream().filter(d -> obtainedIds.contains(d.getItemId())).count();
+        int obtainedCount = !isTracking()
+                ? totalDrops
+                : (int) drops.stream().filter(d -> obtainedIds.contains(d.getItemId())).count();
 
-        Widget root = client.getWidget(MUSIC_GROUP, 0);
         Widget title = updateTitle(dropData);
 
         if (root != null)
@@ -1841,10 +1959,6 @@ public class MusicWidgetController
             drawProgressBarAndToggle(root, title, dropData, obtainedCount, totalDrops);
         }
 
-        Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
-        Widget jukebox = client.getWidget(MUSIC_GROUP, 6);
-        Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
-
         drawDropIcons(scrollable, scrollbar, jukebox, drops, obtainedIds);
 
         if (root != null) { root.revalidate(); }
@@ -1854,21 +1968,19 @@ public class MusicWidgetController
     {
         if (!overrideActive) { return; }
 
+        purgeCreatedWidgets();
+
         Widget root = client.getWidget(MUSIC_GROUP, 0);
         Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
         Widget jukebox = client.getWidget(MUSIC_GROUP, 6);
 
         if (root != null)
         {
-            Widget[] dynRoot = root.getDynamicChildren();
-            if (dynRoot != null)
+            if (originalRootType != null)
             {
-                for (Widget w : dynRoot)
-                {
-                    w.setHidden(true);
-                    w.revalidate();
-                }
+                root.setType(originalRootType);
             }
+            restoreChildren(root, backupRootStaticKids, backupRootDynamicKids);
         }
 
         restoreChildren(scrollable, backupScrollStaticKids, backupScrollDynamicKids);
@@ -1910,16 +2022,78 @@ public class MusicWidgetController
         originalTitleText = null;
         currentDrops = null;
         overrideActive = false;
+
+        backupRootStaticKids = null;
+        backupRootDynamicKids = null;
         backupJukeboxStaticKids = null;
         backupJukeboxDynamicKids = null;
         backupScrollStaticKids = null;
         backupScrollDynamicKids = null;
+
+        originalRootType = null;
+
         iconItemMap.clear();
+        overrideRootWidgets.clear();
+        overrideScrollWidgets.clear();
+    }
+
+    private void resetWidgetCaches()
+    {
+        backupRootStaticKids = null;
+        backupRootDynamicKids = null;
+        backupJukeboxStaticKids = null;
+        backupJukeboxDynamicKids = null;
+        backupScrollStaticKids = null;
+        backupScrollDynamicKids = null;
+
+        originalRootType = null;
+        originalTitleText = null;
+
+        iconItemMap.clear();
+        overrideRootWidgets.clear();
+        overrideScrollWidgets.clear();
+    }
+
+    private void purgeCreatedWidgets()
+    {
+        for (Widget w : overrideRootWidgets)
+        {
+            safeNeutralizeWidget(w);
+        }
+        for (Widget w : overrideScrollWidgets)
+        {
+            safeNeutralizeWidget(w);
+        }
+        overrideRootWidgets.clear();
+        overrideScrollWidgets.clear();
+    }
+
+    private static void safeNeutralizeWidget(Widget w)
+    {
+        if (w == null)
+        {
+            return;
+        }
+
+        try
+        {
+            w.setOnOpListener((JavaScriptCallback) null);
+            w.setHasListener(false);
+            w.setHidden(true);
+            w.setType(0); // prevent resurrection by onLoad listeners
+            w.revalidate();
+        }
+        catch (Exception ignored)
+        {
+            // Widget references can become invalid after reload; best-effort cleanup.
+        }
     }
 
     private ObtainedItemsManager.Scope mapScope(LootLedgerConfig.Scope s)
     {
-        return s == LootLedgerConfig.Scope.PER_NPC ? ObtainedItemsManager.Scope.PER_NPC : ObtainedItemsManager.Scope.PER_ACCOUNT;
+        return s == LootLedgerConfig.Scope.PER_NPC
+                ? ObtainedItemsManager.Scope.PER_NPC
+                : ObtainedItemsManager.Scope.PER_ACCOUNT;
     }
 }
 
@@ -2681,10 +2855,11 @@ package com.lootledger.ui;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.api.VarClientInt;
 import net.runelite.api.events.VarClientIntChanged;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.Subscribe;
+
+import com.lootledger.LootLedgerConfig;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -2696,30 +2871,39 @@ public class TabListener
     private final Client client;
     private final ClientThread clientThread;
     private final MusicWidgetController widgetController;
+    private final LootLedgerConfig config;
+    private static final int INVENTORY_TAB_VARC = 171;
 
     @Inject
     public TabListener(
             Client client,
             ClientThread clientThread,
-            MusicWidgetController widgetController
+            MusicWidgetController widgetController,
+            LootLedgerConfig config
     )
     {
         this.client = client;
         this.clientThread = clientThread;
         this.widgetController = widgetController;
+        this.config = config;
     }
 
     @Subscribe
     public void onVarClientIntChanged(VarClientIntChanged ev)
     {
-        if (ev.getIndex() != VarClientInt.INVENTORY_TAB) return;
+        if (ev.getIndex() != INVENTORY_TAB_VARC) return;
 
-        int newTab = client.getVarcIntValue(VarClientInt.INVENTORY_TAB);
+        int newTab = client.getVarcIntValue(INVENTORY_TAB_VARC);
         if (widgetController.isOverrideActive() && newTab != 13)
         {
-            clientThread.invokeLater(widgetController::restore);
+            if (!config.showDropsAlwaysOpen())
+            {
+                clientThread.invokeLater(widgetController::restore);
+            }
+            return;
         }
-        else if (!widgetController.isOverrideActive() && newTab == 13 && widgetController.hasData())
+
+        if (!widgetController.isOverrideActive() && newTab == 13 && widgetController.hasData())
         {
             clientThread.invokeLater(() ->
                     widgetController.override(widgetController.getCurrentData())
@@ -3007,13 +3191,15 @@ import com.lootledger.drops.DropFetcher;
 import com.lootledger.items.ItemIdIndex;
 import com.lootledger.managers.ObtainedItemsManager;
 import com.lootledger.ui.DropsMenuListener;
-import com.lootledger.ui.MusicWidgetController;
 import com.lootledger.ui.DropsTooltipOverlay;
+import com.lootledger.ui.MusicWidgetController;
 import com.lootledger.ui.TabListener;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.GameState;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
 import net.runelite.api.TileItem;
+import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.ItemContainerChanged;
 import net.runelite.api.events.ItemSpawned;
 import net.runelite.client.config.ConfigManager;
@@ -3024,9 +3210,6 @@ import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.api.GameState;
-import net.runelite.api.events.GameStateChanged;
-
 
 import javax.inject.Inject;
 import java.util.HashSet;
@@ -3036,7 +3219,7 @@ import java.util.Set;
 @PluginDescriptor(
         name = "Loot Ledger",
         description = "Show drop tables in the Music tab with obtained tracking",
-        tags = {"drops","loot","wiki"}
+        tags = {"drops", "loot", "wiki"}
 )
 public class LootLedgerPlugin extends Plugin
 {
@@ -3055,29 +3238,43 @@ public class LootLedgerPlugin extends Plugin
     @Inject private DropsTooltipOverlay dropsTooltipOverlay;
 
     @Provides
-    LootLedgerConfig provideConfig(ConfigManager cm) { return cm.getConfig(LootLedgerConfig.class); }
+    LootLedgerConfig provideConfig(ConfigManager cm)
+    {
+        return cm.getConfig(LootLedgerConfig.class);
+    }
 
-    @Override protected void startUp()
+    @Override
+    protected void startUp()
     {
         ItemIdIndex.setGson(gson);
         ItemIdIndex.load();
+
         accountManager.init();
         dropFetcher.startUp();
+
         eventBus.register(accountManager);
         eventBus.register(tabListener);
         eventBus.register(dropsMenuListener);
+        eventBus.register(musicWidgetController); // <-- needed for WidgetLoaded handler
+
         overlayManager.add(dropsTooltipOverlay);
     }
 
-    @Override protected void shutDown()
+    @Override
+    protected void shutDown()
     {
         musicWidgetController.restore();
+
         obtainedItems.save();
         obtainedItems.shutdown();
+
         eventBus.unregister(accountManager);
         eventBus.unregister(tabListener);
         eventBus.unregister(dropsMenuListener);
+        eventBus.unregister(musicWidgetController); // <-- unregister to match startUp
+
         overlayManager.remove(dropsTooltipOverlay);
+
         dropCache.shutdown();
         dropFetcher.shutdown();
     }
@@ -3100,13 +3297,20 @@ public class LootLedgerPlugin extends Plugin
         {
             return;
         }
-        // Any of these affect visibility/ordering of items; re-render if open
+
         String k = e.getKey();
+
+        // RDT/Gem toggles affect the underlying drop tables -> clear caches then refresh
+        if ("showRareDropTable".equals(k) || "showGemDropTable".equals(k))
+        {
+            dropCache.clearAllCaches();
+            refreshIfShowing();
+            return;
+        }
+
         if ("trackObtained".equals(k)
                 || "obtainedScope".equals(k)
                 || "obtainedView".equals(k)
-                || "showRareDropTable".equals(k)
-                || "showGemDropTable".equals(k)
                 || "sortDropsByRarity".equals(k))
         {
             refreshIfShowing();
@@ -3133,7 +3337,8 @@ public class LootLedgerPlugin extends Plugin
 
         final ObtainedItemsManager.Scope scope = mapScope(config.obtainedScope());
         final String npcNameContext = musicWidgetController.hasData() && musicWidgetController.getCurrentData() != null
-                ? musicWidgetController.getCurrentData().getName() : "";
+                ? musicWidgetController.getCurrentData().getName()
+                : "";
 
         if (!obtainedItems.isObtained(account, npcNameContext, canonicalId, scope))
         {
@@ -3168,11 +3373,13 @@ public class LootLedgerPlugin extends Plugin
 
         final ObtainedItemsManager.Scope scope = mapScope(config.obtainedScope());
         final String npcNameContext = musicWidgetController.hasData() && musicWidgetController.getCurrentData() != null
-                ? musicWidgetController.getCurrentData().getName() : "";
+                ? musicWidgetController.getCurrentData().getName()
+                : "";
 
         for (Item item : c.getItems())
         {
             if (item == null) continue;
+
             final int canonicalId = itemManager.canonicalize(item.getId());
             if (processed.contains(canonicalId))
             {
@@ -3202,9 +3409,9 @@ public class LootLedgerPlugin extends Plugin
 
     private ObtainedItemsManager.Scope mapScope(LootLedgerConfig.Scope s)
     {
-        return s == LootLedgerConfig.Scope.PER_NPC ?
-                ObtainedItemsManager.Scope.PER_NPC :
-                ObtainedItemsManager.Scope.PER_ACCOUNT;
+        return s == LootLedgerConfig.Scope.PER_NPC
+                ? ObtainedItemsManager.Scope.PER_NPC
+                : ObtainedItemsManager.Scope.PER_ACCOUNT;
     }
 }
 
