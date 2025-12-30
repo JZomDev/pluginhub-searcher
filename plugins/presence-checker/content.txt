@@ -423,6 +423,18 @@ public interface PresenceCheckerConfig extends Config
         return new Color(128, 0, 128); // Default Purple
     }
 
+    @ConfigItem(
+            keyName = "highlightDuration",
+            name = "Highlight Duration",
+            description = "How many seconds to keep names highlighted before letting them revert (0 to disable).",
+            position = 4,
+            section = generalSettings
+    )
+    default int highlightDuration()
+    {
+        return 5;
+    }
+
     // --- CHAT FILTER SECTION ---
 
     @ConfigItem(
@@ -550,6 +562,7 @@ public interface PresenceCheckerConfig extends Config
     )
     default int overlayNamesLimit() { return 5; }
 }
+
 package com.presencechecker;
 
 import com.google.inject.Provides;
@@ -572,6 +585,7 @@ import net.runelite.api.FriendsChatManager;
 import net.runelite.api.FriendsChatMember;
 import net.runelite.api.FriendsChatRank;
 import net.runelite.api.WorldView;
+import net.runelite.api.events.ClientTick;
 import net.runelite.api.events.CommandExecuted;
 import net.runelite.api.widgets.ComponentID;
 import net.runelite.api.widgets.Widget;
@@ -628,6 +642,10 @@ public class PresenceChecker extends Plugin
     // Store the list of missing members for the Overlay to access
     private volatile List<FriendsChatMember> lastMissingMembers = Collections.emptyList();
     private ScheduledFuture<?> overlayTask;
+
+    // Timer variables
+    private long highlightStartTime = 0;
+    private boolean isHighlighting = false;
 
     @Provides
     @SuppressWarnings("unused") // Used by Guice
@@ -698,10 +716,35 @@ public class PresenceChecker extends Plugin
         }
     }
 
+    @Subscribe
+    public void onClientTick(ClientTick event)
+    {
+        if (lastMissingMembers == null || lastMissingMembers.isEmpty())
+        {
+            return;
+        }
+
+        long durationMs = config.highlightDuration() * 1000L;
+        long timeElapsed = System.currentTimeMillis() - highlightStartTime;
+
+        // If time is remaining, KEEP highlighting
+        if (timeElapsed < durationMs)
+        {
+            int highlightColor = config.getHighlightColor().getRGB() & 0xFFFFFF;
+            setMemberColor(lastMissingMembers, highlightColor);
+            isHighlighting = true;
+        }
+        // If time expired AND we were previously highlighting, REVERT to white once
+        else if (isHighlighting)
+        {
+            setMemberColor(lastMissingMembers, 0xFFFFFF); // Revert to White
+            isHighlighting = false;
+        }
+    }
+
     private void backgroundScan()
     {
         clientThread.invokeLater(() -> {
-            // FIX: Removed redundant variable 'missing'
             lastMissingMembers = scanForMissingMembers();
         });
     }
@@ -729,7 +772,11 @@ public class PresenceChecker extends Plugin
             // 2. Update Overlay data
             lastMissingMembers = missingMembersList;
 
-            // 3. Prepare Chat Output
+            // 3. Reset timer
+            highlightStartTime = System.currentTimeMillis();
+            isHighlighting = true;
+
+            // 4. Prepare Chat Output
             List<String> missingMembersChat = new ArrayList<>();
             Color msgColor = config.getMessageColor();
             for (FriendsChatMember member : missingMembersList)
@@ -739,7 +786,7 @@ public class PresenceChecker extends Plugin
                 missingMembersChat.add(rankStr + nameStr);
             }
 
-            // 4. Report results (Chat & Panel)
+            // 5. Report results (Chat & Panel)
             if (missingMembersChat.isEmpty())
             {
                 if (config.showChatMessages())
@@ -758,9 +805,10 @@ public class PresenceChecker extends Plugin
                 }
 
                 updatePanel(missingMembersList);
-                highlightMissingMembers(missingMembersList);
 
-                // FIX: Removed the line that forced the panel to open (SwingUtilities.invokeLater(() -> clientToolbar.openPanel(navButton)))
+                // Apply color immediately (ClientTick will pick it up from here)
+                int highlightColor = config.getHighlightColor().getRGB() & 0xFFFFFF;
+                setMemberColor(missingMembersList, highlightColor);
             }
         });
     }
@@ -773,7 +821,6 @@ public class PresenceChecker extends Plugin
             return Collections.emptyList();
         }
 
-        // FIX: Replaced client.getPlayers() with client.getTopLevelWorldView().players()
         WorldView worldView = client.getTopLevelWorldView();
         if (worldView == null)
         {
@@ -821,30 +868,30 @@ public class PresenceChecker extends Plugin
         return lastMissingMembers;
     }
 
-    // FIX: Suppress deprecation warning for ComponentID until InterfaceID is standardized
+    // Refactored method to apply ANY color (Highlight or White)
     @SuppressWarnings("deprecation")
-    private void highlightMissingMembers(List<FriendsChatMember> missingMembers)
+    private void setMemberColor(List<FriendsChatMember> members, int color)
     {
         Widget list = client.getWidget(ComponentID.FRIENDS_CHAT_LIST);
-        if (list == null || list.getDynamicChildren() == null)
+
+        // Visibility check to save resources
+        if (list == null || list.getDynamicChildren() == null || list.isHidden())
         {
             return;
         }
 
-        Set<String> missingNames = missingMembers.stream()
+        Set<String> targetNames = members.stream()
                 .map(m -> Text.standardize(m.getName()))
                 .collect(Collectors.toSet());
-
-        int colorInt = config.getHighlightColor().getRGB() & 0xFFFFFF;
 
         for (Widget child : list.getDynamicChildren())
         {
             String rawText = child.getText();
             String name = Text.standardize(Text.removeTags(rawText));
 
-            if (missingNames.contains(name))
+            if (targetNames.contains(name))
             {
-                child.setTextColor(colorInt);
+                child.setTextColor(color);
             }
         }
     }
@@ -903,6 +950,7 @@ import java.awt.Dimension;
 import java.awt.Graphics2D;
 import java.util.List;
 import javax.inject.Inject;
+import net.runelite.api.Client; // Added Import
 import net.runelite.api.FriendsChatMember;
 import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayPosition;
@@ -911,13 +959,15 @@ import net.runelite.client.ui.overlay.components.PanelComponent;
 
 public class PresenceCheckerOverlay extends Overlay
 {
+    private final Client client; // Added Client field
     private final PresenceChecker plugin;
     private final PresenceCheckerConfig config;
     private final PanelComponent panelComponent = new PanelComponent();
 
     @Inject
-    private PresenceCheckerOverlay(PresenceChecker plugin, PresenceCheckerConfig config)
+    private PresenceCheckerOverlay(Client client, PresenceChecker plugin, PresenceCheckerConfig config)
     {
+        this.client = client; // Initialize Client
         this.plugin = plugin;
         this.config = config;
         setPosition(OverlayPosition.TOP_LEFT);
@@ -926,8 +976,15 @@ public class PresenceCheckerOverlay extends Overlay
     @Override
     public Dimension render(Graphics2D graphics)
     {
-        // Check config before rendering
+        // 1. Check Config
         if (!config.enableOverlay())
+        {
+            return null;
+        }
+
+        // 2. Check if we are actually in a Friends Chat
+        // If this is null, we are not in a chat, so we hide the overlay completely.
+        if (client.getFriendsChatManager() == null)
         {
             return null;
         }
@@ -957,6 +1014,7 @@ public class PresenceCheckerOverlay extends Overlay
         return panelComponent.render(graphics);
     }
 }
+
 package com.presencechecker;
 
 import net.runelite.client.RuneLite;
