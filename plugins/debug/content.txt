@@ -622,13 +622,16 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.zip.GZIPOutputStream;
+import lombok.AllArgsConstructor;
 import lombok.RequiredArgsConstructor;
 
-public class HProfStripper
+public class HProfStripper implements AutoCloseable
 {
 	// top-level records
 	private final static int
@@ -704,41 +707,79 @@ public class HProfStripper
 					this.def.setLevel(3);
 				}
 			};
-		};
+		}
+
 		this.out = new DataOutputStream(new BufferedOutputStream(gzo));
 	}
 
-	public void run() throws IOException
+	public HProfStripper(File in) throws IOException
 	{
-		try (this.in; this.out)
+		this.in = new SeekFile(in);
+		this.out = null;
+	}
+
+	@Override
+	public void close() throws IOException
+	{
+		in.close();
+		if (out != null)
 		{
-			{
-				byte[] header = new byte[EXPECTED_HEADER.length];
-				in.readFully(header);
-				if (!Arrays.equals(header, EXPECTED_HEADER))
-				{
-					throw new IOException("incorrect header " + Arrays.toString(header));
-				}
-			}
-			out.write(EXPECTED_HEADER);
-
-			identSize = in.readInt();
-			out.writeInt(identSize);
-
-			typeSizes = new int[]{-1, identSize, identSize, -1, 1, 2, 4, 8, 1, 2, 4, 8};
-
-			// ts
-			out.writeInt(in.readInt());
-			out.writeInt(in.readInt());
-
-			start = in.offset();
-
-			var fk = new FindKeepers();
-			fk.run();
-			var emit = new Emit(fk.keepObjects);
-			emit.run();
-			//emit.sizes.forEach((k, v) -> System.out.println(k + " " + (v / 1024) + "kiB"));
+			out.close();
 		}
+	}
+
+	public void runStripper() throws IOException
+	{
+		{
+			byte[] header = new byte[EXPECTED_HEADER.length];
+			in.readFully(header);
+			if (!Arrays.equals(header, EXPECTED_HEADER))
+			{
+				throw new IOException("incorrect header " + Arrays.toString(header));
+			}
+		}
+		out.write(EXPECTED_HEADER);
+
+		identSize = in.readInt();
+		out.writeInt(identSize);
+
+		typeSizes = new int[]{-1, identSize, identSize, -1, 1, 2, 4, 8, 1, 2, 4, 8};
+
+		// ts
+		out.writeInt(in.readInt());
+		out.writeInt(in.readInt());
+
+		start = in.offset();
+
+		var fk = new FindKeepers();
+		fk.run();
+		var emit = new Emit(fk.keepObjects);
+		emit.run();
+	}
+
+	public RetainedSizeResult runRetainedSizeComputer() throws IOException
+	{
+		{
+			byte[] header = new byte[EXPECTED_HEADER.length];
+			in.readFully(header);
+			if (!Arrays.equals(header, EXPECTED_HEADER))
+			{
+				throw new IOException("incorrect header " + Arrays.toString(header));
+			}
+		}
+
+		identSize = in.readInt();
+
+		typeSizes = new int[]{-1, identSize, identSize, -1, 1, 2, 4, 8, 1, 2, 4, 8};
+
+		// ts
+		in.readLong();
+
+		start = in.offset();
+
+		var dv = new RetainedSizeComputer();
+		dv.run();
+		return dv.computeRetainedSizes();
 	}
 
 	protected long readId() throws IOException
@@ -1242,6 +1283,360 @@ public class HProfStripper
 		}
 	}
 
+	private static class RetainedClassMetadata
+	{
+		long superClassId = -1;
+		String name;
+		int size;
+		byte[] fields;
+		String[] fieldNames;
+		long[] statics;
+
+		RetainedClassMetadata(String name)
+		{
+			this.name = name;
+		}
+
+		void addStatic(long objId)
+		{
+			if (statics == null)
+			{
+				statics = new long[1];
+			}
+			else
+			{
+				statics = Arrays.copyOf(statics, statics.length + 1);
+			}
+			statics[statics.length - 1] = objId;
+		}
+	}
+
+	@AllArgsConstructor
+	public static class RetainedSizeResult
+	{
+		final int num;
+		private final Map<Long, RetainedClassMetadata> classes;
+		private final List<RetainedClassMetadata> objClasses;
+		final long[] retainedSize;
+		final int[] numObjects;
+
+		public String clazz(int n)
+		{
+			var c = objClasses.get(n);
+			return c != null ? c.name : null;
+		}
+
+		public String parentClazz(int n)
+		{
+			var c = objClasses.get(n);
+			if (c == null)
+			{
+				return null;
+			}
+			c = classes.get(c.superClassId);
+			if (c == null)
+			{
+				return null;
+			}
+			return c.name;
+		}
+	}
+
+	private class RetainedSizeComputer extends DumpVisitor
+	{
+		private static final int OBJECT_HEADER_SIZE = 16;
+		private static final int ARRAY_LENGTH_SIZE = 8;
+
+		private final Map<Long, String> strings = new HashMap<>();
+		private final Map<Long, RetainedClassMetadata> classes = new HashMap<>();
+
+		private final List<Long> objIds = new ArrayList<>();
+		private final List<Integer> objSizes = new ArrayList<>();
+		private final List<RetainedClassMetadata> objClasses = new ArrayList<>();
+		private final Map<Long, Integer> objIdToNodeId = new HashMap<>();
+		private final List<List<Long>> succs = new ArrayList<>();
+
+		@Override
+		protected void section(int tag, int ts, int bytes) throws IOException
+		{
+			if (tag == HPROF_UTF8)
+			{
+				long id = readId();
+				byte[] b = new byte[bytes - identSize];
+				in.readFully(b);
+				String s = new String(b);
+				strings.put(id, s);
+				return;
+			}
+			if (tag == HPROF_LOAD_CLASS)
+			{
+				skip(4); // serial
+				long objectId = readId();
+				skip(4); // stack trace serial
+				long classNameId = readId();
+				classes.put(objectId, new RetainedClassMetadata(strings.get(classNameId)));
+				return;
+			}
+
+			super.section(tag, ts, bytes);
+		}
+
+		@Override
+		protected void readTag(int tag, long obj) throws IOException
+		{
+			switch (tag)
+			{
+				case HPROF_GC_CLASS_DUMP:
+				{
+					RetainedClassMetadata rcm = classes.get(obj);
+					skip(4); // serno
+					rcm.superClassId = readId();
+					skip(identSize);
+					skip(identSize);
+					skip(identSize);
+					skip(identSize);
+					skip(identSize);
+					rcm.size = in.readInt(); // sum of field sizes, which doesn't account for compressed oops
+					rcm.size += OBJECT_HEADER_SIZE;
+					int cpsize = in.readUnsignedShort();
+					if (cpsize != 0)
+					{
+						throw new IllegalArgumentException();
+					}
+					int numStatics = in.readUnsignedShort();
+					for (int i = 0; i < numStatics; i++)
+					{
+						skip(identSize); // name
+						int typ = in.readByte();
+						if (typ == HPROF_ARRAY_OBJECT || typ == HPROF_NORMAL_OBJECT)
+						{
+							long fieldObjectId = readId();
+							rcm.addStatic(fieldObjectId);
+						}
+						else
+						{
+							skip(typeSizes[typ]);
+						}
+					}
+					int numInsts = in.readUnsignedShort();
+					rcm.fields = new byte[numInsts];
+					rcm.fieldNames = new String[numInsts];
+					for (int i = 0; i < numInsts; ++i)
+					{
+						long symId = readId();
+						int type = in.readByte(); // see sig2tag
+						rcm.fields[i] = (byte) type;
+						rcm.fieldNames[i] = strings.get(symId);
+					}
+
+					objIds.add(obj);
+					objClasses.add(null);
+					objSizes.add(0);
+					objIdToNodeId.put(obj, objIds.size() - 1);
+					succs.add(new ArrayList<>());
+
+					return;
+				}
+				case HPROF_GC_INSTANCE_DUMP:
+				{
+					skip(4); // serno
+					long classId = readId();
+					RetainedClassMetadata rcm = classes.get(classId);
+					int sz = in.readInt();
+					long end = sz + in.offset();
+
+					objIds.add(obj);
+					objClasses.add(rcm);
+					objSizes.add(rcm.size);
+					objIdToNodeId.put(obj, objIds.size() - 1);
+					succs.add(new ArrayList<>());
+
+					int fieldIdx = 0;
+					while (in.offset() < end)
+					{
+						if (fieldIdx < rcm.fields.length)
+						{
+							byte typ = rcm.fields[fieldIdx++];
+							if (typ == HPROF_ARRAY_OBJECT || typ == HPROF_NORMAL_OBJECT)
+							{
+								long fieldObjectId = readId();
+								if (fieldObjectId > 0)
+								{
+									succs.get(succs.size() - 1).add(fieldObjectId);
+								}
+							}
+							else
+							{
+								skip(typeSizes[typ]);
+							}
+						}
+						else
+						{
+							rcm = classes.get(rcm.superClassId);
+							fieldIdx = 0;
+						}
+					}
+					if (in.offset() != end)
+					{
+						throw new IllegalArgumentException();
+					}
+
+					return;
+				}
+				case HPROF_GC_OBJ_ARRAY_DUMP:
+				{
+					skip(4); // serno
+					int size = in.readInt();
+					long arrayClassId = readId();
+
+					RetainedClassMetadata rcm = classes.get(arrayClassId);
+
+					objIds.add(obj);
+					objClasses.add(rcm);
+					objSizes.add(size * identSize + OBJECT_HEADER_SIZE + ARRAY_LENGTH_SIZE);
+					objIdToNodeId.put(obj, objIds.size() - 1);
+					succs.add(new ArrayList<>());
+
+					for (int i = 0; i < size; ++i)
+					{
+						long elementObjectId = readId();
+						if (elementObjectId > 0)
+						{
+							succs.get(succs.size() - 1).add(elementObjectId);
+						}
+					}
+					return;
+				}
+				case HPROF_GC_PRIM_ARRAY_DUMP:
+				{
+					skip(4); // serno
+					int size = in.readInt();
+					int typ = in.readByte();
+					skip(size * typeSizes[typ]);
+
+					objIds.add(obj);
+					objClasses.add(null);
+					objSizes.add(size * typeSizes[typ] + OBJECT_HEADER_SIZE + ARRAY_LENGTH_SIZE);
+					objIdToNodeId.put(obj, objIds.size() - 1);
+					succs.add(new ArrayList<>());
+					return;
+				}
+			}
+
+			super.readTag(tag, obj);
+		}
+
+		RetainedSizeResult computeRetainedSizes()
+		{
+			addRoot();
+
+			int[][] succs = new int[objIds.size()][];
+			for (int i = 0; i < succs.length; ++i)
+			{
+				succs[i] = new int[this.succs.get(i).size()];
+				for (int j = 0; j < succs[i].length; ++j)
+				{
+					Integer node = objIdToNodeId.get(this.succs.get(i).get(j));
+					assert node >= 0;
+					succs[i][j] = node;
+				}
+			}
+
+			var dom = new LengauerTarjan(objIds.size(), objIdToNodeId.get(-1L), succs);
+			int[] idom = dom.computeIdom();
+//			System.out.println("done computing immediate dominators");
+
+			List<Integer>[] domTree = computeDomTree(idom);
+//			System.out.println("done computing dominator tree");
+
+			long[] retainedSize = new long[idom.length];
+			computeRetained(domTree, objIdToNodeId.get(-1L), retainedSize);
+//			System.out.println("done computing retained size");
+
+			int[] numObjects = new int[idom.length];
+			computeObjects(domTree, objIdToNodeId.get(-1L), numObjects);
+//			System.out.println("done computing retained objects");
+
+			return new RetainedSizeResult(idom.length, classes, objClasses, retainedSize, numObjects);
+		}
+
+		private List<Integer>[] computeDomTree(int[] idom)
+		{
+			int n = idom.length;
+			List<Integer>[] children = new List[n];
+			for (int i = 0; i < n; i++)
+			{
+				children[i] = new ArrayList<>();
+			}
+			for (int i = 0; i < n; i++)
+			{
+				if (idom[i] != -1)
+				{
+					children[idom[i]].add(i);
+				}
+			}
+			return children;
+		}
+
+		private long computeRetained(List<Integer>[] domTree, int node, long[] retainedSize)
+		{
+			long sum = objSizes.get(node);
+			for (int child : domTree[node])
+			{
+				sum += computeRetained(domTree, child, retainedSize);
+			}
+			return retainedSize[node] = sum;
+		}
+
+		private int computeObjects(List<Integer>[] domTree, int node, int[] numObjects)
+		{
+			int n = 0;
+			for (int child : domTree[node])
+			{
+				n += computeObjects(domTree, child, numObjects);
+			}
+			return numObjects[node] = n + 1;
+		}
+
+		private void addRoot()
+		{
+			objIds.add(-1L);
+			objClasses.add(null);
+			objSizes.add(0);
+			objIdToNodeId.put(-1L, objIds.size() - 1);
+			succs.add(new ArrayList<>());
+
+			for (var rcm : classes.values())
+			{
+				if (rcm.statics != null)
+				{
+					for (long rootObjId : rcm.statics)
+					{
+						if (rootObjId > 0)
+						{
+							succs.get(succs.size() - 1).add(rootObjId);
+						}
+					}
+				}
+			}
+		}
+
+//		void dumpTree(List<Integer>[] domTree, int node, int level, long[] retainedSizes, int[] numObjects)
+//		{
+//			var rcm = objClasses.get(node);
+//			String clazz = rcm != null ? rcm.name : "<none>";
+//			for (int i = 0; i < level; ++i)
+//			{
+//				System.out.print(" ");
+//			}
+//			System.out.println("object node " + node + " class " + clazz + " size " + retainedSizes[node] + " objects " + numObjects[node]);
+//			for (int child : domTree[node])
+//			{
+//				dumpTree(domTree, child, level + 1, retainedSizes, numObjects);
+//			}
+//		}
+	}
+
 	private final byte[] zero = new byte[256];
 
 	private void zero(int bytes) throws IOException
@@ -1271,7 +1666,10 @@ public class HProfStripper
 	public static void main(String... args) throws IOException
 	{
 		ZstdOutputStream.init();
-		new HProfStripper(new File(args[0]), new File(args[1]), true).run();
+		try (var h = new HProfStripper(new File(args[0]), new File(args[1]), true))
+		{
+			h.runStripper();
+		}
 	}
 }
 
@@ -1489,18 +1887,15 @@ public class SeekFile extends DataInputStream
 package abex.os.debug;
 
 import com.sun.management.HotSpotDiagnosticMXBean;
+import java.awt.Dimension;
 import java.awt.Window;
 import java.awt.event.ActionEvent;
 import java.io.File;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
-import java.nio.MappedByteBuffer;
-import java.nio.channels.FileChannel;
 import java.nio.file.Files;
-import java.nio.file.StandardOpenOption;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
-import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import javax.inject.Inject;
@@ -1515,19 +1910,17 @@ import javax.swing.JLabel;
 import javax.swing.JOptionPane;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
-import javax.swing.JTextArea;
+import javax.swing.JTable;
 import javax.swing.Timer;
 import javax.swing.border.EmptyBorder;
 import javax.swing.filechooser.FileNameExtensionFilter;
 import javax.swing.filechooser.FileSystemView;
+import javax.swing.table.DefaultTableModel;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.client.RuneLite;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.ui.DynamicGridLayout;
-import org.netbeans.lib.profiler.heap.Heap;
-import org.netbeans.lib.profiler.heap.HeapFactory;
-import org.netbeans.lib.profiler.heap.JavaClass;
 
 @Slf4j
 @Singleton
@@ -1614,7 +2007,10 @@ public class HeapDumpPanel extends JPanel
 
 					File outFile = new File(inFile.getParentFile(),
 						inFile.getName().replaceAll("\\.[^.]+$", "") + "_stripped.hprof." + (zstd ? "zstd" : "gz"));
-					new HProfStripper(inFile, outFile, zstd).run();
+					try (var h = new HProfStripper(inFile, outFile, zstd))
+					{
+						h.runStripper();
+					}
 					DebugPlugin.openExplorer(outFile);
 				}
 				catch (IOException e)
@@ -1736,22 +2132,22 @@ public class HeapDumpPanel extends JPanel
 				new String[]{String.class.getName(), boolean.class.getName()}
 			);
 
-			Heap heap;
-			try (FileChannel fc = FileChannel.open(file.toPath(), StandardOpenOption.READ))
+			HProfStripper.RetainedSizeResult rsr;
+			try (var hprof = new HProfStripper(file))
 			{
-				MappedByteBuffer buffer =
-					fc.map(FileChannel.MapMode.READ_ONLY, 0, fc.size());
-				heap = HeapFactory.createHeap(buffer, 0);
+				rsr = hprof.runRetainedSizeComputer();
 			}
 
-			List<JavaClass> all = heap.getAllClasses();
 			Map<String, Long> pluginRetainedSizes = new HashMap<>();
-			for (JavaClass clazz : all)
+			Map<String, Integer> pluginNumObjects = new HashMap<>();
+			for (int n = 0; n < rsr.num; ++n)
 			{
-				if (clazz.getSuperClass() != null && clazz.getSuperClass().getName().equals("net.runelite.client.plugins.Plugin"))
+				String parentClazz = rsr.parentClazz(n);
+				if (parentClazz != null && parentClazz.equals("net/runelite/client/plugins/Plugin"))
 				{
-					long retainedSize = clazz.getRetainedSizeByClass();
-					pluginRetainedSizes.put(clazz.getName(), retainedSize);
+					String clazz = rsr.clazz(n);
+					pluginRetainedSizes.put(clazz, rsr.retainedSize[n]);
+					pluginNumObjects.put(clazz, rsr.numObjects[n]);
 				}
 			}
 
@@ -1765,24 +2161,40 @@ public class HeapDumpPanel extends JPanel
 						LinkedHashMap::new
 					));
 
-			StringBuilder text = new StringBuilder();
+			DefaultTableModel model = new DefaultTableModel(
+				new Object[]{"Plugin", "Size (KB)", "Num objects"}, 0
+			)
+			{
+				@Override
+				public boolean isCellEditable(int row, int column)
+				{
+					return false; // make table read-only
+				}
+			};
+
 			for (var entry : sorted.entrySet())
 			{
-				text.append(entry.getKey()).append(": ").append(String.format("%,d", entry.getValue() / 1024)).append("KB\n");
+				model.addRow(new Object[]{
+					entry.getKey(),
+					String.format("%,d", entry.getValue() / 1024),
+					String.format("%,d", pluginNumObjects.get(entry.getKey()))
+				});
 			}
 
-			JTextArea textArea = new JTextArea(text.toString());
-			textArea.setEditable(false);
-			textArea.setLineWrap(true);
-			textArea.setWrapStyleWord(true);
+			JTable table = new JTable(model);
+			table.setFillsViewportHeight(true);
+			table.setAutoCreateRowSorter(false);
+
+			table.getColumnModel().getColumn(0).setPreferredWidth(400);
+			table.getColumnModel().getColumn(1).setPreferredWidth(150);
 
 			JScrollPane scrollPane = new JScrollPane(
-				textArea,
+				table,
 				JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
 				JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
 			);
 
-			scrollPane.setPreferredSize(new java.awt.Dimension(600, 400));
+			scrollPane.setPreferredSize(new Dimension(800, 600));
 
 			JOptionPane.showMessageDialog(
 				this,
@@ -1790,13 +2202,184 @@ public class HeapDumpPanel extends JPanel
 				"Memory Analyzer",
 				JOptionPane.INFORMATION_MESSAGE
 			);
-
 		}
 		catch (Exception ex)
 		{
 			log.error(null, ex);
 			JOptionPane.showMessageDialog(this, ex.toString(), "Memory Analyzer", JOptionPane.ERROR_MESSAGE);
 		}
+	}
+}
+
+package abex.os.debug;
+
+import java.util.*;
+
+// this is a slightly modified, chatgpt converted version of a scala script https://gist.github.com/yuzeh/a5e6602dfdb0db3c2130c10537db54d7
+// which is taken from "Modern Compiler Implementation in Java", 2nd ed. chapter 19.2
+public class LengauerTarjan
+{
+	int nodeCount;
+	int root;
+	int[][] succs;
+	List<Integer>[] preds;
+
+	public LengauerTarjan(int nodeCount, int root, int[][] succs)
+	{
+		this.nodeCount = nodeCount;
+		this.root = root;
+		this.succs = succs;
+		buildPreds();
+	}
+
+	private void buildPreds()
+	{
+		preds = new ArrayList[nodeCount];
+		for (int i = 0; i < nodeCount; i++)
+		{
+			preds[i] = new ArrayList<>();
+		}
+		for (int v = 0; v < nodeCount; v++)
+		{
+			for (int p : succs[v])
+			{
+				// v -> p
+				preds[p].add(v);
+			}
+		}
+	}
+
+	public int[] computeIdom()
+	{
+		int nNodes = nodeCount;
+		int N = 0;
+
+		@SuppressWarnings("unchecked")
+		Set<Integer>[] bucket = new Set[nNodes];
+		for (int i = 0; i < nNodes; i++)
+		{
+			bucket[i] = new HashSet<>();
+		}
+
+		int[] dfnum = new int[nNodes];
+		Arrays.fill(dfnum, 0);
+		int[] vertex = new int[nNodes];
+		Arrays.fill(vertex, -1);
+		int[] parent = new int[nNodes];
+		Arrays.fill(parent, -1);
+		int[] semi = new int[nNodes];
+		Arrays.fill(semi, -1);
+		int[] ancestor = new int[nNodes];
+		Arrays.fill(ancestor, -1);
+		int[] idom = new int[nNodes];
+		Arrays.fill(idom, -1);
+		int[] samedom = new int[nNodes];
+		Arrays.fill(samedom, -1);
+		int[] best = new int[nNodes];
+		Arrays.fill(best, -1);
+
+		// DFS to number nodes
+		Deque<int[]> stack = new ArrayDeque<>();
+		stack.push(new int[]{-1, root}); // parent, node
+		while (!stack.isEmpty())
+		{
+			int[] pair = stack.pop();
+			int p = pair[0], v = pair[1];
+			if (dfnum[v] == 0)
+			{
+				dfnum[v] = N;
+				vertex[N] = v;
+				parent[v] = p;
+				N++;
+				for (int w : succs[v])
+				{
+					stack.push(new int[]{v, w});
+				}
+			}
+		}
+
+		// Helper: ancestor with lowest semi
+		final int[] dfnumRef = dfnum;
+		final int[] semiRef = semi;
+		final int[] ancestorRef = ancestor;
+		final int[] bestRef = best;
+
+		class Helper
+		{
+			int ancestorWithLowestSemi(int v)
+			{
+				int a = ancestorRef[v];
+				if (a >= 0 && ancestorRef[a] >= 0)
+				{
+					int b = ancestorWithLowestSemi(a);
+					ancestorRef[v] = ancestorRef[a];
+					if (dfnumRef[semiRef[b]] < dfnumRef[semiRef[bestRef[v]]])
+					{
+						bestRef[v] = b;
+					}
+				}
+				return bestRef[v];
+			}
+		}
+
+		Helper helper = new Helper();
+
+		// Link function
+		class Linker
+		{
+			void link(int p, int n)
+			{
+				ancestor[n] = p;
+				best[n] = n;
+			}
+		}
+		Linker linker = new Linker();
+
+		// Main computation
+		for (int i = N - 1; i >= 1; i--)
+		{
+			int n = vertex[i];
+			int p = parent[n];
+			int s = p;
+
+			for (int v : preds[n])
+			{
+				int sPrime = dfnum[v] <= dfnum[n] ? v : semi[helper.ancestorWithLowestSemi(v)];
+				if (dfnum[sPrime] < dfnum[s])
+				{
+					s = sPrime;
+				}
+			}
+
+			semi[n] = s;
+			bucket[s].add(n);
+			linker.link(p, n);
+
+			for (int v : bucket[p])
+			{
+				int y = helper.ancestorWithLowestSemi(v);
+				if (semi[y] == semi[v])
+				{
+					idom[v] = p;
+				}
+				else
+				{
+					samedom[v] = y;
+				}
+			}
+			bucket[p].clear();
+		}
+
+		for (int i = 1; i < N; i++)
+		{
+			int n = vertex[i];
+			if (samedom[n] >= 0)
+			{
+				idom[n] = idom[samedom[n]];
+			}
+		}
+
+		return idom;
 	}
 }
 
