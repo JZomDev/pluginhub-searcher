@@ -545,9 +545,17 @@ public class LootTrackerApiClient
     }
     
     /**
-     * Submit a collection log entry
+     * Submit a collection log entry (legacy - no screenshot)
      */
     public void submitCollectionLogEntry(LootDropData drop) throws IOException
+    {
+        submitCollectionLogEntry(drop, null, null);
+    }
+    
+    /**
+     * Submit a collection log entry with optional screenshot
+     */
+    public void submitCollectionLogEntry(LootDropData drop, String screenshotUrl, String screenshotBase64) throws IOException
     {
         if (!authManager.isAuthenticated())
         {
@@ -561,6 +569,16 @@ public class LootTrackerApiClient
         body.addProperty("username", drop.getUsername());
         body.addProperty("item_name", drop.getItemName());
         
+        // Add screenshot if available
+        if (screenshotUrl != null && !screenshotUrl.isEmpty())
+        {
+            body.addProperty("image_url", screenshotUrl);
+        }
+        if (screenshotBase64 != null && !screenshotBase64.isEmpty())
+        {
+            body.addProperty("image_base64", screenshotBase64);
+        }
+        
         // Use first destination's guild_id for collection log (or legacy mode)
         if (destinationsJson != null && !destinationsJson.isEmpty() && !destinationsJson.equals("[]"))
         {
@@ -569,6 +587,35 @@ public class LootTrackerApiClient
             {
                 JsonObject firstDest = rawDestinations.get(0).getAsJsonObject();
                 body.addProperty("guild_id", firstDest.get("guildId").getAsString());
+                
+                // Add channel IDs for the collection log entry
+                if (firstDest.has("channels") && firstDest.get("channels").isJsonArray())
+                {
+                    JsonArray channels = firstDest.get("channels").getAsJsonArray();
+                    JsonArray channelIds = new JsonArray();
+                    for (int i = 0; i < channels.size(); i++)
+                    {
+                        JsonObject ch = channels.get(i).getAsJsonObject();
+                        // Check for "id" field (new format) or "channelId" field (old format)
+                        if (ch.has("id") && !ch.get("id").isJsonNull())
+                        {
+                            channelIds.add(ch.get("id").getAsString());
+                        }
+                        else if (ch.has("channelId") && !ch.get("channelId").isJsonNull())
+                        {
+                            channelIds.add(ch.get("channelId").getAsString());
+                        }
+                    }
+                    if (channelIds.size() > 0)
+                    {
+                        body.add("channel_ids", channelIds);
+                    }
+                }
+                // Fallback: check for channelIds array directly on destination
+                else if (firstDest.has("channelIds") && firstDest.get("channelIds").isJsonArray())
+                {
+                    body.add("channel_ids", firstDest.get("channelIds").getAsJsonArray());
+                }
                 
                 if (firstDest.has("eventId") && !firstDest.get("eventId").isJsonNull())
                 {
@@ -2969,6 +3016,8 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
@@ -3012,6 +3061,10 @@ public class OSRSLootTrackerPlugin extends Plugin
     private OSRSLootTrackerPanel panel;
     
     private NavigationButton navButton;
+    
+    // Deduplication cache for collection log entries (item name -> timestamp)
+    private final Map<String, Long> recentCollectionLogItems = new ConcurrentHashMap<>();
+    private static final long COLLECTION_LOG_DEDUP_WINDOW_MS = 5000; // 5 seconds
 
     @Override
     protected void startUp() throws Exception
@@ -3106,8 +3159,7 @@ public class OSRSLootTrackerPlugin extends Plugin
         // IMPORTANT: Pre-process all item data on the client thread because ItemManager 
         // methods must be called on the client thread. We store the processed data for 
         // use in the async callback.
-        final List<ProcessedItem> processedItems = new ArrayList<>();
-        int totalDropValue = 0;
+        final List<ProcessedItem> allItems = new ArrayList<>();
         
         for (ItemStack item : event.getItems())
         {
@@ -3116,17 +3168,41 @@ public class OSRSLootTrackerPlugin extends Plugin
             final int value = itemManager.getItemPrice(itemId) * quantity;
             final String itemName = itemManager.getItemComposition(itemId).getName();
             
-            processedItems.add(new ProcessedItem(itemName, quantity, value));
-            totalDropValue += value;
+            allItems.add(new ProcessedItem(itemName, quantity, value));
         }
         
-        log.info("Processing loot for RSN: {}, from: {}, items: {}, total value: {}gp", 
-            rsn, sourceName, processedItems.size(), totalDropValue);
-
-        // Check if this drop would be sent to at least one channel based on per-channel thresholds
-        if (!apiClient.wouldDropBeSent(totalDropValue))
+        // Get the lowest channel threshold - only items meeting this threshold will be logged
+        final int lowestThreshold = apiClient.getLowestChannelMinValue();
+        
+        // Filter items to only include those that individually meet the threshold
+        final List<ProcessedItem> processedItems = new ArrayList<>();
+        for (ProcessedItem item : allItems)
         {
-            log.debug("Drop value {}gp doesn't meet any channel threshold", totalDropValue);
+            if (item.value >= lowestThreshold)
+            {
+                processedItems.add(item);
+                log.debug("Item {} ({}gp) meets threshold ({}gp)", item.name, item.value, lowestThreshold);
+            }
+            else
+            {
+                log.debug("Item {} ({}gp) below threshold ({}gp), skipping", item.name, item.value, lowestThreshold);
+            }
+        }
+        
+        // Calculate total value of items that passed the filter
+        int totalDropValue = 0;
+        for (ProcessedItem item : processedItems)
+        {
+            totalDropValue += item.value;
+        }
+        
+        log.info("Processing loot for RSN: {}, from: {}, items: {}/{} passed filter, total value: {}gp (threshold: {}gp)", 
+            rsn, sourceName, processedItems.size(), allItems.size(), totalDropValue, lowestThreshold);
+
+        // Skip if no items passed the filter
+        if (processedItems.isEmpty())
+        {
+            log.debug("No items meet the minimum value threshold of {}gp", lowestThreshold);
             return;
         }
 
@@ -3309,29 +3385,42 @@ public class OSRSLootTrackerPlugin extends Plugin
             String itemName = extractCollectionLogItem(message);
             if (itemName != null)
             {
-                final String rsn = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : "Unknown";
+                // Check for duplicate - prevent processing the same item within 5 seconds
+                final String dedupKey = itemName.toLowerCase();
+                final long now = System.currentTimeMillis();
+                final Long lastProcessed = recentCollectionLogItems.get(dedupKey);
                 
-                LootDropData drop = new LootDropData(
-                    rsn,
-                    itemName,
-                    1,
-                    0, // Value will be looked up on server
-                    "Collection Log",
-                    "COLLECTION_LOG"
-                );
-
-                executor.execute(() -> {
-                    try
-                    {
-                        apiClient.submitCollectionLogEntry(drop);
-                        log.info("Submitted collection log entry: {}", itemName);
-                        SwingUtilities.invokeLater(() -> panel.addRecentDrop(drop));
-                    }
-                    catch (Exception e)
-                    {
-                        log.error("Failed to submit collection log entry", e);
-                    }
-                });
+                if (lastProcessed != null && (now - lastProcessed) < COLLECTION_LOG_DEDUP_WINDOW_MS)
+                {
+                    log.debug("Skipping duplicate collection log entry for: {} (processed {}ms ago)", 
+                        itemName, now - lastProcessed);
+                    return;
+                }
+                
+                // Mark as processed
+                recentCollectionLogItems.put(dedupKey, now);
+                
+                // Clean up old entries (older than 30 seconds)
+                recentCollectionLogItems.entrySet().removeIf(e -> (now - e.getValue()) > 30000);
+                
+                final String rsn = client.getLocalPlayer() != null ? client.getLocalPlayer().getName() : "Unknown";
+                final String finalItemName = itemName;
+                
+                log.info("Processing collection log entry: {}", itemName);
+                
+                // Capture screenshot if enabled, then submit
+                if (config.captureScreenshots())
+                {
+                    captureScreenshot(screenshotData -> {
+                        String url = screenshotData != null ? screenshotData.url : null;
+                        String base64 = screenshotData != null ? screenshotData.base64 : null;
+                        submitCollectionLogEntry(rsn, finalItemName, url, base64);
+                    });
+                }
+                else
+                {
+                    executor.execute(() -> submitCollectionLogEntry(rsn, finalItemName, null, null));
+                }
             }
         }
 
@@ -3371,13 +3460,63 @@ public class OSRSLootTrackerPlugin extends Plugin
 
     private String extractCollectionLogItem(String message)
     {
-        // Format: "New item added to your collection log: <item name>"
+        // Format: "New item added to your collection log: <col=ff0000>item name</col>"
         int colonIndex = message.lastIndexOf(':');
         if (colonIndex != -1 && colonIndex < message.length() - 1)
         {
-            return message.substring(colonIndex + 1).trim();
+            String itemName = message.substring(colonIndex + 1).trim();
+            // Strip OSRS color tags like <col=ff0000>...</col>
+            itemName = stripColorTags(itemName);
+            return itemName;
         }
         return null;
+    }
+    
+    /**
+     * Strip OSRS color formatting tags from text
+     * Format: <col=XXXXXX>text</col>
+     */
+    private String stripColorTags(String text)
+    {
+        if (text == null)
+        {
+            return null;
+        }
+        // Remove opening color tags like <col=ff0000>
+        text = text.replaceAll("<col=[0-9a-fA-F]+>", "");
+        // Remove closing </col> tags
+        text = text.replaceAll("</col>", "");
+        return text.trim();
+    }
+    
+    /**
+     * Submit a collection log entry with optional screenshot
+     */
+    private void submitCollectionLogEntry(String rsn, String itemName, String screenshotUrl, String screenshotBase64)
+    {
+        LootDropData drop = new LootDropData(
+            rsn,
+            itemName,
+            1,
+            0, // Value will be looked up on server
+            "Collection Log",
+            "COLLECTION_LOG",
+            screenshotUrl
+        );
+
+        executor.execute(() -> {
+            try
+            {
+                apiClient.submitCollectionLogEntry(drop, screenshotUrl, screenshotBase64);
+                log.info("Submitted collection log entry: {} with screenshot: {}", 
+                    itemName, (screenshotUrl != null || screenshotBase64 != null));
+                SwingUtilities.invokeLater(() -> panel.addRecentDrop(drop));
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to submit collection log entry", e);
+            }
+        });
     }
 
     @Subscribe
@@ -3433,6 +3572,7 @@ public class OSRSLootTrackerPlugin extends Plugin
         return configManager.getConfig(OSRSLootTrackerConfig.class);
     }
 }
+
 
 
 package com.osrsloottracker;
