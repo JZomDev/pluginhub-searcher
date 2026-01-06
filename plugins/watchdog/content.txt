@@ -766,7 +766,7 @@ import static net.runelite.api.MenuAction.RUNELITE_OVERLAY_CONFIG;
 @PluginDescriptor(
     name = "Watchdog",
     description = "Create custom alerts for different events like messages, stats, or built-in notifications",
-    tags = {"alert", "notification","custom","advanced","overlay","sound","drop","afk","tracker","reminder","notify","notifier","helper","timer","message"}
+    tags = {"alert","notification","custom","advanced","overlay","sound","drop","afk","tracker","reminder","notify","notifier","helper","timer","message","action"}
 )
 public class WatchdogPlugin extends Plugin {
     @Getter
@@ -1095,6 +1095,7 @@ public enum NotificationType {
     OBJECT_MARKER("Object Marker", "Show an object marker", NotificationCategory.OVERLAY, ObjectMarker.class),
     DINK("Dink", "Tell Dink to send a custom notification to your webhook", NotificationCategory.ADVANCED, Dink.class),
     SHORTEST_PATH("Shortest Path", "Sets the Shortest Path plugin's path", NotificationCategory.ADVANCED, ShortestPath.class),
+    ALERT_TOGGLE("Alert Toggle", "Toggle an alert's enabled state", NotificationCategory.ADVANCED, AlertToggle.class),
     PLUGIN_MESSAGE("Plugin Message", "Send a message to another plugin", NotificationCategory.ADVANCED, PluginMessage.class),
     PLUGIN_TOGGLE("Plugin Toggle", "Toggle a plugin's enabled state", NotificationCategory.ADVANCED, PluginToggle.class),
     DISMISS_OVERLAY("Dismiss Overlay", "Dismiss a sticky overlay by ID", NotificationCategory.ADVANCED, DismissOverlay.class),
@@ -1701,6 +1702,56 @@ public class AlertHubClient {
 
 package com.adamk33n3r.runelite.watchdog;
 
+import javax.swing.*;
+import javax.swing.filechooser.FileNameExtensionFilter;
+import java.io.File;
+
+public class OverwriteCheckFileChooser extends JFileChooser {
+    private String extension;
+    public OverwriteCheckFileChooser(String description, String extension) {
+        super();
+        this.extension = extension;
+        this.setFileFilter(new FileNameExtensionFilter(description, extension));
+    }
+
+    @Override
+    public File getSelectedFile() {
+        File selectedFile = super.getSelectedFile();
+        if (selectedFile != null) {
+            String name = selectedFile.getName();
+            if (!name.contains(".")) {
+                selectedFile = new File(selectedFile.getAbsolutePath() + "." + this.extension);
+            }
+        }
+
+        return selectedFile;
+    }
+
+    @Override
+    public void approveSelection() {
+        if (this.getDialogType() == SAVE_DIALOG) {
+            File selectedFile = getSelectedFile();
+            if (selectedFile != null && selectedFile.exists()) {
+                int result = JOptionPane.showConfirmDialog(
+                    this,
+                    "Overwrite existing file?",
+                    "Overwrite?",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.WARNING_MESSAGE
+                );
+
+                if (result != JOptionPane.YES_OPTION) {
+                    return;
+                }
+            }
+        }
+
+        super.approveSelection();
+    }
+}
+
+package com.adamk33n3r.runelite.watchdog;
+
 import com.adamk33n3r.runelite.watchdog.alerts.FlashMode;
 import com.adamk33n3r.runelite.watchdog.notifications.tts.TTSSource;
 import com.adamk33n3r.runelite.watchdog.notifications.tts.Voice;
@@ -1729,6 +1780,7 @@ public interface WatchdogConfig extends Config {
     String OVERRIDE_IMPORTS_WITH_DEFAULTS = "overrideImportsWithDefaults";
     String SIDE_PANEL_PRIORITY = "sidePanelPriority";
     String ENABLE_NOTIFICATION_CATEGORIES = "enableNotificationCategories";
+    String DISABLE_ALL_ALERTS_ON_STARTUP = "disableAllAlertsOnStartup";
 
     // AFK Notification
     String DEFAULT_AFK_MODE = "defaultAFKMode";
@@ -1861,16 +1913,24 @@ public interface WatchdogConfig extends Config {
 
     @ConfigItem(
         keyName = ENABLE_NOTIFICATION_CATEGORIES,
-        name = "Enable Notification Categories",
-        description = "Enables the notification categories in the side panel"
+        name = "Enable Action Categories",
+        description = "Enables the action categories in the side panel"
     )
     default boolean enableNotificationCategories() { return true; }
 
+    @ConfigItem(
+        keyName = DISABLE_ALL_ALERTS_ON_STARTUP,
+        name = "Disable All Alerts on Startup",
+        description = "Disables all alerts on startup"
+    )
+    default boolean disableAllAlertsOnStartup() { return false; }
+
     //region AFK Notification
     @ConfigSection(
-        name = "AFK Notification",
-        description = "The options that control the afk notification settings",
-        position = 0
+        name = "AFK Settings",
+        description = "The options that control the afk settings",
+        position = 0,
+        closedByDefault = true
     )
     String afkNotificationSection = "afkNotificationSection";
 
@@ -2456,18 +2516,32 @@ public class WatchdogProperties {
 
 package com.adamk33n3r.runelite.watchdog;
 
+import com.adamk33n3r.runelite.watchdog.alerts.RegexMatcher;
 import net.runelite.api.GameObject;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.client.config.RuneLiteConfig;
+import net.runelite.client.plugins.grounditems.config.OwnershipFilterMode;
 import net.runelite.client.util.Text;
 
 import com.google.common.base.Splitter;
 
 import javax.swing.*;
 import java.awt.Color;
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStreamReader;
 import java.text.Normalizer;
+import java.util.Base64;
 import java.util.List;
+import java.util.function.Supplier;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
+import java.util.zip.GZIPInputStream;
+import java.util.zip.GZIPOutputStream;
+
+import static net.runelite.api.TileItem.*;
 
 public class Util {
     public static <T> T defaultArg(T thing, T defaultValue) {
@@ -2568,6 +2642,33 @@ public class Util {
         return sb.toString();
     }
 
+    /**
+     * Match a pattern against an input string
+     * @param pattern the pattern to match
+     * @param regexEnabled whether the pattern is a regex
+     * @param input the input string
+     * @return the groups of the pattern, or null if no match
+     */
+    public static String[] matchPattern(
+        Supplier<String> pattern,
+        Supplier<Boolean> regexEnabled,
+        String input
+    ) {
+        String regex = regexEnabled.get() ? pattern.get() : Util.createRegexFromGlob(pattern.get());
+        Matcher matcher = Pattern.compile(regex, regexEnabled.get() ? 0 : Pattern.CASE_INSENSITIVE).matcher(input);
+        if (!matcher.find()) return null;
+
+        String[] groups = new String[matcher.groupCount()];
+        for (int i = 0; i < matcher.groupCount(); i++) {
+            groups[i] = matcher.group(i+1);
+        }
+        return groups;
+    }
+
+    public static String[] matchPattern(RegexMatcher regexMatcher, String input) {
+        return matchPattern(regexMatcher::getPattern, regexMatcher::isRegexEnabled, input);
+    }
+
     public static String splitCamelCase(String s) {
         return s.replaceAll(
             String.format("%s|%s|%s",
@@ -2648,6 +2749,75 @@ public class Util {
             dialog.setAlwaysOnTop(true);
         }
     }
+
+    /**
+     * All      -> none | self | other | group<br>
+     * Drops    -> self | group<br>
+     * Takeable -> none | self | group | (if a main then other)<br>
+     * <br>
+     * Taken from GroundItemsPlugin
+     */
+    public static boolean shouldTriggerItem(OwnershipFilterMode filterMode, int ownership, int accountType) {
+        switch (filterMode) {
+            case DROPS:
+                return ownership == OWNERSHIP_SELF || ownership == OWNERSHIP_GROUP;
+            case TAKEABLE:
+                return ownership != OWNERSHIP_OTHER || accountType == 0; // Mains can always take items
+            default:
+                return true;
+        }
+    }
+
+    /**
+     * Compresses the given alert string.
+     * @param alertJSON expects a string
+     * @return the compressed string
+     */
+    public static String compressAlerts(String alertJSON) {
+        try {
+            ByteArrayOutputStream byteArrayOutputStream = new ByteArrayOutputStream();
+            GZIPOutputStream gzipOutputStream = new GZIPOutputStream(byteArrayOutputStream);
+            gzipOutputStream.write(alertJSON.getBytes());
+            gzipOutputStream.close();
+            byteArrayOutputStream.close();
+            return Base64.getEncoder().encodeToString(byteArrayOutputStream.toByteArray());
+        } catch (Exception e) {
+            return alertJSON;
+        }
+    }
+
+    /**
+     * Decompresses the given compressed alert string.
+     * @param compressedAlerts expects a base64 encoded string
+     * @return the decompressed string
+     */
+    public static String decompressAlerts(String compressedAlerts) {
+        try {
+            byte[] bytes = Base64.getDecoder().decode(compressedAlerts);
+            ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(bytes);
+            GZIPInputStream gzipInputStream = new GZIPInputStream(byteArrayInputStream);
+            BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(gzipInputStream));
+            StringBuilder stringBuilder = new StringBuilder();
+            String line;
+            while ((line = bufferedReader.readLine()) != null) {
+                stringBuilder.append(line);
+            }
+            gzipInputStream.close();
+            byteArrayInputStream.close();
+            return stringBuilder.toString();
+        } catch (Exception e) {
+            return compressedAlerts;
+        }
+    }
+
+    public static boolean isCompressed(String compressedAlerts) {
+        try {
+            byte[] bytes = Base64.getDecoder().decode(compressedAlerts);
+            return (bytes[0] == (byte) (GZIPInputStream.GZIP_MAGIC)) && (bytes[1] == (byte) (GZIPInputStream.GZIP_MAGIC >> 8));
+        } catch (IllegalArgumentException e) {
+            return false;
+        }
+    }
 }
 
 package com.adamk33n3r.runelite.watchdog.alerts;
@@ -2659,6 +2829,7 @@ import lombok.AllArgsConstructor;
 import lombok.Getter;
 import lombok.Setter;
 import lombok.experimental.Accessors;
+import net.runelite.client.plugins.grounditems.config.OwnershipFilterMode;
 
 @Getter
 @Setter
@@ -2666,7 +2837,9 @@ import lombok.experimental.Accessors;
 public class SpawnedAlert extends Alert implements RegexMatcher {
     private SpawnedDespawned spawnedDespawned = SpawnedDespawned.SPAWNED;
     private SpawnedType spawnedType = SpawnedType.ITEM;
+    private OwnershipFilterMode itemOwnershipFilterMode = OwnershipFilterMode.TAKEABLE;
     private String spawnedName = "";
+    @Accessors(chain = false)
     private boolean regexEnabled = false;
     private int distance = -1;
     private ComparableNumber.Comparator distanceComparator = ComparableNumber.Comparator.LESS_THAN_OR_EQUALS;
@@ -2735,6 +2908,7 @@ import lombok.experimental.Accessors;
 public class InventoryAlert extends Alert implements RegexMatcher {
     private InventoryAlertType inventoryAlertType = InventoryAlertType.FULL;
     private String itemName = "";
+    @Accessors(chain = false)
     private boolean isRegexEnabled = false;
     private InventoryMatchType inventoryMatchType = InventoryMatchType.BOTH;
     private int itemQuantity = 1;
@@ -2819,6 +2993,7 @@ import lombok.experimental.Accessors;
 @Setter
 @Accessors(chain = true)
 public class PlayerChatAlert extends Alert implements RegexMatcher {
+    @Accessors(chain = false)
     private boolean regexEnabled = false;
     private String message = "";
     private PlayerChatType playerChatType = PlayerChatType.ANY;
@@ -2875,6 +3050,7 @@ import lombok.experimental.Accessors;
 @Setter
 @Accessors(chain = true)
 public class OverheadTextAlert extends Alert implements RegexMatcher {
+    @Accessors(chain = false)
     private boolean regexEnabled = false;
     private String message = "";
     private boolean npcRegexEnabled = false;
@@ -2986,6 +3162,7 @@ import lombok.experimental.Accessors;
 @Accessors(chain = true)
 public class ChatAlert extends Alert implements RegexMatcher {
     private String message = "";
+    @Accessors(chain = false)
     private boolean regexEnabled = false;
     private GameMessageType gameMessageType = GameMessageType.ANY;
 
@@ -3012,7 +3189,7 @@ package com.adamk33n3r.runelite.watchdog.alerts;
 
 public interface RegexMatcher {
     boolean isRegexEnabled();
-    Alert setRegexEnabled(boolean regexEnabled);
+    void setRegexEnabled(boolean regexEnabled);
     String getPattern();
     void setPattern(String pattern);
 }
@@ -3124,11 +3301,12 @@ public abstract class Alert {
     private boolean enabled = true;
     private String name;
     private int debounceTime;
+    private boolean debounceResetTime = false;
     private boolean randomNotifications = false;
 
     @Nullable
     private transient AlertGroup parent;
-    public AlertGroup getParent() {
+    public @Nullable AlertGroup getParent() {
         if (this.parent == null) {
             this.parent = WatchdogPlugin.getInstance()
                 .getAlertManager()
@@ -3255,6 +3433,7 @@ import lombok.experimental.Accessors;
 @Accessors(chain = true)
 public class NotificationFiredAlert extends Alert implements RegexMatcher {
     private String message = "";
+    @Accessors(chain = false)
     private boolean regexEnabled = false;
     private boolean allowSelf = false;
 
@@ -3427,6 +3606,7 @@ import net.runelite.api.coords.LocalPoint;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.gameval.InventoryID;
 import net.runelite.api.events.*;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.NotificationFired;
@@ -3445,6 +3625,7 @@ import java.awt.TrayIcon;
 import java.time.Instant;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -3515,7 +3696,7 @@ public class EventHandler {
                         var playerName = Text.sanitize(Text.removeFormattingTags(chatMessage.getName()));
                         message = String.format("%s: %s", playerName, message);
                     }
-                    String[] groups = this.matchPattern(chatAlert, message);
+                    String[] groups = Util.matchPattern(chatAlert, message);
                     if (groups == null) return;
 
                     this.fireAlert(chatAlert, groups);
@@ -3526,7 +3707,7 @@ public class EventHandler {
         this.alertManager.getAllEnabledAlertsOfType(ChatAlert.class)
             .filter(chatAlert -> chatAlert.getGameMessageType() == GameMessageType.ANY || chatAlert.getGameMessageType().isOfType(chatMessage.getType()))
             .forEach(gameAlert -> {
-                String[] groups = this.matchPattern(gameAlert, unformattedMessage);
+                String[] groups = Util.matchPattern(gameAlert, unformattedMessage);
                 if (groups == null) return;
 
                 this.fireAlert(gameAlert, groups);
@@ -3540,7 +3721,7 @@ public class EventHandler {
         this.alertManager.getAllEnabledAlertsOfType(NotificationFiredAlert.class)
             .filter(notificationFiredAlert -> !this.firedByWatchdog || notificationFiredAlert.isAllowSelf())
             .forEach(notificationFiredAlert -> {
-                String[] groups = this.matchPattern(notificationFiredAlert, notificationFired.getMessage());
+                String[] groups = Util.matchPattern(notificationFiredAlert, notificationFired.getMessage());
                 if (groups == null) return;
 
                 this.fireAlert(notificationFiredAlert, groups);
@@ -3685,7 +3866,7 @@ public class EventHandler {
                 || (inventoryAlert.getInventoryMatchType() == InventoryAlert.InventoryMatchType.NOTED && itemData.getValue().isNoted())
                 || (inventoryAlert.getInventoryMatchType() == InventoryAlert.InventoryMatchType.UN_NOTED && !itemData.getValue().isNoted()))
             .map(itemData -> {
-                String[] groups = this.matchPattern(inventoryAlert, itemData.getValue().itemComposition.getName());
+                String[] groups = Util.matchPattern(inventoryAlert, itemData.getValue().itemComposition.getName());
                 if (groups == null) return null;
                 var prevItem = this.previousItemsTable.get(itemData.getKey());
                 return new MatchedItem(
@@ -3710,12 +3891,16 @@ public class EventHandler {
     @Subscribe
     private void onItemSpawned(ItemSpawned itemSpawned) {
         ItemComposition comp = this.itemManager.getItemComposition(itemSpawned.getItem().getId());
-        this.onSpawned(comp.getName(), comp.getId(), itemSpawned.getTile().getWorldLocation(), SPAWNED, ITEM);
+        final int accountType = this.client.getVarbitValue(VarbitID.IRONMAN);
+        this.onSpawned(comp.getName(), comp.getId(), itemSpawned.getTile().getWorldLocation(), SPAWNED, ITEM, spawnedAlert ->
+            Util.shouldTriggerItem(spawnedAlert.getItemOwnershipFilterMode(), itemSpawned.getItem().getOwnership(), accountType));
     }
     @Subscribe
     private void onItemDespawned(ItemDespawned itemDespawned) {
         ItemComposition comp = this.itemManager.getItemComposition(itemDespawned.getItem().getId());
-        this.onSpawned(comp.getName(), comp.getId(), itemDespawned.getTile().getWorldLocation(), DESPAWNED, ITEM);
+        final int accountType = this.client.getVarbitValue(VarbitID.IRONMAN);
+        this.onSpawned(comp.getName(), comp.getId(), itemDespawned.getTile().getWorldLocation(), DESPAWNED, ITEM, spawnedAlert ->
+            Util.shouldTriggerItem(spawnedAlert.getItemOwnershipFilterMode(), itemDespawned.getItem().getOwnership(), accountType));
     }
     @Subscribe
     private void onNpcSpawned(NpcSpawned npcSpawned) {
@@ -3791,6 +3976,10 @@ public class EventHandler {
     }
 
     private void onSpawned(@Nullable String name, int id, WorldPoint location, SpawnedAlert.SpawnedDespawned mode, SpawnedAlert.SpawnedType type) {
+        this.onSpawned(name, id, location, mode, type, spawnedAlert -> true);
+    }
+
+    private void onSpawned(@Nullable String name, int id, WorldPoint location, SpawnedAlert.SpawnedDespawned mode, SpawnedAlert.SpawnedType type, Predicate<SpawnedAlert> additionalFilter) {
         if (name == null) {
             return;
         }
@@ -3800,6 +3989,7 @@ public class EventHandler {
             .filter(spawnedAlert -> spawnedAlert.getSpawnedDespawned() == mode)
             .filter(spawnedAlert -> spawnedAlert.getSpawnedType() == type)
             .filter(spawnedAlert -> spawnedAlert.getDistance() == -1 || spawnedAlert.getDistanceComparator().compare(distanceToObject, spawnedAlert.getDistance()))
+            .filter(additionalFilter)
             .forEach(spawnedAlert -> {
                 try {
                     int parsedID = Integer.parseInt(spawnedAlert.getPattern());
@@ -3807,7 +3997,7 @@ public class EventHandler {
                         this.fireAlert(spawnedAlert, new String[] { spawnedAlert.getPattern() });
                     }
                 } catch (NumberFormatException ignored) {
-                    String[] groups = this.matchPattern(spawnedAlert, unformattedName);
+                    String[] groups = Util.matchPattern(spawnedAlert, unformattedName);
                     if (groups == null) return;
 
                     this.fireAlert(spawnedAlert, groups);
@@ -3819,9 +4009,9 @@ public class EventHandler {
     @Subscribe
     private void onOverheadTextChanged(OverheadTextChanged overheadTextChanged) {
         this.alertManager.getAllEnabledAlertsOfType(OverheadTextAlert.class)
-            .filter(alert -> alert.getNpcName().isEmpty() || this.matchPattern(alert::getNpcName, alert::isNpcRegexEnabled, overheadTextChanged.getActor().getName()) != null)
+            .filter(alert -> alert.getNpcName().isEmpty() || Util.matchPattern(alert::getNpcName, alert::isNpcRegexEnabled, overheadTextChanged.getActor().getName()) != null)
             .forEach(alert -> {
-                String[] groups = this.matchPattern(alert, overheadTextChanged.getOverheadText());
+                String[] groups = Util.matchPattern(alert, overheadTextChanged.getOverheadText());
                 if (groups == null) return;
 
                 this.fireAlert(alert, groups);
@@ -3852,26 +4042,6 @@ public class EventHandler {
         this.previousLocation = worldLocation;
     }
 
-    private String[] matchPattern(
-        Supplier<String> pattern,
-        Supplier<Boolean> regexEnabled,
-        String input
-    ) {
-        String regex = regexEnabled.get() ? pattern.get() : Util.createRegexFromGlob(pattern.get());
-        Matcher matcher = Pattern.compile(regex, regexEnabled.get() ? 0 : Pattern.CASE_INSENSITIVE).matcher(input);
-        if (!matcher.find()) return null;
-
-        String[] groups = new String[matcher.groupCount()];
-        for (int i = 0; i < matcher.groupCount(); i++) {
-            groups[i] = matcher.group(i+1);
-        }
-        return groups;
-    }
-
-    private String[] matchPattern(RegexMatcher regexMatcher, String input) {
-        return this.matchPattern(regexMatcher::getPattern, regexMatcher::isRegexEnabled, input);
-    }
-
     private void fireAlert(Alert alert, String triggerValue) {
         this.fireAlert(alert, new String[] { triggerValue });
     }
@@ -3891,14 +4061,23 @@ public class EventHandler {
             .max(Comparator.comparingInt(Alert::getDebounceTime))
             .orElse(alert);
 
-        // If the alert hasn't been fired yet, or has been enough time, set the last trigger time to now and fire.
-        if (!this.lastTriggered.containsKey(alertToDebounceWith) || Instant.now().compareTo(this.lastTriggered.get(alertToDebounceWith).plusMillis(alertToDebounceWith.getDebounceTime())) >= 0) {
-            SwingUtilities.invokeLater(() -> {
-                this.historyPanelProvider.get().addEntry(alert, triggerValues);
-            });
-            this.lastTriggered.put(alertToDebounceWith, Instant.now());
-            this.plugin.processAlert(alert, triggerValues, false);
+        // now < (lastTriggered + debounceTime) ? -1
+        // now > (lastTriggered + debounceTime) ? 1
+        boolean isPastDebounceTime = !this.lastTriggered.containsKey(alertToDebounceWith) ||
+            Instant.now().compareTo(this.lastTriggered.get(alertToDebounceWith).plusMillis(alertToDebounceWith.getDebounceTime())) >= 0;
+        if (!isPastDebounceTime) {
+            if (alertToDebounceWith.isDebounceResetTime()) {
+                this.lastTriggered.put(alertToDebounceWith, Instant.now());
+            }
+            return;
         }
+
+        // If the alert hasn't been fired yet, or has been enough time, set the last trigger time to now and fire.
+        SwingUtilities.invokeLater(() -> {
+            this.historyPanelProvider.get().addEntry(alert, triggerValues);
+        });
+        this.lastTriggered.put(alertToDebounceWith, Instant.now());
+        this.plugin.processAlert(alert, triggerValues, false);
     }
 
     @AllArgsConstructor
@@ -4055,6 +4234,7 @@ public class AlertManager {
             .registerSubtype(ShortestPath.class)
             .registerSubtype(PluginMessage.class)
             .registerSubtype(PluginToggle.class)
+            .registerSubtype(AlertToggle.class)
             .registerSubtype(DismissObjectMarker.class)
             .registerSubtype(DismissOverlay.class)
             .registerSubtype(DismissScreenMarker.class);
@@ -4316,6 +4496,9 @@ public class AlertManager {
         this.importAlerts(json, this.alerts, false, false, false);
         this.createStarterAlertsIfEmpty();
         this.handleUpgrades();
+        if (this.watchdogConfig.disableAllAlertsOnStartup()) {
+            this.getAllAlertsFrom(this.alerts.stream(), true).forEach(alert -> alert.setEnabled(false));
+        }
     }
 
     public boolean importAlerts(String json, List<Alert> alerts, boolean append, boolean checkRegex, boolean overrideWithDefaults) throws JsonSyntaxException {
@@ -4943,7 +5126,11 @@ public class NotificationOverlay extends OverlayPanel {
             }
             if (config.overlayShowTime()) {
                 this.getChildren().add(WrappedTitleComponent.builder()
-                    .text(formatDuration(ChronoUnit.MILLIS.between(this.timeStarted, Instant.now()), "m'm' s's' 'ago'"))
+                    .text(
+                        this.overlayNotification.isCountDown() && !this.overlayNotification.isSticky() ?
+                        formatDuration(ChronoUnit.MILLIS.between(Instant.now(), this.timeStarted.plusSeconds(this.overlayNotification.getTimeToLive() + 1)), "m'm' s's' 'to go'") :
+                        formatDuration(ChronoUnit.MILLIS.between(this.timeStarted, Instant.now()), "m'm' s's' 'ago'")
+                    )
                     .color(this.overlayNotification.getTextColor())
                     .preferredSize(this.getPreferredSize())
                     .build());
@@ -6087,8 +6274,8 @@ public class PlayerChatAlertPanel extends AlertPanel<PlayerChatAlert> {
                 this.alert.setPattern(selected);
                 this.rebuild();
             }, this.alert::getPlayerChatType))
-            .addCheckbox("Prepend Sender", "Prepend the sender's name to the message in the form of '{name}: {message}'", this.alert.isPrependSender(), this.alert::setPrependSender)
             .addSelect("Chat Type", "The type of message", PlayerChatType.class, this.alert.getPlayerChatType(), this.alert::setPlayerChatType)
+            .addCheckbox("Prepend Sender", "Prepend the sender's name to the message in the form of '{name}: {message}'. Affects pattern matching", this.alert.isPrependSender(), this.alert::setPrependSender)
             .addNotifications();
     }
 }
@@ -6174,6 +6361,7 @@ import com.adamk33n3r.runelite.watchdog.alerts.SpawnedAlert;
 import com.adamk33n3r.runelite.watchdog.ui.ComparableNumber;
 import com.adamk33n3r.runelite.watchdog.ui.panels.AlertPanel;
 import com.adamk33n3r.runelite.watchdog.ui.panels.PanelUtils;
+import net.runelite.client.plugins.grounditems.config.OwnershipFilterMode;
 
 public class SpawnedAlertPanel extends AlertPanel<SpawnedAlert> {
     public SpawnedAlertPanel(WatchdogPanel watchdogPanel, SpawnedAlert alert) {
@@ -6184,7 +6372,13 @@ public class SpawnedAlertPanel extends AlertPanel<SpawnedAlert> {
     protected void build() {
         this.addAlertDefaults()
             .addSelect("Spawned/Despawned", "Spawned or Despawned", SpawnedAlert.SpawnedDespawned.class, this.alert.getSpawnedDespawned(), this.alert::setSpawnedDespawned)
-            .addSelect("Type", "The type of object to trigger on", SpawnedAlert.SpawnedType.class, this.alert.getSpawnedType(), this.alert::setSpawnedType)
+            .addSelect("Type", "The type of object to trigger on", SpawnedAlert.SpawnedType.class, this.alert.getSpawnedType(), val -> {
+                this.alert.setSpawnedType(val);
+                this.rebuild();
+            })
+            .addIf(panel ->
+                panel.addSelect("Ownership", "Filter items by ownership", OwnershipFilterMode.class, this.alert.getItemOwnershipFilterMode(), this.alert::setItemOwnershipFilterMode),
+                () -> this.alert.getSpawnedType() == SpawnedAlert.SpawnedType.ITEM)
             .addSubPanelControl(PanelUtils.createLabeledComponent(
                 "Distance Limit",
                 "Limit to a distance from the player. Use -1 for no limit. For objects which are larger than 1 tile, the location is the center most tile, rounded to the south-west",
@@ -6265,6 +6459,9 @@ public class ToolsPanel extends PluginPanel {
         tools.add(PanelUtils.createButton("Dismiss All Object Markers", "Dismiss All Object Markers", (btn, mods) -> {
             WatchdogPlugin.getInstance().getObjectMarkerManager().removeAllMarkers();
         }));
+        tools.add(PanelUtils.createButton("Reload All Alerts from Profile", "This will reload all alerts from disk", (btn, mods) -> {
+            WatchdogPlugin.getInstance().getAlertManager().loadAlerts();
+        }));
         this.add(tools);
     }
 }
@@ -6273,6 +6470,7 @@ package com.adamk33n3r.runelite.watchdog.ui.panels;
 
 import com.adamk33n3r.runelite.watchdog.*;
 import com.adamk33n3r.runelite.watchdog.alerts.Alert;
+import com.adamk33n3r.runelite.watchdog.alerts.RegexMatcher;
 import com.adamk33n3r.runelite.watchdog.ui.FlatTextArea;
 import com.adamk33n3r.runelite.watchdog.ui.FlatTextAreaNamespace;
 import com.adamk33n3r.runelite.watchdog.ui.Icons;
@@ -6299,9 +6497,12 @@ import java.awt.event.*;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.List;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 import java.util.stream.Collectors;
@@ -6464,7 +6665,11 @@ public class PanelUtils {
         flatTextArea.getTextArea().setToolTipText(secondTooltip);
         flatTextArea.getPrefixTextArea().setText(firstInitialValue);
         flatTextArea.getTextArea().setText(secondInitialValue);
+        ((AbstractDocument) flatTextArea.getPrefixTextArea().getDocument()).setDocumentFilter(new LengthLimitFilter(4096));
         ((AbstractDocument) flatTextArea.getDocument()).setDocumentFilter(new LengthLimitFilter(4096));
+        flatTextArea.getPrefixTextArea().getDocument().addDocumentListener((SimpleDocumentListener) ev -> {
+            onChange.accept(flatTextArea.getPrefixTextArea().getText(), flatTextArea.getTextArea().getText());
+        });
         flatTextArea.getDocument().addDocumentListener((SimpleDocumentListener) ev -> {
             onChange.accept(flatTextArea.getPrefixTextArea().getText(), flatTextArea.getTextArea().getText());
         });
@@ -6490,6 +6695,8 @@ public class PanelUtils {
                 onChange.accept(flatTextArea.getPrefixTextArea().getText(), flatTextArea.getTextArea().getText());
             }
         });
+        addPasteMenu(flatTextArea.getPrefixTextArea());
+        addPasteMenu(flatTextArea.getTextArea());
         return flatTextArea;
     }
 
@@ -6513,6 +6720,7 @@ public class PanelUtils {
             }
         });
         flatTextArea.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        addPasteMenu(flatTextArea.getTextArea());
         return flatTextArea;
     }
 
@@ -6537,6 +6745,7 @@ public class PanelUtils {
             }
         });
         textArea.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        addPasteMenu(textArea.getTextArea());
         return textArea;
     }
 
@@ -6687,6 +6896,77 @@ public class PanelUtils {
         addDropDownButton.setPreferredSize(new Dimension(40, addDropDownButton.getPreferredSize().height));
         addDropDownButton.setToolTipText("Create New Alert");
         return addDropDownButton;
+    }
+
+    public static void addPasteMenu(JTextArea textArea) {
+        JPopupMenu popupMenu = new JPopupMenu();
+        JMenuItem pasteItem = new JMenuItem("Paste (Ctrl+V)");
+        pasteItem.addActionListener(e -> textArea.paste());
+        popupMenu.add(pasteItem);
+        textArea.setComponentPopupMenu(popupMenu);
+    }
+
+    public static JPanel createInputGroupWithSuffix(JComponent mainComponent, JComponent suffix) {
+        return createInputGroup(mainComponent, null, Collections.singletonList(suffix));
+    }
+
+    public static JPanel createInputGroup(JComponent mainComponent, java.util.List<JComponent> prefixes, List<JComponent> suffixes) {
+        return new InputGroup(mainComponent)
+            .addPrefixes(prefixes)
+            .addSuffixes(suffixes);
+    }
+
+    public static JPanel createRegexMatcher(RegexMatcher regexMatcher, String placeholder, String tooltip) {
+        return createRegexMatcher(regexMatcher, placeholder, tooltip, null);
+    }
+
+    public static JPanel createRegexMatcher(RegexMatcher regexMatcher, String placeholder, String tooltip, JComponent suffixAppend) {
+        return createRegexMatcher(
+            regexMatcher::getPattern,
+            regexMatcher::setPattern,
+            regexMatcher::isRegexEnabled,
+            regexMatcher::setRegexEnabled,
+            placeholder,
+            tooltip,
+            suffixAppend
+        );
+    }
+
+    public static JPanel createRegexMatcher(
+        Supplier<String> pattern,
+        Consumer<String> savePattern,
+        Supplier<Boolean> regexEnabled,
+        Consumer<Boolean> saveRegexEnabled,
+        String placeholder,
+        String tooltip,
+        JComponent suffixAppend
+    ) {
+        JPanel btnGroup = new JPanel(new GridLayout(1, 0, 5, 5));
+        btnGroup.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        JButton regex = PanelUtils.createToggleActionButton(
+            Icons.REGEX_SELECTED,
+            Icons.REGEX_SELECTED_HOVER,
+            Icons.REGEX,
+            Icons.REGEX_HOVER,
+            "Disable regex",
+            "Enable regex",
+            regexEnabled.get(),
+            (btn, modifiers) -> {
+                saveRegexEnabled.accept(btn.isSelected());
+            }
+        );
+        btnGroup.add(regex);
+        if (suffixAppend != null) {
+            btnGroup.add(suffixAppend);
+        }
+        return createInputGroupWithSuffix(
+            createTextArea(placeholder, tooltip, pattern.get(), msg -> {
+                if (!isPatternValid(SwingUtilities.getWindowAncestor(btnGroup), msg, regexEnabled.get()))
+                    return;
+                savePattern.accept(msg);
+            }),
+            btnGroup
+        );
     }
 }
 
@@ -6897,18 +7177,18 @@ public class NotificationsPanel extends JPanel {
         });
         JButton addDropDownButton = DropDownButtonFactory.createDropDownButton(Icons.ADD, popupMenu);
         addDropDownButton.setPreferredSize(new Dimension(40, addDropDownButton.getPreferredSize().height));
-        addDropDownButton.setToolTipText("Create New Notification");
+        addDropDownButton.setToolTipText("Create New Action");
         JPanel headerPanel = new JPanel(new BorderLayout());
         JPanel leftPanel = new JPanel(new DynamicGridLayout(1, 0, 5, 5));
         headerPanel.add(leftPanel, BorderLayout.WEST);
-        leftPanel.add(new JLabel("Notifications"));
+        leftPanel.add(new JLabel("Actions"));
         JButton randomBtn = PanelUtils.createToggleActionButton(
             Icons.DICE_MULTIPLE,
             Icons.DICE_MULTIPLE_HOVER,
             Icons.DICE_MULTIPLE_OFF,
             Icons.DICE_MULTIPLE_OFF_HOVER,
-            "Fire all notifications in sequence",
-            "Fire a random notification",
+            "Fire all actions in sequence",
+            "Fire a random action",
             alert.isRandomNotifications(),
             (btn, mods) -> {
                 alert.setRandomNotifications(!alert.isRandomNotifications());
@@ -6938,6 +7218,8 @@ public class NotificationsPanel extends JPanel {
 
     private void addPanel(Notification notification) {
         PanelUtils.OnRemove removeNotification = (removedPanel) -> {
+            WatchdogPlugin.getInstance().getScreenMarkerUtil().finishCreation(true);
+            WatchdogPlugin.getInstance().getObjectMarkerManager().turnOffObjectMarkerMode();
             this.alert.getNotifications().remove(notification);
             this.notificationContainer.remove(removedPanel);
             this.notificationContainer.revalidate();
@@ -6985,6 +7267,8 @@ public class NotificationsPanel extends JPanel {
             notificationPanel = new PluginMessageNotificationPanel((PluginMessage) notification, this, this.alertManager::saveAlerts, removeNotification);
         else if (notification instanceof PluginToggle)
             notificationPanel = new PluginToggleNotificationPanel((PluginToggle) notification, this, this.pluginManager, this.alertManager::saveAlerts, removeNotification);
+        else if (notification instanceof AlertToggle)
+            notificationPanel = new AlertToggleNotificationPanel((AlertToggle) notification, this, this.alertManager::saveAlerts, removeNotification);
 
         if (notificationPanel != null)
             this.notificationContainer.add(notificationPanel);
@@ -7013,7 +7297,6 @@ import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.DynamicGridLayout;
 import net.runelite.client.ui.components.DragAndDropReorderPane;
 
-import com.google.common.base.Splitter;
 import lombok.Getter;
 
 import javax.annotation.Nullable;
@@ -7031,7 +7314,6 @@ import java.util.stream.Collectors;
 
 public class AlertListPanel extends JPanel {
     private String filterText = "";
-    private static final Splitter SPLITTER = Splitter.on(" ").trimResults().omitEmptyStrings();
     private final List<AlertListItem> alertListItems = new ArrayList<>();
     private final DragAndDropReorderPane dragAndDropReorderPane = new DragAndDropReorderPane();
     @Getter
@@ -7126,6 +7408,7 @@ public class AlertListPanel extends JPanel {
                 .filter(AlertListItem::isSelected)
                 .forEach((ali) -> {
                     this.alertManager.removeAlert(ali.getAlert(), false);
+                    ali.getAlert().setParent(group);
                     group.getAlerts().add(ali.getAlert());
                 });
             WatchdogPlugin.getInstance().getPanel().openAlert(group);
@@ -7143,6 +7426,7 @@ public class AlertListPanel extends JPanel {
                     .filter(AlertListItem::isSelected)
                     .forEach((ali) -> {
                         this.alertManager.removeAlert(ali.getAlert(), false);
+                        ali.getAlert().setParent(alertGroupParent);
                         if (alertGroupParent == null) {
                             this.alertManager.addAlert(ali.getAlert(), false);
                         } else {
@@ -7150,6 +7434,13 @@ public class AlertListPanel extends JPanel {
                         }
                     });
                 WatchdogPlugin.getInstance().getPanel().getMuxer().popState();
+                if (alertGroupParent == null) {
+                    WatchdogPlugin.getInstance().getPanel().rebuild();
+                } else {
+                    // pop and reopen in order to rebuild the list
+                    WatchdogPlugin.getInstance().getPanel().getMuxer().popState();
+                    WatchdogPlugin.getInstance().getPanel().openAlert(alertGroupParent);
+                }
             })).setEnabled(this.selectMode);
         }
         multiSelectActions.add(PanelUtils.createActionButton(Icons.EXPORT, Icons.EXPORT_HOVER, "Export selected Alerts", (btn, modifiers) -> {
@@ -7858,16 +8149,31 @@ public abstract class AlertPanel<T extends Alert> extends PluginPanel {
     }
 
     public AlertPanel<T> addAlertDefaults() {
-        return this.addTextField("Enter the alert name...", "Name of Alert", this.alert.getName(), this.alert::setName)
-            .addSpinner(
-                "Debounce Time (ms)",
+        JSpinner spinner = PanelUtils.createSpinner(
+            this.alert.getDebounceTime(),
+            0,
+            8640000, // 6 hours - max time a player can be logged in
+            100,
+            val -> {
+                this.alert.setDebounceTime(val);
+                this.alertManager.saveAlerts();
+            }
+        );
+        JCheckBox checkbox = PanelUtils.createCheckbox("Reset", "Reset the debounce time every time this alert is triggered", this.alert.isDebounceResetTime(), val -> {
+            this.alert.setDebounceResetTime(val);
+            this.alertManager.saveAlerts();
+        });
+        JPanel sub = new JPanel(new BorderLayout(5, 5));
+        sub.add(spinner);
+        sub.add(checkbox, BorderLayout.EAST);
+        return this
+            .addTextField("Enter the alert name...", "Name of Alert", this.alert.getName(), this.alert::setName)
+            .addSubPanelControl(PanelUtils.createLabeledComponent(
+                "Debounce (ms)",
                 "How long to wait before allowing this alert to trigger again in milliseconds",
-                this.alert.getDebounceTime(),
-                this.alert::setDebounceTime,
-                0,
-                8640000, // 6 hours - max time a player can be logged in
-                100
-            );
+                sub
+            )
+        );
     }
 
     public AlertPanel<T> addIf(Consumer<AlertPanel<T>> panel, Supplier<Boolean> ifFunc) {
@@ -7902,33 +8208,9 @@ public abstract class AlertPanel<T extends Alert> extends PluginPanel {
         String tooltip,
         JComponent suffixAppend
     ) {
-        JPanel btnGroup = new JPanel(new GridLayout(1, 0, 5, 5));
-        JButton regex = PanelUtils.createToggleActionButton(
-            Icons.REGEX_SELECTED,
-            Icons.REGEX_SELECTED_HOVER,
-            Icons.REGEX,
-            Icons.REGEX_HOVER,
-            "Disable regex",
-            "Enable regex",
-            regexEnabled.get(),
-            (btn, modifiers) -> {
-                saveRegexEnabled.accept(btn.isSelected());
-                this.alertManager.saveAlerts();
-            }
-        );
-        btnGroup.add(regex);
-        if (suffixAppend != null) {
-            btnGroup.add(suffixAppend);
-        }
-        return this.addInputGroupWithSuffix(
-            PanelUtils.createTextArea(placeholder, tooltip, pattern.get(), msg -> {
-                if (!PanelUtils.isPatternValid(this, msg, regexEnabled.get()))
-                    return;
-                savePattern.accept(msg);
-                this.alertManager.saveAlerts();
-            }),
-            btnGroup
-        );
+        var regexMatcher = PanelUtils.createRegexMatcher(pattern, savePattern, regexEnabled, saveRegexEnabled, placeholder, tooltip, suffixAppend);
+        this.controlContainer.add(regexMatcher);
+        return this;
     }
 
     public AlertPanel<T> addNotifications() {
@@ -8072,19 +8354,18 @@ public class PlaceholderTextArea extends JTextArea {
 
 package com.adamk33n3r.runelite.watchdog.ui;
 
+import com.adamk33n3r.runelite.watchdog.FileNameMultiExtensionFilter;
+import com.adamk33n3r.runelite.watchdog.OverwriteCheckFileChooser;
 import com.adamk33n3r.runelite.watchdog.Util;
 import com.adamk33n3r.runelite.watchdog.WatchdogPlugin;
 import com.adamk33n3r.runelite.watchdog.alerts.Alert;
 import com.adamk33n3r.runelite.watchdog.ui.panels.PanelUtils;
-
-import net.runelite.client.config.RuneLiteConfig;
 
 import com.google.gson.Gson;
 import lombok.extern.slf4j.Slf4j;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
-import javax.swing.filechooser.FileNameExtensionFilter;
 import java.awt.BorderLayout;
 import java.awt.Component;
 import java.awt.GridLayout;
@@ -8092,12 +8373,13 @@ import java.awt.Toolkit;
 import java.awt.datatransfer.Clipboard;
 import java.awt.datatransfer.StringSelection;
 import java.awt.event.ActionListener;
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
+import java.io.*;
+import java.util.Base64;
 import java.util.List;
 import java.util.function.BiFunction;
 import java.util.function.Function;
+import java.util.stream.Collectors;
+import java.util.zip.GZIPInputStream;
 
 @Slf4j
 public class ImportExportDialog extends JDialog {
@@ -8110,13 +8392,48 @@ public class ImportExportDialog extends JDialog {
         this.setUndecorated(true);
         Util.syncAlwaysOnTop(this);
 
+        JTextArea textArea = new JTextArea();
+
         JPanel wrapper = this.createWrapper();
         this.add(wrapper);
 
-        wrapper.add(new JLabel("Paste the Alert JSON here"), BorderLayout.NORTH);
+        JPanel top = new JPanel(new BorderLayout());
+        wrapper.add(top, BorderLayout.NORTH);
+        top.add(new JLabel("Paste the Alert here"), BorderLayout.WEST);
+        JButton openFile = new JButton("Open File");
+        openFile.addActionListener((ev) -> {
+            JFileChooser fileChooser = new JFileChooser();
+            fileChooser.setFileFilter(new FileNameMultiExtensionFilter("JSON Files (*.json,*.json.gz)", "json", "json.gz"));
+            int userSelection = fileChooser.showOpenDialog(this);
+            if (userSelection == JFileChooser.APPROVE_OPTION) {
+                File fileToOpen = fileChooser.getSelectedFile();
+                try {
+                    if (fileToOpen.getName().endsWith(".gz")) {
+                        try (var in = new GZIPInputStream(new FileInputStream(fileToOpen))) {
+                            BufferedReader bufferedReader = new BufferedReader(new InputStreamReader(in));
+                            StringBuilder stringBuilder = new StringBuilder();
+                            String line;
+                            while ((line = bufferedReader.readLine()) != null) {
+                                stringBuilder.append(line);
+                            }
+                            textArea.setText(stringBuilder.toString());
+                        }
+                    } else {
+                        try (var fr = new FileReader(fileToOpen); var reader = new BufferedReader(fr)) {
+                            textArea.setText(reader.lines().collect(Collectors.joining("\n")));
+                        }
+                    }
+                } catch (IOException e) {
+                    log.error("Error reading file", e);
+                    JOptionPane.showMessageDialog(this, "There was an error reading the file", "Error reading file", JOptionPane.ERROR_MESSAGE);
+                }
+            }
+        });
+        top.add(openFile, BorderLayout.EAST);
 
-        JTextArea textArea = new JTextArea();
         textArea.setLineWrap(true);
+        PanelUtils.addPasteMenu(textArea);
+
         JScrollPane scrollPane = new JScrollPane(textArea);
         wrapper.add(scrollPane, BorderLayout.CENTER);
 
@@ -8126,12 +8443,17 @@ public class ImportExportDialog extends JDialog {
                 return;
             }
             String json = textArea.getText();
+
+            if (Util.isCompressed(json)) {
+                json = Util.decompressAlerts(json);
+            }
+
             try {
                 if (onImport.apply(json, append)) {
                     this.setVisible(false);
                 }
             } catch (Exception ex) {
-                log.error("Error parsing json: " + ex);
+                log.error("Error parsing json", ex);
                 JOptionPane.showMessageDialog(this, "There was an error parsing the alert json", "Error parsing JSON", JOptionPane.ERROR_MESSAGE);
             }
         };
@@ -8147,6 +8469,7 @@ public class ImportExportDialog extends JDialog {
         });
         btnGroup.add(closeBtn);
         wrapper.add(btnGroup, BorderLayout.SOUTH);
+        SwingUtilities.invokeLater(textArea::requestFocusInWindow);
     }
 
     // Export
@@ -8154,23 +8477,24 @@ public class ImportExportDialog extends JDialog {
         Gson gson = WatchdogPlugin.getInstance().getAlertManager().getGson();
         String json = gson.toJson(alert);
         String pretty = gson.newBuilder().setPrettyPrinting().create().toJson(alert);
-        this.show(parent, json, pretty);
+        this.showExport(parent, json, pretty);
     }
 
     public ImportExportDialog(Component parent, List<Alert> alerts) {
         Gson gson = WatchdogPlugin.getInstance().getAlertManager().getGson();
         String json = gson.toJson(alerts);
         String pretty = gson.newBuilder().setPrettyPrinting().create().toJson(alerts);
-        this.show(parent, json, pretty);
+        this.showExport(parent, json, pretty);
     }
 
-    public void show(Component parent, String exportString, String prettyExportString) {
+    private void showExport(Component parent, String exportString, String prettyExportString) {
         this.setTitle("Export");
         this.setSize(500, 250);
         this.setLocationRelativeTo(parent);
         this.setModal(true);
         this.setUndecorated(true);
         Util.syncAlwaysOnTop(this);
+        var compressedExportString = Util.compressAlerts(exportString);
 
         JTextArea textArea = new JTextArea(exportString);
         textArea.setLineWrap(true);
@@ -8180,44 +8504,56 @@ public class ImportExportDialog extends JDialog {
         JPanel wrapper = this.createWrapper();
         this.add(wrapper);
         JPanel top = new JPanel(new BorderLayout());
-        top.add(new JLabel("Exported Alert JSON"), BorderLayout.WEST);
+        top.add(new JLabel("Exported Alert"), BorderLayout.WEST);
         JCheckBox prettyPrint = PanelUtils.createCheckbox("Pretty Print", "Pretty Print", false, (selected) -> {
             textArea.setText(selected ? prettyExportString : exportString);
             textArea.setCaretPosition(0);
             textArea.requestFocusInWindow();
         });
-        top.add(prettyPrint, BorderLayout.EAST);
+        JCheckBox compress = PanelUtils.createCheckbox("Compress", "Compress with GZIP", false, (selected) -> {
+            prettyPrint.setEnabled(!selected);
+            textArea.setText(selected ? compressedExportString : (prettyPrint.isSelected() ? prettyExportString : exportString));
+            textArea.setCaretPosition(0);
+            textArea.requestFocusInWindow();
+        });
+        var checkboxes = new JPanel(new GridLayout(1, 2, 3, 3));
+        checkboxes.add(compress);
+        checkboxes.add(prettyPrint);
+        top.add(checkboxes, BorderLayout.EAST);
         wrapper.add(top, BorderLayout.NORTH);
         JPanel btnGroup = new JPanel(new GridLayout(1, 2, 25, 0));
         JButton copyBtn = new JButton("Copy to Clipboard");
         copyBtn.addActionListener(ev -> {
             Clipboard clipboard = Toolkit.getDefaultToolkit().getSystemClipboard();
-            clipboard.setContents(new StringSelection(prettyPrint.isSelected() ? prettyExportString : exportString), null);
+            clipboard.setContents(new StringSelection(textArea.getText()), null);
             this.setVisible(false);
         });
         btnGroup.add(copyBtn);
         JButton saveToFileBtn = new JButton("Save to File");
         saveToFileBtn.addActionListener(ev -> {
-            JFileChooser fileChooser = new JFileChooser();
-            fileChooser.setFileFilter(new FileNameExtensionFilter("JSON Files (*.json)", "json"));
+            JFileChooser fileChooser = compress.isSelected()
+                ? new OverwriteCheckFileChooser("Compressed JSON Files (*.json.gz)", "json.gz")
+                : new OverwriteCheckFileChooser("JSON Files (*.json)", "json");
             int userSelection = fileChooser.showSaveDialog(this);
             if (userSelection == JFileChooser.APPROVE_OPTION) {
                 File fileToSave = fileChooser.getSelectedFile();
 
-                if (!fileToSave.getName().contains(".")) {
-                    fileToSave = new File(fileToSave.getAbsolutePath() + ".json");
-                }
-
                 try {
-                    try (FileWriter fileWriter = new FileWriter(fileToSave)) {
-                        fileWriter.write(prettyPrint.isSelected() ? prettyExportString : exportString);
+                    if (compress.isSelected()) {
+                        try (FileOutputStream fileOutputStream = new FileOutputStream(fileToSave)) {
+                            fileOutputStream.write(Base64.getDecoder().decode(compressedExportString));
+                        }
+                    } else {
+                        try (FileWriter fileWriter = new FileWriter(fileToSave)) {
+                            fileWriter.write(prettyPrint.isSelected() ? prettyExportString : exportString);
+                        }
                     }
                 } catch (IOException e) {
                     log.error("Error writing file", e);
                     JOptionPane.showMessageDialog(this, "There was an error saving the file", "Error saving file", JOptionPane.ERROR_MESSAGE);
                 }
+                this.setVisible(false);
             }
-            this.setVisible(false);
         });
         btnGroup.add(saveToFileBtn);
         JButton closeBtn = new JButton("Close");
@@ -9967,15 +10303,23 @@ public class OverlayNotificationPanel extends MessageNotificationPanel {
         displayTime.setEnabled(!notification.isSticky());
         this.displayTime = PanelUtils.createIconComponent(Icons.CLOCK, "Time to display in seconds", displayTime);
 
-        var stickyCheckbox = PanelUtils.createCheckbox("Sticky", "Set the notification to not expire", notification.isSticky(), val -> {
-            notification.setSticky(val);
-            displayTime.setEnabled(!val);
+        var countDownCheckbox = PanelUtils.createCheckbox("Countdown", "Count down to 0 instead of up to time", notification.isCountDown(), val -> {
+            notification.setCountDown(val);
             this.revalidate();
             onChangeListener.run();
         });
 
         sub.add(this.displayTime);
-        sub.add(stickyCheckbox, BorderLayout.EAST);
+        sub.add(countDownCheckbox, BorderLayout.EAST);
+
+        var stickyCheckbox = PanelUtils.createCheckbox("Sticky", "Set the notification to not expire", notification.isSticky(), val -> {
+            notification.setSticky(val);
+            displayTime.setEnabled(!val);
+            countDownCheckbox.setEnabled(!val);
+            this.revalidate();
+            onChangeListener.run();
+        });
+        this.settings.add(stickyCheckbox);
 
         this.stickyId = PanelUtils.createTextField(
             "ID for Dismiss Overlay...",
@@ -9988,6 +10332,44 @@ public class OverlayNotificationPanel extends MessageNotificationPanel {
         );
 
         this.settings.add(this.stickyId);
+    }
+}
+
+package com.adamk33n3r.runelite.watchdog.ui.notifications.panels;
+
+import com.adamk33n3r.runelite.watchdog.notifications.AlertToggle;
+import com.adamk33n3r.runelite.watchdog.ui.panels.NotificationsPanel;
+import com.adamk33n3r.runelite.watchdog.ui.panels.PanelUtils;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.ui.ColorScheme;
+
+import javax.swing.*;
+import java.awt.*;
+
+@Slf4j
+public class AlertToggleNotificationPanel extends NotificationPanel {
+    public AlertToggleNotificationPanel(AlertToggle notification, NotificationsPanel parentPanel, Runnable onChangeListener, PanelUtils.OnRemove onRemove) {
+        super(notification, parentPanel, onChangeListener, onRemove);
+
+        this.rebuild();
+    }
+
+    private void rebuild() {
+        this.settings.removeAll();
+
+        AlertToggle notification = (AlertToggle) this.notification;
+
+        JComboBox<AlertToggle.ToggleMode> modeSelect = PanelUtils.createSelect(AlertToggle.ToggleMode.values(), notification.getMode(), (selected) -> {
+            notification.setMode(selected);
+            onChangeListener.run();
+            this.rebuild();
+        });
+        JPanel mode = PanelUtils.createLabeledComponent("Mode", "The toggle mode", modeSelect);
+        mode.setBorder(null);
+        mode.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        this.settings.add(mode);
+
+        this.settings.add(PanelUtils.createRegexMatcher(notification, "Enter alert name pattern", "The pattern to match against the alert name"));
     }
 }
 
@@ -10142,7 +10524,7 @@ public class PluginToggleNotificationPanel extends NotificationPanel {
             onChangeListener.run();
             this.rebuild();
         });
-        JPanel mode = PanelUtils.createLabeledComponent("Mode", "The toggle mode plugin", modeSelect);
+        JPanel mode = PanelUtils.createLabeledComponent("Mode", "The toggle mode", modeSelect);
         mode.setBorder(null);
         mode.setBackground(ColorScheme.DARKER_GRAY_COLOR);
         this.settings.add(mode);
@@ -10294,12 +10676,11 @@ public class ScreenMarkerNotificationPanel extends NotificationPanel {
                 this.setMarkerButton.setToolTipText("Set Marker");
                 // Start
             } else {
+                // Call this first so that it can get the location and size before we delete it
+                screenMarkerUtil.startCreation(notification);
                 if (this.screenMarkerOverlay != null) {
                     screenMarkerUtil.deleteMarker(this.screenMarkerOverlay);
                 }
-                screenMarkerUtil.setMouseListenerEnabled(true);
-                screenMarkerUtil.setCreatingScreenMarker(true);
-                screenMarkerUtil.setCurrentMarker(notification);
                 this.setMarkerButton.setText("Finish");
                 this.setMarkerButton.setToolTipText("Finish");
             }
@@ -11311,6 +11692,7 @@ import com.adamk33n3r.runelite.watchdog.notifications.ScreenMarker;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.input.MouseManager;
 import net.runelite.client.ui.components.colorpicker.ColorPickerManager;
+import net.runelite.client.ui.overlay.Overlay;
 import net.runelite.client.ui.overlay.OverlayManager;
 
 import com.google.gson.Gson;
@@ -11385,6 +11767,28 @@ public class ScreenMarkerUtil {
         } else {
             this.mouseManager.unregisterMouseListener(this.mouseListener);
         }
+    }
+
+    public void startCreation(ScreenMarker screenMarker) {
+        setMouseListenerEnabled(true);
+        setCreatingScreenMarker(true);
+        setCurrentMarker(screenMarker);
+//        startLocation = location;
+        var tmpOverlay = new ScreenMarkerOverlay(screenMarker);
+        var size = loadOverlaySize(tmpOverlay);
+        var location = loadOverlayLocation(tmpOverlay);
+        overlay.setPreferredLocation(location);
+        overlay.setPreferredSize(size);
+    }
+
+    private Point loadOverlayLocation(Overlay overlay) {
+        String key = overlay.getName() + "_preferredLocation";
+        return this.configManager.getConfiguration("runelite", key, Point.class);
+    }
+
+    private Dimension loadOverlaySize(Overlay overlay) {
+        String key = overlay.getName() + "_preferredSize";
+        return this.configManager.getConfiguration("runelite", key, Dimension.class);
     }
 
     public void startCreation(Point location)
@@ -11559,8 +11963,10 @@ class ScreenMarkerRenderable implements RenderableEntity
         int height = size.height;
 
         //draw the fill
-        graphics.setColor(fill);
-        graphics.fillRect(thickness, thickness, width - thickness * 2, height - thickness * 2);
+        if (fill != null) {
+            graphics.setColor(fill);
+            graphics.fillRect(thickness, thickness, width - thickness * 2, height - thickness * 2);
+        }
 
         //because the stroke is centered on the rectangle we draw, we need to translate where we draw the rectangle
         //this is to ensure that the rectangle we draw is our preferred size
@@ -11647,8 +12053,9 @@ public abstract class Icons {
     public static final ImageIcon IMPORT = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "mdi_import.png"));
     public static final ImageIcon IMPORT_HOVER = new ImageIcon(ImageUtil.alphaOffset(IMPORT.getImage(), -120));
     public static final ImageIcon DELETE = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "mdi_delete.png"));
-    public static final ImageIcon DELETE_HOVER = new ImageIcon(ImageUtil.luminanceOffset(DELETE.getImage(), -80));
+    public static final ImageIcon DELETE_HOVER = new ImageIcon(ImageUtil.luminanceOffset(DELETE.getImage(), -120));
     public static final ImageIcon DOWNLOAD = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "mdi_download.png"));
+    public static final ImageIcon DOWNLOAD_HOVER = new ImageIcon(ImageUtil.luminanceOffset(DOWNLOAD.getImage(), -120));
 
     public static final ImageIcon CLONE = new ImageIcon(ImageUtil.loadImageResource(Icons.class, "mdi_content-duplicate.png"));
     public static final ImageIcon CLONE_HOVER = new ImageIcon(ImageUtil.alphaOffset(CLONE.getImage(), -120));
@@ -12004,6 +12411,64 @@ public interface SimpleDocumentListener extends DocumentListener {
     @Override
     default void changedUpdate(DocumentEvent e) {
         update(e);
+    }
+}
+
+package com.adamk33n3r.runelite.watchdog;
+
+import lombok.Getter;
+
+import javax.swing.filechooser.FileFilter;
+import java.io.File;
+import java.util.Locale;
+
+/**
+ * Mostly copied from {@link javax.swing.filechooser.FileNameExtensionFilter} but uses endsWith instead of equals
+ * so that it can match a multi-part extension.
+ */
+public class FileNameMultiExtensionFilter extends FileFilter {
+    @Getter
+    private final String description;
+    private final String[] extensions;
+    private final String[] lowerCaseExtensions;
+
+    public FileNameMultiExtensionFilter(String description, String... extensions) {
+        if (extensions == null || extensions.length == 0) {
+            throw new IllegalArgumentException(
+                "Extensions must be non-null and not empty");
+        }
+        this.description = description;
+        this.extensions = new String[extensions.length];
+        this.lowerCaseExtensions = new String[extensions.length];
+        for (int i = 0; i < extensions.length; i++) {
+            if (extensions[i] == null || extensions[i].length() == 0) {
+                throw new IllegalArgumentException(
+                    "Each extension must be non-null and not empty");
+            }
+            this.extensions[i] = extensions[i];
+            lowerCaseExtensions[i] = extensions[i].toLowerCase(Locale.ENGLISH);
+        }
+    }
+
+    public boolean accept(File f) {
+        if (f != null) {
+            if (f.isDirectory()) {
+                return true;
+            }
+            // NOTE: we tested implementations using Maps, binary search
+            // on a sorted list and this implementation. All implementations
+            // provided roughly the same speed, most likely because of
+            // overhead associated with java.io.File. Therefor we've stuck
+            // with the simple lightweight approach.
+            String fileName = f.getName();
+            String desiredExtension = fileName.toLowerCase(Locale.ENGLISH);
+            for (String extension : lowerCaseExtensions) {
+                if (desiredExtension.endsWith(extension)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 }
 
@@ -12637,6 +13102,7 @@ public class Overlay extends MessageNotification {
     private Color textColor = DEFAULT_NOTIFICATION_TEXT_COLOR;
     private boolean sticky = false;
     private int timeToLive = 5;
+    private boolean countDown = false;
     private String imagePath;
     private String id;
     private boolean resizeImage = true;
@@ -12939,6 +13405,58 @@ public class Sound extends AudioNotification {
         super.setDefaults();
         this.setGain(this.watchdogConfig.defaultSoundVolume());
         this.setPath(this.watchdogConfig.defaultSoundPath());
+    }
+}
+
+package com.adamk33n3r.runelite.watchdog.notifications;
+
+import com.adamk33n3r.runelite.watchdog.AlertManager;
+import com.adamk33n3r.runelite.watchdog.Displayable;
+import com.adamk33n3r.runelite.watchdog.Util;
+import com.adamk33n3r.runelite.watchdog.alerts.RegexMatcher;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.NoArgsConstructor;
+import lombok.Setter;
+import lombok.experimental.Accessors;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Inject;
+
+@Slf4j
+@Getter
+@Setter
+@NoArgsConstructor
+@Accessors(chain = true)
+public class AlertToggle extends Notification implements RegexMatcher {
+    @Accessors(chain = false)
+    private String pattern;
+    @Accessors(chain = false)
+    private boolean regexEnabled = false;
+    private ToggleMode mode = ToggleMode.TOGGLE;
+
+    @Inject
+    private transient AlertManager alertManager;
+
+    @Override
+    protected void fireImpl(String[] triggerValues) {
+        this.alertManager.getAllAlerts()
+            .filter(alert -> Util.matchPattern(this, alert.getName()) != null)
+            .forEach(alert -> {
+                alert.setEnabled(this.mode == ToggleMode.ENABLE || (this.mode == ToggleMode.TOGGLE && !alert.isEnabled()));
+            });
+    }
+
+    @Getter
+    @AllArgsConstructor
+    public enum ToggleMode implements Displayable {
+        ENABLE("Enable", "Enable the alert"),
+        DISABLE("Disable", "Disable the alert"),
+        TOGGLE("Toggle", "Toggle the alert"),
+        ;
+
+        private final String name;
+        private final String tooltip;
     }
 }
 
