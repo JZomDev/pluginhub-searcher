@@ -1,3 +1,54 @@
+package com.translator;
+
+import com.google.gson.JsonArray;
+import okhttp3.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import java.util.HashSet;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Singleton
+class TranslatorAPI {
+	private static final Logger log = LoggerFactory.getLogger(TranslatorAPI.class);
+	/**
+	 * An HTTP Client to access the Google Translate API.
+	 */
+	@Inject
+	private OkHttpClient client;
+
+	/**
+	 * Send collected dialogues to the runelite-translator-api.
+	 *
+	 * @param arr array of dialogues
+	 */
+	void sendDialogues(HashSet<String> arr) throws Exception {
+		JsonArray body = new JsonArray();
+		for (String d : arr) {
+			body.add(d);
+		}
+
+		MediaType JSON = MediaType.parse("application/json; charset=utf-8");
+		RequestBody rb = RequestBody.create(JSON, body.toString());
+
+		Request req = new Request.Builder()
+			.header("Content-Type", "application/json")
+			.method("POST", rb)
+			.url("https://runelite-translator-api-production.up.railway.app/api/v1/dialogues")
+			.build();
+
+		Response response = client.newCall(req).execute();
+		if (response.code() != 200) {
+			response.close();
+			throw new Exception("failed to send dialogues, got status " + response.code());
+		}
+		response.close();
+	}
+}
+
+
+
 /*
  * Copyright (c) 2017, Aria <aria@ar1as.space>
  * All rights reserved.
@@ -41,13 +92,18 @@ import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.game.ItemManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import javax.inject.Inject;
 import java.io.*;
+import java.net.*;
 import java.util.Arrays;
 import java.util.HashMap;
-
-
+import java.util.HashSet;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 @PluginDescriptor(
         name = "Translator",
@@ -57,7 +113,8 @@ import java.util.HashMap;
 public class TranslatorPlugin extends Plugin
 {
 
-    @Inject
+	private static final Logger log = LoggerFactory.getLogger(TranslatorPlugin.class);
+	@Inject
     private TranslatorConfig config;
     @Inject
     private Client client;
@@ -65,20 +122,59 @@ public class TranslatorPlugin extends Plugin
     private ItemManager itemManager;
     @Provides
     TranslatorConfig provideConfig(ConfigManager configManager) {return configManager.getConfig(TranslatorConfig.class);}
+	@Inject
+	private TranslatorAPI api;
+	private ScheduledExecutorService executor;
 
     private HashMap<String, String> itemsMap;
     private HashMap<String, String> npcMap;
     private HashMap<String, String> objectMap;
     private HashMap<String, String> dialogueMap;
+    private final HashSet<String> dialoguesToSend = new HashSet<String>();
+    private Widget prevTickWidget;
     private Actor actor;
 
 
     @Override
-    protected void startUp() throws Exception
-    {
+    protected void startUp() throws Exception {
+		executor = Executors.newSingleThreadScheduledExecutor();
+
+		if (config.enableTextCapture()) {
+			executor.scheduleAtFixedRate(
+				this::collectGameTexts,
+				0,
+				5,
+				TimeUnit.MINUTES
+			);
+		}
+
         updateLanguage();
     }
 
+	@Override
+	protected void shutDown() {
+		executor.shutdownNow();
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event) {
+		if (event.getGroup().equals("translator")) {
+			updateLanguage();
+		}
+
+		if (event.getKey().equals("enableOSRSTextCollection")) {
+			if (config.enableTextCapture()) {
+				executor.scheduleAtFixedRate(
+					this::collectGameTexts,
+					0,
+					10,
+					TimeUnit.SECONDS
+				);
+			} else {
+				executor.shutdownNow();
+			}
+		}
+	}
 
     public HashMap<String, String> parseDialogue(String filepath) {
         HashMap<String, String> words = new HashMap<String, String>();
@@ -93,7 +189,6 @@ public class TranslatorPlugin extends Plugin
             }
             return words;
         } catch (IOException e) {
-            // System.out.println("An error occurred.");
             e.printStackTrace();
             return null;
         }
@@ -112,20 +207,9 @@ public class TranslatorPlugin extends Plugin
             }
             return words;
         } catch (IOException e) {
-            // System.out.println("An error occurred.");
             e.printStackTrace();
             return null;
         }
-    }
-
-    @Subscribe
-    public void onConfigChanged(ConfigChanged event)
-    {
-        if (!event.getGroup().equals("translator"))
-        {
-            return;
-        }
-        updateLanguage();
     }
 
     private void updateLanguage()
@@ -211,7 +295,6 @@ public class TranslatorPlugin extends Plugin
                 //amount after item
                 if (itemSubStrings.length > 1){
                     String amount = "("+itemSubStrings[itemSubStrings.length-1];
-                    // System.out.println(amount);
                     if (translated != null) {
                         menuEntry.setTarget(colour + translated + amount);
                     }
@@ -239,42 +322,97 @@ public class TranslatorPlugin extends Plugin
         if (actor != null)
         {
             checkWidgetDialogs();
-            //checkWidgetOptionDialogs(); messes with questhelper
+            checkWidgetOptionDialogs();
         }
     }
 
-    private void checkWidgetOptionDialogs()
-    {
-        Widget playerOptionsWidget = client.getWidget(ComponentID.DIALOG_OPTION_OPTIONS);
-        Widget[] optionWidgets = playerOptionsWidget.getChildren();
-        if (optionWidgets != null) {
-            for (Widget i : optionWidgets) {
-                String optionText = i.getText() != null ? i.getText().replace("<br>", " ") : null;
-                if (optionText != null && dialogueMap.get(optionText) != null) {
-                    i.setText(dialogueMap.get(optionText));
-                }
-            }
+	private void checkWidgetOptionDialogs() {
+		if (!config.translateWidgetsOptions()) {
+			return;
+		}
+
+		Widget playerOptionsWidget = client.getWidget(ComponentID.DIALOG_OPTION_OPTIONS);
+        if (playerOptionsWidget == null) {
+            return;
         }
-    }
+
+        Widget[] optionWidgets = playerOptionsWidget.getChildren();
+		if (optionWidgets == null) {
+			return;
+		}
+
+        boolean shouldSetDialogues = false;
+        if (prevTickWidget == null) {
+            shouldSetDialogues = true;
+        } else if (!prevTickWidget.toString().equals(playerOptionsWidget.toString())) {
+            shouldSetDialogues = true;
+        }
+        prevTickWidget = playerOptionsWidget;
+
+		for (Widget widget : optionWidgets) {
+            String optionText = widget.getText();
+            if (optionText == null) {
+                continue;
+            }
+			optionText = optionText.replace("<br>", " ");
+            if (shouldSetDialogues) {
+                dialoguesToSend.add(optionText);
+			}
+
+			if (dialogueMap.get(optionText) != null) {
+				widget.setText(dialogueMap.get(optionText));
+			}
+		}
+	}
 
     private void checkWidgetDialogs()
     {
-        Widget npcTextWidget = client.getWidget(ComponentID.DIALOG_NPC_TEXT);
-        String npcDialogText = (npcTextWidget != null) ? npcTextWidget.getText() : null;
-        Widget playerTextWidget = client.getWidget(ComponentID.DIALOG_PLAYER_TEXT);
-        String playerDialogText = (playerTextWidget != null) ? playerTextWidget.getText() : null;
-        String npcdialogue = npcDialogText != null ? npcDialogText.replace("<br>", " ") : null;
-        String playerdialogue = playerDialogText != null ? playerDialogText.replace("<br>", " ") : null;
-
-        if (npcdialogue!= null && dialogueMap.get(npcdialogue) != null) {
-            npcTextWidget.setText(dialogueMap.get(npcdialogue));
+        Widget widget;
+        if (client.getWidget(ComponentID.DIALOG_NPC_TEXT) != null) {
+            widget = client.getWidget(ComponentID.DIALOG_NPC_TEXT);
+        } else {
+            widget = client.getWidget(ComponentID.DIALOG_PLAYER_TEXT);
         }
-        if (playerdialogue!= null && dialogueMap.get(playerdialogue) != null) {
-            playerTextWidget.setText(dialogueMap.get(playerdialogue));
+
+        if (widget == null) {
+            return;
+        }
+
+        String text = widget.getText();
+        if (text == null) {
+            return;
+        }
+        text = text.replace("<br>", " ");
+
+        boolean shouldSetDialogues = false;
+        if (prevTickWidget == null) {
+            shouldSetDialogues = true;
+        } else if (!prevTickWidget.toString().equals(widget.toString())) {
+            shouldSetDialogues = true;
+        }
+        prevTickWidget = widget;
+		if (shouldSetDialogues) {
+			dialoguesToSend.add(text);
+		}
+        if (dialogueMap.get(text) != null) {
+            widget.setText(dialogueMap.get(text));
         }
     }
-}
 
+	private void collectGameTexts() {
+		try {
+			if (dialoguesToSend.isEmpty()) {
+				log.debug("no dialogues to send");
+			} else {
+				log.debug("sending dialogues: {}", dialoguesToSend);
+				api.sendDialogues(dialoguesToSend);
+				dialoguesToSend.clear();
+			}
+		} catch (Exception e) {
+			log.error("failed to send dialogues to backend", e);
+		}
+	}
+}
 /*
  * Copyright (c) 2018, Morgan Lewis <https://github.com/MESLewis>
  * All rights reserved.
@@ -308,21 +446,44 @@ import net.runelite.client.config.ConfigItem;
 @ConfigGroup("translator")
 public interface TranslatorConfig extends Config
 {
-    enum SelectLanguage{
-	Spanish,
-        Finnish
-    }
+	enum SelectLanguage{
+		Spanish,
+		Finnish
+	}
 
-    @ConfigItem(
-            keyName = "Select Language",
-            name = "Language",
-            description = "Select target language",
-            position = 1
-    )
-    default SelectLanguage selectLanguage()
-    {
-        return SelectLanguage.Spanish;
-    }
+	@ConfigItem(
+		keyName = "Select Language",
+		name = "Language",
+		description = "Select target language",
+		position = 1
+	)
+	default SelectLanguage selectLanguage() {
+		return SelectLanguage.Spanish;
+	}
+
+	@ConfigItem(
+		keyName = "enableOSRSTextCollection",
+		name = "Enable text capture",
+		description = "If enabled, OSRS game texts will be captured in order to improve and have a more complete translation system (dialogues, guides, npc names).\n"+
+			"We highly suggest to enable this option so you can contribute to the plugin.",
+		warning = "Enabling this feature submits your IP address to a 3rd-party server not controlled or verified by Runelite developers.",
+		position = 2
+	)
+	default boolean enableTextCapture() {
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "translateWidgetsOptions",
+		name = "Translate Dialogues Options",
+		description = "Translate dialogues options (messes with quest helper)",
+		position = 3
+	)
+	default boolean translateWidgetsOptions() {
+		return false;
+	}
+
+
 }
 
 package com.translator;
