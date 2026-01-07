@@ -1,0 +1,338 @@
+package com.bop;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.util.Text;
+
+import java.util.*;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Deprio Leave",
+	description = "Deprioritize the leave option when configured loot is on the ground"
+)
+public class DeprioLeavePlugin extends Plugin
+{
+	@Inject
+	private Client client;
+
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private DeprioLeaveConfig config;
+
+	private List<Pattern> deprioOptionPatterns = List.of();
+	private List<Pattern> deprioItemPatterns = List.of();
+
+	private final Map<WorldPoint, Map<Integer, Integer>> groundItems = new HashMap<>();
+
+	private List<Pattern> whitelistPatterns = List.of();
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		reloadWhitelist();
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged e)
+	{
+		if (e.getGameState() == GameState.LOADING)
+		{
+			groundItems.clear();
+		}
+	}
+
+
+	@Provides
+	DeprioLeaveConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(DeprioLeaveConfig.class);
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged e)
+	{
+		if (e.getGroup().equals("DeprioLeave"))
+			reloadWhitelist();
+	}
+
+
+	@Subscribe(priority = -1)
+	public void onPostMenuSort(PostMenuSort e)
+	{
+		if (!lootExists() || !client.getTopLevelWorldView().isInstance())
+			return;
+
+		MenuEntry[] entries = client.getMenuEntries();
+
+		List<MenuEntry> deprio = new ArrayList<>();
+		List<MenuEntry> rest = new ArrayList<>();
+
+		for (MenuEntry me : entries)
+		{
+			if (shouldDeprioritize(me))
+				deprio.add(me);
+			else
+				rest.add(me);
+		}
+
+		if (deprio.isEmpty())
+			return;
+
+		int anchor = findAnchor(rest);
+
+		rest.addAll(anchor, deprio);
+		client.setMenuEntries(rest.toArray(new MenuEntry[0]));
+	}
+
+	private int findAnchor(List<MenuEntry> entries)
+	{
+		// Object menus, place below "walk here"
+		for (int i = 0; i < entries.size(); i++)
+			if (entries.get(i).getType() == MenuAction.WALK)
+				return i;
+
+		// Inventory / widget menus, place below "use"
+		for (int i = 0; i < entries.size(); i++)
+			if ("use".equalsIgnoreCase(Text.removeTags(entries.get(i).getOption())))
+				return i;
+
+		// Fallback: push to bottom
+		return entries.size() - 1;
+	}
+
+	private boolean lootExists()
+	{
+		int threshold = config.lootValue();
+
+		for (Map<Integer, Integer> tile : groundItems.values())
+		{
+			for (var entry : tile.entrySet())
+			{
+				int id = entry.getKey();
+				int qty = entry.getValue();
+
+				if (isWhitelisted(id))
+					return true;
+
+				long value = (long) itemManager.getItemPrice(id) * qty;
+				if (value >= threshold)
+					return true;
+			}
+		}
+		return false;
+	}
+
+
+	@Subscribe
+	public void onItemSpawned(ItemSpawned e)
+	{
+		WorldPoint wp = e.getTile().getWorldLocation();
+		TileItem item = e.getItem();
+
+		groundItems
+				.computeIfAbsent(wp, k -> new HashMap<>())
+				.merge(item.getId(), item.getQuantity(), Integer::sum);
+		rebuildMenu();
+	}
+
+	@Subscribe
+	public void onItemDespawned(ItemDespawned e)
+	{
+		WorldPoint wp = e.getTile().getWorldLocation();
+		Map<Integer, Integer> tile = groundItems.get(wp);
+		if (tile == null)
+			return;
+
+		tile.remove(e.getItem().getId());
+
+		if (tile.isEmpty())
+			groundItems.remove(wp);
+
+		rebuildMenu();
+	}
+
+	@Subscribe
+	public void onItemQuantityChanged(ItemQuantityChanged e)
+	{
+		WorldPoint wp = e.getTile().getWorldLocation();
+		groundItems
+				.computeIfAbsent(wp, k -> new HashMap<>())
+				.put(e.getItem().getId(), e.getNewQuantity());
+
+		rebuildMenu();
+	}
+
+	private boolean shouldDeprioritize(MenuEntry e)
+	{
+		String opt = Text.removeTags(e.getOption()).toLowerCase();
+
+		// Only apply to:
+		//  - objects (doors)
+		//  - widgets (inventory / equipment / spells)
+		MenuAction menuAction = e.getType();
+		boolean eligible = menuAction == MenuAction.CC_OP || menuAction == MenuAction.CC_OP_LOW_PRIORITY ||
+						(menuAction.getId() >= MenuAction.GAME_OBJECT_FIRST_OPTION.getId()
+								&& menuAction.getId() <= MenuAction.GAME_OBJECT_FIFTH_OPTION.getId());
+
+		if (!eligible)
+			return false;
+
+		if (menuAction == MenuAction.CC_OP || menuAction == MenuAction.CC_OP_LOW_PRIORITY) {
+			for (Pattern p : deprioItemPatterns)
+				if (p.matcher(opt).matches())
+					return true;
+			return false;
+		}
+
+		else {
+			for (Pattern p : deprioOptionPatterns)
+				if (p.matcher(opt).matches()) return true;
+			return false;
+		}
+	}
+
+	private boolean isWidgetItemEntry(MenuEntry e)
+	{
+		MenuAction t = e.getType();
+		return t == MenuAction.CC_OP || t == MenuAction.CC_OP_LOW_PRIORITY;
+	}
+
+	private boolean isWhitelisted(int itemId)
+	{
+		String name = itemManager.getItemComposition(itemId).getName().toLowerCase();
+
+		for (Pattern p : whitelistPatterns)
+			if (p.matcher(name).matches())
+				return true;
+
+		return false;
+	}
+
+	private void rebuildMenu()
+	{
+		if (client.isMenuOpen())
+		{
+			client.setMenuEntries(client.getMenuEntries());
+		}
+	}
+
+	private void reloadWhitelist()
+	{
+		whitelistPatterns = Arrays.stream(config.whitelist().split(","))
+				.map(String::trim)
+				.filter(s -> !s.isEmpty())
+				.map(this::wildcardToRegex)
+				.map(Pattern::compile)
+				.collect(Collectors.toList());
+
+		// and menuoptions to deprio
+		deprioOptionPatterns = Arrays.stream(config.deprioOptions().split(","))
+				.map(String::trim)
+				.filter(s -> !s.isEmpty())
+				.map(String::toLowerCase)
+				.map(this::wildcardToRegex)
+				.map(Pattern::compile)
+				.collect(Collectors.toList());
+
+		// add widget options to deprio
+		deprioItemPatterns = Arrays.stream(config.deprioItems().split(","))
+				.map(String::trim)
+				.filter(s -> !s.isEmpty())
+				.map(String::toLowerCase)
+				.map(this::wildcardToRegex)
+				.map(Pattern::compile)
+				.collect(Collectors.toList());
+	}
+
+	private String wildcardToRegex(String s)
+	{
+		StringBuilder out = new StringBuilder("^");
+		for (char c : s.toLowerCase().toCharArray())
+		{
+			if (c == '*') out.append(".*");
+			else out.append(Pattern.quote(String.valueOf(c)));
+		}
+		out.append("$");
+		return out.toString();
+	}
+}
+
+package com.bop;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("DeprioLeave")
+public interface DeprioLeaveConfig extends Config
+{
+	@ConfigItem(
+			keyName = "lootValue",
+			name = "Value over",
+			description = "Deprio leave if item/stack value over x",
+			position = 0
+	)
+	default int lootValue() { return 10000000; }
+	@ConfigItem(
+			keyName = "whitelist",
+			name = "Whitelist",
+			description = "Comma seperated item whitelist",
+			position = 1
+	)
+	default String whitelist() { return "*(elite), *(hard), *(master), Twisted bow"; }
+	@ConfigItem(
+			keyName = "deprioOptions",
+			name = "Deprioritized object options",
+			description = "Comma separated list of menu options to deprioritize (supports * wildcards)",
+			position = 5
+	)
+	default String deprioOptions()
+	{
+		return "exit,leave,quick-exit,quick-leave";
+	}
+	@ConfigItem(
+			keyName= "deprioItems",
+			name = "Deprioritized widget options",
+			description = "Comma separated list of menu options to deprioritize (supports * wildcards). " +
+					"Works for inventory, equipment and spells",
+			position = 6
+	)
+	default String deprioItems()
+	{
+		return "break,nardah";
+	}
+}
+
+package com.bop;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class ExamplePluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(DeprioLeavePlugin.class);
+		RuneLite.main(args);
+	}
+}
