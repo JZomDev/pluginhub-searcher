@@ -463,8 +463,12 @@ import javax.inject.Inject;
 import javax.inject.Singleton;
 
 import com.customemoji.model.Emoji;
+import com.customemoji.service.EmojiStateManager;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.Menu;
+import net.runelite.api.MenuAction;
+import net.runelite.api.MenuEntry;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.IconID;
@@ -507,6 +511,11 @@ public class CustomEmojiTooltip extends Overlay
 
     @Inject
     private ClientThread clientThread;
+
+    @Inject
+    private EmojiStateManager emojiStateManager;
+
+    private static final String MENU_OPTION_EMOJI = "Emoji";
 
     // Tooltip state
     private String hoveredEmojiName = null;
@@ -594,6 +603,11 @@ public class CustomEmojiTooltip extends Overlay
 
     private void showTooltip()
     {
+        if (this.client.isMenuOpen())
+        {
+            return;
+        }
+
         if (hoveredEmojiName != null && !hoveredEmojiName.isEmpty() && config.showEmojiTooltips())
         {
             tooltipManager.add(new Tooltip(hoveredEmojiName));
@@ -708,6 +722,65 @@ public class CustomEmojiTooltip extends Overlay
             result.append(word.substring(1));
         }
         return result.toString();
+    }
+
+    public void onMenuOpened()
+    {
+        if (this.emojis == null || this.emojis.isEmpty())
+        {
+            return;
+        }
+
+        net.runelite.api.Point mouseCanvasPosition = this.client.getMouseCanvasPosition();
+        if (mouseCanvasPosition == null)
+        {
+            return;
+        }
+
+        Point mousePoint = new Point(mouseCanvasPosition.getX(), mouseCanvasPosition.getY());
+
+        Widget chatbox = this.client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
+        if (chatbox == null || chatbox.isHidden() || !this.isPointInWidget(chatbox, mousePoint))
+        {
+            return;
+        }
+
+        List<Widget> visibleWidgets = PluginUtils.getVisibleChatWidgets(chatbox);
+        String emojiName = this.checkWidgetsForEmoji(visibleWidgets, mousePoint);
+
+        boolean isCustomEmoji = emojiName != null && this.emojis.containsKey(emojiName.toLowerCase());
+        if (isCustomEmoji)
+        {
+            this.addContextMenuEntries(emojiName);
+        }
+    }
+
+    private void addContextMenuEntries(String emojiName)
+    {
+        boolean isEnabled = this.emojiStateManager.isEmojiEnabled(emojiName);
+        boolean isResizingEnabled = this.emojiStateManager.isResizingEnabled(emojiName);
+
+        MenuEntry parent = this.client.getMenu().createMenuEntry(-1)
+            .setOption(MENU_OPTION_EMOJI)
+            .setTarget("<col=ffff00>" + emojiName + "</col>")
+            .setType(MenuAction.RUNELITE);
+
+        Menu submenu = parent.createSubMenu();
+
+        String enableOption = isEnabled ? "Hide" : "Show";
+        submenu.createMenuEntry(0)
+            .setOption(enableOption)
+            .setType(MenuAction.RUNELITE)
+            .onClick(e -> this.emojiStateManager.setEmojiEnabled(emojiName, !isEnabled));
+
+        if (isEnabled)
+        {
+            String resizeOption = isResizingEnabled ? "Full Size" : "Scale Down";
+            submenu.createMenuEntry(0)
+                .setOption(resizeOption)
+                .setType(MenuAction.RUNELITE)
+                .onClick(e -> this.emojiStateManager.setEmojiResizing(emojiName, !isResizingEnabled));
+        }
     }
 }
 
@@ -908,7 +981,6 @@ public class ChatSpacingManager
             ? imageId -> PluginUtils.getEmojiDimension(modIcons, imageId)
             : null;
 
-        // Get the set of custom emoji image IDs to filter out icons from other plugins
         Set<Integer> customEmojiIds = Collections.emptySet();
         if (dynamicSpacing && this.emojiLookupSupplier != null)
         {
@@ -1744,6 +1816,11 @@ public class GitHubEmojiDownloader
 		}
 	}
 
+	public boolean hasDownloadedBefore()
+	{
+		return METADATA_FILE.exists();
+	}
+
 	private DownloadMetadata loadMetadata()
 	{
 		if (!METADATA_FILE.exists())
@@ -2100,6 +2177,7 @@ import com.customemoji.model.Emoji;
 import com.customemoji.model.Soundoji;
 import com.customemoji.model.StaticEmoji;
 import com.customemoji.io.GitHubEmojiDownloader;
+import com.customemoji.service.EmojiStateManager;
 import com.google.common.io.Resources;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
@@ -2127,12 +2205,12 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.UnaryOperator;
 import java.util.regex.Pattern;
 
 import javax.annotation.Nullable;
 import javax.imageio.ImageIO;
 import javax.inject.Inject;
-import javax.inject.Named;
 import javax.sound.sampled.LineUnavailableException;
 import javax.sound.sampled.UnsupportedAudioFileException;
 import javax.swing.SwingUtilities;
@@ -2142,10 +2220,12 @@ import lombok.NonNull;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
+import net.runelite.api.IterableHashTable;
 import net.runelite.api.MessageNode;
 import net.runelite.api.Player;
 import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.CommandExecuted;
+import net.runelite.api.events.MenuOpened;
 import net.runelite.api.events.OverheadTextChanged;
 import net.runelite.api.events.VarClientIntChanged;
 import net.runelite.api.events.VarClientStrChanged;
@@ -2199,6 +2279,7 @@ public class CustomEmojiPlugin extends Plugin
 	public static final float NOISE_FLOOR = -60f;
 
 	private static final Pattern WHITESPACE_REGEXP = Pattern.compile("[\\s\\u00A0]");
+	private static final String IMG_TAG_PREFIX = "<img=";
 
 	@Inject
 	private EventBus eventBus;
@@ -2244,6 +2325,9 @@ public class CustomEmojiPlugin extends Plugin
 
 	@Inject
 	private Provider<CustomEmojiPanel> panelProvider;
+
+	@Inject
+	private EmojiStateManager emojiStateManager;
 
 	@Inject
 	private ScheduledExecutorService executor;
@@ -2340,7 +2424,11 @@ public class CustomEmojiPlugin extends Plugin
 
 		this.githubDownloader = new GitHubEmojiDownloader(this.okHttpClient, this.gson, this.executor);
 
-		loadEmojis();
+		this.emojiStateManager.setOnEmojiEnabled(this::replaceEnabledEmojiInChat);
+		this.emojiStateManager.setOnEmojiDisabled(this::replaceDisabledEmojiInChat);
+		this.emojiStateManager.setOnEmojiResizingToggled(this::handleEmojiResizingToggled);
+
+		this.loadEmojisAsync(this::replaceAllTextWithEmojis);
 		loadSoundojis();
 
 		if (this.isGitHubDownloadConfigured())
@@ -2362,7 +2450,6 @@ public class CustomEmojiPlugin extends Plugin
 		// Set up animation overlays (they check config.enableAnimatedEmojis() during render)
 		this.setupAnimationOverlays();
 
-		// Set up chat spacing manager with emoji lookup for filtering
 		this.chatSpacingManager.setEmojiLookupSupplier(() ->
 			PluginUtils.buildEmojiLookup(() -> this.emojis, this.chatIconManager));
 
@@ -2391,6 +2478,8 @@ public class CustomEmojiPlugin extends Plugin
 	@Override
 	protected void shutDown() throws Exception
 	{
+		this.replaceAllEmojisWithText();
+
 		this.githubDownloader.shutdown();
 		shutdownFileWatcher();
 		emojis.clear();
@@ -2438,6 +2527,8 @@ public class CustomEmojiPlugin extends Plugin
 			}
 		} : null;
 
+		boolean hadPreviousDownload = this.githubDownloader.hasDownloadedBefore();
+
 		this.githubDownloader.downloadEmojis(this.config.githubRepoUrl(), onStarted, result ->
 		{
 			if (openPanelOnStart && !result.isSuccess())
@@ -2455,7 +2546,12 @@ public class CustomEmojiPlugin extends Plugin
 
 			if (result.hasChanges())
 			{
-				this.forceReloadChangedEmojis(result.getChangedEmojiNames());
+				List<String> changedNames = result.getChangedEmojiNames();
+				if (this.panel != null && hadPreviousDownload)
+				{
+					this.panel.setPendingRecentlyDownloaded(changedNames);
+				}
+				this.forceReloadChangedEmojis(changedNames);
 			}
 		});
 	}
@@ -2669,7 +2765,13 @@ public class CustomEmojiPlugin extends Plugin
 			case CustomEmojiConfig.KEY_MAX_IMAGE_HEIGHT:
 				scheduleReload(true);
 				break;
+			case CustomEmojiConfig.KEY_DISABLED_EMOJIS:
+				// Panel refresh handled at end of method
+				break;
 			case CustomEmojiConfig.KEY_RESIZING_DISABLED_EMOJIS:
+				this.animationManager.clearAllAnimations();
+				this.clientThread.invokeLater(this.chatSpacingManager::applyChatSpacing);
+				break;
 			case CustomEmojiConfig.KEY_ENABLE_ANIMATED_EMOJIS:
 				this.animationManager.clearAllAnimations();
 				break;
@@ -2719,7 +2821,7 @@ public class CustomEmojiPlugin extends Plugin
 	{
 		int index = event.getIndex();
 		String value = this.client.getVarcStrValue(index);
-		
+
 		boolean isNormalChatInput  = index == VarClientID.CHATINPUT;
 		boolean isPrivateChatInput = index == VarClientID.MESLAYERINPUT;
 
@@ -2729,6 +2831,12 @@ public class CustomEmojiPlugin extends Plugin
 		{
 			this.overlay.updateChatInput(value);
 		}
+	}
+
+	@Subscribe
+	public void onMenuOpened(MenuOpened event)
+	{
+		this.tooltip.onMenuOpened();
 	}
 
 	@Nullable
@@ -2748,7 +2856,7 @@ public class CustomEmojiPlugin extends Plugin
 			if (emoji != null && this.isEmojiEnabled(emoji.getText()))
 			{
 				messageWords[i] = messageWords[i].replace(trigger,
-						"<img=" + this.chatIconManager.chatIconIndex(emoji.getId()) + ">");
+						IMG_TAG_PREFIX + this.chatIconManager.chatIconIndex(emoji.getId()) + ">");
 				editedMessage = true;
 				log.debug("Replacing {} with emoji {}", trigger, emoji.getText());
 			}
@@ -2784,7 +2892,7 @@ public class CustomEmojiPlugin extends Plugin
 
 	boolean isEmojiEnabled(String emojiName)
 	{
-		return !PluginUtils.parseDisabledEmojis(this.config.disabledEmojis()).contains(emojiName);
+		return this.emojiStateManager.isEmojiEnabled(emojiName);
 	}
 
 	public void loadEmojis()
@@ -2841,7 +2949,7 @@ public class CustomEmojiPlugin extends Plugin
 
 				if (onComplete != null)
 				{
-					this.clientThread.invokeLater(onComplete);
+					this.clientThread.invokeLater(() -> this.clientThread.invokeLater(onComplete));
 				}
 			});
 		});
@@ -3103,10 +3211,19 @@ public class CustomEmojiPlugin extends Plugin
 
 	public void reloadSingleEmoji(String emojiName)
 	{
+		this.reloadSingleEmoji(emojiName, null);
+	}
+
+	public void reloadSingleEmoji(String emojiName, Runnable onComplete)
+	{
 		Emoji emoji = this.emojis.get(emojiName);
 		if (emoji == null)
 		{
 			log.warn("Cannot reload emoji '{}' - not found", emojiName);
+			if (onComplete != null)
+			{
+				onComplete.run();
+			}
 			return;
 		}
 
@@ -3119,6 +3236,10 @@ public class CustomEmojiPlugin extends Plugin
 			if (!imageResult.isOk())
 			{
 				log.error("Failed to load image for emoji '{}'", emojiName, imageResult.unwrapError());
+				if (onComplete != null)
+				{
+					this.clientThread.invokeLater(onComplete);
+				}
 				return;
 			}
 
@@ -3135,11 +3256,20 @@ public class CustomEmojiPlugin extends Plugin
 					Emoji updatedEmoji = this.registerLoadedEmoji(loaded);
 					this.emojis.put(emojiName, updatedEmoji);
 					log.info("Reloaded emoji '{}' with resizing={}", emojiName, shouldResize);
+
+					if (onComplete != null)
+					{
+						onComplete.run();
+					}
 				});
 			}
 			catch (RuntimeException e)
 			{
 				log.error("Failed to reload emoji '{}'", emojiName, e);
+				if (onComplete != null)
+				{
+					this.clientThread.invokeLater(onComplete);
+				}
 			}
 		});
 	}
@@ -3150,8 +3280,128 @@ public class CustomEmojiPlugin extends Plugin
 	 */
 	private boolean shouldResizeEmoji(String emojiName)
 	{
-		Set<String> resizingDisabledEmojis = PluginUtils.parseResizingDisabledEmojis(this.config.resizingDisabledEmojis());
-		return !resizingDisabledEmojis.contains(emojiName);
+		return this.emojiStateManager.isResizingEnabled(emojiName);
+	}
+
+	private void replaceEnabledEmojiInChat(String emojiName)
+	{
+		this.replaceEmojiInChat(emojiName, true);
+	}
+
+	private void replaceDisabledEmojiInChat(String emojiName)
+	{
+		this.replaceEmojiInChat(emojiName, false);
+	}
+
+	private void replaceEmojiInChat(String emojiName, boolean showAsImage)
+	{
+		Emoji emoji = this.emojis.get(emojiName);
+		if (emoji == null)
+		{
+			return;
+		}
+
+		int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
+		String imageTag = IMG_TAG_PREFIX + imageId + ">";
+
+		this.clientThread.invokeLater(() ->
+		{
+			this.processAllChatMessages(value ->
+			{
+				if (showAsImage)
+				{
+					return this.replaceTextWithImage(value, emojiName, imageTag);
+				}
+				return value.replace(imageTag, emojiName);
+			});
+		});
+	}
+
+	private void replaceAllEmojisWithText()
+	{
+		this.processAllChatMessages(value ->
+		{
+			String updated = value;
+			for (Emoji emoji : this.emojis.values())
+			{
+				int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
+				String imageTag = IMG_TAG_PREFIX + imageId + ">";
+				updated = updated.replace(imageTag, emoji.getText());
+			}
+			return updated;
+		});
+	}
+
+	private void replaceAllTextWithEmojis()
+	{
+		this.processAllChatMessages(value ->
+		{
+			String updated = value;
+			for (Emoji emoji : this.emojis.values())
+			{
+				boolean isEnabled = this.emojiStateManager.isEmojiEnabled(emoji.getText());
+				if (!isEnabled)
+				{
+					continue;
+				}
+				int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
+				String imageTag = IMG_TAG_PREFIX + imageId + ">";
+				updated = this.replaceTextWithImage(updated, emoji.getText(), imageTag);
+			}
+			return updated;
+		});
+	}
+
+	private void processAllChatMessages(UnaryOperator<String> transformer)
+	{
+		log.debug("Processing all chat messages...");
+		IterableHashTable<MessageNode> messages = this.client.getMessages();
+		for (MessageNode messageNode : messages)
+		{
+			ChatMessageType type = messageNode.getType();
+			String value = messageNode.getValue();
+
+			boolean shouldProcess = shouldUpdateChatMessage(type) && value != null;
+			if (shouldProcess)
+			{
+				String updatedValue = transformer.apply(value);
+				if (!updatedValue.equals(value))
+				{
+					messageNode.setValue(updatedValue);
+				}
+			}
+		}
+		this.client.refreshChat();
+	}
+
+	private String replaceTextWithImage(String message, String emojiName, String imageTag)
+	{
+		String[] words = WHITESPACE_REGEXP.split(message);
+		boolean modified = false;
+
+		for (int i = 0; i < words.length; i++)
+		{
+			String trigger = Text.removeFormattingTags(words[i]);
+			boolean isMatch = trigger.equalsIgnoreCase(emojiName);
+			if (isMatch)
+			{
+				words[i] = words[i].replace(trigger, imageTag);
+				modified = true;
+			}
+		}
+
+		return modified ? String.join(" ", words) : message;
+	}
+
+	private void handleEmojiResizingToggled(String emojiName)
+	{
+		Emoji emoji = this.emojis.get(emojiName);
+		if (emoji instanceof AnimatedEmoji)
+		{
+			this.animationManager.invalidateAnimation(emoji.getId());
+		}
+
+		this.reloadSingleEmoji(emojiName, this.chatSpacingManager::applyChatSpacing);
 	}
 
 	public static Result<BufferedImage, Throwable> loadImage(final File file)
@@ -3232,6 +3482,16 @@ public class CustomEmojiPlugin extends Plugin
 	{
 		log.info("Reloading emojis and soundojis due to file changes");
 
+		// Replace all emoji images with text on the client thread, then continue reload
+		this.clientThread.invokeLater(() ->
+		{
+			this.replaceAllEmojisWithText();
+			this.continueReloadAfterTextReplacement(force, showStatus);
+		});
+	}
+
+	private void continueReloadAfterTextReplacement(boolean force, boolean showStatus)
+	{
 		// Store current emoji names for deletion detection
 		Set<String> currentEmojiNames = new HashSet<>(this.emojis.keySet());
 
@@ -3326,6 +3586,8 @@ public class CustomEmojiPlugin extends Plugin
 				{
 					SwingUtilities.invokeLater(() -> this.panel.refreshEmojiTree());
 				}
+
+				this.clientThread.invokeLater(this::replaceAllTextWithEmojis);
 			});
 		});
 	}
@@ -3392,20 +3654,6 @@ public class CustomEmojiPlugin extends Plugin
 	Map<String, Emoji> provideEmojis()
 	{
 		return this.emojis;
-	}
-
-	@Provides
-	@Named("disabledEmojis")
-	Set<String> provideDisabledEmojis()
-	{
-		return PluginUtils.parseDisabledEmojis(this.config.disabledEmojis());
-	}
-
-	@Provides
-	@Named("resizingDisabledEmojis")
-	Set<String> provideResizingDisabledEmojis()
-	{
-		return PluginUtils.parseResizingDisabledEmojis(this.config.resizingDisabledEmojis());
 	}
 
 	public void openConfiguration()
@@ -3979,6 +4227,241 @@ public interface CustomEmojiConfig extends Config
 	}
 }
 
+package com.customemoji.service;
+
+import com.customemoji.CustomEmojiConfig;
+import com.customemoji.PluginUtils;
+import net.runelite.client.config.ConfigManager;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.function.Consumer;
+
+@Singleton
+public class EmojiStateManager
+{
+	private final ConfigManager configManager;
+	private final CustomEmojiConfig config;
+	private final Object stateLock = new Object();
+
+	private Consumer<String> onEmojiEnabled;
+	private Consumer<String> onEmojiDisabled;
+	private Consumer<String> onEmojiResizingToggled;
+
+	@Inject
+	public EmojiStateManager(ConfigManager configManager, CustomEmojiConfig config)
+	{
+		this.configManager = configManager;
+		this.config = config;
+	}
+
+	public void setOnEmojiEnabled(Consumer<String> callback)
+	{
+		this.onEmojiEnabled = callback;
+	}
+
+	public void setOnEmojiDisabled(Consumer<String> callback)
+	{
+		this.onEmojiDisabled = callback;
+	}
+
+	public void setOnEmojiResizingToggled(Consumer<String> callback)
+	{
+		this.onEmojiResizingToggled = callback;
+	}
+
+	public boolean isEmojiEnabled(String emojiName)
+	{
+		synchronized (this.stateLock)
+		{
+			Set<String> disabled = PluginUtils.parseDisabledEmojis(this.config.disabledEmojis());
+			return !disabled.contains(emojiName);
+		}
+	}
+
+	public boolean isResizingEnabled(String emojiName)
+	{
+		synchronized (this.stateLock)
+		{
+			Set<String> resizingDisabled = PluginUtils.parseResizingDisabledEmojis(this.config.resizingDisabledEmojis());
+			return !resizingDisabled.contains(emojiName);
+		}
+	}
+
+	public Set<String> getDisabledEmojis()
+	{
+		synchronized (this.stateLock)
+		{
+			return new HashSet<>(PluginUtils.parseDisabledEmojis(this.config.disabledEmojis()));
+		}
+	}
+
+	public Set<String> getResizingDisabledEmojis()
+	{
+		synchronized (this.stateLock)
+		{
+			return new HashSet<>(PluginUtils.parseResizingDisabledEmojis(this.config.resizingDisabledEmojis()));
+		}
+	}
+
+	public void setEmojiEnabled(String emojiName, boolean enabled)
+	{
+		synchronized (this.stateLock)
+		{
+			Set<String> disabled = new HashSet<>(PluginUtils.parseDisabledEmojis(this.config.disabledEmojis()));
+
+			if (enabled)
+			{
+				disabled.remove(emojiName);
+			}
+			else
+			{
+				disabled.add(emojiName);
+			}
+
+			String serialized = String.join(",", disabled);
+			this.configManager.setConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, CustomEmojiConfig.KEY_DISABLED_EMOJIS, serialized);
+		}
+
+		if (enabled && this.onEmojiEnabled != null)
+		{
+			this.onEmojiEnabled.accept(emojiName);
+		}
+		else if (!enabled && this.onEmojiDisabled != null)
+		{
+			this.onEmojiDisabled.accept(emojiName);
+		}
+	}
+
+	public void setEmojiResizing(String emojiName, boolean resizingEnabled)
+	{
+		synchronized (this.stateLock)
+		{
+			Set<String> resizingDisabled = new HashSet<>(PluginUtils.parseResizingDisabledEmojis(this.config.resizingDisabledEmojis()));
+
+			if (resizingEnabled)
+			{
+				resizingDisabled.remove(emojiName);
+			}
+			else
+			{
+				resizingDisabled.add(emojiName);
+			}
+
+			String serialized = String.join(",", resizingDisabled);
+			this.configManager.setConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, CustomEmojiConfig.KEY_RESIZING_DISABLED_EMOJIS, serialized);
+		}
+
+		if (this.onEmojiResizingToggled != null)
+		{
+			this.onEmojiResizingToggled.accept(emojiName);
+		}
+	}
+
+	public void setMultipleEmojisEnabled(Set<String> emojiNames, boolean enabled)
+	{
+		if (emojiNames == null || emojiNames.isEmpty())
+		{
+			return;
+		}
+
+		Set<String> emojisToNotify = new HashSet<>();
+
+		synchronized (this.stateLock)
+		{
+			Set<String> disabled = new HashSet<>(PluginUtils.parseDisabledEmojis(this.config.disabledEmojis()));
+
+			for (String emojiName : emojiNames)
+			{
+				boolean wasDisabled = disabled.contains(emojiName);
+
+				if (enabled)
+				{
+					disabled.remove(emojiName);
+					if (wasDisabled)
+					{
+						emojisToNotify.add(emojiName);
+					}
+				}
+				else
+				{
+					disabled.add(emojiName);
+					if (!wasDisabled)
+					{
+						emojisToNotify.add(emojiName);
+					}
+				}
+			}
+
+			String serialized = String.join(",", disabled);
+			this.configManager.setConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, CustomEmojiConfig.KEY_DISABLED_EMOJIS, serialized);
+		}
+
+		if (enabled && this.onEmojiEnabled != null)
+		{
+			for (String emojiName : emojisToNotify)
+			{
+				this.onEmojiEnabled.accept(emojiName);
+			}
+		}
+		else if (!enabled && this.onEmojiDisabled != null)
+		{
+			for (String emojiName : emojisToNotify)
+			{
+				this.onEmojiDisabled.accept(emojiName);
+			}
+		}
+	}
+
+	public void setMultipleEmojisResizing(Set<String> emojiNames, boolean resizingEnabled)
+	{
+		if (emojiNames == null || emojiNames.isEmpty())
+		{
+			return;
+		}
+
+		Set<String> emojisToNotify = new HashSet<>();
+
+		synchronized (this.stateLock)
+		{
+			Set<String> resizingDisabled = new HashSet<>(PluginUtils.parseResizingDisabledEmojis(this.config.resizingDisabledEmojis()));
+
+			for (String emojiName : emojiNames)
+			{
+				boolean wasResizingEnabled = !resizingDisabled.contains(emojiName);
+				boolean stateChanged = wasResizingEnabled != resizingEnabled;
+
+				if (resizingEnabled)
+				{
+					resizingDisabled.remove(emojiName);
+				}
+				else
+				{
+					resizingDisabled.add(emojiName);
+				}
+
+				if (stateChanged)
+				{
+					emojisToNotify.add(emojiName);
+				}
+			}
+
+			String serialized = String.join(",", resizingDisabled);
+			this.configManager.setConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, CustomEmojiConfig.KEY_RESIZING_DISABLED_EMOJIS, serialized);
+		}
+
+		if (this.onEmojiResizingToggled != null)
+		{
+			for (String emojiName : emojisToNotify)
+			{
+				this.onEmojiResizingToggled.accept(emojiName);
+			}
+		}
+	}
+}
+
 package com.customemoji;
 
 import net.runelite.api.FontTypeFace;
@@ -4268,7 +4751,6 @@ public class EmojiPositionCalculator
 
         for (EmojiPosition position : positions)
         {
-            // The lion does not concern itself with emoji from other plugins
             boolean isCustomEmoji = customEmojiImageIds.contains(position.getImageId());
             if (!isCustomEmoji)
             {
@@ -4282,7 +4764,6 @@ public class EmojiPositionCalculator
             maxEmojiBottom = Math.max(maxEmojiBottom, emojiBottom);
         }
 
-        // No custom emojis found that affect spacing
         if (minEmojiTop == Integer.MAX_VALUE)
         {
             return new SpacingInfo(0, 0);
@@ -5110,6 +5591,7 @@ import java.util.List;
 public class NavigationController
 {
 	private static final String PATH_SEPARATOR = "/";
+	private static final int MAX_RECENTLY_DOWNLOADED_DISPLAY = 50;
 
 	private final JButton backButton;
 	private final JLabel pathLabel;
@@ -5117,6 +5599,8 @@ public class NavigationController
 
 	private List<String> currentPath = new ArrayList<>();
 	private String currentSearchFilter = "";
+	private List<String> recentlyDownloadedEmojis = new ArrayList<>();
+	private int totalRecentlyDownloadedCount = 0;
 
 	public NavigationController(JButton backButton, JLabel pathLabel, Runnable onNavigationChanged)
 	{
@@ -5134,6 +5618,15 @@ public class NavigationController
 
 	public void navigateBack()
 	{
+		if (!this.recentlyDownloadedEmojis.isEmpty())
+		{
+			this.recentlyDownloadedEmojis.clear();
+			this.totalRecentlyDownloadedCount = 0;
+			this.updateHeader();
+			this.onNavigationChanged.run();
+			return;
+		}
+
 		if (!this.currentPath.isEmpty())
 		{
 			this.currentPath.remove(this.currentPath.size() - 1);
@@ -5151,11 +5644,20 @@ public class NavigationController
 
 	public void updateHeader()
 	{
+		boolean isRecentlyDownloaded = !this.recentlyDownloadedEmojis.isEmpty();
 		boolean isSearching = !this.currentSearchFilter.isEmpty();
 		boolean isAtRoot = this.currentPath.isEmpty();
-		this.backButton.setEnabled(!isAtRoot && !isSearching);
+		this.backButton.setEnabled(isRecentlyDownloaded || (!isAtRoot && !isSearching));
 
-		if (isSearching)
+		if (isRecentlyDownloaded)
+		{
+			boolean hasMore = this.totalRecentlyDownloadedCount > MAX_RECENTLY_DOWNLOADED_DISPLAY;
+			String countText = hasMore
+				? MAX_RECENTLY_DOWNLOADED_DISPLAY + "+"
+				: String.valueOf(this.recentlyDownloadedEmojis.size());
+			this.pathLabel.setText("New Emoji (" + countText + ")");
+		}
+		else if (isSearching)
 		{
 			this.pathLabel.setText("Search results");
 		}
@@ -5183,6 +5685,11 @@ public class NavigationController
 	public void setSearchFilter(String filter)
 	{
 		this.currentSearchFilter = filter;
+		if (!filter.isEmpty())
+		{
+			this.recentlyDownloadedEmojis.clear();
+			this.totalRecentlyDownloadedCount = 0;
+		}
 		this.updateHeader();
 	}
 
@@ -5212,6 +5719,30 @@ public class NavigationController
 		{
 			this.currentPath.clear();
 		}
+	}
+
+	public void setRecentlyDownloadedEmojis(List<String> emojiNames)
+	{
+		this.totalRecentlyDownloadedCount = emojiNames.size();
+		if (emojiNames.size() > MAX_RECENTLY_DOWNLOADED_DISPLAY)
+		{
+			this.recentlyDownloadedEmojis = new ArrayList<>(emojiNames.subList(0, MAX_RECENTLY_DOWNLOADED_DISPLAY));
+		}
+		else
+		{
+			this.recentlyDownloadedEmojis = new ArrayList<>(emojiNames);
+		}
+		this.currentPath.clear();
+	}
+
+	public boolean isShowingRecentlyDownloaded()
+	{
+		return !this.recentlyDownloadedEmojis.isEmpty();
+	}
+
+	public List<String> getRecentlyDownloadedEmojis()
+	{
+		return new ArrayList<>(this.recentlyDownloadedEmojis);
 	}
 }
 
@@ -5514,18 +6045,17 @@ public class RowPanelBuilder
 
 package com.customemoji.panel.tree;
 
+import com.customemoji.service.EmojiStateManager;
+
 import javax.swing.JButton;
 import javax.swing.JPanel;
 import javax.swing.JScrollPane;
 import javax.swing.SwingUtilities;
 import java.awt.Component;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.function.Consumer;
 
 /**
  * Handles toggle operations for enabling/disabling emojis and resizing mode.
@@ -5536,34 +6066,24 @@ public class EmojiToggleHandler
 	public static final String MODE_ENABLE_DISABLE = "Enable/Disable";
 	public static final String MODE_RESIZING = "Resizing";
 
-	private final Set<String> disabledEmojis;
-	private final Set<String> resizingDisabledEmojis;
-	private final ScheduledExecutorService executor;
+	private final EmojiStateManager emojiStateManager;
 	private final Runnable onContentRefreshNeeded;
 	private final Runnable onFolderStatesUpdateNeeded;
 	private final JScrollPane scrollPane;
 	private final JPanel contentPanel;
-
-	private Consumer<Set<String>> onDisabledEmojisChanged;
-	private Consumer<Set<String>> onResizingDisabledEmojisChanged;
-	private Consumer<String> onEmojiResizingToggled;
 
 	private String currentMode = MODE_ENABLE_DISABLE;
 	private boolean isLoading = false;
 
 	private Map<String, List<EmojiTreeNode>> folderContents;
 
-	public EmojiToggleHandler(Set<String> disabledEmojis,
-							   Set<String> resizingDisabledEmojis,
-							   ScheduledExecutorService executor,
+	public EmojiToggleHandler(EmojiStateManager emojiStateManager,
 							   JScrollPane scrollPane,
 							   JPanel contentPanel,
 							   Runnable onContentRefreshNeeded,
 							   Runnable onFolderStatesUpdateNeeded)
 	{
-		this.disabledEmojis = disabledEmojis;
-		this.resizingDisabledEmojis = resizingDisabledEmojis;
-		this.executor = executor;
+		this.emojiStateManager = emojiStateManager;
 		this.scrollPane = scrollPane;
 		this.contentPanel = contentPanel;
 		this.onContentRefreshNeeded = onContentRefreshNeeded;
@@ -5573,21 +6093,6 @@ public class EmojiToggleHandler
 	public void setFolderContents(Map<String, List<EmojiTreeNode>> folderContents)
 	{
 		this.folderContents = folderContents;
-	}
-
-	public void setOnDisabledEmojisChanged(Consumer<Set<String>> callback)
-	{
-		this.onDisabledEmojisChanged = callback;
-	}
-
-	public void setOnResizingDisabledEmojisChanged(Consumer<Set<String>> callback)
-	{
-		this.onResizingDisabledEmojisChanged = callback;
-	}
-
-	public void setOnEmojiResizingToggled(Consumer<String> callback)
-	{
-		this.onEmojiResizingToggled = callback;
 	}
 
 	public String getCurrentMode()
@@ -5652,7 +6157,10 @@ public class EmojiToggleHandler
 		if (item.isFolder())
 		{
 			String targetPath = currentFolderPath.isEmpty() ? item.getName() : currentFolderPath + PATH_SEPARATOR + item.getName();
-			this.toggleFolderEmojisEnabled(targetPath, enabled);
+			Set<String> emojisToToggle = this.collectFolderEmojis(targetPath);
+			this.updateFolderEmojiNodes(targetPath, enabled);
+
+			this.emojiStateManager.setMultipleEmojisEnabled(emojisToToggle, enabled);
 
 			this.onFolderStatesUpdateNeeded.run();
 			int scrollPosition = this.scrollPane.getVerticalScrollBar().getValue();
@@ -5661,21 +6169,13 @@ public class EmojiToggleHandler
 		}
 		else
 		{
-			if (enabled)
-			{
-				this.disabledEmojis.remove(item.getName());
-			}
-			else
-			{
-				this.disabledEmojis.add(item.getName());
-			}
+			this.emojiStateManager.setEmojiEnabled(item.getName(), enabled);
+
 			this.onFolderStatesUpdateNeeded.run();
 			int scrollPosition = this.scrollPane.getVerticalScrollBar().getValue();
 			this.onContentRefreshNeeded.run();
 			SwingUtilities.invokeLater(() -> this.scrollPane.getVerticalScrollBar().setValue(scrollPosition));
 		}
-
-		this.notifyDisabledEmojisChanged();
 	}
 
 	private void handleResizingToggle(EmojiTreeNode item, boolean resizingEnabled, String currentFolderPath)
@@ -5703,27 +6203,13 @@ public class EmojiToggleHandler
 		int scrollPosition = this.scrollPane.getVerticalScrollBar().getValue();
 		this.disableAllButtons();
 
-		if (resizingEnabled)
-		{
-			this.resizingDisabledEmojis.remove(item.getName());
-		}
-		else
-		{
-			this.resizingDisabledEmojis.add(item.getName());
-		}
+		this.emojiStateManager.setEmojiResizing(item.getName(), resizingEnabled);
 
-		this.notifyResizingDisabledEmojisChanged();
-
-		this.executor.execute(() ->
+		SwingUtilities.invokeLater(() ->
 		{
-			this.notifyEmojiResizingToggled(item.getName());
-
-			SwingUtilities.invokeLater(() ->
-			{
-				this.isLoading = false;
-				this.onContentRefreshNeeded.run();
-				SwingUtilities.invokeLater(() -> this.scrollPane.getVerticalScrollBar().setValue(scrollPosition));
-			});
+			this.isLoading = false;
+			this.onContentRefreshNeeded.run();
+			SwingUtilities.invokeLater(() -> this.scrollPane.getVerticalScrollBar().setValue(scrollPosition));
 		});
 	}
 
@@ -5733,52 +6219,96 @@ public class EmojiToggleHandler
 		this.disableAllButtons();
 
 		String targetPath = currentFolderPath.isEmpty() ? item.getName() : currentFolderPath + PATH_SEPARATOR + item.getName();
-		List<String> emojisToReload = this.toggleFolderEmojisResizing(targetPath, resizingEnabled);
+		Set<String> emojisToToggle = this.collectEnabledFolderEmojis(targetPath);
+		this.updateFolderEmojiResizingNodes(targetPath, resizingEnabled);
 
-		this.notifyResizingDisabledEmojisChanged();
+		this.emojiStateManager.setMultipleEmojisResizing(emojisToToggle, resizingEnabled);
 
-		this.executor.execute(() ->
+		SwingUtilities.invokeLater(() ->
 		{
-			for (String emojiName : emojisToReload)
-			{
-				this.notifyEmojiResizingToggled(emojiName);
-			}
-
-			SwingUtilities.invokeLater(() ->
-			{
-				this.isLoading = false;
-				this.onFolderStatesUpdateNeeded.run();
-				this.onContentRefreshNeeded.run();
-				this.scrollPane.getVerticalScrollBar().setValue(scrollPosition);
-			});
+			this.isLoading = false;
+			this.onFolderStatesUpdateNeeded.run();
+			this.onContentRefreshNeeded.run();
+			this.scrollPane.getVerticalScrollBar().setValue(scrollPosition);
 		});
 	}
 
-	private void toggleFolderEmojisEnabled(String folderPath, boolean enabled)
+	private Set<String> collectFolderEmojis(String folderPath)
+	{
+		Set<String> emojis = new HashSet<>();
+		for (Map.Entry<String, List<EmojiTreeNode>> entry : this.folderContents.entrySet())
+		{
+			boolean isInFolder = this.isPathInFolder(entry.getKey(), folderPath);
+			if (isInFolder)
+			{
+				for (EmojiTreeNode item : entry.getValue())
+				{
+					if (!item.isFolder())
+					{
+						emojis.add(item.getName());
+					}
+				}
+			}
+		}
+		return emojis;
+	}
+
+	private Set<String> collectEnabledFolderEmojis(String folderPath)
+	{
+		Set<String> emojis = new HashSet<>();
+		for (Map.Entry<String, List<EmojiTreeNode>> entry : this.folderContents.entrySet())
+		{
+			boolean isInFolder = this.isPathInFolder(entry.getKey(), folderPath);
+			if (isInFolder)
+			{
+				for (EmojiTreeNode item : entry.getValue())
+				{
+					boolean isEnabledEmoji = !item.isFolder() && item.isEnabled();
+					if (isEnabledEmoji)
+					{
+						emojis.add(item.getName());
+					}
+				}
+			}
+		}
+		return emojis;
+	}
+
+	private void updateFolderEmojiNodes(String folderPath, boolean enabled)
 	{
 		for (Map.Entry<String, List<EmojiTreeNode>> entry : this.folderContents.entrySet())
 		{
 			boolean isInFolder = this.isPathInFolder(entry.getKey(), folderPath);
 			if (isInFolder)
 			{
-				this.toggleEmojisEnabledInList(entry.getValue(), enabled);
+				for (EmojiTreeNode item : entry.getValue())
+				{
+					if (!item.isFolder())
+					{
+						item.setEnabled(enabled);
+					}
+				}
 			}
 		}
 	}
 
-	private List<String> toggleFolderEmojisResizing(String folderPath, boolean resizingEnabled)
+	private void updateFolderEmojiResizingNodes(String folderPath, boolean resizingEnabled)
 	{
-		List<String> toggledEmojis = new ArrayList<>();
 		for (Map.Entry<String, List<EmojiTreeNode>> entry : this.folderContents.entrySet())
 		{
 			boolean isInFolder = this.isPathInFolder(entry.getKey(), folderPath);
 			if (isInFolder)
 			{
-				List<String> toggled = this.toggleEmojisResizingInList(entry.getValue(), resizingEnabled);
-				toggledEmojis.addAll(toggled);
+				for (EmojiTreeNode item : entry.getValue())
+				{
+					boolean isEnabledEmoji = !item.isFolder() && item.isEnabled();
+					if (isEnabledEmoji)
+					{
+						item.setResizingEnabled(resizingEnabled);
+					}
+				}
 			}
 		}
-		return toggledEmojis;
 	}
 
 	private boolean isPathInFolder(String path, String folderPath)
@@ -5786,82 +6316,6 @@ public class EmojiToggleHandler
 		boolean isExactMatch = path.equals(folderPath);
 		boolean isSubfolder = path.startsWith(folderPath + PATH_SEPARATOR);
 		return isExactMatch || isSubfolder;
-	}
-
-	private void toggleEmojisEnabledInList(List<EmojiTreeNode> items, boolean enabled)
-	{
-		for (EmojiTreeNode item : items)
-		{
-			if (!item.isFolder())
-			{
-				this.updateEmojiEnabledState(item, enabled);
-			}
-		}
-	}
-
-	private List<String> toggleEmojisResizingInList(List<EmojiTreeNode> items, boolean resizingEnabled)
-	{
-		List<String> toggledEmojis = new ArrayList<>();
-		for (EmojiTreeNode item : items)
-		{
-			boolean isEnabledEmoji = !item.isFolder() && item.isEnabled();
-			if (isEnabledEmoji)
-			{
-				this.updateEmojiResizingState(item, resizingEnabled);
-				toggledEmojis.add(item.getName());
-			}
-		}
-		return toggledEmojis;
-	}
-
-	private void updateEmojiEnabledState(EmojiTreeNode item, boolean enabled)
-	{
-		item.setEnabled(enabled);
-		if (enabled)
-		{
-			this.disabledEmojis.remove(item.getName());
-		}
-		else
-		{
-			this.disabledEmojis.add(item.getName());
-		}
-	}
-
-	private void updateEmojiResizingState(EmojiTreeNode item, boolean resizingEnabled)
-	{
-		item.setResizingEnabled(resizingEnabled);
-		if (resizingEnabled)
-		{
-			this.resizingDisabledEmojis.remove(item.getName());
-		}
-		else
-		{
-			this.resizingDisabledEmojis.add(item.getName());
-		}
-	}
-
-	private void notifyDisabledEmojisChanged()
-	{
-		if (this.onDisabledEmojisChanged != null)
-		{
-			this.onDisabledEmojisChanged.accept(new HashSet<>(this.disabledEmojis));
-		}
-	}
-
-	private void notifyResizingDisabledEmojisChanged()
-	{
-		if (this.onResizingDisabledEmojisChanged != null)
-		{
-			this.onResizingDisabledEmojisChanged.accept(new HashSet<>(this.resizingDisabledEmojis));
-		}
-	}
-
-	private void notifyEmojiResizingToggled(String emojiName)
-	{
-		if (this.onEmojiResizingToggled != null)
-		{
-			this.onEmojiResizingToggled.accept(emojiName);
-		}
 	}
 
 	private void disableAllButtons()
@@ -5888,7 +6342,6 @@ public class EmojiToggleHandler
 		}
 	}
 }
-
 
 package com.customemoji.panel.tree;
 
@@ -5990,10 +6443,10 @@ import com.customemoji.model.Emoji;
 import com.customemoji.panel.DownloadProgressPanel;
 import com.customemoji.panel.PanelConstants;
 import com.customemoji.panel.StatusMessagePanel;
+import com.customemoji.service.EmojiStateManager;
 import net.runelite.client.util.ImageUtil;
 
 import javax.inject.Inject;
-import javax.inject.Named;
 import java.util.function.Supplier;
 import javax.swing.BorderFactory;
 import javax.swing.Box;
@@ -6014,8 +6467,6 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.function.Consumer;
 
 /**
  * Panel containing an explorer-style emoji browser with folder navigation.
@@ -6023,7 +6474,7 @@ import java.util.function.Consumer;
 public class EmojiTreePanel extends JPanel
 {
 	private final Map<String, Emoji> emojis;
-	private final ScheduledExecutorService executor;
+	private final EmojiStateManager emojiStateManager;
 
 	private Set<String> disabledEmojis;
 	private Set<String> resizingDisabledEmojis;
@@ -6041,35 +6492,17 @@ public class EmojiTreePanel extends JPanel
 	private transient Map<String, List<EmojiTreeNode>> folderContents = new HashMap<>();
 
 	@Inject
-	public EmojiTreePanel(Map<String, Emoji> emojis,
-						  @Named("disabledEmojis") Set<String> disabledEmojis,
-						  @Named("resizingDisabledEmojis") Set<String> resizingDisabledEmojis,
-						  ScheduledExecutorService executor)
+	public EmojiTreePanel(Map<String, Emoji> emojis, EmojiStateManager emojiStateManager)
 	{
 		this.emojis = emojis;
-		this.executor = executor;
-		this.disabledEmojis = new HashSet<>(disabledEmojis);
-		this.resizingDisabledEmojis = new HashSet<>(resizingDisabledEmojis);
+		this.emojiStateManager = emojiStateManager;
+		this.disabledEmojis = this.emojiStateManager.getDisabledEmojis();
+		this.resizingDisabledEmojis = this.emojiStateManager.getResizingDisabledEmojis();
 
 		this.setLayout(new BorderLayout());
 		this.initializeComponents();
 		this.buildFolderStructure();
 		this.navigationController.navigateToFolder(new ArrayList<>());
-	}
-
-	public void setOnDisabledEmojisChanged(Consumer<Set<String>> callback)
-	{
-		this.toggleHandler.setOnDisabledEmojisChanged(callback);
-	}
-
-	public void setOnResizingDisabledEmojisChanged(Consumer<Set<String>> callback)
-	{
-		this.toggleHandler.setOnResizingDisabledEmojisChanged(callback);
-	}
-
-	public void setOnEmojiResizingToggled(Consumer<String> callback)
-	{
-		this.toggleHandler.setOnEmojiResizingToggled(callback);
 	}
 
 	public void setSearchFilter(String filter)
@@ -6122,9 +6555,7 @@ public class EmojiTreePanel extends JPanel
 		this.scrollPane.getViewport().setBackground(PanelConstants.CONTENT_BACKGROUND);
 
 		this.toggleHandler = new EmojiToggleHandler(
-			this.disabledEmojis,
-			this.resizingDisabledEmojis,
-			this.executor,
+			this.emojiStateManager,
 			this.scrollPane,
 			this.contentPanel,
 			this::updateContent,
@@ -6265,6 +6696,11 @@ public class EmojiTreePanel extends JPanel
 
 	private List<EmojiTreeNode> getItemsForCurrentView()
 	{
+		if (this.navigationController.isShowingRecentlyDownloaded())
+		{
+			return this.getRecentlyDownloadedItems();
+		}
+
 		if (this.navigationController.isSearching())
 		{
 			List<EmojiTreeNode> items = new ArrayList<>();
@@ -6286,6 +6722,27 @@ public class EmojiTreePanel extends JPanel
 			String pathKey = this.navigationController.getCurrentFolderPath();
 			return this.folderContents.getOrDefault(pathKey, new ArrayList<>());
 		}
+	}
+
+	private List<EmojiTreeNode> getRecentlyDownloadedItems()
+	{
+		List<String> emojiNames = this.navigationController.getRecentlyDownloadedEmojis();
+		List<EmojiTreeNode> items = new ArrayList<>();
+
+		for (List<EmojiTreeNode> folderItems : this.folderContents.values())
+		{
+			for (EmojiTreeNode item : folderItems)
+			{
+				boolean isMatchingEmoji = !item.isFolder() && emojiNames.contains(item.getName());
+				if (isMatchingEmoji)
+				{
+					items.add(item);
+				}
+			}
+		}
+
+		items.sort((a, b) -> a.getName().compareToIgnoreCase(b.getName()));
+		return items;
 	}
 
 	private void rebuildAndRefresh()
@@ -6358,6 +6815,12 @@ public class EmojiTreePanel extends JPanel
 	public void showStatusMessage(String message, StatusMessagePanel.MessageType type, boolean autoDismiss)
 	{
 		this.statusMessagePanel.showMessage(message, type, autoDismiss);
+	}
+
+	public void showRecentlyDownloaded(List<String> emojiNames)
+	{
+		this.navigationController.setRecentlyDownloadedEmojis(emojiNames);
+		this.rebuildAndRefresh();
 	}
 }
 
@@ -6484,13 +6947,11 @@ public class StatusMessagePanel extends JPanel
 
 package com.customemoji.panel;
 
-import com.customemoji.CustomEmojiConfig;
 import com.customemoji.CustomEmojiPlugin;
-import com.customemoji.PluginUtils;
 import com.customemoji.io.GitHubEmojiDownloader.DownloadProgress;
 import com.customemoji.panel.tree.EmojiTreePanel;
+import com.customemoji.service.EmojiStateManager;
 import com.google.inject.Provider;
-import net.runelite.client.config.ConfigManager;
 import net.runelite.client.ui.PluginPanel;
 
 import javax.inject.Inject;
@@ -6499,9 +6960,10 @@ import javax.swing.JPanel;
 import java.awt.BorderLayout;
 import java.awt.Container;
 import java.awt.Dimension;
+import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Set;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.function.Supplier;
 
 /**
@@ -6512,24 +6974,21 @@ import java.util.function.Supplier;
 public class CustomEmojiPanel extends PluginPanel
 {
 	private final CustomEmojiPlugin plugin;
-	private final CustomEmojiConfig config;
-	private final ConfigManager configManager;
-	private final ScheduledExecutorService executor;
+	private final EmojiStateManager emojiStateManager;
 	private Set<String> disabledEmojis = new HashSet<>();
 	private Set<String> resizingDisabledEmojis = new HashSet<>();
+	private List<String> pendingRecentlyDownloaded = new ArrayList<>();
 	private SearchPanel searchPanel;
 	private EmojiTreePanel emojiTreePanel;
 
 	@Inject
-	public CustomEmojiPanel(CustomEmojiPlugin plugin, CustomEmojiConfig config, ConfigManager configManager,
-							Provider<EmojiTreePanel> emojiTreePanelProvider, ScheduledExecutorService executor)
+	public CustomEmojiPanel(CustomEmojiPlugin plugin, EmojiStateManager emojiStateManager,
+							Provider<EmojiTreePanel> emojiTreePanelProvider)
 	{
 		this.plugin = plugin;
-		this.configManager = configManager;
-		this.config = config;
-		this.executor = executor;
-		this.disabledEmojis = PluginUtils.parseDisabledEmojis(config.disabledEmojis());
-		this.resizingDisabledEmojis = PluginUtils.parseResizingDisabledEmojis(config.resizingDisabledEmojis());
+		this.emojiStateManager = emojiStateManager;
+		this.disabledEmojis = this.emojiStateManager.getDisabledEmojis();
+		this.resizingDisabledEmojis = this.emojiStateManager.getResizingDisabledEmojis();
 
 		this.setLayout(new BorderLayout());
 		this.setBorder(BorderFactory.createEmptyBorder(5, 5, 5, 5));
@@ -6537,9 +6996,6 @@ public class CustomEmojiPanel extends PluginPanel
 
 		this.searchPanel = new SearchPanel(this::onSearchChanged);
 		this.emojiTreePanel = emojiTreePanelProvider.get();
-		this.emojiTreePanel.setOnDisabledEmojisChanged(this::onDisabledEmojisChanged);
-		this.emojiTreePanel.setOnResizingDisabledEmojisChanged(this::onResizingDisabledEmojisChanged);
-		this.emojiTreePanel.setOnEmojiResizingToggled(this::onEmojiResizingToggled);
 		this.emojiTreePanel.setOnDownloadClicked(this.plugin::triggerGitHubDownload);
 		this.emojiTreePanel.setOnReloadClicked(() -> this.plugin.scheduleReload(true));
 		this.emojiTreePanel.setDownloadButtonVisible(this.plugin.isGitHubDownloadConfigured());
@@ -6577,7 +7033,8 @@ public class CustomEmojiPanel extends PluginPanel
 
 	public void refreshEmojiTree(boolean clearSearch)
 	{
-		this.disabledEmojis = PluginUtils.parseDisabledEmojis(this.config.disabledEmojis());
+		this.disabledEmojis = this.emojiStateManager.getDisabledEmojis();
+		this.resizingDisabledEmojis = this.emojiStateManager.getResizingDisabledEmojis();
 
 		if (clearSearch)
 		{
@@ -6586,6 +7043,19 @@ public class CustomEmojiPanel extends PluginPanel
 		}
 
 		this.emojiTreePanel.updateDisabledEmojis(this.disabledEmojis);
+		this.emojiTreePanel.updateResizingDisabledEmojis(this.resizingDisabledEmojis);
+
+		if (!this.pendingRecentlyDownloaded.isEmpty())
+		{
+			List<String> toShow = new ArrayList<>(this.pendingRecentlyDownloaded);
+			this.pendingRecentlyDownloaded.clear();
+			this.emojiTreePanel.showRecentlyDownloaded(toShow);
+		}
+	}
+
+	public void setPendingRecentlyDownloaded(List<String> emojiNames)
+	{
+		this.pendingRecentlyDownloaded = new ArrayList<>(emojiNames);
 	}
 
 	public Set<String> getDisabledEmojis()
@@ -6624,23 +7094,6 @@ public class CustomEmojiPanel extends PluginPanel
 		this.emojiTreePanel.setSearchFilter(searchText);
 	}
 
-	private void onDisabledEmojisChanged(Set<String> newDisabledEmojis)
-	{
-		this.disabledEmojis = newDisabledEmojis;
-		this.saveDisabledEmojis();
-	}
-
-	private void onResizingDisabledEmojisChanged(Set<String> newResizingDisabledEmojis)
-	{
-		this.resizingDisabledEmojis = newResizingDisabledEmojis;
-		this.saveResizingDisabledEmojis();
-	}
-
-	private void onEmojiResizingToggled(String emojiName)
-	{
-		this.plugin.reloadSingleEmoji(emojiName);
-	}
-
 	private Dimension getPanelDimension()
 	{
 		Container parent = this.getParent();
@@ -6649,18 +7102,6 @@ public class CustomEmojiPanel extends PluginPanel
 			return new Dimension(parent.getSize().width - 5, parent.getSize().height - 5);
 		}
 		return new Dimension(245, 395);
-	}
-
-	private void saveDisabledEmojis()
-	{
-		String disabledEmojisString = String.join(",", this.disabledEmojis);
-		this.executor.execute(() -> this.configManager.setConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, CustomEmojiConfig.KEY_DISABLED_EMOJIS, disabledEmojisString));
-	}
-
-	private void saveResizingDisabledEmojis()
-	{
-		String resizingDisabledEmojisString = String.join(",", this.resizingDisabledEmojis);
-		this.executor.execute(() -> this.configManager.setConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, CustomEmojiConfig.KEY_RESIZING_DISABLED_EMOJIS, resizingDisabledEmojisString));
 	}
 }
 
@@ -6747,6 +7188,7 @@ package com.customemoji.animation;
 import com.customemoji.CustomEmojiConfig;
 import com.customemoji.PluginUtils;
 import com.customemoji.model.AnimatedEmoji;
+import com.customemoji.service.EmojiStateManager;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -6785,12 +7227,14 @@ public class AnimationManager
 
 	private final CustomEmojiConfig config;
 	private final ScheduledExecutorService executor;
+	private final EmojiStateManager emojiStateManager;
 
 	@Inject
-	public AnimationManager(CustomEmojiConfig config, ScheduledExecutorService executor)
+	public AnimationManager(CustomEmojiConfig config, ScheduledExecutorService executor, EmojiStateManager emojiStateManager)
 	{
 		this.config = config;
 		this.executor = executor;
+		this.emojiStateManager = emojiStateManager;
 	}
 
 	public void markAnimationVisible(int emojiId)
@@ -6873,6 +7317,13 @@ public class AnimationManager
 		this.animationLastSeenTime.clear();
 	}
 
+	public void invalidateAnimation(int emojiId)
+	{
+		this.animationCache.remove(emojiId);
+		this.animationLastSeenTime.remove(emojiId);
+		this.pendingAnimationLoads.remove(emojiId);
+	}
+
 	private GifAnimation loadAnimation(AnimatedEmoji emoji)
 	{
 		File file = emoji.getFile();
@@ -6940,8 +7391,7 @@ public class AnimationManager
 				int[] delays = new int[frameCount];
 
 				int maxHeight = this.config.maxImageHeight();
-				Set<String> resizingDisabledEmojis = PluginUtils.parseResizingDisabledEmojis(this.config.resizingDisabledEmojis());
-				boolean shouldResize = !resizingDisabledEmojis.contains(emojiName);
+				boolean shouldResize = this.emojiStateManager.isResizingEnabled(emojiName);
 
 				for (int i = 0; i < frameCount; i++)
 				{
