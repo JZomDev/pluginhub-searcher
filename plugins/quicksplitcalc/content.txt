@@ -4,7 +4,17 @@ import net.runelite.api.Client;
 import net.runelite.api.InventoryID;
 import net.runelite.api.ItemID;
 import net.runelite.api.MenuAction;
+import net.runelite.api.VarClientInt;
+import net.runelite.api.VarClientStr;
 import net.runelite.api.events.MenuEntryAdded;
+import net.runelite.api.events.VarClientIntChanged;
+import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.widgets.JavaScriptCallback;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetPositionMode;
+import net.runelite.api.widgets.WidgetSizeMode;
+import net.runelite.api.widgets.WidgetTextAlignment;
+import net.runelite.api.widgets.WidgetType;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -17,12 +27,14 @@ import net.runelite.client.config.ConfigManager;
 import net.runelite.client.game.chatbox.ChatboxPanelManager;
 import net.runelite.client.callback.ClientThread;
 import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
 
 import javax.inject.Inject;
 import java.text.NumberFormat;
 import java.util.Locale;
+import com.QuickSplitCalc.QuickSplitCalcConfig.RoundingPlace;
 
-
+@Slf4j
 @PluginDescriptor(
         name = "QuickSplitCalc",
         description = "Calculate cash splits between multiple players",
@@ -44,6 +56,17 @@ public class QuickSplitCalcPlugin extends Plugin {
 
     @Inject
     private ClientThread clientThread;
+
+    // Store the last split amount and tracking info
+    private int lastSplitAmount = 0;
+    private int numberOfPeople = 0;
+    private int totalTrades = 0;
+    private int tradesRemaining = 0;
+    private Widget splitTextWidget = null;
+
+    // Text colors
+    private static final int MOUSE_OFF_TEXT_COLOR = 0x00008B;
+    private static final int MOUSE_OVER_TEXT_COLOR = 0x00FFFF;
 
     @Provides
     QuickSplitCalcConfig provideConfig(ConfigManager configManager) {
@@ -89,9 +112,55 @@ public class QuickSplitCalcPlugin extends Plugin {
                     .setTarget("Players")
                     .setType(MenuAction.RUNELITE)
                     .onClick(menuEntry -> handleCustomSplit(menuEntry, event.getActionParam0()));
+
+            // Add "Clear Split" option if there's an active split
+// Add "Clear Split" option if there's an active split and helper is enabled
+            if (config.enableSplitHelper() && lastSplitAmount > 0 && tradesRemaining > 0) {
+                subMenu.createMenuEntry(0)
+                        .setOption("<col=ff0000>Clear Split</col>")
+                        .setTarget("")
+                        .setType(MenuAction.RUNELITE)
+                        .onClick(menuEntry -> clearSplit());
+            }
         }
     }
 
+    @Subscribe
+    public void onVarClientIntChanged(VarClientIntChanged event) {
+        // Detect when number input opens (INPUT_TYPE = 7)
+        if (event.getIndex() == VarClientInt.INPUT_TYPE) {
+            int inputType = client.getVarcIntValue(VarClientInt.INPUT_TYPE);
+
+            log.debug("VarClientInt INPUT_TYPE changed to: {}", inputType);
+            log.debug("Current state - lastSplitAmount: {}, tradesRemaining: {}", lastSplitAmount, tradesRemaining);
+
+            if (inputType == 7) {
+                // Input opened - check if it's the trade amount prompt and we have trades remaining
+                clientThread.invokeLater(() -> {
+                    Widget chatboxTitle = client.getWidget(ComponentID.CHATBOX_TITLE);
+                    if (chatboxTitle != null) {
+                        String titleText = chatboxTitle.getText();
+                        log.debug("Chatbox title: '{}'", titleText);
+
+                        if (lastSplitAmount > 0 && tradesRemaining > 0) {
+                            log.debug("Conditions met - attempting to create widget");
+                            if (titleText != null && titleText.equals("Enter amount:")) {
+                                int currentTrade = totalTrades - tradesRemaining + 1;
+                                log.info("Creating split text widget for trade {}/{}", currentTrade, totalTrades);
+                                createSplitTextWidget();
+                            }
+                        } else {
+                            log.debug("Conditions NOT met - lastSplitAmount:  {}, tradesRemaining: {}",
+                                    lastSplitAmount, tradesRemaining);
+                        }
+                    }
+                });
+            } else if (inputType == 0) {
+                // Input closed - remove the widget
+                removeSplitTextWidget();
+            }
+        }
+    }
 
     private void createQuickSplitEntry(net.runelite.api.Menu parentMenu, int numPeople, MenuEntryAdded event) {
         parentMenu.createMenuEntry(0)
@@ -101,17 +170,27 @@ public class QuickSplitCalcPlugin extends Plugin {
                 .onClick(menuEntry -> performSplit(event.getActionParam0(), numPeople));
     }
 
-    private String formatNumber(int number, NumberFormat formatter, boolean isSplitAmount) {
+    // Formats the split amount as millions with the correct number of decimals based on rounding
+    private String formatSplitAmount(int splitAmount, int roundingValue) {
+        double millions = splitAmount / 1_000_000.0;
+        int decimals;
+        if (roundingValue == 100_000) {
+            decimals = 1;
+        } else if (roundingValue == 10_000) {
+            decimals = 2;
+        } else {
+            decimals = 3;
+        }
+        return String.format("%." + decimals + "fM", millions);
+    }
+
+    private String formatNumber(int number, NumberFormat formatter, boolean isSplitAmount, int roundingValue) {
         if (!config.roundedSplits() || !isSplitAmount) {
             return formatter.format(number);
         }
-
+        // Only format as M if >= 1M, otherwise use normal formatting
         if (number >= 1_000_000) {
-            double millions = number / 1_000_000.0;
-            return String.format("%.1fM", Math.floor(millions * 10) / 10);
-        } else if (number >= 1_000) {
-            double thousands = number / 1_000.0;
-            return String.format("%.1fK", Math.floor(thousands * 10) / 10);
+            return formatSplitAmount(number, roundingValue);
         }
         return formatter.format(number);
     }
@@ -123,37 +202,43 @@ public class QuickSplitCalcPlugin extends Plugin {
         int splitAmount = stackSize / numPeople;
         int remainder = stackSize % numPeople;
 
-        // If rounding is enabled, calculate the actual remainder after rounding
+        int roundingValue = 1_000;
         if (config.roundedSplits()) {
-            // Calculate what the rounded display represents in actual coins
-            int roundedValue;
-            if (splitAmount >= 1_000_000) {
-                // Round down to nearest 100K (0.1M)
-                roundedValue = (splitAmount / 100_000) * 100_000;
-            } else if (splitAmount >= 1_000) {
-                // Round down to nearest 100 (0.1K)
-                roundedValue = (splitAmount / 100) * 100;
-            } else {
-                roundedValue = splitAmount;
+            switch (config.roundingPlace()) {
+                case HUNDRED_THOUSAND:
+                    roundingValue = 100_000;
+                    break;
+                case TEN_THOUSAND:
+                    roundingValue = 10_000;
+                    break;
+                case ONE_THOUSAND:
+                default:
+                    roundingValue = 1_000;
+                    break;
             }
-
-            // The actual remainder is everything that can't be evenly distributed at the rounded amount
-            remainder = stackSize - (roundedValue * numPeople);
+            splitAmount = (splitAmount / roundingValue) * roundingValue;
+            remainder = stackSize - (splitAmount * numPeople);
         }
 
+        String splitDisplay = formatNumber(splitAmount, formatter, true, roundingValue);
+
         String message = new ChatMessageBuilder()
-                .append(ChatColorType. HIGHLIGHT)
-                .append(formatNumber(stackSize, formatter, false))
-                .append(ChatColorType.NORMAL)
-                .append(" coins split between " + numPeople + " people: ")
                 .append(ChatColorType.HIGHLIGHT)
-                .append(formatNumber(splitAmount, formatter, true))
+                .append(formatter.format(stackSize))
+                .append(ChatColorType.NORMAL)
+                .append(" coins split between ")
+                .append(ChatColorType.HIGHLIGHT)
+                .append(String.valueOf(numPeople))
+                .append(ChatColorType.NORMAL)
+                .append(" people: ")
+                .append(ChatColorType.HIGHLIGHT)
+                .append(splitDisplay)
                 .append(ChatColorType.NORMAL)
                 .append(" coins each")
                 .build();
 
         chatMessageManager.queue(QueuedMessage.builder()
-                .type(ChatMessageType.CONSOLE)  // ← Changed from GAMEMESSAGE
+                .type(ChatMessageType.CONSOLE)
                 .runeLiteFormattedMessage(message)
                 .build());
 
@@ -162,12 +247,37 @@ public class QuickSplitCalcPlugin extends Plugin {
                     .append(ChatColorType.NORMAL)
                     .append("Remainder: ")
                     .append(ChatColorType.HIGHLIGHT)
-                    .append(formatNumber(remainder, formatter, false) + " coins")
+                    .append(formatter.format(remainder) + " coins")
                     .build();
 
             chatMessageManager.queue(QueuedMessage.builder()
-                    .type(ChatMessageType.CONSOLE)  // ← Changed from GAMEMESSAGE
+                    .type(ChatMessageType.CONSOLE)
                     .runeLiteFormattedMessage(remainderMsg)
+                    .build());
+        }
+
+        // Only activate Split Helper if enabled in config
+        if (config.enableSplitHelper()) {
+            lastSplitAmount = splitAmount;
+            numberOfPeople = numPeople;
+            totalTrades = numPeople - 1;
+            tradesRemaining = totalTrades;
+
+            log.info("Split calculated - Amount: {}, People: {}, Total trades: {}, Trades remaining: {}",
+                    lastSplitAmount, numberOfPeople, totalTrades, tradesRemaining);
+
+            String helperMessage = new ChatMessageBuilder()
+                    .append(ChatColorType.NORMAL)
+                    .append("Split helper active for the next ")
+                    .append(ChatColorType.HIGHLIGHT)
+                    .append(String.valueOf(totalTrades))
+                    .append(ChatColorType.NORMAL)
+                    .append(totalTrades == 1 ? " trade" : " trades")
+                    .build();
+
+            chatMessageManager.queue(QueuedMessage.builder()
+                    .type(ChatMessageType.CONSOLE)
+                    .runeLiteFormattedMessage(helperMessage)
                     .build());
         }
     }
@@ -175,10 +285,9 @@ public class QuickSplitCalcPlugin extends Plugin {
 
     private void handleCustomSplit(net.runelite.api.MenuEntry menuEntry, int inventorySlot) {
         int stackSize = client.getItemContainer(InventoryID.INVENTORY).getItem(inventorySlot).getQuantity();
-        NumberFormat formatter = NumberFormat.getInstance(Locale.US);
 
         clientThread.invokeLater(() -> {
-            chatboxPanelManager.openTextInput("How many people to split between?")
+            chatboxPanelManager.openTextInput("How many people to split between? ")
                     .onDone((input) -> {
                         clientThread.invokeLater(() -> {
                             if (input == null || input.isEmpty()) {
@@ -199,17 +308,182 @@ public class QuickSplitCalcPlugin extends Plugin {
                     .build();
         });
     }
-}
 
+    /**
+     * Clears the current split data and shows confirmation message
+     */
+    private void clearSplit() {
+        log.info("Clearing split data - was at trade {}/{}", (totalTrades - tradesRemaining + 1), totalTrades);
+
+        // Store values for the message before clearing
+        int tradesLeft = tradesRemaining;
+        int amount = lastSplitAmount;
+
+        // Clear all split data
+        lastSplitAmount = 0;
+        numberOfPeople = 0;
+        totalTrades = 0;
+        tradesRemaining = 0;
+
+        // Remove any visible widget
+        removeSplitTextWidget();
+
+        // Show confirmation message
+        String clearMessage = new ChatMessageBuilder()
+                .append(ChatColorType.NORMAL)
+                .append("Split helper cleared (")
+                .append(ChatColorType.HIGHLIGHT)
+                .append(String.format("%,d", amount))
+                .append(ChatColorType.NORMAL)
+                .append(" gp, ")
+                .append(ChatColorType.HIGHLIGHT)
+                .append(String.valueOf(tradesLeft))
+                .append(ChatColorType.NORMAL)
+                .append(tradesLeft == 1 ? " trade remaining)" : " trades remaining)")
+                .build();
+
+        chatMessageManager.queue(QueuedMessage.builder()
+                .type(ChatMessageType.CONSOLE)
+                .runeLiteFormattedMessage(clearMessage)
+                .build());
+    }
+
+    /**
+     * Creates a clickable text widget in the chatbox to fill the split amount
+     */
+    private void createSplitTextWidget() {
+        Widget chatboxContainer = client.getWidget(ComponentID.CHATBOX_CONTAINER);
+        if (chatboxContainer == null) {
+            log.warn("Chatbox container is null, cannot create widget");
+            return;
+        }
+
+        // Remove old widget if it exists
+        removeSplitTextWidget();
+
+        // Create the text widget
+        splitTextWidget = chatboxContainer.createChild(-1, WidgetType.TEXT);
+
+        // Calculate current trade number (e.g., 1/3, 2/3, 3/3)
+        int currentTrade = totalTrades - tradesRemaining + 1;
+        String formattedAmount = String.format("%,d", lastSplitAmount);
+        String tradeCounter = currentTrade + "/" + totalTrades + " Trade" + (totalTrades == 1 ? "" : "s");
+
+        splitTextWidget.setText("Set to Split Amount:  " + formattedAmount + " gp (" + tradeCounter + ")");
+
+        log.info("Created split widget with text: {}", splitTextWidget.getText());
+
+        // Styling (matching Flipping Copilot)
+        splitTextWidget.setTextColor(MOUSE_OFF_TEXT_COLOR);
+        splitTextWidget.setFontId(495); // VERDANA_11_BOLD
+        splitTextWidget.setXPositionMode(WidgetPositionMode.ABSOLUTE_CENTER);
+        splitTextWidget.setYPositionMode(WidgetPositionMode.ABSOLUTE_TOP);
+        splitTextWidget.setOriginalX(0);
+        splitTextWidget.setOriginalY(40);
+        splitTextWidget.setOriginalHeight(20);
+        splitTextWidget.setXTextAlignment(WidgetTextAlignment.CENTER);
+        splitTextWidget.setWidthMode(WidgetSizeMode.MINUS);
+
+        // Make it clickable
+        splitTextWidget.setAction(0, "Fill amount");
+        splitTextWidget.setHasListener(true);
+        splitTextWidget.setOnOpListener((JavaScriptCallback) ev -> {
+            log.info("Split widget clicked - filling trade amount:  {}", lastSplitAmount);
+            fillTradeAmount(lastSplitAmount);
+            // Decrement trades remaining after use
+            tradesRemaining--;
+            log.info("Trades remaining after use: {} (Trade {}/{})", tradesRemaining, currentTrade, totalTrades);
+            if (tradesRemaining <= 0) {
+                // No more trades remaining, clear the split data
+                log.info("No more trades remaining - clearing split data");
+                lastSplitAmount = 0;
+                numberOfPeople = 0;
+                totalTrades = 0;
+                tradesRemaining = 0;
+            }
+        });
+
+        // Add hover effect
+        splitTextWidget.setOnMouseRepeatListener((JavaScriptCallback) ev ->
+                splitTextWidget.setTextColor(MOUSE_OVER_TEXT_COLOR)
+        );
+        splitTextWidget.setOnMouseLeaveListener((JavaScriptCallback) ev ->
+                splitTextWidget.setTextColor(MOUSE_OFF_TEXT_COLOR)
+        );
+
+        // Shift the chatbox title and input down to make room
+        Widget chatboxTitle = client.getWidget(ComponentID.CHATBOX_TITLE);
+        if (chatboxTitle != null) {
+            chatboxTitle.setOriginalY(chatboxTitle.getOriginalY() + 12);
+            chatboxTitle.revalidate();
+        }
+
+        Widget chatboxInput = client.getWidget(ComponentID.CHATBOX_FULL_INPUT);
+        if (chatboxInput != null) {
+            chatboxInput.setOriginalY(chatboxInput.getOriginalY() + 12);
+            chatboxInput.revalidate();
+        }
+
+        splitTextWidget.revalidate();
+    }
+
+    /**
+     * Removes the split text widget and resets chatbox positions
+     */
+    private void removeSplitTextWidget() {
+        if (splitTextWidget != null) {
+            log.debug("Removing split text widget");
+            // Hide the widget instead of deleting it
+            splitTextWidget.setHidden(true);
+
+            // Reset chatbox positions
+            Widget chatboxTitle = client.getWidget(ComponentID.CHATBOX_TITLE);
+            if (chatboxTitle != null) {
+                chatboxTitle.setOriginalY(chatboxTitle.getOriginalY() - 12);
+                chatboxTitle.revalidate();
+            }
+
+            Widget chatboxInput = client.getWidget(ComponentID.CHATBOX_FULL_INPUT);
+            if (chatboxInput != null) {
+                chatboxInput.setOriginalY(chatboxInput.getOriginalY() - 12);
+                chatboxInput.revalidate();
+            }
+
+            splitTextWidget = null;
+        }
+    }
+
+    /**
+     * Fills the trade chatbox with the specified amount
+     */
+    private void fillTradeAmount(int amount) {
+        Widget chatboxInputWidget = client.getWidget(ComponentID.CHATBOX_FULL_INPUT);
+        if (chatboxInputWidget != null) {
+            chatboxInputWidget.setText(String.valueOf(amount) + "*");
+            client.setVarcStrValue(VarClientStr.INPUT_TEXT, String.valueOf(amount));
+            log.info("Filled trade amount: {}", amount);
+        } else {
+            log.warn("Could not fill trade amount - chatbox input widget is null");
+        }
+    }
+}
 package com.QuickSplitCalc;
 
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.*;
 
 @ConfigGroup("cashsplit")
 public interface QuickSplitCalcConfig extends Config
 {
+	@ConfigItem(
+			keyName = "enableSplitHelper",
+			name = "Enable Split Helper",
+			description = "Shows a clickable widget to auto-fill split amounts when trading",
+			position = 2
+	)
+	default boolean enableSplitHelper()
+	{
+		return true;
+	}
 
 	@ConfigItem(
 			keyName = "roundedSplits",
@@ -220,6 +494,30 @@ public interface QuickSplitCalcConfig extends Config
 	{
 		return false;
 	}
+
+	enum RoundingPlace
+	{
+		HUNDRED_THOUSAND("100,000"),
+		TEN_THOUSAND("10,000"),
+		ONE_THOUSAND("1,000");
+
+		private final String name;
+		RoundingPlace(String name) { this.name = name; }
+		@Override
+		public String toString() { return name; }
+	}
+
+	@ConfigItem(
+			keyName = "roundingPlace",
+			name = "Rounding Place",
+			description = "Choose the place to round split amounts to",
+			position = 1
+	)
+	default RoundingPlace roundingPlace()
+	{
+		return RoundingPlace.HUNDRED_THOUSAND;
+	}
+
 }
 
 package com.QuickSplitCalc;
