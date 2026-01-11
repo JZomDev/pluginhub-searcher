@@ -732,13 +732,27 @@ public class FocusedFlip
 	 */
 	public static FocusedFlip forBuy(int itemId, String itemName, int buyPrice, int buyQuantity, int sellPrice)
 	{
+		return forBuy(itemId, itemName, buyPrice, buyQuantity, sellPrice, 0);
+	}
+	
+	/**
+	 * Create a FocusedFlip for the BUY step with price offset applied
+	 * @param priceOffset Positive offset = buy higher to fill faster
+	 */
+	public static FocusedFlip forBuy(int itemId, String itemName, int buyPrice, int buyQuantity, int sellPrice, int priceOffset)
+	{
+		// Apply offset: add to buy price (pay more to fill faster)
+		int adjustedBuyPrice = Math.max(1, buyPrice + priceOffset);
+		// Also adjust sell price by subtracting offset (sell lower to fill faster)
+		int adjustedSellPrice = Math.max(1, sellPrice - priceOffset);
+		
 		return new FocusedFlip(
 			itemId,
 			itemName,
 			FlipStep.BUY,
-			buyPrice,
+			adjustedBuyPrice,
 			buyQuantity,
-			sellPrice,
+			adjustedSellPrice,
 			0  // No sell quantity yet
 		);
 	}
@@ -748,13 +762,25 @@ public class FocusedFlip
 	 */
 	public static FocusedFlip forSell(int itemId, String itemName, int sellPrice, int sellQuantity)
 	{
+		return forSell(itemId, itemName, sellPrice, sellQuantity, 0);
+	}
+	
+	/**
+	 * Create a FocusedFlip for the SELL step with price offset applied
+	 * @param priceOffset Positive offset = sell lower to fill faster
+	 */
+	public static FocusedFlip forSell(int itemId, String itemName, int sellPrice, int sellQuantity, int priceOffset)
+	{
+		// Apply offset: subtract from sell price (sell lower to fill faster)
+		int adjustedSellPrice = Math.max(1, sellPrice - priceOffset);
+		
 		return new FocusedFlip(
 			itemId,
 			itemName,
 			FlipStep.SELL,
 			0,  // Not relevant for selling
 			0,
-			sellPrice,
+			adjustedSellPrice,
 			sellQuantity
 		);
 	}
@@ -818,6 +844,12 @@ import java.util.concurrent.ThreadLocalRandom;
 @Slf4j
 public class FlipFinderPanel extends PluginPanel
 {
+	// Configuration constants
+	private static final String CONFIG_GROUP = "flipsmart";
+	private static final String CONFIG_KEY_FLIP_STYLE = "flipStyle";
+	private static final String CONFIG_KEY_EMAIL = "email";
+	private static final String CONFIG_KEY_PASSWORD = "password";
+	
 	// Constants for duplicated literals
 	private static final String FONT_ARIAL = "Arial";
 	private static final String ERROR_PREFIX = "Error: ";
@@ -899,6 +931,10 @@ public class FlipFinderPanel extends PluginPanel
 	private transient JPanel currentFocusedPanel = null;
 	private transient int currentFocusedItemId = -1;
 	private transient java.util.function.Consumer<FocusedFlip> onFocusChanged;
+	
+	// Cache displayed sell prices to ensure focus uses same price as shown in UI
+	// Key: itemId, Value: calculated sell price shown in the active flip panel
+	private final java.util.Map<Integer, Integer> displayedSellPrices = new java.util.concurrent.ConcurrentHashMap<>();
 
 	public FlipFinderPanel(FlipSmartConfig config, FlipSmartApiClient apiClient, ItemManager itemManager, FlipSmartPlugin plugin, ConfigManager configManager)
 	{
@@ -921,7 +957,7 @@ public class FlipFinderPanel extends PluginPanel
 			FlipSmartConfig.FlipStyle selectedStyle = (FlipSmartConfig.FlipStyle) flipStyleDropdown.getSelectedItem();
 			if (selectedStyle != null)
 			{
-				configManager.setConfiguration("flipsmart", "flipStyle", selectedStyle);
+				configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_FLIP_STYLE, selectedStyle);
 			}
 			// Refresh recommendations when flip style changes
 			if (isAuthenticated)
@@ -1396,8 +1432,8 @@ public class FlipFinderPanel extends PluginPanel
 	 */
 	private void saveCredentials(String email, String password)
 	{
-		configManager.setConfiguration("flipsmart", "email", email);
-		configManager.setConfiguration("flipsmart", "password", password);
+		configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_EMAIL, email);
+		configManager.setConfiguration(CONFIG_GROUP, CONFIG_KEY_PASSWORD, password);
 	}
 
 	/**
@@ -1482,7 +1518,21 @@ public class FlipFinderPanel extends PluginPanel
 	 */
 	public void refresh(boolean shuffleSuggestions)
 	{
-		refreshRecommendations(shuffleSuggestions);
+		// Skip recommendations refresh during auto-refresh if user is focused on a flip
+		// This prevents the focused item from disappearing while user is mid-transaction
+		// Manual refresh (shuffleSuggestions=true) always refreshes
+		boolean skipRecommendationsRefresh = !shuffleSuggestions && currentFocus != null;
+		
+		if (skipRecommendationsRefresh)
+		{
+			log.debug("Skipping recommendations refresh - user is focused on {} ({})", 
+				currentFocus.getItemName(), currentFocus.isBuying() ? "BUY" : "SELL");
+		}
+		else
+		{
+			refreshRecommendations(shuffleSuggestions);
+		}
+		
 		refreshActiveFlips();
 		refreshCompletedFlips();
 	}
@@ -1569,6 +1619,9 @@ public class FlipFinderPanel extends PluginPanel
 		final int scrollPos = getScrollPosition(activeFlipsScrollPane);
 		// Don't clear container yet - keep showing old flips until new data arrives
 		// This prevents the UI flash when flips disappear and reappear
+		
+		// Clear cached sell prices - they'll be recalculated when panels are created
+		displayedSellPrices.clear();
 
 		// Pass current RSN to filter data for the logged-in account
 		String rsn = plugin.getCurrentRsnSafe().orElse(null);
@@ -1586,27 +1639,63 @@ public class FlipFinderPanel extends PluginPanel
 				currentActiveFlips.clear();
 				if (response.getActiveFlips() != null)
 				{
-					// Filter active flips to only show items that are currently being tracked:
-					// 1. Items currently in GE buy slots (pending or filled)
-					// 2. Items currently in GE sell slots (waiting to fully sell)
-					// 3. Items collected from GE in this session (waiting to be sold)
-					// This prevents showing old stale data while keeping active items visible
+					// Show flips that are either:
+					// 1. Currently in GE slots or collected items (thread-safe check)
+					// 2. Had activity in the last 7 days (covers client restart scenarios)
+					// We use a generous 7-day threshold because:
+					// - On client restart, GE tracking takes time to populate
+					// - collectedItemIds is session-only and resets on restart
+					// - The backend handles proper stale flip cleanup via /flips/cleanup
+					// Note: Using getActiveFlipItemIds() instead of WithInventory() to avoid thread issues
 					java.util.Set<Integer> activeItemIds = plugin.getActiveFlipItemIds();
-					log.debug("Active flip filter: {} tracked item IDs, {} flips from backend",
-						activeItemIds.size(), response.getActiveFlips().size());
+					java.time.Instant sevenDaysAgo = java.time.Instant.now().minus(java.time.Duration.ofDays(7));
+					
 					for (ActiveFlip flip : response.getActiveFlips())
 					{
-						if (activeItemIds.contains(flip.getItemId()))
+						boolean inGeOrCollected = activeItemIds.contains(flip.getItemId());
+						boolean isRecent = false;
+						
+						// Check if flip had activity in the last 7 days
+						// Use lastBuyTime if available (more accurate), fall back to firstBuyTime
+						String timeStr = flip.getLastBuyTime();
+						if (timeStr == null || timeStr.isEmpty())
 						{
-							currentActiveFlips.add(flip);
-							log.debug("Including active flip: {} (ID {})", flip.getItemName(), flip.getItemId());
+							timeStr = flip.getFirstBuyTime();
+						}
+						
+						if (timeStr != null && !timeStr.isEmpty())
+						{
+							try
+							{
+								java.time.Instant buyTime = java.time.Instant.parse(timeStr);
+								isRecent = buyTime.isAfter(sevenDaysAgo);
+							}
+							catch (Exception e)
+							{
+								// Can't parse, assume recent to be safe
+								isRecent = true;
+							}
 						}
 						else
 						{
-							log.debug("Filtering out active flip: {} (ID {}) - not in tracked items",
-								flip.getItemName(), flip.getItemId());
+							// No timestamp, assume recent
+							isRecent = true;
+						}
+						
+						if (inGeOrCollected || isRecent)
+						{
+							currentActiveFlips.add(flip);
+							log.debug("Including flip: {} (inGE={}, recent={})", 
+								flip.getItemName(), inGeOrCollected, isRecent);
+						}
+						else
+						{
+							log.debug("Filtering stale flip: {} (not in GE and older than 7 days)", flip.getItemName());
 						}
 					}
+					log.debug("Loaded {} active flips ({} from backend, {} filtered)", 
+						currentActiveFlips.size(), response.getActiveFlips().size(),
+						response.getActiveFlips().size() - currentActiveFlips.size());
 				}
 
 				// Get pending orders from plugin
@@ -1858,6 +1947,10 @@ public class FlipFinderPanel extends PluginPanel
 
 	/**
 	 * Determine if an active flip should be shown (not duplicated by pending orders)
+	 * 
+	 * Logic: If an item has ANY pending buy order in the GE, skip the active flip.
+	 * The pending order is the source of truth for items currently in buy slots.
+	 * Active flips should only show for COLLECTED items (no longer in GE, waiting to sell).
 	 */
 	private boolean shouldShowActiveFlip(ActiveFlip flip, 
 			java.util.Map<Integer, java.util.List<FlipSmartPlugin.PendingOrder>> pendingByItemId)
@@ -1866,28 +1959,15 @@ public class FlipFinderPanel extends PluginPanel
 		
 		if (matchingPending == null || matchingPending.isEmpty())
 		{
+			// No pending buy orders for this item - show the active flip
 			return true;
 		}
 		
-		// Sum up ALL filled quantities from pending orders for this item
-		int totalPendingFilled = 0;
-		for (FlipSmartPlugin.PendingOrder pending : matchingPending)
-		{
-			totalPendingFilled += pending.quantityFilled;
-		}
-		
-		// If pending orders account for ALL or MORE of the active flip quantity,
-		// skip the active flip to avoid showing duplicates
-		if (totalPendingFilled >= flip.getTotalQuantity())
-		{
-			log.debug("Skipping active flip {} - pending orders account for {} items (flip has {})",
-				flip.getItemName(), totalPendingFilled, flip.getTotalQuantity());
-			return false;
-		}
-		
-		log.debug("Showing active flip {} - {} collected items not in pending ({} pending filled)",
-			flip.getItemName(), flip.getTotalQuantity() - totalPendingFilled, totalPendingFilled);
-		return true;
+		// There's a pending buy order for this item in the GE.
+		// Skip the active flip to avoid duplicates - the pending order panel shows the current state.
+		log.debug("Skipping active flip {} - has {} pending buy order(s) in GE",
+			flip.getItemName(), matchingPending.size());
+		return false;
 	}
 
 	/**
@@ -1903,24 +1983,26 @@ public class FlipFinderPanel extends PluginPanel
 	}
 
 	/**
-	 * Update the status label with response info
+	 * Update the status label with response info (for Recommended tab)
 	 */
 	private void updateStatusLabel(FlipFinderResponse response)
 	{
 		FlipSmartConfig.FlipStyle selectedStyle = (FlipSmartConfig.FlipStyle) flipStyleDropdown.getSelectedItem();
 		String flipStyleText = selectedStyle != null ? selectedStyle.toString() : "Balanced";
 		int count = response.getRecommendations().size();
+		String itemWord = count == 1 ? "suggestion" : "suggestions";
 		
 		if (response.getCashStack() != null)
 		{
-			statusLabel.setText(String.format("%s | %d flips | Cash: %s",
+			statusLabel.setText(String.format("%s | %d %s | Cash: %s",
 				flipStyleText,
 				count,
+				itemWord,
 				formatGP(response.getCashStack())));
 		}
 		else
 		{
-			statusLabel.setText(String.format("%s | %d flips", flipStyleText, count));
+			statusLabel.setText(String.format("%s | %d %s", flipStyleText, count, itemWord));
 		}
 	}
 
@@ -2325,6 +2407,12 @@ public class FlipFinderPanel extends PluginPanel
 			? formatGP(marginPerItem) 
 			: formatGPExact(marginPerItem);
 		
+		// Handle Infinity/NaN ROI (happens when cost is 0, e.g. pending orders with no fills)
+		if (Double.isInfinite(roi) || Double.isNaN(roi))
+		{
+			return String.format("Margin: %s (pending)", marginText);
+		}
+		
 		if (isLoss)
 		{
 			return String.format(FORMAT_MARGIN_ROI_LOSS, marginText, roi);
@@ -2551,13 +2639,15 @@ public class FlipFinderPanel extends PluginPanel
 	 */
 	private void setFocus(FlipRecommendation rec, JPanel panel)
 	{
-		// Create focused flip for buying
+		// Create focused flip for buying with price offset applied
+		int priceOffset = config.priceOffset();
 		FocusedFlip newFocus = FocusedFlip.forBuy(
 			rec.getItemId(),
 			rec.getItemName(),
 			rec.getRecommendedBuyPrice(),
 			rec.getRecommendedQuantity(),
-			rec.getRecommendedSellPrice()
+			rec.getRecommendedSellPrice(),
+			priceOffset
 		);
 		
 		updateFocus(newFocus, panel);
@@ -2565,41 +2655,65 @@ public class FlipFinderPanel extends PluginPanel
 	
 	/**
 	 * Set an active flip as the current focus for Flip Assist.
-	 * Fetches current market data to determine the smart sell price.
+	 * Uses the cached sell price from the panel display to ensure consistency.
 	 */
 	private void setFocus(ActiveFlip flip, JPanel panel)
 	{
-		// Fetch current market data to calculate smart sell price
-		apiClient.getItemAnalysisAsync(flip.getItemId()).thenAccept(analysis ->
+		// Use the cached sell price that's already displayed in the panel
+		// This ensures the Flip Assist shows the same price as the Active Flips tab
+		Integer cachedSellPrice = displayedSellPrices.get(flip.getItemId());
+		int priceOffset = config.priceOffset();
+		
+		if (cachedSellPrice != null && cachedSellPrice > 0)
 		{
-			Integer currentMarketPrice = null;
-			Integer dailyVolume = null;
-			
-			if (analysis != null && analysis.getCurrentPrices() != null)
-			{
-				FlipAnalysis.CurrentPrices prices = analysis.getCurrentPrices();
-				currentMarketPrice = prices.getHigh();
-				
-				if (analysis.getLiquidity() != null && analysis.getLiquidity().getTotalVolumePerHour() != null)
-				{
-					dailyVolume = (int)(analysis.getLiquidity().getTotalVolumePerHour() * 24);
-				}
-			}
-			
-			// Calculate smart sell price
-			Integer smartSellPrice = calculateSmartSellPrice(flip, currentMarketPrice, dailyVolume);
-			int sellPrice = smartSellPrice != null ? smartSellPrice : calculateMinProfitableSellPrice(flip.getAverageBuyPrice());
-			
-			// Create focused flip for selling
+			// Use the price that's already shown in the UI with offset applied
 			FocusedFlip newFocus = FocusedFlip.forSell(
 				flip.getItemId(),
 				flip.getItemName(),
-				sellPrice,
-				flip.getTotalQuantity()
+				cachedSellPrice,
+				flip.getTotalQuantity(),
+				priceOffset
 			);
-			
-			SwingUtilities.invokeLater(() -> updateFocus(newFocus, panel));
-		});
+			updateFocus(newFocus, panel);
+		}
+		else
+		{
+			// Fallback: fetch market data if no cached price (shouldn't normally happen)
+			apiClient.getItemAnalysisAsync(flip.getItemId()).thenAccept(analysis ->
+			{
+				Integer currentMarketPrice = null;
+				Integer dailyVolume = null;
+				
+				if (analysis != null && analysis.getCurrentPrices() != null)
+				{
+					FlipAnalysis.CurrentPrices prices = analysis.getCurrentPrices();
+					currentMarketPrice = prices.getHigh();
+					
+					if (analysis.getLiquidity() != null && analysis.getLiquidity().getTotalVolumePerHour() != null)
+					{
+						dailyVolume = (int)(analysis.getLiquidity().getTotalVolumePerHour() * 24);
+					}
+				}
+				
+				// Calculate smart sell price
+				Integer smartSellPrice = calculateSmartSellPrice(flip, currentMarketPrice, dailyVolume);
+				int sellPrice = smartSellPrice != null ? smartSellPrice : calculateMinProfitableSellPrice(flip.getAverageBuyPrice());
+				
+				// Cache this price for future use
+				displayedSellPrices.put(flip.getItemId(), sellPrice);
+				
+				// Create focused flip for selling with offset applied
+				FocusedFlip newFocus = FocusedFlip.forSell(
+					flip.getItemId(),
+					flip.getItemName(),
+					sellPrice,
+					flip.getTotalQuantity(),
+					priceOffset
+				);
+				
+				SwingUtilities.invokeLater(() -> updateFocus(newFocus, panel));
+			});
+		}
 	}
 	
 	/**
@@ -2612,12 +2726,14 @@ public class FlipFinderPanel extends PluginPanel
 			? pending.recommendedSellPrice 
 			: (int)(pending.pricePerItem * 1.05); // Default 5% markup
 		
-		// Create focused flip for selling the filled items
+		// Create focused flip for selling the filled items with price offset applied
+		int priceOffset = config.priceOffset();
 		FocusedFlip newFocus = FocusedFlip.forSell(
 			pending.itemId,
 			pending.itemName,
 			sellPrice,
-			pending.quantityFilled > 0 ? pending.quantityFilled : pending.quantity
+			pending.quantityFilled > 0 ? pending.quantityFilled : pending.quantity,
+			priceOffset
 		);
 		
 		updateFocus(newFocus, panel);
@@ -2877,6 +2993,9 @@ public class FlipFinderPanel extends PluginPanel
 				
 				if (smartSellPrice != null && smartSellPrice > 0)
 				{
+					// Cache the displayed sell price so Flip Assist uses the same value
+					displayedSellPrices.put(flip.getItemId(), smartSellPrice);
+					
 					// Row 1: Update Buy | Sell prices
 					String priceSuffix = pastThreshold ? "*" : "";
 					pricesLabel.setText(String.format("Buy: %s | Sell: %s%s", 
@@ -3298,8 +3417,9 @@ public class FlipFinderPanel extends PluginPanel
 
 		if (result == JOptionPane.YES_OPTION)
 		{
-			// Dismiss asynchronously
-			apiClient.dismissActiveFlipAsync(flip.getItemId()).thenAccept(success ->
+			// Dismiss asynchronously with RSN filter for multi-account support
+			String rsn = plugin.getCurrentRsnSafe().orElse(null);
+			apiClient.dismissActiveFlipAsync(flip.getItemId(), rsn).thenAccept(success ->
 			{
 				SwingUtilities.invokeLater(() ->
 				{
@@ -3353,6 +3473,7 @@ public class FlipFinderPanel extends PluginPanel
 		// Use invokeLater to restore after layout is complete
 		SwingUtilities.invokeLater(() -> scrollPane.getVerticalScrollBar().setValue(position));
 	}
+	
 	
 	/**
 	 * Calculate the sell price threshold time for an active flip.
@@ -3589,7 +3710,6 @@ public class FlipAssistOverlay extends Overlay
 	
 	// GE Interface IDs
 	private static final int GE_INTERFACE_GROUP = 465;
-	private static final int GE_OFFER_GROUP = 162;
 	private static final int GE_OFFER_PANEL_CHILD = 26;
 	private static final int GE_QTY_CHILD_START = 31;
 	private static final int GE_QTY_CHILD_END = 36;
@@ -4111,10 +4231,18 @@ public class FlipAssistOverlay extends Overlay
 	
 	private boolean isGrandExchangeOpen()
 	{
+		// Check the main GE interface (465) - this is the primary indicator
 		Widget geWidget = client.getWidget(GE_INTERFACE_GROUP, 0);
-		Widget offerWidget = client.getWidget(GE_OFFER_GROUP, 0);
-		return (geWidget != null && !geWidget.isHidden()) ||
-			   (offerWidget != null && !offerWidget.isHidden());
+		if (geWidget != null && !geWidget.isHidden())
+		{
+			return true;
+		}
+		
+		// Also check if we're in the GE offer setup dialog specifically
+		// Widget 162 is the chatbox which is used for many dialogs, so we need
+		// to verify it's actually a GE-related dialog by checking for GE-specific content
+		Widget offerPanel = client.getWidget(GE_INTERFACE_GROUP, GE_OFFER_PANEL_CHILD);
+		return offerPanel != null && !offerPanel.isHidden();
 	}
 	
 	private boolean isOfferSetupOpen()
@@ -4793,6 +4921,18 @@ public interface FlipSmartConfig extends Config
 		return false;
 	}
 
+	@ConfigItem(
+		keyName = "priceOffset",
+		name = "Price Offset (GP)",
+		description = "Adjust buy/sell prices to fill faster. Positive = buy higher and sell lower by this amount. Set to 0 for no offset.",
+		section = flipAssistantSection,
+		position = 4
+	)
+	default int priceOffset()
+	{
+		return 0;
+	}
+
 	// ============================================
 	// General Section
 	// ============================================
@@ -5096,7 +5236,6 @@ public class FlipSmartPlugin extends Plugin
 		java.util.Set<Integer> itemIds = new java.util.HashSet<>();
 		
 		// Add items currently in ANY GE slots (buy OR sell)
-		// Items in sell slots are still part of an active flip until sold
 		for (TrackedOffer offer : trackedOffers.values())
 		{
 			itemIds.add(offer.itemId);
@@ -5104,6 +5243,31 @@ public class FlipSmartPlugin extends Plugin
 		
 		// Add items collected from GE (waiting to be sold)
 		itemIds.addAll(collectedItemIds);
+		
+		return itemIds;
+	}
+	
+	/**
+	 * Get all active flip item IDs including items in inventory.
+	 * This is used for filtering active flips display to show items the player
+	 * actually has (in GE slots or inventory).
+	 */
+	public java.util.Set<Integer> getActiveFlipItemIdsWithInventory()
+	{
+		java.util.Set<Integer> itemIds = getActiveFlipItemIds();
+		
+		// Also include items currently in inventory
+		ItemContainer inventory = client.getItemContainer(INVENTORY_CONTAINER_ID);
+		if (inventory != null)
+		{
+			for (Item item : inventory.getItems())
+			{
+				if (item.getId() > 0)
+				{
+					itemIds.add(item.getId());
+				}
+			}
+		}
 		
 		return itemIds;
 	}
@@ -5121,42 +5285,63 @@ public class FlipSmartPlugin extends Plugin
 			log.debug("Removed item {} from collected tracking (sold)", itemId);
 		}
 		
-		// Check if this item is still in a GE sell slot (not yet fully sold)
-		boolean hasActiveSellSlot = false;
+		boolean hasActiveSellSlot = hasActiveSellSlotForItem(itemId);
+		
+		if (hasActiveSellSlot)
+		{
+			log.debug("Item {} still has active sell slot, keeping flip open", itemId);
+			return;
+		}
+		
+		// Only auto-close if inventory is empty AND there's no active sell slot
+		tryAutoCloseFlip(itemId);
+	}
+	
+	/**
+	 * Check if an item has an active sell slot in the GE.
+	 */
+	private boolean hasActiveSellSlotForItem(int itemId)
+	{
 		for (TrackedOffer offer : trackedOffers.values())
 		{
 			if (offer.itemId == itemId && !offer.isBuy)
 			{
-				hasActiveSellSlot = true;
-				break;
+				return true;
 			}
+		}
+		return false;
+	}
+	
+	/**
+	 * Attempt to auto-close a flip if inventory is empty.
+	 */
+	private void tryAutoCloseFlip(int itemId)
+	{
+		int inventoryCount = getInventoryCountForItem(itemId);
+		if (inventoryCount > 0)
+		{
+			return;
 		}
 		
-		// Only auto-close if inventory is empty AND there's no active sell slot
-		// This prevents closing flips that are still selling in the GE
-		if (!hasActiveSellSlot)
+		log.info("Inventory empty and no active sell slot for item {}, auto-closing active flip", itemId);
+		apiClient.dismissActiveFlipAsync(itemId, getCurrentRsnSafe().orElse(null)).thenAccept(success ->
 		{
-			int inventoryCount = getInventoryCountForItem(itemId);
-			if (inventoryCount == 0)
+			if (Boolean.TRUE.equals(success))
 			{
-				log.info("Inventory empty and no active sell slot for item {}, auto-closing active flip", itemId);
-				apiClient.dismissActiveFlipAsync(itemId, getCurrentRsnSafe().orElse(null)).thenAccept(success ->
-				{
-					if (Boolean.TRUE.equals(success))
-					{
-						log.info("Successfully auto-closed active flip for item {} (no items remaining)", itemId);
-						// Refresh the panel to reflect the change
-						if (flipFinderPanel != null)
-						{
-							javax.swing.SwingUtilities.invokeLater(() -> flipFinderPanel.refresh());
-						}
-					}
-				});
+				log.info("Successfully auto-closed active flip for item {} (no items remaining)", itemId);
+				refreshPanelOnSwingThread();
 			}
-		}
-		else
+		});
+	}
+	
+	/**
+	 * Refresh the flip finder panel on the Swing EDT.
+	 */
+	private void refreshPanelOnSwingThread()
+	{
+		if (flipFinderPanel != null)
 		{
-			log.debug("Item {} still has active sell slot, keeping flip open", itemId);
+			javax.swing.SwingUtilities.invokeLater(() -> flipFinderPanel.refresh());
 		}
 	}
 	
@@ -5396,37 +5581,9 @@ public class FlipSmartPlugin extends Plugin
 	}
 	
 	/**
-	 * Load previously persisted offer state from config.
-	 * Called during login burst to compare with current state.
-	 * Uses RSN-specific key to support multiple accounts.
-	 */
-	private Map<Integer, TrackedOffer> loadPersistedOfferState()
-	{
-		String key = getPersistedOffersKey();
-		
-		try
-		{
-			String json = configManager.getConfiguration(CONFIG_GROUP, key);
-			if (json == null || json.isEmpty())
-			{
-				return new HashMap<>();
-			}
-			
-			Type type = new TypeToken<Map<Integer, TrackedOffer>>(){}.getType();
-			Map<Integer, TrackedOffer> offers = gson.fromJson(json, type);
-			log.debug("Loaded {} persisted offers for {}", offers != null ? offers.size() : 0, currentRsn);
-			return offers != null ? offers : new HashMap<>();
-		}
-		catch (Exception e)
-		{
-			log.error("Failed to load persisted offer state for {}: {}", currentRsn, e.getMessage());
-			return new HashMap<>();
-		}
-	}
-	
-	/**
-	 * Sync fills that occurred while offline by comparing persisted state to current state.
-	 * Should be called after all login burst offer events have been processed.
+	 * Sync fills that occurred while offline.
+	 * Records current GE state to the backend. Cleanup of stale flips happens
+	 * later via schedulePostSyncTasks() after GE state is fully loaded.
 	 */
 	private void syncOfflineFills()
 	{
@@ -5436,99 +5593,244 @@ public class FlipSmartPlugin extends Plugin
 		}
 		offlineSyncCompleted = true;
 		
-		Map<Integer, TrackedOffer> persistedOffers = loadPersistedOfferState();
-		if (persistedOffers.isEmpty())
+		// Clear persisted state so all fills are treated as new
+		configManager.unsetConfiguration(CONFIG_GROUP, getPersistedOffersKey());
+		
+		// NOTE: We do NOT clear active flips here anymore!
+		// The old code sent an empty set to cleanup which incorrectly closed ALL active flips.
+		// Instead, cleanup happens in schedulePostSyncTasks() AFTER GE state is loaded,
+		// using the actual active item IDs from trackedOffers + inventory.
+		
+		// Start fresh - no persisted offers, record all current fills
+		Map<Integer, TrackedOffer> persistedOffers = new HashMap<>();
+		log.debug("Full sync: recording {} current GE offers to backend", trackedOffers.size());
+		
+		// Always sync current offers - handles both:
+		// 1. Offers with persisted state (compare for offline fills)
+		// 2. Offers WITHOUT persisted state (record as new transactions)
+		if (!trackedOffers.isEmpty())
 		{
-			log.debug("No persisted offers to compare for offline sync");
-			return;
+			syncCurrentOffersWithPersisted(persistedOffers);
 		}
 		
-		log.info("Checking {} persisted offers against {} current offers for offline fills",
-			persistedOffers.size(), trackedOffers.size());
+		// Handle slots that became empty while offline
+		if (!persistedOffers.isEmpty())
+		{
+			handleEmptyPersistedSlots(persistedOffers);
+			// Clear persisted state after sync (RSN-specific key)
+			configManager.unsetConfiguration(CONFIG_GROUP, getPersistedOffersKey());
+		}
 		
+		log.info("Offline sync completed for {}", currentRsn);
+		
+		// Schedule panel refresh and cleanup
+		schedulePostSyncTasks();
+	}
+	
+	/**
+	 * Sync current GE offers against persisted state to detect offline fills.
+	 */
+	private void syncCurrentOffersWithPersisted(Map<Integer, TrackedOffer> persistedOffers)
+	{
 		for (Map.Entry<Integer, TrackedOffer> entry : trackedOffers.entrySet())
 		{
 			int slot = entry.getKey();
 			TrackedOffer currentOffer = entry.getValue();
 			TrackedOffer persistedOffer = persistedOffers.get(slot);
 			
-			if (persistedOffer == null)
+			if (persistedOffer != null && persistedOffer.itemId == currentOffer.itemId)
 			{
-				// New offer placed while offline (unlikely but possible)
-				continue;
+				// Have persisted state - check for offline fills
+				recordOfflineFillsIfAny(slot, currentOffer, persistedOffer);
 			}
-			
-			// Check if the same item in the same slot
-			if (persistedOffer.itemId != currentOffer.itemId)
+			else if (currentOffer.totalQuantity > 0)
 			{
-				log.debug("Slot {} has different item (was {}, now {}), skipping offline sync for this slot",
-					slot, persistedOffer.itemId, currentOffer.itemId);
-				continue;
-			}
-			
-			// Check if more items were sold while offline
-			int offlineFills = currentOffer.previousQuantitySold - persistedOffer.previousQuantitySold;
-			if (offlineFills > 0)
-			{
-				log.info("Detected {} offline fills for {} (slot {}): {} -> {}",
-					offlineFills,
-					currentOffer.itemName,
-					slot,
-					persistedOffer.previousQuantitySold,
-					currentOffer.previousQuantitySold);
+				// No persisted state but there's an active order - record it
+				log.debug("Recording GE order for {} {} (slot {}): {}/{} items at {} gp",
+					currentOffer.isBuy ? "BUY" : "SELL",
+					currentOffer.itemName, slot, currentOffer.previousQuantitySold, 
+					currentOffer.totalQuantity, currentOffer.price);
 				
-				// Record the offline transaction
 				Integer recommendedSellPrice = currentOffer.isBuy ? recommendedPrices.get(currentOffer.itemId) : null;
 				
-				apiClient.recordTransactionAsync(
-					currentOffer.itemId,
-					currentOffer.itemName,
-					currentOffer.isBuy,
-					offlineFills,
-					currentOffer.price,
-					slot,
-					recommendedSellPrice,
-					getCurrentRsnSafe().orElse(null)
-				);
+				apiClient.recordTransactionAsync(FlipSmartApiClient.TransactionRequest
+					.builder(currentOffer.itemId, currentOffer.itemName, currentOffer.isBuy,
+						currentOffer.previousQuantitySold, currentOffer.price)
+					.geSlot(slot)
+					.recommendedSellPrice(recommendedSellPrice)
+					.rsn(getCurrentRsnSafe().orElse(null))
+					.totalQuantity(currentOffer.totalQuantity)
+					.build());
+				
+				// For buy orders with fills, add to collected tracking so it shows in active flips
+				if (currentOffer.isBuy && currentOffer.previousQuantitySold > 0)
+				{
+					collectedItemIds.add(currentOffer.itemId);
+				}
 			}
 		}
+	}
+	
+	/**
+	 * Record offline fills if the current offer has more fills than persisted.
+	 */
+	private void recordOfflineFillsIfAny(int slot, TrackedOffer currentOffer, TrackedOffer persistedOffer)
+	{
+		int offlineFills = currentOffer.previousQuantitySold - persistedOffer.previousQuantitySold;
+		if (offlineFills <= 0)
+		{
+			return;
+		}
 		
-		// Check for offers that completed (became empty) while offline
+		log.debug("Detected {} offline fills for {} (slot {}): {} -> {} (order size: {})",
+			offlineFills, currentOffer.itemName, slot,
+			persistedOffer.previousQuantitySold, currentOffer.previousQuantitySold,
+			currentOffer.totalQuantity);
+		
+		Integer recommendedSellPrice = currentOffer.isBuy ? recommendedPrices.get(currentOffer.itemId) : null;
+		
+		apiClient.recordTransactionAsync(FlipSmartApiClient.TransactionRequest
+			.builder(currentOffer.itemId, currentOffer.itemName, currentOffer.isBuy,
+				offlineFills, currentOffer.price)
+			.geSlot(slot)
+			.recommendedSellPrice(recommendedSellPrice)
+			.rsn(getCurrentRsnSafe().orElse(null))
+			.totalQuantity(currentOffer.totalQuantity)
+			.build());
+	}
+	
+	/**
+	 * Handle persisted slots that are now empty (offer completed or cancelled offline).
+	 */
+	private void handleEmptyPersistedSlots(Map<Integer, TrackedOffer> persistedOffers)
+	{
 		for (Map.Entry<Integer, TrackedOffer> entry : persistedOffers.entrySet())
 		{
 			int slot = entry.getKey();
 			TrackedOffer persistedOffer = entry.getValue();
 			
-			if (!trackedOffers.containsKey(slot))
+			if (trackedOffers.containsKey(slot))
 			{
-				// This slot is now empty - the offer either completed, was cancelled, or was collected while offline
-				// We CANNOT safely assume it completed with all remaining items - it may have been cancelled
-				// with only partial fills. The safest approach is to NOT auto-record anything here.
-				// The actual fill amount should have been recorded when the items were collected in-game.
-				log.info("Slot {} is now empty (was tracking {} x{}). Cannot determine if completed or cancelled offline - skipping auto-record.",
-					slot, persistedOffer.itemName, persistedOffer.totalQuantity);
-				
-				// If this was a buy with some items already filled, add to collected tracking
-				// so the user can still sell those items and complete the flip
-				if (persistedOffer.isBuy && persistedOffer.previousQuantitySold > 0)
-				{
-					log.info("Adding {} to collected tracking (had {} items filled before going offline)",
-						persistedOffer.itemName, persistedOffer.previousQuantitySold);
-					collectedItemIds.add(persistedOffer.itemId);
-				}
+				continue;
+			}
+			
+			log.info("Slot {} is now empty (was tracking {} x{}). Cannot determine if completed or cancelled offline.",
+				slot, persistedOffer.itemName, persistedOffer.totalQuantity);
+			
+			// Track partially filled buys so user can sell them
+			if (persistedOffer.isBuy && persistedOffer.previousQuantitySold > 0)
+			{
+				log.info("Adding {} to collected tracking (had {} items filled before going offline)",
+					persistedOffer.itemName, persistedOffer.previousQuantitySold);
+				collectedItemIds.add(persistedOffer.itemId);
 			}
 		}
-		
-		// Clear persisted state after sync (RSN-specific key)
-		configManager.unsetConfiguration(CONFIG_GROUP, getPersistedOffersKey());
-		log.info("Offline sync completed for {}", currentRsn);
-		
-		// Refresh the flip finder panel to show updated data after offline sync
+	}
+	
+	/**
+	 * Schedule panel refresh and stale flip cleanup after offline sync.
+	 */
+	private void schedulePostSyncTasks()
+	{
+		// Refresh the panel after a short delay
 		if (flipFinderPanel != null)
 		{
 			javax.swing.Timer refreshTimer = new javax.swing.Timer(1000, e -> flipFinderPanel.refresh());
 			refreshTimer.setRepeats(false);
 			refreshTimer.start();
+		}
+		
+		// Schedule stale flip cleanup after GE state is stable
+		javax.swing.Timer cleanupTimer = new javax.swing.Timer(15000, e -> {
+			if (!trackedOffers.isEmpty() || collectedItemIds.isEmpty())
+			{
+				cleanupStaleActiveFlips();
+			}
+			else
+			{
+				log.info("Skipping cleanup - no GE offers detected yet, may not be safe");
+			}
+		});
+		cleanupTimer.setRepeats(false);
+		cleanupTimer.start();
+	}
+	
+	/**
+	 * Clean up stale active flips on the backend.
+	 * Sends the list of item IDs that are "truly active" (in GE slots or inventory)
+	 * to the API, which will mark all other active flips as closed.
+	 */
+	private void cleanupStaleActiveFlips()
+	{
+		// Must run on client thread to access game state
+		clientThread.invokeLater(this::executeStaleFlipCleanup);
+	}
+	
+	/**
+	 * Execute the stale flip cleanup (must be called on client thread).
+	 */
+	private void executeStaleFlipCleanup()
+	{
+		java.util.Set<Integer> activeItemIds = collectAllActiveItemIds();
+		
+		log.info("Cleaning up stale flips - {} item IDs are truly active", activeItemIds.size());
+		
+		apiClient.cleanupStaleFlipsAsync(activeItemIds, getCurrentRsnSafe().orElse(null))
+			.thenAccept(this::handleCleanupResult);
+	}
+	
+	/**
+	 * Collect all item IDs that are currently active (in GE slots or inventory).
+	 * Must be called on client thread.
+	 */
+	private java.util.Set<Integer> collectAllActiveItemIds()
+	{
+		java.util.Set<Integer> activeItemIds = getActiveFlipItemIds();
+		addInventoryItemIds(activeItemIds);
+		return activeItemIds;
+	}
+	
+	/**
+	 * Add all item IDs from inventory to the given set.
+	 * Must be called on client thread.
+	 */
+	private void addInventoryItemIds(java.util.Set<Integer> itemIds)
+	{
+		ItemContainer inventory = client.getItemContainer(INVENTORY_CONTAINER_ID);
+		if (inventory == null)
+		{
+			return;
+		}
+		
+		for (Item item : inventory.getItems())
+		{
+			if (item.getId() > 0)
+			{
+				itemIds.add(item.getId());
+			}
+		}
+	}
+	
+	/**
+	 * Handle the result of stale flip cleanup.
+	 */
+	private void handleCleanupResult(Boolean success)
+	{
+		if (Boolean.TRUE.equals(success))
+		{
+			log.info("Stale flip cleanup completed successfully");
+			refreshActiveFlipsOnSwingThread();
+		}
+	}
+	
+	/**
+	 * Refresh the active flips panel on the Swing EDT.
+	 */
+	private void refreshActiveFlipsOnSwingThread()
+	{
+		if (flipFinderPanel != null)
+		{
+			javax.swing.SwingUtilities.invokeLater(() -> flipFinderPanel.refreshActiveFlips());
 		}
 	}
 
@@ -5811,25 +6113,23 @@ public class FlipSmartPlugin extends Plugin
 					int newQuantity = quantitySold - previousOffer.previousQuantitySold;
 					int pricePerItem = spent / quantitySold;
 
-					log.info("Recording final transaction before cancellation: {} {} x{} @ {} gp each",
+					log.info("Recording final transaction before cancellation: {} {} x{}/{} @ {} gp each",
 						isBuy ? "BUY" : "SELL",
 						previousOffer.itemName,
 						newQuantity,
+						previousOffer.totalQuantity,
 						pricePerItem);
 
 					// Get recommended sell price if available
 					Integer recommendedSellPrice = isBuy ? recommendedPrices.get(itemId) : null;
 					
-					apiClient.recordTransactionAsync(
-						itemId,
-						previousOffer.itemName,
-						isBuy,
-						newQuantity,
-						pricePerItem,
-						slot,
-						recommendedSellPrice,
-						getCurrentRsnSafe().orElse(null)
-					);
+					apiClient.recordTransactionAsync(FlipSmartApiClient.TransactionRequest
+						.builder(itemId, previousOffer.itemName, isBuy, newQuantity, pricePerItem)
+						.geSlot(slot)
+						.recommendedSellPrice(recommendedSellPrice)
+						.rsn(getCurrentRsnSafe().orElse(null))
+						.totalQuantity(previousOffer.totalQuantity)
+						.build());
 				}
 				
 				log.info("Order cancelled: {} {} - {} items filled out of {}",
@@ -5913,7 +6213,7 @@ public class FlipSmartPlugin extends Plugin
 				// Calculate the actual price per item from the spent amount
 				int pricePerItem = spent / quantitySold;
 
-				log.info("Recording transaction: {} {} x{} @ {} gp each (slot {}, {}/{})",
+				log.info("Recording transaction: {} {} x{} @ {} gp each (slot {}, {}/{} filled)",
 					isBuy ? "BUY" : "SELL",
 					itemName,
 					newQuantity,
@@ -5925,17 +6225,14 @@ public class FlipSmartPlugin extends Plugin
 				// Get recommended sell price if this was a buy from a recommendation
 				Integer recommendedSellPrice = isBuy ? recommendedPrices.get(itemId) : null;
 				
-				// Record the transaction asynchronously
-				apiClient.recordTransactionAsync(
-					itemId,
-					itemName,
-					isBuy,
-					newQuantity,
-					pricePerItem,
-					slot,
-					recommendedSellPrice,
-					getCurrentRsnSafe().orElse(null)
-				);
+				// Record the transaction asynchronously with total order quantity
+				apiClient.recordTransactionAsync(FlipSmartApiClient.TransactionRequest
+					.builder(itemId, itemName, isBuy, newQuantity, pricePerItem)
+					.geSlot(slot)
+					.recommendedSellPrice(recommendedSellPrice)
+					.rsn(getCurrentRsnSafe().orElse(null))
+					.totalQuantity(totalQuantity)
+					.build());
 				
 				// Clear recommended price after recording (only for buys)
 				if (isBuy && recommendedSellPrice != null)
@@ -5972,6 +6269,23 @@ public class FlipSmartPlugin extends Plugin
 			
 			// Clear Flip Assist focus if this order matches the focused flip
 			clearFlipAssistFocusIfMatches(itemId, isBuy);
+			
+			// Record new buy orders to the API (even with 0 fills) so webapp can track them
+			if (isBuy && totalQuantity > 0 && previousOffer == null)
+			{
+				log.debug("Recording new buy order: {} x{} @ {} gp each (slot {}, 0/{} filled)",
+					itemName, 0, price, slot, totalQuantity);
+				
+				Integer recommendedSellPrice = recommendedPrices.get(itemId);
+				
+				apiClient.recordTransactionAsync(FlipSmartApiClient.TransactionRequest
+					.builder(itemId, itemName, true, 0, price)
+					.geSlot(slot)
+					.recommendedSellPrice(recommendedSellPrice)
+					.rsn(getCurrentRsnSafe().orElse(null))
+					.totalQuantity(totalQuantity)
+					.build());
+			}
 			
 			// Refresh the flip finder panel when any new order is submitted
 			// This ensures sell orders show up immediately in active flips
@@ -6798,33 +7112,98 @@ public class FlipSmartApiClient
 	}
 
 	/**
+	 * Data class for transaction request parameters (use Builder to construct)
+	 */
+	public static class TransactionRequest
+	{
+		public final int itemId;
+		public final String itemName;
+		public final boolean isBuy;
+		public final int quantity;
+		public final int pricePerItem;
+		public final Integer geSlot;
+		public final Integer recommendedSellPrice;
+		public final String rsn;
+		public final Integer totalQuantity;
+
+		private TransactionRequest(Builder builder)
+		{
+			this.itemId = builder.itemId;
+			this.itemName = builder.itemName;
+			this.isBuy = builder.isBuy;
+			this.quantity = builder.quantity;
+			this.pricePerItem = builder.pricePerItem;
+			this.geSlot = builder.geSlot;
+			this.recommendedSellPrice = builder.recommendedSellPrice;
+			this.rsn = builder.rsn;
+			this.totalQuantity = builder.totalQuantity;
+		}
+
+		public static Builder builder(int itemId, String itemName, boolean isBuy, int quantity, int pricePerItem)
+		{
+			return new Builder(itemId, itemName, isBuy, quantity, pricePerItem);
+		}
+
+		public static class Builder
+		{
+			private final int itemId;
+			private final String itemName;
+			private final boolean isBuy;
+			private final int quantity;
+			private final int pricePerItem;
+			private Integer geSlot;
+			private Integer recommendedSellPrice;
+			private String rsn;
+			private Integer totalQuantity;
+
+			private Builder(int itemId, String itemName, boolean isBuy, int quantity, int pricePerItem)
+			{
+				this.itemId = itemId;
+				this.itemName = itemName;
+				this.isBuy = isBuy;
+				this.quantity = quantity;
+				this.pricePerItem = pricePerItem;
+			}
+
+			public Builder geSlot(Integer geSlot) { this.geSlot = geSlot; return this; }
+			public Builder recommendedSellPrice(Integer price) { this.recommendedSellPrice = price; return this; }
+			public Builder rsn(String rsn) { this.rsn = rsn; return this; }
+			public Builder totalQuantity(Integer qty) { this.totalQuantity = qty; return this; }
+
+			public TransactionRequest build() { return new TransactionRequest(this); }
+		}
+	}
+
+	/**
 	 * Record a Grand Exchange transaction asynchronously
 	 */
-	public CompletableFuture<Void> recordTransactionAsync(int itemId, String itemName, boolean isBuy, 
-														  int quantity, int pricePerItem, Integer geSlot, 
-														  Integer recommendedSellPrice, String rsn)
+	public CompletableFuture<Void> recordTransactionAsync(TransactionRequest request)
 	{
 		String apiUrl = getApiUrl();
 		String url = String.format("%s/transactions", apiUrl);
 		
 		// Create JSON body
 		JsonObject jsonBody = new JsonObject();
-		jsonBody.addProperty("item_id", itemId);
-		jsonBody.addProperty("item_name", itemName);
-		jsonBody.addProperty("is_buy", isBuy);
-		jsonBody.addProperty("quantity", quantity);
-		jsonBody.addProperty("price_per_item", pricePerItem);
-		if (geSlot != null)
+		jsonBody.addProperty("item_id", request.itemId);
+		jsonBody.addProperty("item_name", request.itemName);
+		jsonBody.addProperty("is_buy", request.isBuy);
+		jsonBody.addProperty("quantity", request.quantity);
+		jsonBody.addProperty("price_per_item", request.pricePerItem);
+		if (request.geSlot != null)
 		{
-			jsonBody.addProperty("ge_slot", geSlot);
+			jsonBody.addProperty("ge_slot", request.geSlot);
 		}
-		if (recommendedSellPrice != null)
+		if (request.recommendedSellPrice != null)
 		{
-			jsonBody.addProperty("recommended_sell_price", recommendedSellPrice);
+			jsonBody.addProperty("recommended_sell_price", request.recommendedSellPrice);
 		}
-		if (rsn != null && !rsn.isEmpty())
+		if (request.rsn != null && !request.rsn.isEmpty())
 		{
-			jsonBody.addProperty("rsn", rsn);
+			jsonBody.addProperty("rsn", request.rsn);
+		}
+		if (request.totalQuantity != null && request.totalQuantity > 0)
+		{
+			jsonBody.addProperty("total_quantity", request.totalQuantity);
 		}
 		
 		RequestBody body = RequestBody.create(JSON, jsonBody.toString());
@@ -6836,7 +7215,7 @@ public class FlipSmartApiClient
 		return executeAuthenticatedAsync(requestBuilder, jsonData ->
 		{
 			JsonObject responseObj = gson.fromJson(jsonData, JsonObject.class);
-			log.info("Transaction recorded for {}: {}", rsn, responseObj.get("message").getAsString());
+			log.info("Transaction recorded for {}: {}", request.rsn, responseObj.get("message").getAsString());
 			return null;
 		}).thenApply(v -> null);
 	}
@@ -6911,6 +7290,63 @@ public class FlipSmartApiClient
 		}).exceptionally(e ->
 		{
 			log.warn("Failed to dismiss active flip: {}", e.getMessage());
+			return false;
+		});
+	}
+
+	/**
+	 * Clean up stale active flips that are no longer being tracked.
+	 * Sends the list of item IDs that the plugin considers "truly active"
+	 * (items in GE slots or inventory). The API will mark all other active
+	 * flips as manually closed.
+	 * 
+	 * @param activeItemIds Set of item IDs that are truly active
+	 * @param rsn Optional RSN to filter by (for multi-account support)
+	 * @return CompletableFuture with cleanup result
+	 */
+	public CompletableFuture<Boolean> cleanupStaleFlipsAsync(java.util.Set<Integer> activeItemIds, String rsn)
+	{
+		String apiUrl = getApiUrl();
+		String url;
+		if (rsn != null && !rsn.isEmpty())
+		{
+			url = String.format("%s/transactions/active-flips/cleanup?rsn=%s", apiUrl, rsn);
+		}
+		else
+		{
+			url = String.format("%s/transactions/active-flips/cleanup", apiUrl);
+		}
+		
+		// Build the request body
+		JsonObject requestBody = new JsonObject();
+		com.google.gson.JsonArray itemIdsArray = new com.google.gson.JsonArray();
+		for (Integer itemId : activeItemIds)
+		{
+			itemIdsArray.add(itemId);
+		}
+		requestBody.add("active_item_ids", itemIdsArray);
+		
+		RequestBody body = RequestBody.create(JSON, requestBody.toString());
+		Request.Builder requestBuilder = new Request.Builder()
+			.url(url)
+			.post(body);
+		
+		return executeAuthenticatedAsync(requestBuilder, jsonData ->
+		{
+			JsonObject responseObj = gson.fromJson(jsonData, JsonObject.class);
+			int itemsCleaned = responseObj.has("items_cleaned") ? responseObj.get("items_cleaned").getAsInt() : 0;
+			if (itemsCleaned > 0)
+			{
+				log.info("Cleaned up {} stale active flips", itemsCleaned);
+			}
+			else
+			{
+				log.debug("No stale flips to clean up");
+			}
+			return true;
+		}).exceptionally(e ->
+		{
+			log.warn("Failed to cleanup stale flips: {}", e.getMessage());
 			return false;
 		});
 	}
@@ -7146,6 +7582,12 @@ public class FlipAssistInputListener implements KeyListener
 	@Override
 	public void keyPressed(KeyEvent e)
 	{
+		// Don't process hotkeys if Flip Assist is disabled
+		if (!config.enableFlipAssistant())
+		{
+			return;
+		}
+		
 		// Check if the hotkey matches
 		Keybind hotkey = config.flipAssistHotkey();
 		if (!hotkey.matches(e))
