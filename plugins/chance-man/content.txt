@@ -681,7 +681,7 @@ import java.util.concurrent.*;
 @Singleton
 public class DropFetcher
 {
-    private static final String USER_AGENT = "RuneLite-ChanceMan/2.8.8";
+    private static final String USER_AGENT = "RuneLite-ChanceMan/3.0.0";
     private final OkHttpClient httpClient;
     private final ItemManager itemManager;
     private final ClientThread clientThread;
@@ -1163,8 +1163,11 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Manages the roll animation for unlocking items.
- * It processes roll requests asynchronously and handles the roll animation through the overlay.
+ * Manages roll animations and result announcements.
+ *
+ * New domain meanings:
+ *  - ObtainedItemsManager = items you have obtained (legacy: Rolled)
+ *  - RolledItemsManager   = items that have been rolled/unlocked (legacy: Unlocked)
  */
 @Singleton
 public class RollAnimationManager
@@ -1172,15 +1175,25 @@ public class RollAnimationManager
     @Inject private ItemManager itemManager;
     @Inject private Client client;
     @Inject private ClientThread clientThread;
-    @Inject private UnlockedItemsManager unlockedManager;
+
+    @Inject private ObtainedItemsManager obtainedManager;
+    @Inject private RolledItemsManager rolledManager;
+
     @Inject private ChanceManOverlay overlay;
     @Inject private ChanceManConfig config;
+
     @Setter private ChanceManPanel chanceManPanel;
 
-    @Setter private HashSet<Integer> allTradeableItems;
+    private Set<Integer> allTradeableItems = Collections.emptySet();
+
     private final Queue<Integer> rollQueue = new ConcurrentLinkedQueue<>();
     private ExecutorService executor = Executors.newSingleThreadExecutor();
+
     private volatile boolean isRolling = false;
+
+    // tradeables gating
+    private volatile boolean tradeablesReady = false;
+
     private static final int SNAP_WINDOW_MS = 350;
     private final Random random = new Random();
 
@@ -1188,39 +1201,61 @@ public class RollAnimationManager
     @Setter
     private volatile boolean manualRoll = false;
 
-    /**
-     * Enqueues an item ID for the roll animation.
-     *
-     * @param itemId The item ID to be rolled.
-     */
-    public void enqueueRoll(int itemId)
+    /** Called by plugin after building tradeables. */
+    public void setAllTradeableItems(Set<Integer> allTradeableItems)
     {
-        rollQueue.offer(itemId);
+        this.allTradeableItems = (allTradeableItems != null) ? allTradeableItems : Collections.emptySet();
+        this.tradeablesReady = !this.allTradeableItems.isEmpty();
+    }
+
+    public boolean hasTradeablesReady()
+    {
+        return tradeablesReady && allTradeableItems != null && !allTradeableItems.isEmpty();
     }
 
     /**
-     * Processes the roll queue by initiating a roll animation if not already rolling.
+     * Enqueue an obtained item that should trigger a roll.
+     *
+     * @param obtainedItemId item that caused the roll
+     */
+    public void enqueueRoll(int obtainedItemId)
+    {
+        rollQueue.offer(obtainedItemId);
+    }
+
+    /**
+     * Process pending rolls if idle.
      */
     public void process()
     {
+        if (!hasTradeablesReady())
+        {
+            return; // queue stays intact until tradeables are built
+        }
+
         if (!isRolling && !rollQueue.isEmpty())
         {
-            int queuedItemId = rollQueue.poll();
+            int obtainedItemId = rollQueue.poll();
             isRolling = true;
-            executor.submit(() -> performRoll(queuedItemId));
+            executor.submit(() -> performRoll(obtainedItemId));
         }
     }
 
     /**
-     * Performs the roll animation.
-     * Now announces/unlocks as soon as the item is selected (after the snap),
-     * while still letting the highlight finish visually before accepting another roll.
+     * Perform the roll animation and announce the result.
+     * The rolled item is selected during the snap window and immediately
+     * marked as ROLLED (legacy: unlocked), while the animation finishes visually.
      */
-    private void performRoll(int queuedItemId)
+    private void performRoll(int obtainedItemId)
     {
         try
         {
-            // Duration of the continuous spin phase (ms)
+            // If tradeables became invalid mid-roll, bail safely.
+            if (!hasTradeablesReady())
+            {
+                return;
+            }
+
             int rollDuration = 3000;
             overlay.startRollAnimation(0, rollDuration, this::getRandomLockedItem);
 
@@ -1233,30 +1268,53 @@ public class RollAnimationManager
                 Thread.currentThread().interrupt();
             }
 
-            int finalRolledItem = overlay.getFinalItem();
-            unlockedManager.unlockItem(finalRolledItem);
+            int rolledItemId = overlay.getFinalItem();
 
-            final boolean wasManualRoll = isManualRoll();
-            clientThread.invoke(() -> {
-                String unlockedTag = ColorUtil.wrapWithColorTag(getItemName(finalRolledItem), config.unlockedItemColor());
+            rolledManager.markRolled(rolledItemId);
+
+            final boolean wasManual = manualRoll;
+
+            clientThread.invoke(() ->
+            {
+                String rolledTag = ColorUtil.wrapWithColorTag(
+                        getItemName(rolledItemId),
+                        config.unlockedItemColor()
+                );
+
                 String message;
-                if (wasManualRoll)
+                if (wasManual)
                 {
-                    String pressTag = ColorUtil.wrapWithColorTag("pressing a button", config.rolledItemColor());
-                    message = "Unlocked " + unlockedTag + " by " + pressTag;
+                    String pressTag = ColorUtil.wrapWithColorTag(
+                            "pressing a button",
+                            config.rolledItemColor()
+                    );
+                    message = "Rolled " + rolledTag + " by " + pressTag;
                 }
                 else
                 {
-                    String rolledTag = ColorUtil.wrapWithColorTag(getItemName(queuedItemId), config.rolledItemColor());
-                    message = "Unlocked " + unlockedTag + " by rolling " + rolledTag;
+                    String obtainedTag = ColorUtil.wrapWithColorTag(
+                            getItemName(obtainedItemId),
+                            config.rolledItemColor()
+                    );
+                    message = "Rolled " + rolledTag + " by obtaining " + obtainedTag;
                 }
-                client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", message, null);
-                if (chanceManPanel != null) {
-                    SwingUtilities.invokeLater(() -> chanceManPanel.updatePanel());
+
+                client.addChatMessage(
+                        ChatMessageType.GAMEMESSAGE,
+                        "",
+                        message,
+                        null
+                );
+
+                if (chanceManPanel != null)
+                {
+                    SwingUtilities.invokeLater(chanceManPanel::updatePanel);
                 }
             });
 
-            int remainingHighlight = Math.max(0, overlay.getHighlightDurationMs() - SNAP_WINDOW_MS);
+            int remainingHighlight =
+                    Math.max(0, overlay.getHighlightDurationMs() - SNAP_WINDOW_MS);
+
             if (remainingHighlight > 0)
             {
                 try
@@ -1271,58 +1329,57 @@ public class RollAnimationManager
         }
         finally
         {
-            setManualRoll(false);
+            manualRoll = false;
             isRolling = false;
         }
     }
 
-    /**
-     * Checks if a roll animation is currently in progress.
-     *
-     * @return true if a roll is in progress, false otherwise.
-     */
-    public boolean isRolling() {
+    public boolean isRolling()
+    {
         return isRolling;
     }
 
     /**
-     * Retrieves a random locked item from the list of tradeable items.
-     *
-     * @return A random locked item ID, or a fallback if all items are unlocked.
+     * Pick a random locked item to display during the roll.
      */
-    public int getRandomLockedItem()
+    private int getRandomLockedItem()
     {
+        if (!hasTradeablesReady())
+        {
+            return overlay.getFinalItem();
+        }
+
         List<Integer> locked = new ArrayList<>();
         for (int id : allTradeableItems)
         {
-            if (!unlockedManager.isUnlocked(id))
+            if (!rolledManager.isRolled(id))
             {
                 locked.add(id);
             }
         }
+
         if (locked.isEmpty())
         {
-            // Fallback: keep showing the current center item
             return overlay.getFinalItem();
         }
+
         return locked.get(random.nextInt(locked.size()));
     }
 
-    public String getItemName(int itemId)
+    private String getItemName(int itemId)
     {
         ItemComposition comp = itemManager.getItemComposition(itemId);
         return comp.getName();
     }
 
-    public void startUp() {
-        if (executor == null || executor.isShutdown() || executor.isTerminated()) {
+    public void startUp()
+    {
+        if (executor == null || executor.isShutdown() || executor.isTerminated())
+        {
             executor = Executors.newSingleThreadExecutor();
         }
     }
 
-    /**
-     * Shuts down the roll animation executor service.
-     */
     public void shutdown()
     {
         executor.shutdownNow();
@@ -1356,32 +1413,43 @@ import static net.runelite.client.RuneLite.RUNELITE_DIR;
 public class RolledItemsManager
 {
     private static final int MAX_BACKUPS = 10;
-    private static final String CFG_KEY = "rolled";
+    private static final String CFG_KEY = "unlocked";
+    private static final String FILE_NAME = "chanceman_rolled.json";
+    private static final String OBTAINED_FILE_NAME = "chanceman_obtained.json";
+    private static final String LEGACY_FILE_NAME = "chanceman_unlocked.json";
+
     private static final String BACKUP_TS_PATTERN = "yyyyMMddHHmmss";
     private static final long CONFIG_DEBOUNCE_MS = 3000L;
     private static final long SELF_WRITE_GRACE_MS = 1500L;
     private static final long FS_DEBOUNCE_MS = 200L;
-    private static final String FILE_NAME = "chanceman_rolled.json";
+
     private static final Type SET_TYPE = new TypeToken<Set<Integer>>(){}.getType();
     private final Set<Integer> rolledItems = Collections.synchronizedSet(new LinkedHashSet<>());
+
     @Inject private AccountManager accountManager;
     @Inject private Gson gson;
     @Inject private ConfigPersistence configPersistence;
+
     @Setter private ExecutorService executor; // file writes & cloud mirror
     @Setter private Runnable onChange; // optional UI refresh
+
     private volatile long lastConfigWriteMs = 0L;
     private volatile boolean configWriteWarned = false;
     private volatile boolean dirty = false;
+
     private WatchService watchService;
     private volatile boolean watcherRunning = false;
     private volatile long lastSelfWriteMs = 0L;
     private Thread watcherThread;
+    public boolean ready() { return accountManager.getPlayerName() != null; }
 
     public boolean isRolled(int itemId) { return rolledItems.contains(itemId); }
 
     /** Return an immutable snapshot to avoid leaking the synchronizedSet. */
-    public Set<Integer> getRolledItems() {
-        synchronized (rolledItems) {
+    public Set<Integer> getRolledItems()
+    {
+        synchronized (rolledItems)
+        {
             return Collections.unmodifiableSet(new LinkedHashSet<>(rolledItems));
         }
     }
@@ -1413,7 +1481,7 @@ public class RolledItemsManager
     public void startWatching()
     {
         if (watcherRunning) return;
-        Path file = safeGetFilePathOrNull();
+        Path file = safeGetFilePathOrNull(FILE_NAME);
         if (file == null) return;
 
         try
@@ -1435,7 +1503,6 @@ public class RolledItemsManager
 
         watcherRunning = true;
         final String target = file.getFileName().toString();
-
         watcherThread = new Thread(() -> runWatcherLoop(target), "ChanceMan-Rolled-Watcher");
         watcherThread.setDaemon(true);
         watcherThread.start();
@@ -1454,7 +1521,7 @@ public class RolledItemsManager
     public void flushIfDirtyOnExit()
     {
         if (!dirty) return;
-        Path file = safeGetFilePathOrNull();
+        Path file = safeGetFilePathOrNull(FILE_NAME);
         if (file == null) return;
 
         try
@@ -1479,29 +1546,44 @@ public class RolledItemsManager
     {
         String player = accountManager.getPlayerName();
         if (player == null) return;
+        migrateLegacyObtainedFileIfNeeded();
+        Path newFile = safeGetFilePathOrNull(FILE_NAME);
+        if (newFile == null) return;
 
-        Path file = safeGetFilePathOrNull();
-        if (file == null) return;
+        boolean newFileExisted = Files.exists(newFile);
 
-        boolean fileExisted = Files.exists(file);
+        // Read local new first; if missing, seed from legacy unlocked file
+        Path legacyFile = safeGetFilePathOrNull(LEGACY_FILE_NAME);
 
-        Set<Integer> local = readLocalJson(file);
-        long localMtime = fileExisted ? safeLastModified(file) : 0L;
+        Set<Integer> localNew = readLocalJson(newFile);
+        Set<Integer> local;
+        if (!localNew.isEmpty() || newFileExisted)
+        {
+            local = localNew;
+        }
+        else
+        {
+            local = (legacyFile != null) ? readLocalJson(legacyFile) : new LinkedHashSet<>();
+        }
 
-        ConfigPersistence.StampedSet cloudStamped = readCloud(player);
+        long localMtime = newFileExisted ? safeLastModified(newFile) : 0L;
+
+        // Cloud
+        ConfigPersistence.StampedSet cloudStamped = readCloud(player, CFG_KEY);
         Set<Integer> cloud = new LinkedHashSet<>(cloudStamped.data);
         long cloudTs = cloudStamped.ts;
 
-        // LWW
+        // LWW between local and cloud
         Set<Integer> winner;
         Long winnerStamp = null;
         boolean needPersist;
 
-        if (localMtime > cloudTs) { winner = local;  winnerStamp = localMtime; needPersist = true; } // push to cloud
-        else if (cloudTs > localMtime) { winner = cloud;  winnerStamp = cloudTs;    needPersist = true; } // pull to disk
-        else { winner = local;  needPersist = !fileExisted; } // create disk if missing
+        if (localMtime > cloudTs) { winner = local; winnerStamp = localMtime; needPersist = true; }
+        else if (cloudTs > localMtime) { winner = cloud; winnerStamp = cloudTs; needPersist = true; }
+        else { winner = local; needPersist = !newFileExisted; }
 
-        synchronized (rolledItems) {
+        synchronized (rolledItems)
+        {
             rolledItems.clear();
             rolledItems.addAll(winner);
         }
@@ -1511,7 +1593,60 @@ public class RolledItemsManager
             long stamp = (winnerStamp != null) ? winnerStamp : System.currentTimeMillis();
             saveInternal(stamp, false); // bypass debounce during reconcile
         }
+
         dirty = false;
+    }
+
+    private void migrateLegacyObtainedFileIfNeeded()
+    {
+        Path legacyUnlocked = safeGetFilePathOrNull(LEGACY_FILE_NAME);
+        if (legacyUnlocked == null) return;
+
+        // Legacy marker: if this doesn't exist, it's a new-ish player and we should do nothing.
+        if (!Files.exists(legacyUnlocked)) return;
+
+        Path obtainedFile = safeGetFilePathOrNull(OBTAINED_FILE_NAME);
+        Path legacyObtainedFile = safeGetFilePathOrNull("chanceman_rolled.json");
+        if (obtainedFile == null || legacyObtainedFile == null) return;
+
+        // If obtained already exists, migration is done
+        if (Files.exists(obtainedFile)) return;
+
+        // If legacy obtained doesn't exist, nothing to migrate.
+        if (!Files.exists(legacyObtainedFile)) return;
+
+        try
+        {
+            // Only migrate if legacy obtained actually has data; if it's empty, don't bother.
+            Set<Integer> legacyData = readLocalJson(legacyObtainedFile);
+            if (legacyData.isEmpty())
+            {
+                return;
+            }
+
+            // Ensure directory exists
+            Files.createDirectories(obtainedFile.getParent());
+
+            // Move legacy file into the new obtained file name
+            try
+            {
+                Files.move(legacyObtainedFile, obtainedFile, StandardCopyOption.REPLACE_EXISTING);
+            }
+            catch (IOException moveFail)
+            {
+                // Fallback: copy + delete
+                Files.copy(legacyObtainedFile, obtainedFile, StandardCopyOption.REPLACE_EXISTING);
+                Files.deleteIfExists(legacyObtainedFile);
+            }
+
+            log.info("ChanceMan v3 migration: moved legacy obtained file {} -> {}",
+                    legacyObtainedFile.getFileName(), obtainedFile.getFileName());
+        }
+        catch (Exception e)
+        {
+            log.error("ChanceMan v3 migration: failed to migrate legacy obtained rolled.json -> obtained.json; refusing to proceed", e);
+            throw new RuntimeException(e);
+        }
     }
 
     /** Disk write + cloud mirror (debounced or immediate). */
@@ -1523,8 +1658,9 @@ public class RolledItemsManager
             return;
         }
 
-        executor.submit(() -> {
-            Path file = safeGetFilePathOrNull();
+        executor.submit(() ->
+        {
+            Path file = safeGetFilePathOrNull(FILE_NAME);
             if (file == null)
             {
                 log.error("RolledItemsManager: file path unavailable; skipping save");
@@ -1555,11 +1691,12 @@ public class RolledItemsManager
         String player = accountManager.getPlayerName();
         if (player == null || player.isEmpty() || executor == null) return;
 
-        Set<Integer> snap = (snapshot != null) ? snapshot : snapshotRolled();
-        executor.submit(() -> {
+        final Set<Integer> snap = (snapshot != null) ? snapshot : snapshotRolled();
+
+        executor.submit(() ->
+        {
             try
             {
-                // Guard against out-of-order writes across machines/threads
                 configPersistence.writeStampedSetIfNewer(player, CFG_KEY, snap, stampMillis);
             }
             catch (Exception e)
@@ -1576,9 +1713,9 @@ public class RolledItemsManager
     private boolean isExecutorAvailable()
     {
         if (executor == null) return false;
-        if (executor instanceof java.util.concurrent.ThreadPoolExecutor) {
-            java.util.concurrent.ThreadPoolExecutor tpe =
-                    (java.util.concurrent.ThreadPoolExecutor) executor;
+        if (executor instanceof java.util.concurrent.ThreadPoolExecutor)
+        {
+            java.util.concurrent.ThreadPoolExecutor tpe = (java.util.concurrent.ThreadPoolExecutor) executor;
             return !tpe.isShutdown() && !tpe.isTerminated();
         }
         return true;
@@ -1587,21 +1724,26 @@ public class RolledItemsManager
     private void safeNotifyChange()
     {
         Runnable cb = onChange;
-        if (cb != null) { try { cb.run(); } catch (Throwable t) { log.error("onChange threw", t); } }
+        if (cb != null)
+        {
+            try { cb.run(); }
+            catch (Throwable t) { log.error("onChange threw", t); }
+        }
     }
 
-    private Path getFilePath() throws IOException
+    private Path getFilePath(String fileName) throws IOException
     {
         String name = accountManager.getPlayerName();
         if (name == null) throw new IOException("Player name is null");
         Path dir = RUNELITE_DIR.toPath().resolve("chanceman").resolve(name);
         Files.createDirectories(dir);
-        return dir.resolve(FILE_NAME);
+        return dir.resolve(fileName);
     }
 
-    private Path safeGetFilePathOrNull()
+    private Path safeGetFilePathOrNull(String fileName)
     {
-        try { return getFilePath(); } catch (IOException ioe) { return null; }
+        try { return getFilePath(fileName); }
+        catch (IOException ioe) { return null; }
     }
 
     /** Windows-safe: COPY current file to a timestamped backup with small retries; then prune. */
@@ -1628,9 +1770,10 @@ public class RolledItemsManager
                 if (attempt >= maxAttempts)
                 {
                     log.error("Backup copy failed after {} attempts for {}", attempt, file, fse);
-                    break; // give up on backup, continue save
+                    break;
                 }
-                try { Thread.sleep(50L * attempt); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                try { Thread.sleep(50L * attempt); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
             }
         }
 
@@ -1653,15 +1796,29 @@ public class RolledItemsManager
         lastSelfWriteMs = System.currentTimeMillis();
     }
 
+    /** Move with fallback when ATOMIC_MOVE not supported. */
+    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
+    {
+        try { Files.move(source, target, opts); }
+        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
+        {
+            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
+            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
+            fallback.add(StandardCopyOption.REPLACE_EXISTING);
+            Files.move(source, target, fallback.toArray(new CopyOption[0]));
+        }
+    }
+
     private long safeLastModified(Path file)
     {
-        try { return Files.getLastModifiedTime(file).toMillis(); } catch (IOException e) { return 0L; }
+        try { return Files.getLastModifiedTime(file).toMillis(); }
+        catch (IOException e) { return 0L; }
     }
 
     private Set<Integer> readLocalJson(Path file)
     {
         Set<Integer> local = new LinkedHashSet<>();
-        if (!Files.exists(file)) return local;
+        if (file == null || !Files.exists(file)) return local;
         try (Reader r = Files.newBufferedReader(file))
         {
             Set<Integer> loaded = gson.fromJson(r, SET_TYPE);
@@ -1674,15 +1831,16 @@ public class RolledItemsManager
         return local;
     }
 
-    private ConfigPersistence.StampedSet readCloud(String player)
+    private ConfigPersistence.StampedSet readCloud(String player, String key)
     {
-        try { return configPersistence.readStampedSet(player, CFG_KEY); }
+        try { return configPersistence.readStampedSet(player, key); }
         catch (Exception e) { return new ConfigPersistence.StampedSet(new LinkedHashSet<>(), 0L); }
     }
 
     private void closeWatchServiceQuietly()
     {
-        try { if (watchService != null) watchService.close(); } catch (IOException ignored) {}
+        try { if (watchService != null) watchService.close(); }
+        catch (IOException ignored) {}
         watchService = null;
     }
 
@@ -1706,7 +1864,7 @@ public class RolledItemsManager
                         relevant = true;
                     }
                 }
-                if (!key.reset()) break; // exit if key becomes invalid
+                if (!key.reset()) break;
                 if (!relevant) continue;
 
                 long now = System.currentTimeMillis();
@@ -1732,22 +1890,11 @@ public class RolledItemsManager
         }
     }
 
-    /** Move with fallback when ATOMIC_MOVE not supported. */
-    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
-    {
-        try { Files.move(source, target, opts); }
-        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
-        {
-            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
-            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
-            fallback.add(StandardCopyOption.REPLACE_EXISTING);
-            Files.move(source, target, fallback.toArray(new CopyOption[0]));
-        }
-    }
-
     /** Take a consistent snapshot under the set's monitor. */
-    private Set<Integer> snapshotRolled() {
-        synchronized (rolledItems) {
+    private Set<Integer> snapshotRolled()
+    {
+        synchronized (rolledItems)
+        {
             return new LinkedHashSet<>(rolledItems);
         }
     }
@@ -1776,58 +1923,66 @@ import static net.runelite.client.RuneLite.RUNELITE_DIR;
 
 @Slf4j
 @Singleton
-public class UnlockedItemsManager
+public class ObtainedItemsManager
 {
     private static final int MAX_BACKUPS = 10;
-    private static final String CFG_KEY = "unlocked";
+    private static final String CFG_KEY = "obtained";
+    private static final String FILE_NAME = "chanceman_obtained.json";
+    private static final String LEGACY_CFG_KEY = "rolled";
+    private static final String LEGACY_FILE_NAME = "chanceman_rolled.json";
+    private static final String LEGACY_UNLOCKED_FILE = "chanceman_unlocked.json";
     private static final String BACKUP_TS_PATTERN = "yyyyMMddHHmmss";
     private static final long CONFIG_DEBOUNCE_MS = 3000L;
     private static final long SELF_WRITE_GRACE_MS = 1500L;
     private static final long FS_DEBOUNCE_MS = 200L;
-    private static final String FILE_NAME = "chanceman_unlocked.json";
     private static final Type SET_TYPE = new TypeToken<Set<Integer>>(){}.getType();
-    private final Set<Integer> unlockedItems = Collections.synchronizedSet(new LinkedHashSet<>());
+    private final Set<Integer> obtainedItems = Collections.synchronizedSet(new LinkedHashSet<>());
+
     @Inject private AccountManager accountManager;
     @Inject private Gson gson;
     @Inject private ConfigPersistence configPersistence;
+
     @Setter private ExecutorService executor; // file writes & cloud mirror
     @Setter private Runnable onChange;
+
     private volatile long lastConfigWriteMs = 0L;
     private volatile boolean configWriteWarned = false;
     private volatile boolean dirty = false;
+
     private WatchService watchService;
     private volatile boolean watcherRunning = false;
     private volatile long lastSelfWriteMs = 0L;
     private Thread watcherThread;
 
-    public boolean ready() { return accountManager.getPlayerName() != null; }
-    public boolean isUnlocked(int itemId) { return unlockedItems.contains(itemId); }
+    public boolean isObtained(int itemId) { return obtainedItems.contains(itemId); }
 
     /** Return an immutable snapshot to avoid leaking the synchronizedSet. */
-    public Set<Integer> getUnlockedItems() {
-        synchronized (unlockedItems) {
-            return Collections.unmodifiableSet(new LinkedHashSet<>(unlockedItems));
+    public Set<Integer> getObtainedItems()
+    {
+        synchronized (obtainedItems)
+        {
+            return Collections.unmodifiableSet(new LinkedHashSet<>(obtainedItems));
         }
     }
 
-    public void unlockItem(int itemId)
+    public void markObtained(int itemId)
     {
-        if (unlockedItems.add(itemId))
+        if (obtainedItems.add(itemId))
         {
             dirty = true;
-            saveUnlockedItems();
+            saveObtainedItems();
             safeNotifyChange();
         }
     }
 
-    public void loadUnlockedItems()
+    public void loadObtainedItems()
     {
         reconcileWithCloud(false);
         safeNotifyChange();
     }
 
     /** Normal save: disk + debounced cloud with current time. */
-    public void saveUnlockedItems()
+    public void saveObtainedItems()
     {
         saveInternal(System.currentTimeMillis(), true);
     }
@@ -1836,7 +1991,7 @@ public class UnlockedItemsManager
     public void startWatching()
     {
         if (watcherRunning) return;
-        Path file = safeGetFilePathOrNull();
+        Path file = safeGetFilePathOrNull(FILE_NAME);
         if (file == null) return;
 
         try
@@ -1852,14 +2007,13 @@ public class UnlockedItemsManager
         catch (IOException e)
         {
             closeWatchServiceQuietly();
-            log.error("Unlocked watcher: could not register", e);
+            log.error("Obtained watcher: could not register", e);
             return;
         }
 
         watcherRunning = true;
         final String target = file.getFileName().toString();
-
-        watcherThread = new Thread(() -> runWatcherLoop(target), "ChanceMan-Unlocked-Watcher");
+        watcherThread = new Thread(() -> runWatcherLoop(target), "ChanceMan-Obtained-Watcher");
         watcherThread.setDaemon(true);
         watcherThread.start();
     }
@@ -1876,24 +2030,24 @@ public class UnlockedItemsManager
     public void flushIfDirtyOnExit()
     {
         if (!dirty) return;
-        Path file = safeGetFilePathOrNull();
+        Path file = safeGetFilePathOrNull(FILE_NAME);
         if (file == null) return;
 
         try
         {
             rotateBackupIfExists(file);
-            Set<Integer> snap = snapshotUnlocked();
+            Set<Integer> snap = snapshotObtained();
             writeJsonAtomic(file, snap);
             mirrorToCloud(System.currentTimeMillis(), false, snap);
             dirty = false;
         }
         catch (IOException e)
         {
-            log.error("Shutdown flush failed for unlocked items (local saves may be stale).", e);
+            log.error("Shutdown flush failed for obtained items (local saves may be stale).", e);
         }
         catch (Exception e)
         {
-            log.error("Shutdown flush: failed to mirror unlocked set to ConfigManager.", e);
+            log.error("Shutdown flush: failed to mirror obtained set to ConfigManager.", e);
         }
     }
 
@@ -1902,29 +2056,78 @@ public class UnlockedItemsManager
         String player = accountManager.getPlayerName();
         if (player == null) return;
 
-        Path file = safeGetFilePathOrNull();
-        if (file == null) return;
+        Path newFile = safeGetFilePathOrNull(FILE_NAME);
+        if (newFile == null) return;
 
-        boolean fileExisted = Files.exists(file);
-        Set<Integer> local = readLocalJson(file);
-        long localMtime = fileExisted ? safeLastModified(file) : 0L;
+        boolean newFileExisted = Files.exists(newFile);
 
-        ConfigPersistence.StampedSet cloudStamped = readCloud(player);
-        Set<Integer> cloud = new LinkedHashSet<>(cloudStamped.data);
-        long cloudTs = cloudStamped.ts;
+        migrateLegacyLocalObtainedIfNeeded();
 
-        // LWW
+        // Re-check existence after migration attempt.
+        newFileExisted = Files.exists(newFile);
+
+        // Read local new first; if missing, seed from legacy rolled file (if it still exists)
+        Path legacyFile = safeGetFilePathOrNull(LEGACY_FILE_NAME);
+        boolean legacySeeded = false;
+
+        Set<Integer> localNew = readLocalJson(newFile);
+        Set<Integer> local;
+        if (!localNew.isEmpty() || newFileExisted)
+        {
+            local = localNew;
+        }
+        else
+        {
+            Set<Integer> legacySet = (legacyFile != null) ? readLocalJson(legacyFile) : new LinkedHashSet<>();
+            local = legacySet;
+            legacySeeded = !legacySet.isEmpty();
+        }
+
+        long localMtime = newFileExisted ? safeLastModified(newFile) : 0L;
+
+        // Cloud: new + legacy
+        ConfigPersistence.StampedSet cloudStampedNew = readCloud(player, CFG_KEY);
+        ConfigPersistence.StampedSet cloudStampedLegacy = readCloud(player, LEGACY_CFG_KEY);
+
+        Set<Integer> cloudNew = new LinkedHashSet<>(cloudStampedNew.data);
+        long cloudNewTs = cloudStampedNew.ts;
+
+        Set<Integer> cloudLegacy = new LinkedHashSet<>(cloudStampedLegacy.data);
+        long cloudLegacyTs = cloudStampedLegacy.ts;
+
+        // If new cloud is empty, allow legacy to seed
+        Set<Integer> cloudMerged = new LinkedHashSet<>(cloudNew);
+        if (cloudMerged.isEmpty() && !cloudLegacy.isEmpty())
+        {
+            cloudMerged.addAll(cloudLegacy);
+        }
+
+        long cloudTs = Math.max(cloudNewTs, cloudLegacyTs);
+
+        // LWW between local and (merged) cloud
         Set<Integer> winner;
         Long winnerStamp = null;
         boolean needPersist;
 
-        if (localMtime > cloudTs) { winner = local;  winnerStamp = localMtime; needPersist = true; } // push to cloud
-        else if (cloudTs > localMtime) { winner = cloud;  winnerStamp = cloudTs;    needPersist = true; } // pull to disk
-        else { winner = local;  needPersist = !fileExisted; } // create disk if missing
+        if (localMtime > cloudTs) { winner = local; winnerStamp = localMtime; needPersist = true; }
+        else if (cloudTs > localMtime) { winner = cloudMerged; winnerStamp = cloudTs; needPersist = true; }
+        else { winner = local; needPersist = !newFileExisted; }
 
-        synchronized (unlockedItems) {
-            unlockedItems.clear();
-            unlockedItems.addAll(winner);
+        synchronized (obtainedItems)
+        {
+            obtainedItems.clear();
+            obtainedItems.addAll(winner);
+        }
+        if (legacySeeded && legacyFile != null && Files.exists(legacyFile) && !newFileExisted)
+        {
+            try
+            {
+                archiveLegacyFile(legacyFile);
+            }
+            catch (IOException ioe)
+            {
+                log.error("Failed to archive legacy rolled file during obtained migration", ioe);
+            }
         }
 
         if (needPersist)
@@ -1932,7 +2135,53 @@ public class UnlockedItemsManager
             long stamp = (winnerStamp != null) ? winnerStamp : System.currentTimeMillis();
             saveInternal(stamp, false); // bypass debounce during reconcile
         }
+
         dirty = false;
+    }
+
+    private void migrateLegacyLocalObtainedIfNeeded()
+    {
+        Path legacyMarker = safeGetFilePathOrNull(LEGACY_UNLOCKED_FILE);
+        if (legacyMarker == null) return;
+
+        // New players won't have the legacy unlocked marker, so skip.
+        if (!Files.exists(legacyMarker)) return;
+
+        Path obtainedFile = safeGetFilePathOrNull(FILE_NAME);
+        Path legacyObtained = safeGetFilePathOrNull(LEGACY_FILE_NAME);
+        if (obtainedFile == null || legacyObtained == null) return;
+        if (Files.exists(obtainedFile)) return;
+        if (!Files.exists(legacyObtained)) return;
+
+        try
+        {
+            Set<Integer> legacyData = readLocalJson(legacyObtained);
+            if (legacyData.isEmpty())
+            {
+                return;
+            }
+
+            Files.createDirectories(obtainedFile.getParent());
+
+            // Move legacy -> new
+            try
+            {
+                Files.move(legacyObtained, obtainedFile, StandardCopyOption.REPLACE_EXISTING);
+            }
+            catch (IOException moveFail)
+            {
+                Files.copy(legacyObtained, obtainedFile, StandardCopyOption.REPLACE_EXISTING);
+                Files.deleteIfExists(legacyObtained);
+            }
+
+            log.info("ChanceMan v3 migration: moved legacy obtained file {} -> {}",
+                    legacyObtained.getFileName(), obtainedFile.getFileName());
+        }
+        catch (Exception e)
+        {
+            log.error("ChanceMan v3 migration: failed to migrate legacy obtained file", e);
+            throw new RuntimeException(e);
+        }
     }
 
     /** Disk write + cloud mirror (debounced or immediate). */
@@ -1940,28 +2189,29 @@ public class UnlockedItemsManager
     {
         if (!isExecutorAvailable())
         {
-            log.error("UnlockedItemsManager: executor unavailable; skipping save");
+            log.error("ObtainedItemsManager: executor unavailable; skipping save");
             return;
         }
 
-        executor.submit(() -> {
-            Path file = safeGetFilePathOrNull();
+        executor.submit(() ->
+        {
+            Path file = safeGetFilePathOrNull(FILE_NAME);
             if (file == null)
             {
-                log.error("UnlockedItemsManager: file path unavailable; skipping save");
+                log.error("ObtainedItemsManager: file path unavailable; skipping save");
                 return;
             }
             try
             {
                 rotateBackupIfExists(file);
-                Set<Integer> snap = snapshotUnlocked();
+                Set<Integer> snap = snapshotObtained();
                 writeJsonAtomic(file, snap);
                 mirrorToCloud(stampMillis, debounced, snap);
                 dirty = false;
             }
             catch (IOException e)
             {
-                log.error("Error saving unlocked items", e);
+                log.error("Error saving obtained items", e);
             }
         });
     }
@@ -1976,11 +2226,12 @@ public class UnlockedItemsManager
         String player = accountManager.getPlayerName();
         if (player == null || player.isEmpty() || executor == null) return;
 
-        final Set<Integer> snap = (snapshot != null) ? snapshot : snapshotUnlocked();
-        executor.submit(() -> {
+        final Set<Integer> snap = (snapshot != null) ? snapshot : snapshotObtained();
+
+        executor.submit(() ->
+        {
             try
             {
-                // Guard against out-of-order writes across machines/threads
                 configPersistence.writeStampedSetIfNewer(player, CFG_KEY, snap, stampMillis);
             }
             catch (Exception e)
@@ -1988,7 +2239,7 @@ public class UnlockedItemsManager
                 if (!configWriteWarned)
                 {
                     configWriteWarned = true;
-                    log.error("ChanceMan: failed to mirror unlocked set to ConfigManager (local saves intact).", e);
+                    log.error("ChanceMan: failed to mirror obtained set to ConfigManager (local saves intact).", e);
                 }
             }
         });
@@ -1997,9 +2248,9 @@ public class UnlockedItemsManager
     private boolean isExecutorAvailable()
     {
         if (executor == null) return false;
-        if (executor instanceof java.util.concurrent.ThreadPoolExecutor) {
-            java.util.concurrent.ThreadPoolExecutor tpe =
-                    (java.util.concurrent.ThreadPoolExecutor) executor;
+        if (executor instanceof java.util.concurrent.ThreadPoolExecutor)
+        {
+            java.util.concurrent.ThreadPoolExecutor tpe = (java.util.concurrent.ThreadPoolExecutor) executor;
             return !tpe.isShutdown() && !tpe.isTerminated();
         }
         return true;
@@ -2008,21 +2259,46 @@ public class UnlockedItemsManager
     private void safeNotifyChange()
     {
         Runnable cb = onChange;
-        if (cb != null) { try { cb.run(); } catch (Throwable t) { log.error("onChange threw", t); } }
+        if (cb != null)
+        {
+            try { cb.run(); }
+            catch (Throwable t) { log.error("onChange threw", t); }
+        }
     }
 
-    private Path getFilePath() throws IOException
+    private Path getFilePath(String fileName) throws IOException
     {
         String name = accountManager.getPlayerName();
         if (name == null) throw new IOException("Player name is null");
         Path dir = RUNELITE_DIR.toPath().resolve("chanceman").resolve(name);
         Files.createDirectories(dir);
-        return dir.resolve(FILE_NAME);
+        return dir.resolve(fileName);
     }
 
-    private Path safeGetFilePathOrNull()
+    private Path safeGetFilePathOrNull(String fileName)
     {
-        try { return getFilePath(); } catch (IOException ioe) { return null; }
+        try { return getFilePath(fileName); }
+        catch (IOException ioe) { return null; }
+    }
+
+    /** Move a legacy file out of the way so the new domain file name can take over. */
+    private void archiveLegacyFile(Path legacyFile) throws IOException
+    {
+        Path backups = legacyFile.getParent().resolve("backups");
+        Files.createDirectories(backups);
+
+        String ts = new SimpleDateFormat(BACKUP_TS_PATTERN).format(new Date());
+        Path archived = backups.resolve(legacyFile.getFileName() + ".migrated." + ts + ".bak");
+
+        try
+        {
+            Files.move(legacyFile, archived, StandardCopyOption.REPLACE_EXISTING);
+        }
+        catch (IOException moveFail)
+        {
+            Files.copy(legacyFile, archived, StandardCopyOption.REPLACE_EXISTING);
+            Files.deleteIfExists(legacyFile);
+        }
     }
 
     /** Windows-safe: COPY current file to a timestamped backup with small retries; then prune. */
@@ -2049,9 +2325,10 @@ public class UnlockedItemsManager
                 if (attempt >= maxAttempts)
                 {
                     log.error("Backup copy failed after {} attempts for {}", attempt, file, fse);
-                    break; // give up on backup, continue save
+                    break;
                 }
-                try { Thread.sleep(50L * attempt); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+                try { Thread.sleep(50L * attempt); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
             }
         }
 
@@ -2071,18 +2348,35 @@ public class UnlockedItemsManager
         Path tmp = file.resolveSibling(file.getFileName() + ".tmp");
         try (BufferedWriter w = Files.newBufferedWriter(tmp)) { gson.toJson(data, w); }
         safeMove(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-        lastSelfWriteMs = System.currentTimeMillis(); // mark AFTER swap
+        lastSelfWriteMs = System.currentTimeMillis();
+    }
+
+    /** Move with fallback when ATOMIC_MOVE not supported. */
+    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
+    {
+        try
+        {
+            Files.move(source, target, opts);
+        }
+        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
+        {
+            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
+            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
+            fallback.add(StandardCopyOption.REPLACE_EXISTING);
+            Files.move(source, target, fallback.toArray(new CopyOption[0]));
+        }
     }
 
     private long safeLastModified(Path file)
     {
-        try { return Files.getLastModifiedTime(file).toMillis(); } catch (IOException e) { return 0L; }
+        try { return Files.getLastModifiedTime(file).toMillis(); }
+        catch (IOException e) { return 0L; }
     }
 
     private Set<Integer> readLocalJson(Path file)
     {
         Set<Integer> local = new LinkedHashSet<>();
-        if (!Files.exists(file)) return local;
+        if (file == null || !Files.exists(file)) return local;
         try (Reader r = Files.newBufferedReader(file))
         {
             Set<Integer> loaded = gson.fromJson(r, SET_TYPE);
@@ -2090,20 +2384,21 @@ public class UnlockedItemsManager
         }
         catch (IOException e)
         {
-            log.error("Error reading unlocked items JSON", e);
+            log.error("Error reading obtained items JSON", e);
         }
         return local;
     }
 
-    private ConfigPersistence.StampedSet readCloud(String player)
+    private ConfigPersistence.StampedSet readCloud(String player, String key)
     {
-        try { return configPersistence.readStampedSet(player, CFG_KEY); }
+        try { return configPersistence.readStampedSet(player, key); }
         catch (Exception e) { return new ConfigPersistence.StampedSet(new LinkedHashSet<>(), 0L); }
     }
 
     private void closeWatchServiceQuietly()
     {
-        try { if (watchService != null) watchService.close(); } catch (IOException ignored) {}
+        try { if (watchService != null) watchService.close(); }
+        catch (IOException ignored) {}
         watchService = null;
     }
 
@@ -2127,11 +2422,11 @@ public class UnlockedItemsManager
                         relevant = true;
                     }
                 }
-                if (!key.reset()) break; // exit if key becomes invalid
+                if (!key.reset()) break;
                 if (!relevant) continue;
 
                 long now = System.currentTimeMillis();
-                if (now - lastSelfWriteMs <= SELF_WRITE_GRACE_MS) continue; // our own write
+                if (now - lastSelfWriteMs <= SELF_WRITE_GRACE_MS) continue;
                 if (now - lastHandled < FS_DEBOUNCE_MS) continue;
                 lastHandled = now;
 
@@ -2142,7 +2437,7 @@ public class UnlockedItemsManager
                 }
                 catch (Throwable t)
                 {
-                    log.error("Unlocked watcher reconcile failed", t);
+                    log.error("Obtained watcher reconcile failed", t);
                 }
             }
         }
@@ -2153,26 +2448,12 @@ public class UnlockedItemsManager
         }
     }
 
-    /** Move with fallback when ATOMIC_MOVE not supported. */
-    private void safeMove(Path source, Path target, CopyOption... opts) throws IOException
-    {
-        try
-        {
-            Files.move(source, target, opts);
-        }
-        catch (AtomicMoveNotSupportedException | AccessDeniedException ex)
-        {
-            Set<CopyOption> fallback = new HashSet<>(Arrays.asList(opts));
-            fallback.remove(StandardCopyOption.ATOMIC_MOVE);
-            fallback.add(StandardCopyOption.REPLACE_EXISTING);
-            Files.move(source, target, fallback.toArray(new CopyOption[0]));
-        }
-    }
-
     /** Take a consistent snapshot under the set's monitor. */
-    private Set<Integer> snapshotUnlocked() {
-        synchronized (unlockedItems) {
-            return new LinkedHashSet<>(unlockedItems);
+    private Set<Integer> snapshotObtained()
+    {
+        synchronized (obtainedItems)
+        {
+            return new LinkedHashSet<>(obtainedItems);
         }
     }
 }
@@ -2197,7 +2478,7 @@ import com.google.inject.Provides;
 import lombok.Getter;
 import com.chanceman.managers.RollAnimationManager;
 import com.chanceman.managers.RolledItemsManager;
-import com.chanceman.managers.UnlockedItemsManager;
+import com.chanceman.managers.ObtainedItemsManager;
 import net.runelite.api.*;
 import net.runelite.api.events.*;
 import net.runelite.api.widgets.Widget;
@@ -2223,7 +2504,7 @@ import java.util.concurrent.Executors;
 
 @PluginDescriptor(
         name = "ChanceMan",
-        description = "Locks tradeable items until unlocked via a random roll.",
+        description = "Locks tradeable items until obtained via a random roll.",
         tags = {"chance", "roll", "lock", "unlock", "luck", "game of chance", "goc"}
 )
 public class ChanceManPlugin extends Plugin
@@ -2240,7 +2521,7 @@ public class ChanceManPlugin extends Plugin
     @Inject private ChanceManConfig config;
     @Inject private ConfigManager configManager;
     @Inject private AccountManager accountManager;
-    @Inject private UnlockedItemsManager unlockedItemsManager;
+    @Inject private ObtainedItemsManager obtainedItemsManager;
     @Inject private RolledItemsManager rolledItemsManager;
     @Inject private RollAnimationManager rollAnimationManager;
     @Inject private EventBus eventBus;
@@ -2258,7 +2539,7 @@ public class ChanceManPlugin extends Plugin
     private ExecutorService fileExecutor;
     @Getter private final HashSet<Integer> allTradeableItems = new LinkedHashSet<>();
     private static final int GE_SEARCH_BUILD_SCRIPT = 751;
-    private boolean tradeableItemsInitialized = false;
+    private volatile boolean tradeableItemsInitialized = false;
     private boolean featuresActive = false;
 
     @Provides
@@ -2300,7 +2581,7 @@ public class ChanceManPlugin extends Plugin
             t.setDaemon(true);
             return t;
         });
-        unlockedItemsManager.setExecutor(fileExecutor);
+        obtainedItemsManager.setExecutor(fileExecutor);
         rolledItemsManager.setExecutor(fileExecutor);
 
         if (accountManager.ready())
@@ -2311,10 +2592,10 @@ public class ChanceManPlugin extends Plugin
                 }
                 refreshDropsViewerIfOpen();
             };
-            unlockedItemsManager.setOnChange(refreshPanel);
+            obtainedItemsManager.setOnChange(refreshPanel);
             rolledItemsManager.setOnChange(refreshPanel);
 
-            unlockedItemsManager.loadUnlockedItems();
+            obtainedItemsManager.loadObtainedItems();
             rolledItemsManager.loadRolledItems();
         }
 
@@ -2325,7 +2606,7 @@ public class ChanceManPlugin extends Plugin
         dropsTabUI.startUp();
 
         chanceManPanel = new ChanceManPanel(
-                unlockedItemsManager,
+                obtainedItemsManager,
                 rolledItemsManager,
                 itemManager,
                 allTradeableItems,
@@ -2338,7 +2619,7 @@ public class ChanceManPlugin extends Plugin
 
         if (accountManager.ready())
         {
-            unlockedItemsManager.startWatching();
+            obtainedItemsManager.startWatching();
             rolledItemsManager.startWatching();
         }
 
@@ -2356,6 +2637,8 @@ public class ChanceManPlugin extends Plugin
         eventBus.register(musicWidgetController);
         eventBus.register(musicSearchButton);
         musicSearchButton.onStart();
+        tradeableItemsInitialized = false;
+        rollAnimationManager.setAllTradeableItems(Collections.<Integer>emptySet());
     }
 
     private void disableFeatures()
@@ -2365,9 +2648,9 @@ public class ChanceManPlugin extends Plugin
 
         try
         {
-            if (unlockedItemsManager != null) unlockedItemsManager.stopWatching();
+            if (obtainedItemsManager != null) obtainedItemsManager.stopWatching();
             if (rolledItemsManager != null)   rolledItemsManager.stopWatching();
-            if (unlockedItemsManager != null) unlockedItemsManager.flushIfDirtyOnExit();
+            if (obtainedItemsManager != null) obtainedItemsManager.flushIfDirtyOnExit();
             if (rolledItemsManager != null) rolledItemsManager.flushIfDirtyOnExit();
         }
         catch (Exception ignored) { /* Non-fatal */ }
@@ -2400,10 +2683,10 @@ public class ChanceManPlugin extends Plugin
             fileExecutor.shutdownNow();
             fileExecutor = null;
 
-            if (unlockedItemsManager != null)
+            if (obtainedItemsManager != null)
             {
-                unlockedItemsManager.setExecutor(null);
-                unlockedItemsManager.setOnChange(null);
+                obtainedItemsManager.setExecutor(null);
+                obtainedItemsManager.setOnChange(null);
             }
             if (rolledItemsManager != null)
             {
@@ -2418,6 +2701,7 @@ public class ChanceManPlugin extends Plugin
         chanceManPanel = null;
         allTradeableItems.clear();
         tradeableItemsInitialized = false;
+        rollAnimationManager.setAllTradeableItems(Collections.emptySet());
         accountManager.reset();
     }
 
@@ -2429,26 +2713,39 @@ public class ChanceManPlugin extends Plugin
     }
 
     /** Refreshes the list of tradeable item IDs based on the current configuration. */
-    public void refreshTradeableItems() {
-        clientThread.invokeLater(() -> {
+    public void refreshTradeableItems()
+    {
+        clientThread.invokeLater(() ->
+        {
+            tradeableItemsInitialized = false;
+
             allTradeableItems.clear();
-            for (int i = 0; i < 40000; i++) {
+            for (int i = 0; i < 40000; i++)
+            {
                 ItemComposition comp = itemManager.getItemComposition(i);
                 if (comp != null && comp.isTradeable() && !isNotTracked(i)
-                        && !ItemsFilter.isBlocked(i, config)) {
-                    if (config.freeToPlay() && comp.isMembers()) {
+                        && !ItemsFilter.isBlocked(i, config))
+                {
+                    if (config.freeToPlay() && comp.isMembers())
+                    {
                         continue;
                     }
                     if (!ItemsFilter.isPoisonEligible(i, config.requireWeaponPoison(),
-                            unlockedItemsManager.getUnlockedItems())) {
+                            rolledItemsManager.getRolledItems()))
+                    {
                         continue;
                     }
                     allTradeableItems.add(i);
                 }
             }
             rollAnimationManager.setAllTradeableItems(allTradeableItems);
-            if (chanceManPanel != null) {
-                SwingUtilities.invokeLater(() -> chanceManPanel.updatePanel());
+
+            // Only now mark initialized (prevents early rolls on login/inventory scan).
+            tradeableItemsInitialized = true;
+
+            if (chanceManPanel != null)
+            {
+                SwingUtilities.invokeLater(chanceManPanel::updatePanel);
             }
         });
     }
@@ -2489,22 +2786,19 @@ public class ChanceManPlugin extends Plugin
         if (!featuresActive) return;
         dropCache.pruneOldCaches();
 
-        // Stop watchers around the reload
-        unlockedItemsManager.stopWatching();
+        obtainedItemsManager.stopWatching();
         rolledItemsManager.stopWatching();
 
-        // Reload data
-        unlockedItemsManager.loadUnlockedItems();
+        obtainedItemsManager.loadObtainedItems();
         rolledItemsManager.loadRolledItems();
 
-        // Ensure UI reflects new account state
+        refreshTradeableItems();
         if (chanceManPanel != null)
         {
-            SwingUtilities.invokeLater(() -> chanceManPanel.updatePanel());
+            SwingUtilities.invokeLater(chanceManPanel::updatePanel);
         }
 
-        // Restart watchers
-        unlockedItemsManager.startWatching();
+        obtainedItemsManager.startWatching();
         rolledItemsManager.startWatching();
     }
 
@@ -2515,10 +2809,12 @@ public class ChanceManPlugin extends Plugin
         if (!tradeableItemsInitialized && client.getGameState() == GameState.LOGGED_IN)
         {
             refreshTradeableItems();
-            tradeableItemsInitialized = true;
         }
 
-        rollAnimationManager.process();
+        if (tradeableItemsInitialized)
+        {
+            rollAnimationManager.process();
+        }
     }
 
     @Subscribe
@@ -2528,24 +2824,29 @@ public class ChanceManPlugin extends Plugin
         if (event.getScriptId() == GE_SEARCH_BUILD_SCRIPT) { killSearchResults(); }
     }
 
-    private void killSearchResults() {
+    private void killSearchResults()
+    {
         Widget geSearchResults = client.getWidget(162, 51);
-        if (geSearchResults == null) {
+        if (geSearchResults == null)
+        {
             return;
         }
         Widget[] children = geSearchResults.getDynamicChildren();
-        if (children == null || children.length < 2 || children.length % 3 != 0) {
+        if (children == null || children.length < 2 || children.length % 3 != 0)
+        {
             return;
         }
-        Set<Integer> unlocked = unlockedItemsManager.getUnlockedItems();
+        Set<Integer> obtained = obtainedItemsManager.getObtainedItems();
         Set<Integer> rolled = rolledItemsManager.getRolledItems();
         boolean requireRolled = config.requireRolledUnlockedForGe();
-        for (int i = 0; i < children.length; i += 3) {
+        for (int i = 0; i < children.length; i += 3)
+        {
             int offerItemId = children[i + 2].getItemId();
-            boolean isUnlocked = unlocked.contains(offerItemId);
+            boolean isObtained = obtained.contains(offerItemId);
             boolean isRolled = rolled.contains(offerItemId);
-            boolean hide = requireRolled ? !(isUnlocked && isRolled) : !isUnlocked;
-            if (hide) {
+            boolean hide = requireRolled ? !(isObtained && isRolled) : !isRolled;
+            if (hide)
+            {
                 children[i].setHidden(true);
                 children[i + 1].setOpacity(70);
                 children[i + 2].setOpacity(70);
@@ -2553,11 +2854,18 @@ public class ChanceManPlugin extends Plugin
         }
     }
 
+    private boolean canProcessItemEvents()
+    {
+        return featuresActive
+                && accountManager.ready()
+                && tradeableItemsInitialized
+                && rollAnimationManager.hasTradeablesReady();
+    }
+
     @Subscribe
     public void onItemSpawned(ItemSpawned event)
     {
-        if (!featuresActive) return;
-        if (!accountManager.ready()) return;
+        if (!canProcessItemEvents()) return;
 
         TileItem tileItem = (TileItem) event.getItem();
         int itemId = EnsouledHeadMapping.toTradeableId(tileItem.getId());
@@ -2570,14 +2878,10 @@ public class ChanceManPlugin extends Plugin
         {
             return;
         }
-        if (rolledItemsManager == null)
+        if (!obtainedItemsManager.isObtained(canonicalItemId))
         {
-            return;
-        }
-        if (!rolledItemsManager.isRolled(canonicalItemId))
-        {
+            obtainedItemsManager.markObtained(canonicalItemId);
             rollAnimationManager.enqueueRoll(canonicalItemId);
-            rolledItemsManager.markRolled(canonicalItemId);
             refreshDropsViewerIfOpen();
         }
     }
@@ -2585,8 +2889,7 @@ public class ChanceManPlugin extends Plugin
     @Subscribe
     public void onItemContainerChanged(ItemContainerChanged event)
     {
-        if (!featuresActive) return;
-        if (!accountManager.ready()) return;
+        if (!canProcessItemEvents()) return;
 
         if (event.getContainerId() == 93)
         {
@@ -2600,10 +2903,11 @@ public class ChanceManPlugin extends Plugin
                 {
                     continue;
                 }
-                if (!processed.contains(canonicalId) && !rolledItemsManager.isRolled(canonicalId))
+
+                if (!processed.contains(canonicalId) && !obtainedItemsManager.isObtained(canonicalId))
                 {
+                    obtainedItemsManager.markObtained(canonicalId);
                     rollAnimationManager.enqueueRoll(canonicalId);
-                    rolledItemsManager.markRolled(canonicalId);
                     processed.add(canonicalId);
                 }
             }
@@ -2728,8 +3032,8 @@ public interface ChanceManConfig extends Config
 
     @ConfigItem(
             keyName = "requireRolledUnlockedForGe",
-            name = "GE Requires Rolled and Unlocked",
-            description = "Only allow Grand Exchange purchases once items are both rolled and unlocked.",
+            name = "GE Requires Obtained and Rolled",
+            description = "Only Allow Grand Exchange results for items that have been both obtained and rolled.",
             position = 8
     )
     default boolean requireRolledUnlockedForGe() { return true; }
@@ -2829,7 +3133,7 @@ package com.chanceman.ui;
 import com.chanceman.ChanceManConfig;
 import com.chanceman.drops.DropItem;
 import com.chanceman.drops.NpcDropData;
-import com.chanceman.managers.RolledItemsManager;
+import com.chanceman.managers.ObtainedItemsManager;
 
 import java.util.*;
 import java.util.stream.Collectors;
@@ -2866,7 +3170,7 @@ public class MusicWidgetController
 
     private final Client client;
     private final ClientThread clientThread;
-    private final RolledItemsManager rolledItemsManager;
+    private final ObtainedItemsManager obtainedItemsManager;
     private final SpriteOverrideManager spriteOverrideManager;
     private final ItemSpriteCache itemSpriteCache;
     private final ChanceManConfig config;
@@ -2886,13 +3190,13 @@ public class MusicWidgetController
     @Getter private final Map<Widget, DropItem> iconItemMap = new LinkedHashMap<>();
     @Getter private boolean overrideActive = false;
     @Inject private MusicSearchButton musicSearchButton;
-    private boolean hideRolledItems = false;
+    private boolean hideObtainedItems = false;
 
     @Inject
     public MusicWidgetController(
             Client client,
             ClientThread clientThread,
-            RolledItemsManager rolledItemsManager,
+            ObtainedItemsManager obtainedItemsManager,
             SpriteOverrideManager spriteOverrideManager,
             ItemSpriteCache itemSpriteCache,
             ChanceManConfig config,
@@ -2900,7 +3204,7 @@ public class MusicWidgetController
     {
         this.client = client;
         this.clientThread = clientThread;
-        this.rolledItemsManager = rolledItemsManager;
+        this.obtainedItemsManager = obtainedItemsManager;
         this.spriteOverrideManager = spriteOverrideManager;
         this.itemSpriteCache = itemSpriteCache;
         this.config = config;
@@ -2928,7 +3232,7 @@ public class MusicWidgetController
             return;
         }
         currentDrops = dropData;
-        hideRolledItems = false;
+        hideObtainedItems = false;
         musicSearchButton.onOverrideActivated();
         if (!overrideActive)
         {
@@ -2956,13 +3260,13 @@ public class MusicWidgetController
         }
         spriteOverrideManager.unregister();
         itemSpriteCache.clear();
-        hideRolledItems = false;
+        hideObtainedItems = false;
         clientThread.invokeLater(this::revertOverride);
     }
 
     private void updateIconsVisibilityAndLayout()
     {
-        Set<Integer> rolledIds = rolledItemsManager.getRolledItems();
+        Set<Integer> obtainedIds = obtainedItemsManager.getObtainedItems();
         Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
         Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
 
@@ -2972,9 +3276,9 @@ public class MusicWidgetController
         {
             Widget icon = e.getKey();
             DropItem d = e.getValue();
-            boolean rolled = rolledIds.contains(d.getItemId());
+            boolean obtained = obtainedIds.contains(d.getItemId());
 
-            if (hideRolledItems && rolled)
+            if (hideObtainedItems && obtained)
             {
                 icon.setHidden(true);
             }
@@ -3087,7 +3391,7 @@ public class MusicWidgetController
         return title;
     }
 
-    private void drawProgressBarAndToggle(Widget root, Widget title, NpcDropData dropData, int rolledCount, int totalDrops)
+    private void drawProgressBarAndToggle(Widget root, Widget title, NpcDropData dropData, int obtainedCount, int totalDrops)
     {
         int fontId = title != null ? title.getFontId() : 0;
         boolean shadowed = title != null && title.getTextShadowed();
@@ -3154,7 +3458,9 @@ public class MusicWidgetController
 
         final int border = 1;
         int innerWidth = newW - border * 2;
-        int fillW = Math.round(innerWidth * (float) rolledCount / totalDrops);
+        int fillW = (totalDrops <= 0)
+                ? 0
+                : Math.round(innerWidth * (float) obtainedCount / totalDrops);
 
         Widget fill = root.createChild(-1);
         fill.setHidden(false);
@@ -3168,7 +3474,7 @@ public class MusicWidgetController
         fill.revalidate();
         overrideRootWidgets.add(fill);
 
-        String txt = String.format("%d/%d", rolledCount, totalDrops);
+        String txt = String.format("%d/%d", obtainedCount, totalDrops);
         Widget label = root.createChild(-1);
         label.setHidden(false);
         label.setType(WidgetType.TEXT);
@@ -3193,16 +3499,16 @@ public class MusicWidgetController
         eye.setOriginalY(eyeY);
         eye.setOriginalWidth(EYE_SIZE);
         eye.setOriginalHeight(EYE_SIZE);
-        eye.setSpriteId(hideRolledItems ? 2222 : 2221);
+        eye.setSpriteId(hideObtainedItems ? 2222 : 2221);
         eye.revalidate();
-        eye.setAction(0, "Toggle rolled items");
+        eye.setAction(0, "Toggle obtained items");
 
         overrideRootWidgets.add(eye);
         eye.setOnOpListener((JavaScriptCallback) (ScriptEvent ev) ->
         {
-            hideRolledItems = !hideRolledItems;
+            hideObtainedItems = !hideObtainedItems;
             updateIconsVisibilityAndLayout();
-            eye.setSpriteId(hideRolledItems ? 2222 : 2221);
+            eye.setSpriteId(hideObtainedItems ? 2222 : 2221);
             eye.revalidate();
         });
         eye.setHasListener(true);
@@ -3291,7 +3597,7 @@ public class MusicWidgetController
         showSearchDialog();
     }
 
-    private void drawDropIcons(Widget scrollable, Widget scrollbar, Widget jukebox, List<DropItem> drops, Set<Integer> rolledIds)
+    private void drawDropIcons(Widget scrollable, Widget scrollbar, Widget jukebox, List<DropItem> drops, Set<Integer> obtainedIds)
     {
         if (scrollable == null || scrollbar == null)
         {
@@ -3331,7 +3637,7 @@ public class MusicWidgetController
             icon.setOriginalY(MARGIN_Y);
             icon.setOriginalWidth(ICON_SIZE);
             icon.setOriginalHeight(ICON_SIZE);
-            icon.setOpacity(rolledIds.contains(itemId) ? 0 : 150);
+            icon.setOpacity(obtainedIds.contains(itemId) ? 0 : 150);
             icon.revalidate();
 
             iconItemMap.put(icon, d);
@@ -3394,10 +3700,10 @@ public class MusicWidgetController
                 .collect(Collectors.toList());
         drops = WidgetUtils.dedupeAndSort(drops, config.sortDropsByRarity());
 
-        Set<Integer> rolledIds = rolledItemsManager.getRolledItems();
+        Set<Integer> obtainedIds = obtainedItemsManager.getObtainedItems();
         int totalDrops = drops.size();
-        int rolledCount = (int) drops.stream()
-                .filter(d -> rolledIds.contains(d.getItemId()))
+        int obtainedCount = (int) drops.stream()
+                .filter(d -> obtainedIds.contains(d.getItemId()))
                 .count();
 
         Widget title = updateTitle(dropData);
@@ -3412,14 +3718,14 @@ public class MusicWidgetController
             root.setType(WidgetType.LAYER);
             WidgetUtils.hideAllChildrenSafely(root);
 
-            drawProgressBarAndToggle(root, title, dropData, rolledCount, totalDrops);
+            drawProgressBarAndToggle(root, title, dropData, obtainedCount, totalDrops);
         }
 
         Widget scrollable = client.getWidget(MUSIC_GROUP, 4);
         Widget jukebox = client.getWidget(MUSIC_GROUP, 6);
         Widget scrollbar = client.getWidget(MUSIC_GROUP, 7);
 
-        drawDropIcons(scrollable, scrollbar, jukebox, drops, rolledIds);
+        drawDropIcons(scrollable, scrollbar, jukebox, drops, obtainedIds);
 
         if (root != null)
         {
@@ -4436,7 +4742,7 @@ public class MusicSearchButton {
 
 package com.chanceman.ui;
 
-import com.chanceman.managers.UnlockedItemsManager;
+import com.chanceman.managers.RolledItemsManager;
 import com.chanceman.filters.EnsouledHeadMapping;
 import com.chanceman.menus.EnabledUI;
 import lombok.RequiredArgsConstructor;
@@ -4465,7 +4771,7 @@ import java.util.concurrent.ConcurrentHashMap;
 @RequiredArgsConstructor(onConstructor_ = @Inject)
 public class ItemDimmerController {
     private final Client client;
-    private final UnlockedItemsManager unlockedItemsManager;
+    private final RolledItemsManager rolledItemsManager;
     private final ItemManager itemManager;
 
     // Cache (long-lived) for tradeable-by-canonical-id
@@ -4560,7 +4866,7 @@ public class ItemDimmerController {
         final int canonicalItemId = canonicalize(mappedItemId);
         if (canonicalItemId <= 0) return false;
         if (!isTradeableCanonical(canonicalItemId)) return false;
-        return !isUnlocked(mappedItemId, canonicalItemId);
+        return !isRolled(mappedItemId, canonicalItemId);
     }
 
     private int canonicalize(int rawItemId) {
@@ -4572,13 +4878,13 @@ public class ItemDimmerController {
         }
     }
 
-    private boolean isUnlocked(int normalizedItemId, int canonicalItemId) {
-        if (unlockedItemsManager == null) return true; // fail open if manager missing
+    private boolean isRolled(int normalizedItemId, int canonicalItemId) {
+        if (rolledItemsManager  == null) return true; // fail open if manager missing
 
         try {
-            // Fast paths: raw or canonical known unlocked
-            if (normalizedItemId > 0 && unlockedItemsManager.isUnlocked(normalizedItemId)) return true;
-            if (canonicalItemId > 0 && normalizedItemId != canonicalItemId && unlockedItemsManager.isUnlocked(canonicalItemId))
+            // Fast paths: raw or canonical known obtained
+            if (normalizedItemId > 0 && rolledItemsManager.isRolled(normalizedItemId)) return true;
+            if (canonicalItemId > 0 && normalizedItemId != canonicalItemId && obtainedItemSubCheck(canonicalItemId))
                 return true;
 
             // Slower path: related ids (placeholders / noted variants)
@@ -4592,7 +4898,7 @@ public class ItemDimmerController {
             }
 
             for (int id : candidates) {
-                if (id > 0 && unlockedItemsManager.isUnlocked(id)) {
+                if (id > 0 && obtainedItemSubCheck(id)) {
                     return true;
                 }
             }
@@ -4601,6 +4907,14 @@ public class ItemDimmerController {
         }
 
         return false;
+    }
+
+    private boolean obtainedItemSubCheck(int itemId) {
+        try {
+            return rolledItemsManager.isRolled(itemId);
+        } catch (Exception e) {
+            return true; // fail open if manager misbehaves
+        }
     }
 
     private void collectRelatedIds(int itemId, Set<Integer> sink) {
@@ -4712,7 +5026,7 @@ public class TabListener
 package com.chanceman.account;
 
 import com.chanceman.managers.RolledItemsManager;
-import com.chanceman.managers.UnlockedItemsManager;
+import com.chanceman.managers.ObtainedItemsManager;
 import lombok.Getter;
 import lombok.Setter;
 import net.runelite.api.Client;
@@ -4733,13 +5047,11 @@ import javax.inject.Singleton;
 @Singleton
 public class AccountManager
 {
-
 	@Inject
 	private Client client;
 
 	@Inject
-	private UnlockedItemsManager unlockedItemsManager;
-
+	private ObtainedItemsManager obtainedItemsManager;
 	@Inject
 	private RolledItemsManager rolledItemsManager;
 
@@ -4841,9 +5153,9 @@ public class AccountChanged
 
 package com.chanceman;
 
+import com.chanceman.managers.ObtainedItemsManager;
 import com.chanceman.managers.RollAnimationManager;
 import com.chanceman.managers.RolledItemsManager;
-import com.chanceman.managers.UnlockedItemsManager;
 import net.runelite.api.ItemComposition;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.game.ItemManager;
@@ -4851,86 +5163,86 @@ import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.util.LinkBrowser;
 
 import javax.swing.*;
-import javax.swing.DefaultListModel;
-import javax.swing.JList;
-import javax.swing.JScrollPane;
-import javax.swing.ListSelectionModel;
-import javax.swing.ListCellRenderer;
-import javax.swing.SwingUtilities;
 import javax.swing.border.*;
-import java.awt.Component;
 import java.awt.*;
 import java.awt.event.KeyAdapter;
 import java.awt.event.KeyEvent;
 import java.awt.image.BufferedImage;
 import java.util.*;
 import java.util.List;
-import java.util.function.Consumer;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * Panel for displaying rolled and unlocked items.
- * It provides UI for manual roll actions, search/filter functionality,
- * and displays each item with its icon and full item name.
- * Each item panel shows a tooltip on both the icon and the panel with the item name.
+ * Panel for Chance Man.
+ * Shows a searchable list of items from rolled/obtained state. A dropdown selects which list:
+ *  - Obtained
+ *  - Rolled
+ *  - Rolled, not Obtained
+ *  - Usable (in both sets)
+ * Items are shown newest-first based on underlying manager insertion order; for Usable,
+ * ordering follows rolled recency.
  */
 public class ChanceManPanel extends PluginPanel
 {
-    private final UnlockedItemsManager unlockedItemsManager;
+    private final ObtainedItemsManager obtainedItemsManager;
     private final RolledItemsManager rolledItemsManager;
     private final ItemManager itemManager;
     private final HashSet<Integer> allTradeableItems;
     private final ClientThread clientThread;
     private final RollAnimationManager rollAnimationManager;
 
-    // Caches for item icons and names
-    private final Map<Integer, ImageIcon> itemIconCache = new HashMap<>();
-    private final Map<Integer, String> itemNameCache = new HashMap<>();
+    private final Map<Integer, ImageIcon> itemIconCache = new ConcurrentHashMap<>();
+    private final Map<Integer, String> itemNameCache = new ConcurrentHashMap<>();
+    private final Set<Integer> nameFetchInFlight = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private final Set<Integer> iconFetchInFlight = Collections.newSetFromMap(new ConcurrentHashMap<>());
 
-    // CardLayout panel to show either Rolled or Unlocked view
-    private final JPanel centerCardPanel = new JPanel(new CardLayout());
-    private final DefaultListModel<Integer> rolledModel = new DefaultListModel<>();
-    private final JList<Integer> rolledList = new JList<>(rolledModel);
-    private final DefaultListModel<Integer> unlockedModel = new DefaultListModel<>();
-    private final JList<Integer> unlockedList = new JList<>(unlockedModel);
-
-    // View selection row: 3 buttons (swap, filter unlocked-not-rolled, filter unlocked-and-rolled)
-    private final JButton swapViewButton = new JButton("🔄");
-    private final JToggleButton filterUnlockedNotRolledButton = new JToggleButton("🔓");
-    private final JToggleButton filterUnlockedAndRolledButton = new JToggleButton("🔀");
-
-    // Flag for current view: true = showing Unlocked, false = showing Rolled
-    private boolean showingUnlocked = true;
-
-    // Search text
-    private String searchText = "";
-
-    // Single count label at the bottom
-    private final JLabel countLabel = new JLabel("Unlocked: 0/0");
-
-    // Roll button for manual roll actions
+    private final JLabel modeLabel = new JLabel("Items Rolled");
+    private final JTextField searchField = new JTextField();
+    private final DefaultListModel<Integer> listModel = new DefaultListModel<>();
+    private final JList<Integer> itemList = new JList<>(listModel);
+    private final JLabel countLabel = new JLabel("0/0");
     private final JButton rollButton = new JButton("Roll");
 
-    // Active filter: "NONE", "UNLOCKED_NOT_ROLLED", or "UNLOCKED_AND_ROLLED"
-    private String activeFilter = "NONE";
+    private enum ListMode
+    {
+        ROLLED("Rolled"),
+        OBTAINED("Obtained"),
+        ROLLED_NOT_OBTAINED("Rolled, not Obtained"),
+        USABLE("Usable");
 
-    // Join Discord Button links to discord invite
-    private final JButton discordButton = new JButton();
+        private final String label;
 
-    // Default color for item text
-    private final Color defaultItemTextColor = new Color(220, 220, 220);
+        ListMode(String label)
+        {
+            this.label = label;
+        }
 
-    /**
-     * Constructs a ChanceManPanel.
-     *
-     * @param unlockedItemsManager Manager for unlocked items.
-     * @param rolledItemsManager   Manager for rolled items.
-     * @param itemManager          The item manager.
-     * @param allTradeableItems    List of all tradeable item IDs.
-     * @param clientThread         The client thread for scheduling UI updates.
-     * @param rollAnimationManager The roll animation manager to trigger animations.
-     */
+        public String label()
+        {
+            return label;
+        }
+
+        @Override
+        public String toString()
+        {
+            return label;
+        }
+    }
+
+    private static final Map<ListMode, String> MODE_TOOLTIPS = Map.of(
+            ListMode.ROLLED, "Items that have been rolled/unlocked (legacy: Unlocked).",
+            ListMode.OBTAINED, "Items you have obtained. (legacy: Rolled).",
+            ListMode.ROLLED_NOT_OBTAINED, "Items you have rolled, but have not obtained yet.",
+            ListMode.USABLE, "Items that are both obtained and rolled."
+    );
+
+    private volatile ListMode listMode = ListMode.ROLLED;
+    private volatile String searchText = "";
+
+    private final JComboBox<ListMode> modeDropdown = new JComboBox<>(ListMode.values());
+
     public ChanceManPanel(
-            UnlockedItemsManager unlockedItemsManager,
+            ObtainedItemsManager obtainedItemsManager,
             RolledItemsManager rolledItemsManager,
             ItemManager itemManager,
             HashSet<Integer> allTradeableItems,
@@ -4938,7 +5250,7 @@ public class ChanceManPanel extends PluginPanel
             RollAnimationManager rollAnimationManager
     )
     {
-        this.unlockedItemsManager = unlockedItemsManager;
+        this.obtainedItemsManager = obtainedItemsManager;
         this.rolledItemsManager = rolledItemsManager;
         this.itemManager = itemManager;
         this.allTradeableItems = allTradeableItems;
@@ -4947,522 +5259,500 @@ public class ChanceManPanel extends PluginPanel
         init();
     }
 
-    /**
-     * Initializes the panel UI components.
-     */
     private void init()
     {
         setLayout(new BorderLayout());
-        setBorder(new EmptyBorder(15, 15, 15, 15));
+        setBorder(new EmptyBorder(12, 12, 12, 12));
         setBackground(new Color(37, 37, 37));
 
-        // ========== TOP PANEL (Header, Search, Buttons Row) ==========
-        JPanel topPanel = new JPanel();
-        topPanel.setLayout(new BoxLayout(topPanel, BoxLayout.Y_AXIS));
-        topPanel.setOpaque(false);
+        add(buildTop(), BorderLayout.NORTH);
+        add(buildCenter(), BorderLayout.CENTER);
+        add(buildBottom(), BorderLayout.SOUTH);
 
-        // Header
-        topPanel.add(buildHeaderPanel());
-        topPanel.add(Box.createVerticalStrut(10));
+        itemList.setFixedCellHeight(36);
+        itemList.setVisibleRowCount(-1);
 
-        // Search Bar
-        topPanel.add(buildSearchBar());
-        topPanel.add(Box.createVerticalStrut(10));
-
-        // Button row: 3 columns, each for one button
-        JPanel buttonRowPanel = new JPanel(new GridLayout(1, 3, 10, 0));
-        buttonRowPanel.setOpaque(false);
-
-        // Style the 3 buttons identically
-        styleButton(swapViewButton);
-        styleToggleButton(filterUnlockedNotRolledButton);
-        styleToggleButton(filterUnlockedAndRolledButton);
-
-        // Tooltips & actions
-        swapViewButton.setToolTipText("Swap between Unlocked and Rolled views");
-        swapViewButton.addActionListener(e -> toggleView());
-
-        filterUnlockedNotRolledButton.setToolTipText("Filter: Show items that are unlocked but not rolled");
-        filterUnlockedNotRolledButton.addActionListener(e ->
-        {
-            if (filterUnlockedNotRolledButton.isSelected())
-            {
-                activeFilter = "UNLOCKED_NOT_ROLLED";
-                filterUnlockedAndRolledButton.setSelected(false);
-            }
-            else
-            {
-                activeFilter = "NONE";
-            }
-            updatePanel();
-        });
-
-        filterUnlockedAndRolledButton.setToolTipText("Filter: Show items that are both unlocked and rolled");
-        filterUnlockedAndRolledButton.addActionListener(e ->
-        {
-            if (filterUnlockedAndRolledButton.isSelected())
-            {
-                activeFilter = "UNLOCKED_AND_ROLLED";
-                filterUnlockedNotRolledButton.setSelected(false);
-            }
-            else
-            {
-                activeFilter = "NONE";
-            }
-            updatePanel();
-        });
-
-        // Add them in left->right order
-        buttonRowPanel.add(swapViewButton);
-        buttonRowPanel.add(filterUnlockedNotRolledButton);
-        buttonRowPanel.add(filterUnlockedAndRolledButton);
-
-        // Add the row to the top panel
-        topPanel.add(buttonRowPanel);
-
-        // EXTRA SPACE between the buttons row and the icon panel
-        topPanel.add(Box.createVerticalStrut(10));
-
-        add(topPanel, BorderLayout.NORTH);
-
-        // ========== CENTER PANEL (CardLayout) ==========
-        rolledList.setCellRenderer(new ItemCellRenderer());
-        rolledList.setVisibleRowCount(10);
-        rolledList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        JScrollPane rolledScroll = new JScrollPane(
-                rolledList,
-                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
-                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
-        );
-        rolledScroll.setPreferredSize(new Dimension(250, 300));
-        JPanel rolledContainer = createTitledPanel("Rolled Items", rolledScroll);
-
-        unlockedList.setCellRenderer(new ItemCellRenderer());
-        unlockedList.setVisibleRowCount(10);
-        unlockedList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
-        JScrollPane unlockedScroll = new JScrollPane(
-                unlockedList,
-                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
-                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
-        );
-        unlockedScroll.setPreferredSize(new Dimension(250, 300));
-        JPanel unlockedContainer = createTitledPanel("Unlocked Items", unlockedScroll);
-
-        centerCardPanel.add(rolledContainer, "ROLLED");
-        centerCardPanel.add(unlockedContainer, "UNLOCKED");
-        add(centerCardPanel, BorderLayout.CENTER);
-
-        // ========== BOTTOM PANEL (Count + Roll) ==========
-        JPanel bottomPanel = new JPanel();
-        bottomPanel.setLayout(new BoxLayout(bottomPanel, BoxLayout.Y_AXIS));
-        bottomPanel.setOpaque(false);
-
-        // Single count label
-        JPanel countPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
-        countPanel.setOpaque(false);
-        countLabel.setFont(new Font("Arial", Font.BOLD, 11));
-        countLabel.setForeground(new Color(220, 220, 220));
-        countPanel.add(countLabel);
-        bottomPanel.add(countPanel);
-        bottomPanel.add(Box.createVerticalStrut(10));
-
-        // Roll button
-        JPanel rollButtonPanel = new JPanel(new FlowLayout(FlowLayout.CENTER));
-        rollButtonPanel.setOpaque(false);
-        rollButton.setPreferredSize(new Dimension(100, 30));
-        rollButton.setFocusPainted(false);
-        rollButton.setBackground(new Color(60, 63, 65));
-        rollButton.setForeground(Color.WHITE);
-        rollButton.setFont(new Font("SansSerif", Font.BOLD, 12));
-        rollButton.addActionListener(this::performManualRoll);
-        rollButtonPanel.add(rollButton);
-        bottomPanel.add(rollButtonPanel);
-
-        add(bottomPanel, BorderLayout.SOUTH);
-
-        // Default to Unlocked view
-        showingUnlocked = true;
-        ((CardLayout) centerCardPanel.getLayout()).show(centerCardPanel, "UNLOCKED");
+        setMode(ListMode.ROLLED);
         updatePanel();
     }
 
-    /**
-     * Renders each item ID as an icon + name in the JList.
-     */
-    private class ItemCellRenderer extends JPanel implements ListCellRenderer<Integer>
+    private JPanel buildTop()
     {
-        private final JLabel iconLabel = new JLabel();
-        private final JLabel nameLabel = new JLabel();
+        JPanel top = new JPanel();
+        top.setOpaque(false);
+        top.setLayout(new BoxLayout(top, BoxLayout.Y_AXIS));
 
-        public ItemCellRenderer()
-        {
-            setLayout(new BorderLayout(5, 0));
-            setOpaque(true);
-            add(iconLabel, BorderLayout.WEST);
-            add(nameLabel, BorderLayout.CENTER);
-            nameLabel.setFont(new Font("SansSerif", Font.PLAIN, 11));
-        }
+        top.add(buildHeaderRow());
+        top.add(Box.createVerticalStrut(10));
+        top.add(buildDropdownRow());
+        top.add(Box.createVerticalStrut(8));
+        top.add(buildModeLabelRow());
+        top.add(Box.createVerticalStrut(10));
+        top.add(buildSearchBar());
 
-        @Override
-        public Component getListCellRendererComponent(JList<? extends Integer> list,
-                                                      Integer itemId,
-                                                      int index,
-                                                      boolean isSelected,
-                                                      boolean cellHasFocus)
-        {
-            // icon
-            iconLabel.setIcon(getItemIcon(itemId));
-
-            // name (async load if missing)
-            String name = itemNameCache.get(itemId);
-            if (name == null)
-            {
-                nameLabel.setText("Loading…");
-                getItemNameAsync(itemId, n ->
-                {
-                    itemNameCache.put(itemId, n);
-                    list.repaint(list.getCellBounds(index, index));
-                });
-            }
-            else
-            {
-                nameLabel.setText(name);
-            }
-
-            // selection styling
-            if (isSelected)
-            {
-                setBackground(list.getSelectionBackground());
-                setForeground(list.getSelectionForeground());
-            }
-            else
-            {
-                setBackground(new Color(60, 63, 65));
-                nameLabel.setForeground(defaultItemTextColor);
-            }
-
-            return this;
-        }
+        return top;
     }
 
-    /**
-     * Toggles between Unlocked view and Rolled view.
-     */
-    private void toggleView()
+    private JPanel buildHeaderRow()
     {
-        showingUnlocked = !showingUnlocked;
-        CardLayout cl = (CardLayout) centerCardPanel.getLayout();
-        if (showingUnlocked)
-        {
-            cl.show(centerCardPanel, "UNLOCKED");
-        }
-        else
-        {
-            cl.show(centerCardPanel, "ROLLED");
-        }
-        updatePanel();
-    }
-
-    /**
-     * Creates a titled container panel that wraps the given content panel.
-     *
-     * @param title        The title to display on the border.
-     * @return The container panel.
-     */
-    private JPanel createTitledPanel(String title, Component content)
-    {
-        JPanel container = new JPanel(new BorderLayout());
-        container.setOpaque(false);
-
-        Border line = new LineBorder(new Color(80, 80, 80));
-        Border empty = new EmptyBorder(5, 5, 5, 5);
-        TitledBorder titled = BorderFactory.createTitledBorder(line, title);
-        titled.setTitleColor(new Color(200, 200, 200));
-        container.setBorder(new CompoundBorder(titled, empty));
-
-        // Directly add the passed-in component (which may itself be a JScrollPane)
-        container.add(content, BorderLayout.CENTER);
-        return container;
-    }
-
-    /**
-     * Styles a general JButton to match the design.
-     *
-     * @param button The button to style.
-     */
-    private void styleButton(JButton button)
-    {
-        button.setFocusPainted(false);
-        button.setBackground(new Color(60, 63, 65));
-        button.setForeground(Color.WHITE);
-        button.setFont(new Font("SansSerif", Font.BOLD, 12));
-        button.setPreferredSize(new Dimension(50, 30));
-    }
-
-    /**
-     * Styles a JToggleButton to match the design.
-     *
-     * @param button The toggle button to style.
-     */
-    private void styleToggleButton(JToggleButton button)
-    {
-        button.setFocusPainted(false);
-        button.setBackground(new Color(60, 63, 65));
-        button.setForeground(Color.WHITE);
-        button.setFont(new Font("SansSerif", Font.BOLD, 12));
-        button.setPreferredSize(new Dimension(50, 30));
-    }
-
-    /**
-     * Builds the header panel with an icon and title.
-     *
-     * @return The header panel.
-     */
-    private JPanel buildHeaderPanel()
-    {
-        JPanel headerPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        JPanel headerPanel = new JPanel(new BorderLayout());
         headerPanel.setOpaque(false);
 
-        // Header icon
-        ImageIcon headerIcon = new ImageIcon(getClass().getResource("/net/runelite/client/plugins/chanceman/icon.png"));
+        ImageIcon headerIcon = new ImageIcon(
+                Objects.requireNonNull(getClass().getResource("/net/runelite/client/plugins/chanceman/icon.png"))
+        );
         JLabel iconLabel = new JLabel(headerIcon);
 
-        // Title label
-        JLabel titleLabel = new JLabel("Chance Man");
+        JLabel titleLabel = new JLabel("Chance Man", SwingConstants.CENTER);
         titleLabel.setFont(new Font("SansSerif", Font.BOLD, 18));
         titleLabel.setForeground(new Color(220, 220, 220));
 
-        // Create the Discord button
-        JButton discordButton = new JButton();
-        discordButton.setToolTipText("Join The Chance Man Discord");
-        // Scale the Discord icon to 16x16
-        ImageIcon discordIcon = new ImageIcon(getClass().getResource("/net/runelite/client/plugins/chanceman/discord.png"));
+        JButton discord = new JButton();
+        discord.setToolTipText("Join The Chance Man Discord");
+        ImageIcon discordIcon = new ImageIcon(
+                Objects.requireNonNull(getClass().getResource("/net/runelite/client/plugins/chanceman/discord.png"))
+        );
         Image scaledImage = discordIcon.getImage().getScaledInstance(20, 20, Image.SCALE_SMOOTH);
-        discordButton.setIcon(new ImageIcon(scaledImage));
-        // Make the button look flat (no border or background)
-        discordButton.setOpaque(false);
-        discordButton.setContentAreaFilled(false);
-        discordButton.setBorderPainted(false);
-        // Add an action to open the Discord link
-        discordButton.addActionListener(e -> LinkBrowser.browse("https://discord.gg/TMkAYXxncU"));
+        discord.setIcon(new ImageIcon(scaledImage));
+        discord.setOpaque(false);
+        discord.setContentAreaFilled(false);
+        discord.setBorderPainted(false);
+        discord.addActionListener(e -> LinkBrowser.browse("https://discord.gg/TMkAYXxncU"));
 
-        // Assemble the header panel
-        headerPanel.add(iconLabel);
-        headerPanel.add(Box.createHorizontalStrut(10));
-        headerPanel.add(titleLabel);
-        headerPanel.add(discordButton);
+        headerPanel.add(iconLabel, BorderLayout.WEST);
+        headerPanel.add(titleLabel, BorderLayout.CENTER);
+        headerPanel.add(discord, BorderLayout.EAST);
 
         return headerPanel;
     }
 
-    /**
-     * Builds the search bar panel.
-     *
-     * @return The search bar panel.
-     */
+    private JPanel buildDropdownRow()
+    {
+        JPanel row = new JPanel(new BorderLayout());
+        row.setOpaque(false);
+
+        modeDropdown.setFocusable(false);
+        modeDropdown.setBackground(new Color(60, 63, 65));
+        modeDropdown.setForeground(Color.WHITE);
+        modeDropdown.setFont(new Font("SansSerif", Font.BOLD, 12));
+        modeDropdown.setBorder(
+                new CompoundBorder(new LineBorder(new Color(80, 80, 80)),
+                        new EmptyBorder(2, 6, 2, 6))
+        );
+
+        modeDropdown.setRenderer(new DefaultListCellRenderer()
+        {
+            @Override
+            public Component getListCellRendererComponent(
+                    JList<?> list, Object value, int index,
+                    boolean isSelected, boolean cellHasFocus)
+            {
+                JLabel lbl = (JLabel) super.getListCellRendererComponent(
+                        list, value, index, isSelected, cellHasFocus);
+
+                lbl.setBorder(new EmptyBorder(4, 6, 4, 6));
+
+                if (value instanceof ListMode)
+                {
+                    ListMode mode = (ListMode) value;
+
+                    lbl.setText(index == -1 ? "Filter: " + mode.label() : mode.label());
+
+                    String tip = MODE_TOOLTIPS.get(mode);
+                    lbl.setToolTipText(tip);
+                    modeDropdown.setToolTipText(tip);
+                }
+                else
+                {
+                    lbl.setToolTipText(null);
+                }
+
+                lbl.setBackground(isSelected
+                        ? new Color(75, 78, 80)
+                        : new Color(60, 63, 65));
+                lbl.setForeground(Color.WHITE);
+
+                return lbl;
+            }
+        });
+
+        modeDropdown.addActionListener(e ->
+        {
+            Object sel = modeDropdown.getSelectedItem();
+            if (sel instanceof ListMode)
+            {
+                setMode((ListMode) sel);
+                updatePanel();
+            }
+        });
+
+        row.add(modeDropdown, BorderLayout.CENTER);
+        return row;
+    }
+
+    private JPanel buildModeLabelRow()
+    {
+        JPanel row = new JPanel(new BorderLayout());
+        row.setOpaque(false);
+
+        modeLabel.setFont(new Font("SansSerif", Font.BOLD, 12));
+        modeLabel.setForeground(new Color(210, 210, 210));
+
+        row.add(modeLabel, BorderLayout.WEST);
+        return row;
+    }
+
     private JPanel buildSearchBar()
     {
-        JPanel searchBarPanel = new JPanel(new BorderLayout());
-        searchBarPanel.setOpaque(false);
-        searchBarPanel.setBorder(new EmptyBorder(5, 5, 5, 5));
+        JPanel container = new JPanel(new BorderLayout());
+        container.setOpaque(false);
 
-        JPanel searchContainer = new JPanel(new BorderLayout());
-        searchContainer.setBackground(new Color(30, 30, 30));
-        searchContainer.setBorder(BorderFactory.createEmptyBorder(2, 5, 2, 5));
+        JPanel searchBox = new JPanel(new BorderLayout());
+        searchBox.setBackground(new Color(30, 30, 30));
+        searchBox.setBorder(BorderFactory.createEmptyBorder(6, 8, 6, 8));
 
-        // Search icon
-        JLabel searchIcon = new JLabel("\uD83D\uDD0D");
-        searchIcon.setForeground(new Color(200, 200, 200));
-        searchIcon.setBorder(new EmptyBorder(0, 5, 0, 5));
-        searchContainer.add(searchIcon, BorderLayout.WEST);
+        JLabel icon = new JLabel("\uD83D\uDD0D");
+        icon.setForeground(new Color(200, 200, 200));
+        icon.setBorder(new EmptyBorder(0, 0, 0, 6));
+        searchBox.add(icon, BorderLayout.WEST);
 
-        // Search field
-        JTextField searchField = new JTextField();
         searchField.setBackground(new Color(45, 45, 45));
         searchField.setForeground(Color.WHITE);
         searchField.setBorder(null);
         searchField.setCaretColor(Color.WHITE);
-        searchField.setMaximumSize(new Dimension(Integer.MAX_VALUE, 24));
+
         searchField.addKeyListener(new KeyAdapter()
         {
             @Override
             public void keyReleased(KeyEvent e)
             {
-                SwingUtilities.invokeLater(() ->
-                {
-                    searchText = searchField.getText().toLowerCase();
-                    updatePanel();
-                });
-            }
-        });
-        searchContainer.add(searchField, BorderLayout.CENTER);
-
-        // Clear label to reset search
-        JLabel clearLabel = new JLabel("❌");
-        clearLabel.setFont(new Font("SansSerif", Font.PLAIN, 9));
-        clearLabel.setForeground(Color.RED);
-        clearLabel.setBorder(new EmptyBorder(0, 6, 0, 6));
-        clearLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-        clearLabel.addMouseListener(new java.awt.event.MouseAdapter()
-        {
-            @Override
-            public void mouseClicked(java.awt.event.MouseEvent e)
-            {
-                searchField.setText("");
-                searchText = "";
+                searchText = searchField.getText().toLowerCase();
                 updatePanel();
             }
         });
-        searchContainer.add(clearLabel, BorderLayout.EAST);
 
-        searchBarPanel.add(searchContainer, BorderLayout.CENTER);
-        return searchBarPanel;
+        searchBox.add(searchField, BorderLayout.CENTER);
+
+        container.add(searchBox, BorderLayout.CENTER);
+        return container;
     }
 
-    /**
-     * Triggers a manual roll animation when the Roll button is clicked.
-     *
-     * @param e The action event.
-     */
-    private void performManualRoll(java.awt.event.ActionEvent e)
+    private JPanel buildCenter()
     {
-        if (rollAnimationManager.isRolling())
-        {
-            return;
-        }
-        List<Integer> locked = new ArrayList<>();
-        for (int id : allTradeableItems)
-        {
-            if (!unlockedItemsManager.isUnlocked(id))
-            {
-                locked.add(id);
-            }
-        }
-        if (locked.isEmpty())
-        {
-            JOptionPane.showMessageDialog(
-                    this,
-                    "All items are unlocked!",
-                    "ChanceMan",
-                    JOptionPane.INFORMATION_MESSAGE
-            );
-            return;
-        }
-        int randomItemId = locked.get(new Random().nextInt(locked.size()));
-        rollAnimationManager.setManualRoll(true);
-        rollAnimationManager.enqueueRoll(randomItemId);
+        itemList.setCellRenderer(new ItemCellRenderer());
+        itemList.setSelectionMode(ListSelectionModel.SINGLE_SELECTION);
+
+        JScrollPane scroll = new JScrollPane(
+                itemList,
+                JScrollPane.VERTICAL_SCROLLBAR_AS_NEEDED,
+                JScrollPane.HORIZONTAL_SCROLLBAR_NEVER
+        );
+        scroll.setBorder(null);
+
+        JPanel wrap = new JPanel(new BorderLayout());
+        wrap.setOpaque(false);
+        wrap.setBorder(new CompoundBorder(
+                new LineBorder(new Color(80, 80, 80)),
+                new EmptyBorder(6, 6, 6, 6)));
+
+        wrap.add(scroll, BorderLayout.CENTER);
+        return wrap;
     }
 
-    /**
-     * Main update routine: filters the active set (Unlocked or Rolled), applies search text and filter toggles,
-     * updates the single count label, and then builds the item list without trailing gaps.
-     */
+    private JPanel buildBottom()
+    {
+        JPanel bottom = new JPanel();
+        bottom.setOpaque(false);
+        bottom.setLayout(new BoxLayout(bottom, BoxLayout.Y_AXIS));
+
+        bottom.add(Box.createVerticalStrut(10));
+
+        JPanel countPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        countPanel.setOpaque(false);
+        countLabel.setFont(new Font("Arial", Font.BOLD, 11));
+        countLabel.setForeground(new Color(220, 220, 220));
+        countPanel.add(countLabel);
+        bottom.add(countPanel);
+
+        bottom.add(Box.createVerticalStrut(10));
+
+        JPanel rollPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 0));
+        rollPanel.setOpaque(false);
+        rollButton.setToolTipText("Manual roll (select a random locked item)");
+        rollButton.addActionListener(this::performManualRoll);
+        rollButton.setPreferredSize(new Dimension(120, 30));
+        rollPanel.add(rollButton);
+        bottom.add(rollPanel);
+
+        bottom.add(Box.createVerticalStrut(4));
+        return bottom;
+    }
+
+    private void setMode(ListMode mode)
+    {
+        listMode = mode;
+
+        String tip = MODE_TOOLTIPS.get(mode);
+        modeDropdown.setToolTipText(tip);
+
+        switch (mode)
+        {
+            case ROLLED:
+                modeLabel.setText("Items Rolled");
+                break;
+            case OBTAINED:
+                modeLabel.setText("Items Obtained");
+                break;
+            case ROLLED_NOT_OBTAINED:
+                modeLabel.setText("Items Rolled, not Obtained");
+                break;
+            case USABLE:
+                modeLabel.setText("Items Usable");
+                break;
+        }
+    }
+
     public void updatePanel()
     {
+        final ListMode modeSnap = listMode;
+        final String searchSnap = searchText;
+
         clientThread.invokeLater(() ->
         {
-            // Build filtered lists
-            List<Integer> filteredRolled = new ArrayList<>();
-            for (Integer id : rolledItemsManager.getRolledItems())
+            Set<Integer> obtained = obtainedItemsManager.getObtainedItems();
+            Set<Integer> rolled = rolledItemsManager.getRolledItems();
+            List<Integer> base = new ArrayList<>();
+
+            switch (modeSnap)
             {
-                ItemComposition comp = itemManager.getItemComposition(id);
-                if (comp != null)
+                case ROLLED:
+                    base.addAll(rolled);
+                    break;
+
+                case OBTAINED:
+                    base.addAll(obtained);
+                    break;
+
+                case ROLLED_NOT_OBTAINED:
+                    // Show what you can buy/unlock but haven't obtained yet
+                    base.addAll(rolled);
+                    base.removeIf(obtained::contains);
+                    break;
+
+                case USABLE:
+                    base.addAll(rolled);
+                    base.removeIf(id -> !obtained.contains(id));
+                    break;
+            }
+
+            Collections.reverse(base);
+
+            if (searchSnap != null && !searchSnap.isEmpty())
+            {
+                base.removeIf(id ->
                 {
-                    String name = comp.getName().toLowerCase();
-                    if (searchText.isEmpty() || name.contains(searchText))
-                    {
-                        filteredRolled.add(id);
-                    }
-                }
+                    ItemComposition comp = itemManager.getItemComposition(id);
+                    String name = comp.getName();
+                    return name == null || !name.toLowerCase().contains(searchSnap);
+                });
             }
 
-            Collections.reverse(filteredRolled);
-
-            List<Integer> filteredUnlocked = new ArrayList<>();
-            for (Integer id : unlockedItemsManager.getUnlockedItems())
+            final int total;
+            synchronized (allTradeableItems)
             {
-                ItemComposition comp = itemManager.getItemComposition(id);
-                if (comp != null)
-                {
-                    String name = comp.getName().toLowerCase();
-                    if (searchText.isEmpty() || name.contains(searchText))
-                    {
-                        filteredUnlocked.add(id);
-                    }
-                }
-            }
-
-            Collections.reverse(filteredUnlocked);
-
-            // Apply active filter toggles
-            if (activeFilter.equals("UNLOCKED_NOT_ROLLED"))
-            {
-                filteredUnlocked.removeIf(id -> rolledItemsManager.getRolledItems().contains(id));
-                filteredRolled.clear();
-            }
-            else if (activeFilter.equals("UNLOCKED_AND_ROLLED"))
-            {
-                filteredUnlocked.removeIf(id -> !rolledItemsManager.getRolledItems().contains(id));
-                filteredRolled.removeIf(id -> !unlockedItemsManager.getUnlockedItems().contains(id));
+                total = allTradeableItems.size();
             }
 
             SwingUtilities.invokeLater(() ->
             {
-                rolledModel.clear();
-                for (int id : filteredRolled)
+                listModel.clear();
+                for (Integer id : base)
                 {
-                    rolledModel.addElement(id);
+                    listModel.addElement(id);
                 }
+                countLabel.setText(base.size() + "/" + total);
 
-                unlockedModel.clear();
-                for (int id : filteredUnlocked)
-                {
-                    unlockedModel.addElement(id);
-                }
-
-                int total = allTradeableItems.size();
-                countLabel.setText(showingUnlocked
-                        ? "Unlocked: " + unlockedModel.size() + "/" + total
-                        : "Rolled:  " + rolledModel.size()   + "/" + total);
+                // extra stability during mode swaps
+                itemList.revalidate();
+                itemList.repaint();
             });
         });
     }
 
-    /**
-     * Retrieves (and caches) the item icon for a given item ID.
-     *
-     * @param itemId The item ID.
-     * @return The ImageIcon for the item, or null if not available.
-     */
-    private ImageIcon getItemIcon(int itemId)
+    private class ItemCellRenderer extends JPanel implements ListCellRenderer<Integer>
     {
-        if (itemIconCache.containsKey(itemId))
+        private final JLabel icon = new JLabel();
+        private final JLabel name = new JLabel();
+
+        ItemCellRenderer()
         {
-            return itemIconCache.get(itemId);
+            setLayout(new BorderLayout(8, 0));
+            setOpaque(true);
+            icon.setPreferredSize(new Dimension(32, 32));
+
+            add(icon, BorderLayout.WEST);
+            add(name, BorderLayout.CENTER);
+            name.setFont(new Font("SansSerif", Font.PLAIN, 11));
         }
-        BufferedImage image = itemManager.getImage(itemId, 1, false);
-        if (image == null)
+
+        @Override
+        public Component getListCellRendererComponent(
+                JList<? extends Integer> list, Integer value, int index,
+                boolean isSelected, boolean cellHasFocus)
         {
-            return null;
+            ImageIcon ico = itemIconCache.get(value);
+            if (ico != null)
+            {
+                icon.setIcon(ico);
+            }
+            else
+            {
+                icon.setIcon(null);
+                requestItemIcon(value, list, index);
+            }
+
+            String cached = itemNameCache.get(value);
+            if (cached != null)
+            {
+                name.setText(cached);
+            }
+            else
+            {
+                name.setText("Loading...");
+                requestItemName(value, list, index);
+            }
+
+            setBackground(isSelected ? list.getSelectionBackground() : new Color(60, 63, 65));
+            name.setForeground(new Color(220, 220, 220));
+            return this;
         }
-        ImageIcon icon = new ImageIcon(image);
-        itemIconCache.put(itemId, icon);
-        return icon;
     }
 
-    /**
-     * Asynchronously retrieves the item name for a given item ID and passes it to the callback.
-     *
-     * @param itemId   The item ID.
-     * @param callback Consumer to receive the item name.
-     */
-    private void getItemNameAsync(int itemId, Consumer<String> callback)
+    private void requestItemName(int itemId, JList<?> list, int index)
     {
-        clientThread.invokeLater(() -> {
-            ItemComposition comp = itemManager.getItemComposition(itemId);
-            String name = (comp != null) ? comp.getName() : "Unknown";
-            SwingUtilities.invokeLater(() -> callback.accept(name));
+        if (!nameFetchInFlight.add(itemId))
+        {
+            return;
+        }
+
+        clientThread.invokeLater(() ->
+        {
+            String resolved = "Unknown";
+            try
+            {
+                ItemComposition comp = itemManager.getItemComposition(itemId);
+                if (comp.getName() != null)
+                {
+                    resolved = comp.getName();
+                }
+            }
+            catch (Exception ignored)
+            {
+            }
+
+            final String finalName = resolved;
+            SwingUtilities.invokeLater(() ->
+            {
+                itemNameCache.put(itemId, finalName);
+                nameFetchInFlight.remove(itemId);
+
+                Rectangle r = list.getCellBounds(index, index);
+                if (r != null) list.repaint(r);
+                else list.repaint();
+            });
         });
+    }
+
+    private void requestItemIcon(int itemId, JList<?> list, int index)
+    {
+        if (!iconFetchInFlight.add(itemId))
+        {
+            return;
+        }
+
+        clientThread.invokeLater(() ->
+        {
+            ImageIcon resolved = null;
+            try
+            {
+                BufferedImage img = itemManager.getImage(itemId, 1, false);
+                if (img != null)
+                {
+                    resolved = new ImageIcon(img);
+                }
+            }
+            catch (Exception ignored)
+            {
+            }
+
+            final ImageIcon finalIcon = resolved;
+            SwingUtilities.invokeLater(() ->
+            {
+                if (finalIcon != null)
+                {
+                    itemIconCache.put(itemId, finalIcon);
+                }
+                iconFetchInFlight.remove(itemId);
+
+                Rectangle r = list.getCellBounds(index, index);
+                if (r != null) list.repaint(r);
+                else list.repaint();
+            });
+        });
+    }
+
+    private void performManualRoll(java.awt.event.ActionEvent e)
+    {
+        if (rollAnimationManager.isRolling()) return;
+        if (!rollAnimationManager.hasTradeablesReady()) return;
+
+        final List<Integer> tradeableSnapshot;
+        synchronized (allTradeableItems)
+        {
+            tradeableSnapshot = new ArrayList<>(allTradeableItems);
+        }
+
+        List<Integer> locked = new ArrayList<>();
+        for (int id : tradeableSnapshot)
+        {
+            if (!rolledItemsManager.isRolled(id))
+            {
+                locked.add(id);
+            }
+        }
+
+        if (locked.isEmpty()) return;
+
+        rollAnimationManager.setManualRoll(true);
+        rollAnimationManager.enqueueRoll(
+                locked.get(new Random().nextInt(locked.size()))
+        );
+    }
+
+    @Override
+    public Dimension getPreferredSize()
+    {
+        Dimension d = super.getPreferredSize();
+        int viewportH = getViewportHeight();
+        if (viewportH > 0 && d.height < viewportH)
+        {
+            return new Dimension(d.width, viewportH);
+        }
+        return d;
+    }
+
+    private int getViewportHeight()
+    {
+        Container p = getParent();
+        while (p != null && !(p instanceof JViewport))
+        {
+            p = p.getParent();
+        }
+        if (p != null)
+        {
+            return Math.max(((JViewport) p).getHeight(), 0);
+        }
+        return 0;
     }
 }
 
@@ -7337,7 +7627,7 @@ package com.chanceman.menus;
 import com.chanceman.ChanceManConfig;
 import com.chanceman.ChanceManPlugin;
 import com.chanceman.filters.EnsouledHeadMapping;
-import com.chanceman.managers.UnlockedItemsManager;
+import com.chanceman.managers.RolledItemsManager;
 import lombok.Getter;
 import lombok.Setter;
 import net.runelite.api.GameState;
@@ -7366,7 +7656,6 @@ import java.util.function.Consumer;
 
 @Singleton
 public class ActionHandler {
-
 
 	private static final Set<MenuAction> disabledActions = EnumSet.of(
 			MenuAction.CC_OP,               // inventory “Use” on locked
@@ -7423,14 +7712,14 @@ public class ActionHandler {
 	private Client client;
 	@Inject
 	private EventBus eventBus;
-    @Inject
-    private ChanceManConfig config;
+	@Inject
+	private ChanceManConfig config;
 	@Inject
 	private ChanceManPlugin plugin;
 	@Inject
 	private Restrictions restrictions;
 	@Inject
-	private UnlockedItemsManager unlockedItemsManager;
+	private RolledItemsManager rolledItemsManager;
 	@Getter
 	@Setter
 	private int enabledUIOpen = -1;
@@ -7458,7 +7747,7 @@ public class ActionHandler {
 	}
 
 	private boolean inactive() {
-		if (!unlockedItemsManager.ready()) return true;
+		if (!rolledItemsManager.ready()) return true;
 		return client.getGameState().getState() < GameState.LOADING.getState();
 	}
 
@@ -7500,9 +7789,9 @@ public class ActionHandler {
 			entry.setOption("<col=808080>" + option);
 			entry.setTarget("<col=808080>" + target);
 			entry.onClick(DISABLED);
-            if (config.deprioritizeLockedOptions()) {
-                entry.setDeprioritized(true);
-            }
+			if (config.deprioritizeLockedOptions()) {
+				entry.setDeprioritized(true);
+			}
 		}
 	}
 
@@ -7514,7 +7803,7 @@ public class ActionHandler {
 			return;
 		}
 		// Extra safeguard for ground items.
-		handleGroundItems(plugin.getItemManager(), unlockedItemsManager, event, plugin);
+		handleGroundItems(plugin.getItemManager(), rolledItemsManager, event, plugin);
 	}
 
 	/**
@@ -7533,7 +7822,7 @@ public class ActionHandler {
 	{
 		return plugin.isTradeable(itemId)
 				&& !plugin.isNotTracked(itemId)
-				&& !unlockedItemsManager.isUnlocked(itemId);
+				&& !rolledItemsManager.isRolled(itemId);
 	}
 
 	private boolean isHealthOrbCure(MenuEntry entry)
@@ -7581,7 +7870,7 @@ public class ActionHandler {
 		if (option.equalsIgnoreCase("clean") || option.equalsIgnoreCase("rub"))
 		{
 			if (!plugin.isInPlay(id)) { return true; }
-			return unlockedItemsManager.isUnlocked(id);
+			return rolledItemsManager.isRolled(id);
 		}
 		if ("harpoon".equalsIgnoreCase(option)
 				&& !hasAnyHarpoonInInvOrWorn())
@@ -7602,14 +7891,14 @@ public class ActionHandler {
 			return true;
 		if (id == 0 || id == -1 || !plugin.isInPlay(id))
 			return true;
-		return unlockedItemsManager.isUnlocked(id);
+		return rolledItemsManager.isRolled(id);
 	}
 
 	/**
 	 * A static helper to further safeguard ground item actions.
 	 * If a ground item is locked, this method consumes the event.
 	 */
-	public static void handleGroundItems(ItemManager itemManager, UnlockedItemsManager unlockedItemsManager,
+	public static void handleGroundItems(ItemManager itemManager, RolledItemsManager rolledItemsManager,
 										 MenuOptionClicked event, ChanceManPlugin plugin) {
 		if (event.getMenuAction() != null && GROUND_ACTIONS.contains(event.getMenuAction())) {
 			int rawItemId = event.getId() != -1
@@ -7619,12 +7908,13 @@ public class ActionHandler {
 			int canonicalGroundId = itemManager.canonicalize(mapped);
 			if (plugin.isTradeable(canonicalGroundId)
 					&& !plugin.isNotTracked(canonicalGroundId)
-					&& unlockedItemsManager != null
-					&& !unlockedItemsManager.isUnlocked(canonicalGroundId)) {
+					&& rolledItemsManager != null
+					&& !rolledItemsManager.isRolled(canonicalGroundId)) {
 				event.consume();
 			}
 		}
 	}
+
 	/**
 	 Checks for harpoon in inventory and worn items for
 	 barbarian fishing.
@@ -8210,7 +8500,8 @@ public enum RuneProvider
 package com.chanceman.menus;
 
 import com.chanceman.ChanceManPlugin;
-import com.chanceman.managers.UnlockedItemsManager;
+import com.chanceman.managers.RolledItemsManager;
+import com.chanceman.account.AccountManager;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
@@ -8267,14 +8558,15 @@ public class Restrictions
 
 	@Inject private ChanceManPlugin plugin;
 	@Inject private Client client;
-	@Inject private UnlockedItemsManager unlockedItemsManager;
+	@Inject private RolledItemsManager rolledItemsManager;
+	@Inject private AccountManager accountManager;
 	private final Set<SkillOp> enabledSkillOps = EnumSet.noneOf(SkillOp.class);
 	private final HashSet<Integer> availableRunes = new HashSet<>();
 
 	@Subscribe
 	public void onGameTick(GameTick event)
 	{
-		if (!unlockedItemsManager.ready()) return;
+		if (!accountManager.ready()) return;
 		enabledSkillOps.clear();
 		availableRunes.clear();
 
@@ -8353,7 +8645,7 @@ public class Restrictions
 			return !(RuneProvider.isEquippedProvider(id)
 					|| RuneProvider.isInvProvider(id));
 		}
-		return !unlockedItemsManager.isUnlocked(id);
+		return !rolledItemsManager.isRolled(id);
 	}
 
 	public boolean isSpellOpEnabled(String spellName)
@@ -8364,7 +8656,7 @@ public class Restrictions
 		{
 			int sackId = sack.getSackItemId();
 			ItemContainer inv = client.getItemContainer(InventoryID.INV);
-			if (inv != null	&& (sackId == ItemID.BLIGHTED_SACK_SURGE || unlockedItemsManager.isUnlocked(sackId)))
+			if (inv != null	&& (sackId == ItemID.BLIGHTED_SACK_SURGE || rolledItemsManager.isRolled(sackId)))
 			{
 				for (Item item : inv.getItems())
 				{
