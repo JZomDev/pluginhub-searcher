@@ -782,6 +782,46 @@ public class EmoteNotifier extends BaseNotifier {
 }
 
 
+package com.revalclan.notifiers;
+
+import javax.inject.Singleton;
+
+import com.google.inject.Inject;
+import com.revalclan.PlayerDataCollector;
+
+import java.util.Map;
+
+/**
+ * Notifies when a player logs in.
+ * Sends a lightweight LOGIN event with basic player info.
+ */
+@Singleton
+public class LoginNotifier extends BaseNotifier {
+	@Inject
+	private PlayerDataCollector dataCollector;
+	
+	@Override
+	public boolean isEnabled() {
+		return true;
+	}
+
+	@Override
+	protected String getEventType() {
+		return "LOGIN";
+	}
+
+	/**
+	 * Called when the player logs in.
+	 */
+	public void onLogin() {
+		Map<String, Object> data = dataCollector.collectAllData();
+		data.put("world", client.getWorld());
+
+		sendNotification(data);
+	}
+}
+
+
 /*
  * Portions of this file are derived from or inspired by the Dink plugin
  * Copyright (c) 2022, Jake Barter
@@ -1525,6 +1565,45 @@ public class MusicNotifier extends BaseNotifier {
 
 package com.revalclan.notifiers;
 
+import com.revalclan.PlayerDataCollector;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.Map;
+
+/**
+ * Handles full account sync events.
+ * This is triggered on logout or manually via the collection log button.
+ */
+@Singleton
+public class SyncNotifier extends BaseNotifier {
+	@Inject
+	private PlayerDataCollector dataCollector;
+
+	@Override
+	public boolean isEnabled() {
+		return true;
+	}
+
+	@Override
+	protected String getEventType() {
+		return "SYNC";
+	}
+
+	/**
+	 * Trigger a full account sync.
+	 * Collects all player data (collection log, quests, diaries, combat achievements, etc.)
+	 * and sends it to the webhook.
+	 */
+	public void triggerSync() {
+		Map<String, Object> data = dataCollector.collectAllData();
+		sendNotification(data);
+	}
+}
+
+
+package com.revalclan.notifiers;
+
 import com.revalclan.RevalClanConfig;
 import lombok.extern.slf4j.Slf4j;
 
@@ -1573,7 +1652,7 @@ public class PetNotifier extends BaseNotifier {
 	 * - "Username feels something weird sneaking into her backpack: Pet name at 100 kills."
 	 */
 	private static final Pattern CLAN_REGEX = Pattern.compile(
-		"(?<user>[^:]+?) (?:has a funny feeling like .+? (?:followed|being followed)|feels something weird sneaking into .+? backpack|feels like .+? acquired something special): (?<pet>.+?)(?: at (?<milestone>[^.]+?))?(?:\\.|$)",
+		"(?<user>.+?) (?:has a funny feeling like .+? (?:would have been followed|being followed)|feels something weird sneaking into .+? backpack|feels like .+? acquired something special): (?<pet>.+?)(?: at (?<milestone>.+))?\\.$",
 		Pattern.CASE_INSENSITIVE
 	);
 
@@ -1582,22 +1661,22 @@ public class PetNotifier extends BaseNotifier {
 	 */
 	private static final int MAX_TICKS_WAIT = 5;
 
-	/**
-	 * Waiting state marker - indicates we've seen the initial pet message but not the name yet
-	 */
-	private static final String WAITING_FOR_NAME = "";
-
 	@Inject private RevalClanConfig config;
 
 	/**
-	 * Current pet name (null = no pet, WAITING_FOR_NAME = waiting for name, actual name = ready to notify)
+	 * Whether we've seen the personal "You have a funny feeling" game message
 	 */
-	private volatile String petName = null;
+	private volatile boolean seenGameMessage = false;
 
 	/**
-	 * Original pet message
+	 * The personal game message content
 	 */
-	private volatile String originalMessage = null;
+	private volatile String gameMessage = null;
+
+	/**
+	 * Pet name extracted from follow-up messages
+	 */
+	private volatile String petName = null;
 
 	/**
 	 * Kill count information (e.g., "50 kills")
@@ -1625,38 +1704,33 @@ public class PetNotifier extends BaseNotifier {
 	public void onChatMessage(String message) {
 		if (!isEnabled()) return;
 
-		// Only process initial pet message if we haven't seen one yet
-		if (petName == null) {
-			Matcher petMatcher = PET_PATTERN.matcher(message);
-			if (petMatcher.find()) {
-				// Mark as waiting - we've seen the initial message, now wait for pet name
-				this.petName = WAITING_FOR_NAME;
-				this.originalMessage = message;
-				this.ticksWaited.set(0);
-				log.debug("Pet drop detected, waiting for pet name...");
-				return;
-			}
-		} 
-		// If we're waiting for pet name, check for follow-up messages
-		else if (WAITING_FOR_NAME.equals(petName)) {
-			// Check for untradeable drop message
+		// Check for the personal pet drop message
+		Matcher petMatcher = PET_PATTERN.matcher(message);
+		if (petMatcher.find()) {
+			this.seenGameMessage = true;
+			this.gameMessage = message;
+			this.ticksWaited.set(0);
+			return;
+		}
+
+		// If we've seen a pet message, look for follow-up messages with pet name
+		if (this.seenGameMessage && this.petName == null) {
+			// Check for untradeable drop message (new pets only, not duplicates)
 			Matcher untradeableMatcher = UNTRADEABLE_PATTERN.matcher(message);
 			if (untradeableMatcher.find()) {
 				String itemName = untradeableMatcher.group(1).trim();
 				if (isPetItem(itemName)) {
 					this.petName = itemName;
-					log.debug("Pet name identified from untradeable drop: {}", itemName);
 					return;
 				}
 			}
 
-			// Check for collection log message as a backup
+			// Check for collection log message (new pets only, not duplicates)
 			Matcher collectionMatcher = COLLECTION_LOG_PATTERN.matcher(message);
 			if (collectionMatcher.find()) {
 				String itemName = collectionMatcher.group(1).trim();
 				if (isPetItem(itemName)) {
 					this.petName = itemName;
-					log.debug("Pet name identified from collection log: {}", itemName);
 					return;
 				}
 			}
@@ -1664,15 +1738,11 @@ public class PetNotifier extends BaseNotifier {
 	}
 
 	/**
-	 * Handle clan notifications - only process if we've already seen an initial pet message
-	 * This prevents clan messages from triggering notifications on their own
+	 * Handle clan notifications - extracts pet name and kill count for the current player
+	 * This is especially important for duplicate pets where there's no "Untradeable drop:" message
 	 */
 	public void onClanNotification(String message) {
 		if (!isEnabled()) return;
-
-		if (petName == null) {
-			return;
-		}
 
 		Matcher clanMatcher = CLAN_REGEX.matcher(message);
 		if (clanMatcher.find()) {
@@ -1687,15 +1757,20 @@ public class PetNotifier extends BaseNotifier {
 					pet = clanMatcher.group("pet");
 					milestone = clanMatcher.group("milestone");
 				} catch (IllegalArgumentException e) {
-					log.warn("Error extracting groups from clan pet notification: {}", e.getMessage());
+					return;
 				}
-				
+
 				if (pet != null && !pet.trim().isEmpty()) {
 					this.petName = pet.trim();
-					if (milestone != null && !milestone.trim().isEmpty()) {
-						this.killCount = milestone.trim().replaceAll("\\.$", "");
-					}
-					this.originalMessage = message;
+				}
+				if (milestone != null && !milestone.trim().isEmpty()) {
+					this.killCount = milestone.trim();
+				}
+
+				// If we haven't seen the game message yet, mark that we've seen clan info
+				// The game message should arrive soon (or may have already arrived)
+				if (!seenGameMessage) {
+					this.ticksWaited.set(0);
 				}
 			}
 		}
@@ -1705,20 +1780,32 @@ public class PetNotifier extends BaseNotifier {
 	 * Called on each game tick - checks if we should send notification
 	 */
 	public void onGameTick() {
-		if (petName == null) return;
+		if (!this.seenGameMessage && this.petName == null) {
+			return;
+		}
 
-		// If we have a pet name (not waiting), send notification immediately
-		if (!WAITING_FOR_NAME.equals(petName)) {
+		// We need the personal game message to confirm it's actually a pet drop
+		// But we may have gotten clan info first, so wait for game message
+		if (!this.seenGameMessage) {
+			int ticks = this.ticksWaited.incrementAndGet();
+			if (ticks > MAX_TICKS_WAIT) {
+				// Clan info arrived but no game message - this wasn't our pet
+				reset();
+			}
+			return;
+		}
+
+		// We have the game message - check if we have complete info or should wait
+		if (this.petName != null) {
 			handleNotify();
 			reset();
 			return;
 		}
 
-		// If we're still waiting, increment wait counter
-		int ticks = ticksWaited.incrementAndGet();
+		// Still waiting for pet name
+		int ticks = this.ticksWaited.incrementAndGet();
 		if (ticks > MAX_TICKS_WAIT) {
 			// Timeout - send notification without pet name
-			log.warn("Pet drop detected but pet name not found in follow-up messages");
 			handleNotify();
 			reset();
 		}
@@ -1730,20 +1817,21 @@ public class PetNotifier extends BaseNotifier {
 	private void handleNotify() {
 		if (!isEnabled()) return;
 
-		boolean obtained = originalMessage != null && !originalMessage.contains("would have been");
+		// Determine if pet was obtained or duplicate based on game message
+		boolean obtained = this.gameMessage != null && !this.gameMessage.contains("would have been");
 
 		Map<String, Object> petData = new HashMap<>();
-		petData.put("message", originalMessage);
+		petData.put("message", this.gameMessage);
 		petData.put("obtained", obtained);
 
 		// Add pet name if we have it
-		if (petName != null && !WAITING_FOR_NAME.equals(petName)) {
-			petData.put("petName", petName);
+		if (this.petName != null && !this.petName.isEmpty()) {
+			petData.put("petName", this.petName);
 		}
 
 		// Add kill count if available
-		if (killCount != null && !killCount.isEmpty()) {
-			petData.put("killCount", killCount);
+		if (this.killCount != null && !this.killCount.isEmpty()) {
+			petData.put("killCount", this.killCount);
 		}
 
 		sendNotification(petData);
@@ -1753,8 +1841,9 @@ public class PetNotifier extends BaseNotifier {
 	 * Reset the notifier state
 	 */
 	public void reset() {
+		this.seenGameMessage = false;
+		this.gameMessage = null;
 		this.petName = null;
-		this.originalMessage = null;
 		this.killCount = null;
 		this.ticksWaited.set(0);
 	}
@@ -1763,7 +1852,7 @@ public class PetNotifier extends BaseNotifier {
 	 * Set of all known pet names (case-insensitive matching)
 	 */
 	private static final Set<String> PET_NAMES = new HashSet<>();
-	
+
 	static {
 		// Boss pets
 		PET_NAMES.add("abyssal orphan");
@@ -1817,7 +1906,7 @@ public class PetNotifier extends BaseNotifier {
 		PET_NAMES.add("wisp");
 		PET_NAMES.add("yami");
 		PET_NAMES.add("youngllef");
-		
+
 		// Skill pets
 		PET_NAMES.add("baby chinchompa");
 		PET_NAMES.add("beaver");
@@ -1828,7 +1917,7 @@ public class PetNotifier extends BaseNotifier {
 		PET_NAMES.add("rocky");
 		PET_NAMES.add("soup");
 		PET_NAMES.add("tangleroot");
-		
+
 		// Other pets
 		PET_NAMES.add("abyssal protector");
 		PET_NAMES.add("bloodhound");
@@ -1844,26 +1933,24 @@ public class PetNotifier extends BaseNotifier {
 	 */
 	private boolean isPetItem(String itemName) {
 		if (itemName == null || itemName.isEmpty()) return false;
-		
+
 		// Normalize the item name (lowercase, trim)
 		String normalized = itemName.toLowerCase().trim();
-		
+
 		// Direct match
 		if (PET_NAMES.contains(normalized)) {
 			return true;
 		}
-		
+
 		// Check if it starts with "pet " and the rest matches
 		if (normalized.startsWith("pet ")) {
 			String withoutPrefix = normalized.substring(4).trim();
 			return PET_NAMES.contains(withoutPrefix) || PET_NAMES.contains(normalized);
 		}
-		
+
 		return false;
 	}
-
 }
-
 
 package com.revalclan.notifiers;
 
@@ -2000,7 +2087,6 @@ public abstract class BaseNotifier {
 	 * @param data The notification data
 	 */
 	protected void sendNotification(Map<String, Object> data) {
-		// Validate clan membership before sending
 		if (!ClanValidator.validateClan(client)) return;
 
 		// Add event metadata
@@ -2633,6 +2719,45 @@ public class CombatAchievementNotifier extends BaseNotifier {
 
 package com.revalclan.notifiers;
 
+import java.util.Map;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+import com.revalclan.PlayerDataCollector;
+
+/**
+ * Handles logout events.
+ * Triggers a full account sync when the player logs out.
+ */
+@Singleton
+public class LogoutNotifier extends BaseNotifier {
+	@Inject
+	private PlayerDataCollector dataCollector;
+
+	@Override
+	public boolean isEnabled() {
+		return true;
+	}
+
+	@Override
+	protected String getEventType() {
+		return "LOGOUT";
+	}
+
+	/**
+	 * Called when the player logs out.
+	 * Triggers a full account sync.
+	 */
+	public void onLogout() {
+		Map<String, Object> data = dataCollector.collectAllData();
+		sendNotification(data);
+	}
+}
+
+
+package com.revalclan.notifiers;
+
 import com.revalclan.RevalClanConfig;
 import net.runelite.api.Actor;
 import net.runelite.api.NPC;
@@ -3100,6 +3225,7 @@ package com.revalclan.player;
 
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
+import net.runelite.api.Skill;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -3132,11 +3258,18 @@ public class PlayerManager {
 		metadata.put("totalLevel", client.getTotalLevel());
 		metadata.put("totalExperience", client.getOverallExperience());
 		
+		Map<String, Map<String, Integer>> skills = new HashMap<>();
+		for (Skill skill : Skill.values()) {
+			Map<String, Integer> skillData = new HashMap<>();
+			skillData.put("level", client.getRealSkillLevel(skill));
+			skillData.put("experience", client.getSkillExperience(skill));
+			skills.put(skill.getName().toLowerCase(), skillData);
+		}
+		metadata.put("skills", skills);
+		
 		return metadata;
 	}
 }
-
-
 
 package com.revalclan.collectionlog;
 
@@ -3204,82 +3337,46 @@ public enum CollectionLogCategoryGroup {
 }
 
 /*
- * Portions of this file are derived from or inspired by the TempleOSRS plugin
- * Copyright (c) 2022, SMaloney2017
+ * Portions of this file are derived from or inspired by the RuneProfile plugin
+ * Copyright (c) RuneProfile
  * Licensed under the BSD 2-Clause License
- * See LICENSES/templeOSRS-LICENSE.txt for full license text
  */
 package com.revalclan.collectionlog;
 
-import lombok.Getter;
-import lombok.RequiredArgsConstructor;
+import com.revalclan.notifiers.SyncNotifier;
+import com.revalclan.util.ClanValidator;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
-import net.runelite.api.FontID;
 import net.runelite.api.MenuAction;
-import net.runelite.api.SpriteID;
-import net.runelite.api.annotations.Component;
-import net.runelite.api.events.ScriptPostFired;
-import net.runelite.api.widgets.ComponentID;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.ScriptPreFired;
+import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.widgets.JavaScriptCallback;
 import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetPositionMode;
-import net.runelite.api.widgets.WidgetTextAlignment;
 import net.runelite.api.widgets.WidgetType;
-import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
+import java.util.*;
 
 /**
- * Adds a "Reval" sync button to the collection log interface
- * Based on Temple OSRS implementation
+ * Adds a "Sync Reval" button to the collection log dropdown menu
+ * Similar to RuneProfile's implementation, in order to avoid overlapping buttons
  */
 @Slf4j
 @Singleton
 public class CollectionLogSyncButton {
-	private static final int COLLECTION_LOG_SETUP = 7797;
-	
-	// Sprite IDs for button background (inactive state)
-	private static final int[] SPRITE_IDS_INACTIVE = {
-		SpriteID.DIALOG_BACKGROUND,
-		SpriteID.WORLD_MAP_BUTTON_METAL_CORNER_TOP_LEFT,
-		SpriteID.WORLD_MAP_BUTTON_METAL_CORNER_TOP_RIGHT,
-		SpriteID.WORLD_MAP_BUTTON_METAL_CORNER_BOTTOM_LEFT,
-		SpriteID.WORLD_MAP_BUTTON_METAL_CORNER_BOTTOM_RIGHT,
-		SpriteID.WORLD_MAP_BUTTON_EDGE_LEFT,
-		SpriteID.WORLD_MAP_BUTTON_EDGE_TOP,
-		SpriteID.WORLD_MAP_BUTTON_EDGE_RIGHT,
-		SpriteID.WORLD_MAP_BUTTON_EDGE_BOTTOM,
-	};
-
-	// Sprite IDs for button background (hovered/active state)
-	private static final int[] SPRITE_IDS_ACTIVE = {
-		SpriteID.RESIZEABLE_MODE_SIDE_PANEL_BACKGROUND,
-		SpriteID.EQUIPMENT_BUTTON_METAL_CORNER_TOP_LEFT_HOVERED,
-		SpriteID.EQUIPMENT_BUTTON_METAL_CORNER_TOP_RIGHT_HOVERED,
-		SpriteID.EQUIPMENT_BUTTON_METAL_CORNER_BOTTOM_LEFT_HOVERED,
-		SpriteID.EQUIPMENT_BUTTON_METAL_CORNER_BOTTOM_RIGHT_HOVERED,
-		SpriteID.EQUIPMENT_BUTTON_EDGE_LEFT_HOVERED,
-		SpriteID.EQUIPMENT_BUTTON_EDGE_TOP_HOVERED,
-		SpriteID.EQUIPMENT_BUTTON_EDGE_RIGHT_HOVERED,
-		SpriteID.EQUIPMENT_BUTTON_EDGE_BOTTOM_HOVERED,
-	};
-
-	private static final int FONT_COLOUR_INACTIVE = 0xd6d6d6;
-	private static final int FONT_COLOUR_ACTIVE = 0xffffff;
-	private static final int CLOSE_BUTTON_OFFSET = 28;
-	private static final int BUTTON_WIDTH = 60;
-	private static final int BUTTON_OFFSET = CLOSE_BUTTON_OFFSET + 5;
+	private static final int DRAW_BURGER_MENU = 7812;
+	private static final int FONT_COLOR = 0xFF981F;
+	private static final int FONT_COLOR_ACTIVE = 0xFFFFFF;
+	private static final String BUTTON_TEXT = "Sync Reval";
+	private static final int SYNC_DELAY_TICKS = 3; // Wait 3 ticks for search to complete
 
 	@Inject
 	private Client client;
-
-	@Inject
-	private ClientThread clientThread;
 
 	@Inject
 	private EventBus eventBus;
@@ -3287,187 +3384,164 @@ public class CollectionLogSyncButton {
 	@Inject
 	private CollectionLogManager collectionLogManager;
 
+	@Inject
+	private SyncNotifier syncNotifier;
+
+	private int baseMenuHeight = -1;
+	private int lastAttemptedSync = -1;
+	private int pendingSyncTick = -1;
+
 	public void startUp() {
 		eventBus.register(this);
-		clientThread.invokeLater(() -> tryAddButton(this::onButtonClick));
 	}
 
 	public void shutDown() {
 		eventBus.unregister(this);
-		clientThread.invokeLater(this::removeButton);
-	}
-
-	void tryAddButton(Runnable onClick) {
-		for (Screen screen : Screen.values()) {
-			addButton(screen, onClick);
-		}
 	}
 
 	@Subscribe
-	public void onScriptPostFired(ScriptPostFired scriptPostFired) {
-		if (scriptPostFired.getScriptId() == COLLECTION_LOG_SETUP) {
-			removeButton();
-			addButton(Screen.COLLECTION_LOG, this::onButtonClick);
-		}
-	}
-
-	void onButtonClick() {
-		collectionLogManager.clearObtainedItems();
-
-		client.menuAction(-1, 40697932, MenuAction.CC_OP, 1, -1, "Search", null);
-		client.runScript(2240);
-		
-		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Reval: Capturing collection log data...", "");
-		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Reval: Data will be sent when you log out.", "");
-	}
-
-	void addButton(Screen screen, Runnable onClick) {
-		Widget parent = client.getWidget(screen.getParentId());
-		Widget searchButton = client.getWidget(screen.getSearchButtonId());
-		Widget collectionLogContainer = client.getWidget(screen.getCollectionLogContainer());
-		Widget[] containerChildren;
-		Widget draggableTopbar;
-		
-		if (parent == null || searchButton == null || collectionLogContainer == null ||
-			(containerChildren = collectionLogContainer.getChildren()) == null ||
-			(draggableTopbar = containerChildren[0]) == null) {
+	public void onScriptPreFired(ScriptPreFired event) {
+		if (event.getScriptId() != DRAW_BURGER_MENU) {
 			return;
 		}
 
-		final int w = BUTTON_WIDTH;
-		final int h = searchButton.getOriginalHeight();
-		final int x = BUTTON_OFFSET;
-		final int y = searchButton.getOriginalY();
-		final int cornerDim = 9;
+		Object[] args = event.getScriptEvent().getArguments();
+		int menuId = (int) args[3];
 
-		final Widget[] spriteWidgets = new Widget[10];
-
-		spriteWidgets[0] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[0])
-			.setPos(x, y)
-			.setSize(w, h)
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setYPositionMode(searchButton.getYPositionMode());
-
-		spriteWidgets[1] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[1])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(cornerDim, cornerDim)
-			.setPos(x + (w - cornerDim), y);
-		spriteWidgets[2] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[2])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(cornerDim, cornerDim)
-			.setPos(x, y);
-		spriteWidgets[3] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[3])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(cornerDim, cornerDim)
-			.setPos(x + (w - cornerDim), y + h - cornerDim);
-		spriteWidgets[4] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[4])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(cornerDim, cornerDim)
-			.setPos(x, y + h - cornerDim);
-
-		int sideWidth = 9;
-		int sideHeight = 4;
-		spriteWidgets[5] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[5])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(sideWidth, sideHeight)
-			.setPos(x + (w - sideWidth), y + cornerDim);
-		spriteWidgets[7] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[7])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(sideWidth, sideHeight)
-			.setPos(x, y + cornerDim);
-
-		int topWidth = 42;
-		int topHeight = 9;
-		spriteWidgets[6] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[6])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(topWidth, topHeight)
-			.setPos(x + cornerDim, y);
-		spriteWidgets[8] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SPRITE_IDS_INACTIVE[8])
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(topWidth, topHeight)
-			.setPos(x + cornerDim, y + h - topHeight);
-
-		spriteWidgets[9] = parent.createChild(-1, WidgetType.GRAPHIC)
-			.setSpriteId(SpriteID.UNKNOWN_WHITE_REFRESH_ARROWS)
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setSize(13, 13)
-			.setPos(x + 6, y + 4);
-
-		for (int i = 0; i < 10; i++) {
-			spriteWidgets[i].revalidate();
-		}
-
-		final Widget text = parent.createChild(-1, WidgetType.TEXT)
-			.setText("Reval")
-			.setTextColor(FONT_COLOUR_INACTIVE)
-			.setFontId(FontID.PLAIN_11)
-			.setTextShadowed(true)
-			.setXPositionMode(WidgetPositionMode.ABSOLUTE_RIGHT)
-			.setXTextAlignment(WidgetTextAlignment.LEFT)
-			.setYTextAlignment(WidgetTextAlignment.CENTER)
-			.setPos(x - 8, y)
-			.setSize(w, h)
-			.setYPositionMode(searchButton.getYPositionMode());
-		text.revalidate();
-
-		text.setHasListener(true);
-		text.setOnMouseOverListener((JavaScriptCallback) ev -> {
-			for (int i = 0; i <= 8; i++) {
-				spriteWidgets[i].setSpriteId(SPRITE_IDS_ACTIVE[i]);
-			}
-			text.setTextColor(FONT_COLOUR_ACTIVE);
-		});
-		text.setOnMouseLeaveListener((JavaScriptCallback) ev -> {
-			for (int i = 0; i <= 8; i++) {
-				spriteWidgets[i].setSpriteId(SPRITE_IDS_INACTIVE[i]);
-			}
-			text.setTextColor(FONT_COLOUR_INACTIVE);
-		});
-
-		text.setAction(0, "Capture collection log data");
-		text.setOnOpListener((JavaScriptCallback) ev -> onClick.run());
-
-		draggableTopbar.setOriginalWidth(draggableTopbar.getOriginalWidth() - (w + (x - CLOSE_BUTTON_OFFSET)));
-		draggableTopbar.revalidate();
-
-		parent.revalidate();
-	}
-
-	void removeButton() {
-		for (Screen screen : Screen.values()) {
-			Widget parent = client.getWidget(screen.getParentId());
-			if (parent != null) {
-				parent.deleteAllChildren();
-				parent.revalidate();
-			}
+		try {
+			addButton(menuId, this::onButtonClick);
+		} catch (Exception e) {
+			log.debug("Failed to add Reval button to menu: {}", e.getMessage());
 		}
 	}
 
-	@Getter
-	@RequiredArgsConstructor
-	enum Screen {
-		COLLECTION_LOG(40697944, 40697932, ComponentID.COLLECTION_LOG_CONTAINER); // parentId, searchButtonId, collectionLogContainer
+	private void onButtonClick() {
+		// Rate limit: 30 seconds between syncs
+		if (lastAttemptedSync != -1 && lastAttemptedSync + 50 > client.getTickCount()) {
+			int secondsRemaining = (int) Math.round((lastAttemptedSync + 50 - client.getTickCount()) * 0.6);
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", 
+				"Reval: Please wait " + secondsRemaining + " seconds before syncing again.", "");
+			return;
+		}
+		lastAttemptedSync = client.getTickCount();
 
-		@Getter(onMethod_ = @Component)
-		private final int parentId;
+		// Validate clan membership
+		if (!ClanValidator.validateClan(client)) {
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Reval: You must be in the Reval clan to sync.", "");
+			return;
+		}
 
-		@Getter(onMethod_ = @Component)
-		private final int searchButtonId;
+		// Clear existing data and trigger collection log scan
+		collectionLogManager.clearObtainedItems();
 
-		@Getter(onMethod_ = @Component)
-		private final int collectionLogContainer;
+		// Trigger the search to scan all items
+		client.menuAction(-1, 40697932, MenuAction.CC_OP, 1, -1, "Search", null);
+		client.runScript(2240);
+
+		client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Reval: Scanning collection log...", "");
+
+		// Schedule the sync after a short delay to allow the search to populate items
+		scheduleSync();
+	}
+
+	private void scheduleSync() {
+		pendingSyncTick = client.getTickCount() + SYNC_DELAY_TICKS;
+	}
+
+	@Subscribe
+	public void onGameTick(GameTick event) {
+		if (pendingSyncTick != -1 && client.getTickCount() >= pendingSyncTick) {
+			pendingSyncTick = -1;
+			performSync();
+		}
+	}
+
+	private void performSync() {
+		try {
+			syncNotifier.triggerSync();
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", 
+				"Reval: Synced account data successfully!", "");
+		} catch (Exception e) {
+			client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Reval: Failed to sync. Please try again.", "");
+		}
+	}
+
+	private void addButton(int menuId, Runnable onClick) throws NullPointerException, NoSuchElementException {
+		// Don't add button if viewing from POH adventure log (viewing someone else's log)
+		boolean isOpenedFromAdventureLog = client.getVarbitValue(VarbitID.COLLECTION_POH_HOST_BOOK_OPEN) == 1;
+		if (isOpenedFromAdventureLog) return;
+
+		Widget menu = Objects.requireNonNull(client.getWidget(menuId));
+		Widget[] menuChildren = Objects.requireNonNull(menu.getChildren());
+
+		if (baseMenuHeight == -1) {
+			baseMenuHeight = menu.getOriginalHeight();
+		}
+
+		// Find the last rectangle and text widgets to use as templates
+		List<Widget> reversedMenuChildren = new ArrayList<>(Arrays.asList(menuChildren));
+		Collections.reverse(reversedMenuChildren);
+		
+		Widget lastRectangle = reversedMenuChildren.stream()
+			.filter(w -> w.getType() == WidgetType.RECTANGLE)
+			.findFirst()
+			.orElseThrow(() -> new NoSuchElementException("No RECTANGLE widget found in menu"));
+		
+		Widget lastText = reversedMenuChildren.stream()
+			.filter(w -> w.getType() == WidgetType.TEXT)
+			.findFirst()
+			.orElseThrow(() -> new NoSuchElementException("No TEXT widget found in menu"));
+
+		final int buttonHeight = lastRectangle.getHeight();
+		final int buttonY = lastRectangle.getOriginalY() + buttonHeight;
+
+		// Check if button already exists
+		final boolean existingButton = Arrays.stream(menuChildren)
+			.anyMatch(w -> w.getText() != null && w.getText().equals(BUTTON_TEXT));
+
+		if (!existingButton) {
+			// Create background rectangle
+			final Widget background = menu.createChild(WidgetType.RECTANGLE)
+				.setOriginalWidth(lastRectangle.getOriginalWidth())
+				.setOriginalHeight(lastRectangle.getOriginalHeight())
+				.setOriginalX(lastRectangle.getOriginalX())
+				.setOriginalY(buttonY)
+				.setOpacity(lastRectangle.getOpacity())
+				.setFilled(lastRectangle.isFilled());
+			background.revalidate();
+
+			// Create text button
+			final Widget text = menu.createChild(WidgetType.TEXT)
+				.setText(BUTTON_TEXT)
+				.setTextColor(FONT_COLOR)
+				.setFontId(lastText.getFontId())
+				.setTextShadowed(lastText.getTextShadowed())
+				.setOriginalWidth(lastText.getOriginalWidth())
+				.setOriginalHeight(lastText.getOriginalHeight())
+				.setOriginalX(lastText.getOriginalX())
+				.setOriginalY(buttonY)
+				.setXTextAlignment(lastText.getXTextAlignment())
+				.setYTextAlignment(lastText.getYTextAlignment());
+			
+			text.setHasListener(true);
+			text.setOnMouseOverListener((JavaScriptCallback) ev -> text.setTextColor(FONT_COLOR_ACTIVE));
+			text.setOnMouseLeaveListener((JavaScriptCallback) ev -> text.setTextColor(FONT_COLOR));
+			text.setAction(0, "Sync collection log to Reval");
+			text.setOnOpListener((JavaScriptCallback) ev -> onClick.run());
+			text.revalidate();
+		}
+
+		// Extend menu height to fit new button
+		if (menu.getOriginalHeight() <= baseMenuHeight) {
+			menu.setOriginalHeight(menu.getOriginalHeight() + buttonHeight);
+		}
+
+		menu.revalidate();
+		for (Widget child : menuChildren) {
+			child.revalidate();
+		}
 	}
 }
-
 
 /*
  * Portions of this file are derived from or inspired by the TempleOSRS plugin
@@ -4020,9 +4094,7 @@ package com.revalclan;
 import com.revalclan.collectionlog.CollectionLogManager;
 import com.revalclan.collectionlog.CollectionLogSyncButton;
 import com.revalclan.notifiers.*;
-import com.revalclan.util.ClanValidator;
 import com.revalclan.util.EventFilterManager;
-import com.revalclan.util.WebhookService;
 import com.google.inject.Provides;
 import javax.inject.Inject;
 import lombok.extern.slf4j.Slf4j;
@@ -4048,11 +4120,6 @@ import net.runelite.client.game.ItemManager;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 
-import java.lang.reflect.Array;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
 @Slf4j
 @PluginDescriptor(
 	name = "Reval Clan"
@@ -4060,13 +4127,9 @@ import java.util.Map;
 public class RevalClanPlugin extends Plugin {
 	@Inject private Client client;
 
-	@Inject	private PlayerDataCollector dataCollector;
-
 	@Inject	private CollectionLogManager collectionLogManager;
 
 	@Inject	private CollectionLogSyncButton syncButton;
-
-	@Inject	private WebhookService webhookService;
 
 	@Inject	private LootNotifier lootNotifier;
 
@@ -4095,6 +4158,10 @@ public class RevalClanPlugin extends Plugin {
 	@Inject	private ChatNotifier chatNotifier;
 
 	@Inject	private MusicNotifier musicNotifier;
+
+	@Inject	private LoginNotifier loginNotifier;
+
+	@Inject	private LogoutNotifier logoutNotifier;
 
 	@Inject	private EventBus eventBus;
 
@@ -4150,33 +4217,12 @@ public class RevalClanPlugin extends Plugin {
 			
 			// Fetch dynamic event filters from API on login
 			eventFilterManager.fetchFiltersAsync();
+
+			// Send login notification
+			loginNotifier.onLogin();
 		} else if (gameStateChanged.getGameState() == GameState.LOGIN_SCREEN) {
 			if (wasLoggedIn) {
-				Map<String, Object> data = dataCollector.collectAllData();
-				
-				data.put("eventType", "SYNC");
-				data.put("eventTimestamp", System.currentTimeMillis());
-				
-				if (ClanValidator.validateClan(client)) {
-					// Log only top-level keys and value types
-					Map<String, String> dataSummary = new HashMap<>();
-					data.forEach((key, value) -> {
-						if (value == null) {
-							dataSummary.put(key, "null");
-						} else if (value instanceof Map) {
-							dataSummary.put(key, "Map[" + ((Map<?, ?>) value).size() + " entries]");
-						} else if (value instanceof List) {
-							dataSummary.put(key, "List[" + ((List<?>) value).size() + " items]");
-						} else if (value.getClass().isArray()) {
-							dataSummary.put(key, "Array[" + Array.getLength(value) + " items]");
-						} else {
-							dataSummary.put(key, String.valueOf(value));
-						}
-					});
-					log.info("Data summary: {}", dataSummary);
-					webhookService.sendDataAsync(data);
-				}
-					
+				logoutNotifier.onLogout();
 				wasLoggedIn = false;
 			}
 		}
