@@ -1226,6 +1226,8 @@ import java.util.Optional;
 
 public class Tick {
     public static final int MILLISECONDS_PER_TICK = 600;
+    public static final String TIME_STRING_REGEX =
+            "(\\d+:)?\\d{1,2}:\\d{2}(\\.\\d{2})?";
 
     /**
      * Convert a number of ticks to a human-readable time string.
@@ -1238,10 +1240,20 @@ public class Tick {
             throw new IllegalArgumentException("ticks must be non-negative");
         }
 
+        int hours = 0;
+        if (ticks >= 6000) {
+            hours = ticks / 6000;
+            ticks = ticks % 6000;
+        }
+
         int milliseconds = ticks * MILLISECONDS_PER_TICK;
         int seconds = (milliseconds / 1000) % 60;
         int minutes = milliseconds / 1000 / 60;
         int centiseconds = (milliseconds % 1000) / 10;
+
+        if (hours > 0) {
+            return String.format("%d:%02d:%02d.%02d", hours, minutes, seconds, centiseconds);
+        }
 
         return String.format("%d:%02d.%02d", minutes, seconds, centiseconds);
     }
@@ -1259,19 +1271,30 @@ public class Tick {
             return Optional.empty();
         }
 
-        if (!timeString.matches("\\d+:\\d{2}(\\.\\d{2})?")) {
+        if (!timeString.matches(TIME_STRING_REGEX)) {
             throw new IllegalArgumentException("Invalid time string: " + timeString);
         }
 
         String[] parts = timeString.split(":");
-        int minutes = Integer.parseInt(parts[0]);
 
-        String[] secondsAndCentiseconds = parts[1].split("\\.");
+        int hours = 0;
+        int minutes;
+        String[] secondsAndCentiseconds;
+        if (parts.length == 3) {
+            hours = Integer.parseInt(parts[0]);
+            minutes = Integer.parseInt(parts[1]);
+            secondsAndCentiseconds = parts[2].split("\\.");
+        } else {
+            minutes = Integer.parseInt(parts[0]);
+            secondsAndCentiseconds = parts[1].split("\\.");
+        }
+
         int seconds = Integer.parseInt(secondsAndCentiseconds[0]);
 
         boolean precise = true;
 
-        int milliseconds = minutes * 60 * 1000 + seconds * 1000;
+        int milliseconds =
+                hours * 60 * 60 * 1000 + minutes * 60 * 1000 + seconds * 1000;
         if (secondsAndCentiseconds.length == 2) {
             int centiseconds = Integer.parseInt(secondsAndCentiseconds[1]);
             milliseconds += centiseconds * 10;
@@ -1447,8 +1470,6 @@ import net.runelite.api.events.ChatMessage;
 import net.runelite.api.events.NpcSpawned;
 import net.runelite.api.events.VarbitChanged;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.eventbus.EventBus;
-import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.util.Text;
 import org.apache.commons.lang3.tuple.Pair;
 
@@ -1471,9 +1492,9 @@ public class TheatreChallenge extends RecordableChallenge {
     private static final Pattern RAID_ENTRY_REGEX_3P =
             Pattern.compile("(.+) has entered the Theatre of Blood \\((\\w+) Mode\\). Step inside to join (her|him|them)\\.\\.\\.");
     private static final Pattern RAID_COMPLETION_CHALLENGE_REGEX =
-            Pattern.compile("^.+Theatre of Blood completion time: ([0-9]+:[0-9]+(\\.[0-9]+)?).*");
+            Pattern.compile("^.+Theatre of Blood completion time: (" + Tick.TIME_STRING_REGEX + ").*");
     private static final Pattern RAID_COMPLETION_OVERALL_REGEX =
-            Pattern.compile("Theatre of Blood total completion time: ([0-9]+:[0-9]+(\\.[0-9]+)?).*");
+            Pattern.compile("Theatre of Blood total completion time: (" + Tick.TIME_STRING_REGEX + ").*");
 
     private Location location = Location.ELSEWHERE;
     private boolean locationChangedThisTick = false;
@@ -1486,8 +1507,14 @@ public class TheatreChallenge extends RecordableChallenge {
 
     private @Nullable DeferredTask deferredTask = null;
 
-    public TheatreChallenge(Client client, EventBus eventBus, ClientThread clientThread) {
-        super(Challenge.TOB, client, eventBus, clientThread);
+    public TheatreChallenge(Client client, ClientThread clientThread) {
+        super(Challenge.TOB, client, clientThread);
+    }
+
+    @Nullable
+    @Override
+    protected DataTracker getActiveTracker() {
+        return roomDataTracker;
     }
 
     @Override
@@ -1700,18 +1727,14 @@ public class TheatreChallenge extends RecordableChallenge {
         locationChangedThisTick = true;
     }
 
-    @Subscribe(priority = 10)
-    private void onNpcSpawned(NpcSpawned npcSpawned) {
+    @Override
+    public void onNpcSpawned(NpcSpawned npcSpawned) {
         updateLocation();
-
-        if (locationChangedThisTick && roomDataTracker != null) {
-            // When the room changes, the event must be manually forwarded to the new `roomDataTracker`.
-            roomDataTracker.onNpcSpawned(npcSpawned);
-        }
+        super.onNpcSpawned(npcSpawned);
     }
 
-    @Subscribe(priority = 10)
-    private void onVarbitChanged(VarbitChanged varbit) {
+    @Override
+    public void onVarbitChanged(VarbitChanged varbit) {
         if (varbit.getVarbitId() == Varbits.THEATRE_OF_BLOOD) {
             if (getState().isInactive() && varbit.getValue() == 2) {
                 // A raid start due to a varbit change usually means that the player is joining late, rejoining, or
@@ -1737,48 +1760,52 @@ public class TheatreChallenge extends RecordableChallenge {
         if (previousState != roomState) {
             log.debug("Room status changed from " + previousState + " to " + roomState);
         }
+
+        super.onVarbitChanged(varbit);
     }
 
-    @Subscribe(priority = 5)
-    private void onChatMessage(ChatMessage message) {
+    @Override
+    public void onChatMessage(ChatMessage message) {
         updateLocation();
 
-        if (message.getType() != ChatMessageType.GAMEMESSAGE) {
-            return;
-        }
+        if (message.getType() == ChatMessageType.GAMEMESSAGE) {
+            String stripped = Text.removeTags(message.getMessage());
 
-        String stripped = Text.removeTags(message.getMessage());
+            if (getState().isInactive()) {
+                // Listen for a chat message indicating the start of a raid, and queue the start action immediately
+                // instead of waiting to enter.
+                Matcher matcher = RAID_ENTRY_REGEX_1P.matcher(stripped);
+                if (matcher.matches()) {
+                    log.debug("Raid started via 1p chat message (mode: {})", matcher.group(1));
+                    queueRaidStart(ChallengeMode.parseTob(matcher.group(1)).orElse(ChallengeMode.NO_MODE),
+                            getParty().isEmpty());
+                    super.onChatMessage(message);
+                    return;
+                }
 
-        if (getState().isInactive()) {
-            // Listen for a chat message indicating the start of a raid, and queue the start action immediately
-            // instead of waiting to enter.
-            Matcher matcher = RAID_ENTRY_REGEX_1P.matcher(stripped);
-            if (matcher.matches()) {
-                log.debug("Raid started via 1p chat message (mode: {})", matcher.group(1));
-                queueRaidStart(ChallengeMode.parseTob(matcher.group(1)).orElse(ChallengeMode.NO_MODE),
-                        getParty().isEmpty());
+                matcher = RAID_ENTRY_REGEX_3P.matcher(stripped);
+                if (matcher.matches()) {
+                    log.debug("Raid started via 3p chat message (leader: {} mode: {})", matcher.group(1), matcher.group(2));
+                    queueRaidStart(ChallengeMode.parseTob(matcher.group(2)).orElse(ChallengeMode.NO_MODE),
+                            getParty().isEmpty());
+                }
+                super.onChatMessage(message);
                 return;
             }
 
-            matcher = RAID_ENTRY_REGEX_3P.matcher(stripped);
+            Matcher matcher = RAID_COMPLETION_CHALLENGE_REGEX.matcher(stripped);
             if (matcher.matches()) {
-                log.debug("Raid started via 3p chat message (leader: {} mode: {})", matcher.group(1), matcher.group(2));
-                queueRaidStart(ChallengeMode.parseTob(matcher.group(2)).orElse(ChallengeMode.NO_MODE),
-                        getParty().isEmpty());
+                reportedChallengeTime = Tick.fromTimeString(matcher.group(1)).map(Pair::getLeft).orElse(-1);
             }
-            return;
+
+            matcher = RAID_COMPLETION_OVERALL_REGEX.matcher(stripped);
+            if (matcher.matches()) {
+                int overallTime = Tick.fromTimeString(matcher.group(1)).map(Pair::getLeft).orElse(-1);
+                queueRaidEnd(ChallengeState.COMPLETE, overallTime);
+            }
         }
 
-        Matcher matcher = RAID_COMPLETION_CHALLENGE_REGEX.matcher(stripped);
-        if (matcher.matches()) {
-            reportedChallengeTime = Tick.fromTimeString(matcher.group(1)).map(Pair::getLeft).orElse(-1);
-        }
-
-        matcher = RAID_COMPLETION_OVERALL_REGEX.matcher(stripped);
-        if (matcher.matches()) {
-            int overallTime = Tick.fromTimeString(matcher.group(1)).map(Pair::getLeft).orElse(-1);
-            queueRaidEnd(ChallengeState.COMPLETE, overallTime);
-        }
+        super.onChatMessage(message);
     }
 
     /**
@@ -1818,7 +1845,6 @@ public class TheatreChallenge extends RecordableChallenge {
     private void clearRoomDataTracker() {
         if (roomDataTracker != null) {
             roomDataTracker.terminate();
-            getEventBus().unregister(roomDataTracker);
             roomDataTracker = null;
         }
     }
@@ -1842,7 +1868,6 @@ public class TheatreChallenge extends RecordableChallenge {
 
         if (roomDataTracker != null) {
             log.info("Initialized room data tracker for {} from {}", roomDataTracker.getRoom(), location);
-            getEventBus().register(roomDataTracker);
             dispatchEvent(new StageUpdateEvent(roomDataTracker.getStage(), 0, StageUpdateEvent.Status.ENTERED));
             getParty().forEach(Raider::resetForNewRoom);
         }
@@ -4835,8 +4860,10 @@ import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
 import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.*;
-import net.runelite.client.eventbus.Subscribe;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.events.HitsplatApplied;
+import net.runelite.api.events.VarbitChanged;
 import net.runelite.client.util.Text;
 
 import java.util.regex.Matcher;
@@ -4862,7 +4889,8 @@ public abstract class RoomDataTracker extends DataTracker {
         this.theatreChallenge = theatreChallenge;
         this.room = room;
         this.waveEndRegex = Pattern.compile(
-                "Wave '" + room.waveName() + "' \\(\\w+ Mode\\) complete!Duration: ([0-9:.]+)"
+                "Wave '" + room.waveName() + "' \\(\\w+ Mode\\) " +
+                        "complete!Duration: (" + Tick.TIME_STRING_REGEX + ")"
         );
         this.startOnEntry = startOnEntry;
     }
@@ -4961,54 +4989,6 @@ public abstract class RoomDataTracker extends DataTracker {
      * Initialization method invoked when the room is first started.
      */
     protected abstract void onRoomStart();
-
-    /**
-     * Implementation-specific equivalent of the {@code onGameObjectSpawned} Runelite event handler.
-     * Should be overriden by implementations which require special handling.
-     *
-     * @param event The event.
-     */
-    protected void onGameObjectSpawn(GameObjectSpawned event) {
-    }
-
-    /**
-     * Implementation-specific equivalent of the {@code onGameObjectDespawned} Runelite event handler.
-     * Should be overriden by implementations which require special handling.
-     *
-     * @param event The event.
-     */
-    protected void onGameObjectDespawn(GameObjectDespawned event) {
-    }
-
-    /**
-     * Implementation-specific equivalent of the {@code onGraphicsObjectCreated} Runelite event handler.
-     * Should be overriden by implementations which require special handling.
-     *
-     * @param event The event.
-     */
-    protected void onGraphicsObjectCreation(GraphicsObjectCreated event) {
-    }
-
-    @Subscribe
-    protected final void onGameObjectSpawned(GameObjectSpawned event) {
-        if (!terminating()) {
-            onGameObjectSpawn(event);
-        }
-    }
-
-    @Subscribe
-    protected final void onGameObjectDespawned(GameObjectDespawned event) {
-        if (!terminating()) {
-            onGameObjectDespawn(event);
-        }
-    }
-
-    @Subscribe
-    private void onGraphicsObjectCreated(GraphicsObjectCreated event) {
-        if (!terminating()) {
-            onGraphicsObjectCreation(event);
-        }
-    }
 
     @Override
     protected void onGameState(GameStateChanged event) {
@@ -6084,8 +6064,6 @@ import net.runelite.api.coords.WorldArea;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.eventbus.EventBus;
-import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.util.Text;
 import org.apache.commons.lang3.tuple.Pair;
 
@@ -6098,7 +6076,8 @@ import java.util.stream.Collectors;
 
 @Slf4j
 public final class ColosseumChallenge extends RecordableChallenge {
-    final static Pattern COLOSSEUM_END_REGEX = Pattern.compile("Colosseum duration: ([0-9:.]+).*");
+    final static Pattern COLOSSEUM_END_REGEX = Pattern.compile(
+            "Colosseum duration: (" + Tick.TIME_STRING_REGEX + ")");
 
     private static final int COLOSSEUM_REGION_ID = 7216;
     private static final int COLOSSEUM_LOBBY_REGION_ID = 7316;
@@ -6120,8 +6099,14 @@ public final class ColosseumChallenge extends RecordableChallenge {
     private @Nullable DeferredTask deferredTask = null;
     private boolean stateChangeCooldown;
 
-    public ColosseumChallenge(Client client, EventBus eventBus, ClientThread clientThread) {
-        super(Challenge.COLOSSEUM, client, eventBus, clientThread);
+    public ColosseumChallenge(Client client, ClientThread clientThread) {
+        super(Challenge.COLOSSEUM, client, clientThread);
+    }
+
+    @Nullable
+    @Override
+    protected DataTracker getActiveTracker() {
+        return waveDataTracker;
     }
 
     @Override
@@ -6167,78 +6152,78 @@ public final class ColosseumChallenge extends RecordableChallenge {
         return waveDataTracker != null ? waveDataTracker.getStage() : null;
     }
 
-    @Subscribe
-    private void onNpcSpawned(NpcSpawned event) {
+    @Override
+    public void onNpcSpawned(NpcSpawned event) {
         if (!stateChangeCooldown && event.getNpc().getId() == MINIMUS_NPC_ID) {
             prepareNextWave();
         }
+        super.onNpcSpawned(event);
     }
 
-    @Subscribe
-    private void onNpcDespawned(NpcDespawned event) {
-        if (event.getNpc().getId() != MINIMUS_NPC_ID) {
-            return;
-        }
-
-        if (getState() == ChallengeState.STARTING) {
-            setState(ChallengeState.ACTIVE);
-        } else if (getState() != ChallengeState.ACTIVE) {
-            return;
-        }
-
-        stateChangeCooldown = true;
-        deferredTask = new DeferredTask(() -> {
-            stateChangeCooldown = false;
-
-            if (!waveHandicapOptions.isEmpty()) {
-                // The debuff selection varbit stores the index of the selected debuff option, starting from 1.
-                int selectedDebuffIndex = client.getVarbitValue(HANDICAP_SELECTION_VARBIT_ID) - 1;
-                Handicap selectedHandicap = waveHandicapOptions.get(selectedDebuffIndex);
-                if (waveDataTracker != null) {
-                    waveDataTracker.setHandicapOptions(waveHandicapOptions.toArray(new Handicap[3]));
-                    waveDataTracker.setHandicap(selectedHandicap);
-                }
+    @Override
+    public void onNpcDespawned(NpcDespawned event) {
+        if (event.getNpc().getId() == MINIMUS_NPC_ID) {
+            if (getState() == ChallengeState.STARTING) {
+                setState(ChallengeState.ACTIVE);
             }
-        }, 3);
+
+            if (getState() == ChallengeState.ACTIVE) {
+                stateChangeCooldown = true;
+                deferredTask = new DeferredTask(() -> {
+                    stateChangeCooldown = false;
+
+                    if (!waveHandicapOptions.isEmpty()) {
+                        // The debuff selection varbit stores the index of the selected debuff option, starting from 1.
+                        int selectedDebuffIndex = client.getVarbitValue(HANDICAP_SELECTION_VARBIT_ID) - 1;
+                        Handicap selectedHandicap = waveHandicapOptions.get(selectedDebuffIndex);
+                        if (waveDataTracker != null) {
+                            waveDataTracker.setHandicapOptions(waveHandicapOptions.toArray(new Handicap[3]));
+                            waveDataTracker.setHandicap(selectedHandicap);
+                        }
+                    }
+                }, 3);
+            }
+        }
+        super.onNpcDespawned(event);
     }
 
-    @Subscribe
-    private void onGameObjectSpawned(GameObjectSpawned event) {
+    @Override
+    public void onGameObjectSpawned(GameObjectSpawned event) {
         if (event.getGameObject().getId() == REWARD_CHEST_OBJECT_ID) {
             if (deferredTask != null) {
                 deferredTask.cancel();
             }
             queueFinishColosseum(ChallengeState.COMPLETE);
         }
+        super.onGameObjectSpawned(event);
     }
 
-    @Subscribe
-    private void onChatMessage(ChatMessage event) {
-        if (getState().isInactive()) {
-            return;
-        }
-
-        Matcher matcher = ColosseumChallenge.COLOSSEUM_END_REGEX.matcher(Text.removeTags(event.getMessage()));
-        if (matcher.find()) {
-            try {
-                reportedChallengeTicks = Tick.fromTimeString(matcher.group(1)).map(Pair::getLeft).orElse(-1);
-            } catch (Exception e) {
-                reportedChallengeTicks = -1;
+    @Override
+    public void onChatMessage(ChatMessage event) {
+        if (!getState().isInactive()) {
+            Matcher matcher = ColosseumChallenge.COLOSSEUM_END_REGEX.matcher(Text.removeTags(event.getMessage()));
+            if (matcher.find()) {
+                try {
+                    reportedChallengeTicks = Tick.fromTimeString(matcher.group(1)).map(Pair::getLeft).orElse(-1);
+                } catch (Exception e) {
+                    reportedChallengeTicks = -1;
+                }
             }
         }
+        super.onChatMessage(event);
     }
 
-    @Subscribe
-    private void onScriptPreFired(ScriptPreFired event) {
-        if (getState().isInactive() || event.getScriptId() != HANDICAP_SELECTION_SCRIPT_ID) {
-            return;
+    @Override
+    public void onScriptPreFired(ScriptPreFired event) {
+        if (!getState().isInactive() && event.getScriptId() == HANDICAP_SELECTION_SCRIPT_ID) {
+            waveHandicapOptions.clear();
+            Object[] scriptArgs = event.getScriptEvent().getArguments();
+            waveHandicapOptions.add(Handicap.withId((int) scriptArgs[2]));
+            waveHandicapOptions.add(Handicap.withId((int) scriptArgs[3]));
+            waveHandicapOptions.add(Handicap.withId((int) scriptArgs[4]));
         }
 
-        waveHandicapOptions.clear();
-        Object[] scriptArgs = event.getScriptEvent().getArguments();
-        waveHandicapOptions.add(Handicap.withId((int) scriptArgs[2]));
-        waveHandicapOptions.add(Handicap.withId((int) scriptArgs[3]));
-        waveHandicapOptions.add(Handicap.withId((int) scriptArgs[4]));
+        super.onScriptPreFired(event);
     }
 
     private void checkColosseumState() {
@@ -6295,7 +6280,6 @@ public final class ColosseumChallenge extends RecordableChallenge {
         currentWave++;
         if (currentWave < 13) {
             waveDataTracker = new WaveDataTracker(this, client, currentWave, recordedChallengeTicks);
-            getEventBus().register(waveDataTracker);
         }
     }
 
@@ -6303,7 +6287,6 @@ public final class ColosseumChallenge extends RecordableChallenge {
         if (waveDataTracker != null) {
             recordedChallengeTicks += waveDataTracker.getTotalTicks();
             waveDataTracker.terminate();
-            getEventBus().unregister(waveDataTracker);
             waveDataTracker = null;
         }
     }
@@ -6502,7 +6485,8 @@ public class WaveDataTracker extends DataTracker {
         super(challenge, client, waveToStage(wave));
 
         this.waveStartMessage = "Wave: " + wave;
-        this.waveEndRegex = Pattern.compile("Wave " + wave + " completed! Wave duration: ([0-9:.]+)");
+        this.waveEndRegex = Pattern.compile("Wave " + wave + " completed! " +
+                "Wave duration: (" + Tick.TIME_STRING_REGEX + ")");
         this.ticksOnEntry = ticksOnEntry;
     }
 
@@ -6820,12 +6804,12 @@ import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.WorldType;
 import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.events.GameStateChanged;
-import net.runelite.api.events.GameTick;
+import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.config.ConfigManager;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.ui.ClientToolbar;
@@ -6918,7 +6902,6 @@ public class BlertPlugin extends Plugin {
         attackRegistry.loadDefaults();
         spellRegistry.loadDefaults();
 
-        eventBus.register(websocketManager);
         websocketManager.open();
 
         sidePanel = new BlertPluginPanel(config, websocketManager);
@@ -6927,8 +6910,8 @@ public class BlertPlugin extends Plugin {
         clientToolbar.addNavigation(sidePanelButton);
         sidePanel.startPanel();
 
-        challenges.add(new TheatreChallenge(client, eventBus, clientThread));
-        challenges.add(new ColosseumChallenge(client, eventBus, clientThread));
+        challenges.add(new TheatreChallenge(client, clientThread));
+        challenges.add(new ColosseumChallenge(client, clientThread));
 
         previousGameState = client.getGameState();
         loginState = previousGameState == GameState.LOGGED_IN ? LoginState.LOGGED_IN : LoginState.LOGGED_OUT;
@@ -6941,14 +6924,12 @@ public class BlertPlugin extends Plugin {
     @Override
     protected void shutDown() throws Exception {
         websocketManager.close();
-        eventBus.unregister(websocketManager);
 
         clientToolbar.removeNavigation(sidePanelButton);
         sidePanel.stopPanel();
         sidePanel = null;
 
         if (activeChallenge != null) {
-            eventBus.unregister(activeChallenge);
             activeChallenge.terminate();
             activeChallenge = null;
         }
@@ -6962,12 +6943,7 @@ public class BlertPlugin extends Plugin {
             deferredTask.tick();
         }
 
-        if (loginState == LoginState.JUST_LOGGED_IN) {
-            // Resume the active challenge at the end of the login tick.
-            if (activeChallenge != null) {
-                eventBus.register(activeChallenge);
-            }
-        } else {
+        if (loginState != LoginState.JUST_LOGGED_IN) {
             updateActiveChallenge();
 
             if (activeChallenge != null) {
@@ -7007,15 +6983,14 @@ public class BlertPlugin extends Plugin {
                 websocketManager.getEventHandler().updateGameState(GameState.LOGIN_SCREEN);
             }
 
-            if (activeChallenge != null) {
-                // Suspend the challenge while the player is logged out.
-                eventBus.unregister(activeChallenge);
-            }
-
             loginState = LoginState.LOGGED_OUT;
         }
 
         previousGameState = gameState;
+
+        if (activeChallenge != null) {
+            activeChallenge.onGameStateChanged(gameStateChanged);
+        }
     }
 
     @Provides
@@ -7041,14 +7016,12 @@ public class BlertPlugin extends Plugin {
             }
 
             activeChallenge = challenge;
-            eventBus.register(activeChallenge);
             activeChallenge.initialize(websocketManager.getEventHandler(), attackRegistry, spellRegistry);
 
             log.info("Entered challenge \"{}\"", activeChallenge.getName());
         } else if (activeChallenge != null) {
             log.info("Exited challenge \"{}\"", activeChallenge.getName());
 
-            eventBus.unregister(activeChallenge);
             activeChallenge.terminate();
             activeChallenge = null;
         }
@@ -7062,6 +7035,123 @@ public class BlertPlugin extends Plugin {
                 && !worldTypes.contains(WorldType.SEASONAL);
         if (!enabled) {
             log.info("Plugin is disabled due to world type: {}", worldTypes);
+        }
+    }
+
+    @Subscribe
+    private void onConfigChanged(ConfigChanged event) {
+        websocketManager.onConfigChanged(event);
+    }
+
+    @Subscribe(priority = 10)
+    private void onNpcSpawned(NpcSpawned event) {
+        if (activeChallenge != null) {
+            activeChallenge.onNpcSpawned(event);
+        }
+    }
+
+    @Subscribe
+    private void onNpcDespawned(NpcDespawned event) {
+        if (activeChallenge != null) {
+            activeChallenge.onNpcDespawned(event);
+        }
+    }
+
+    @Subscribe
+    private void onNpcChanged(NpcChanged event) {
+        if (activeChallenge != null) {
+            activeChallenge.onNpcChanged(event);
+        }
+    }
+
+    @Subscribe
+    private void onAnimationChanged(AnimationChanged event) {
+        if (activeChallenge != null) {
+            activeChallenge.onAnimationChanged(event);
+        }
+    }
+
+    @Subscribe
+    private void onProjectileMoved(ProjectileMoved event) {
+        if (activeChallenge != null) {
+            activeChallenge.onProjectileMoved(event);
+        }
+    }
+
+    @Subscribe(priority = 5)
+    private void onChatMessage(ChatMessage event) {
+        if (activeChallenge != null) {
+            activeChallenge.onChatMessage(event);
+        }
+    }
+
+    @Subscribe
+    private void onHitsplatApplied(HitsplatApplied event) {
+        if (activeChallenge != null) {
+            activeChallenge.onHitsplatApplied(event);
+        }
+    }
+
+    @Subscribe
+    private void onGameObjectSpawned(GameObjectSpawned event) {
+        if (activeChallenge != null) {
+            activeChallenge.onGameObjectSpawned(event);
+        }
+    }
+
+    @Subscribe
+    private void onGameObjectDespawned(GameObjectDespawned event) {
+        if (activeChallenge != null) {
+            activeChallenge.onGameObjectDespawned(event);
+        }
+    }
+
+    @Subscribe
+    private void onGroundObjectSpawned(GroundObjectSpawned event) {
+        if (activeChallenge != null) {
+            activeChallenge.onGroundObjectSpawned(event);
+        }
+    }
+
+    @Subscribe
+    private void onGroundObjectDespawned(GroundObjectDespawned event) {
+        if (activeChallenge != null) {
+            activeChallenge.onGroundObjectDespawned(event);
+        }
+    }
+
+    @Subscribe
+    private void onGraphicChanged(GraphicChanged event) {
+        if (activeChallenge != null) {
+            activeChallenge.onGraphicChanged(event);
+        }
+    }
+
+    @Subscribe
+    private void onGraphicsObjectCreated(GraphicsObjectCreated event) {
+        if (activeChallenge != null) {
+            activeChallenge.onGraphicsObjectCreated(event);
+        }
+    }
+
+    @Subscribe
+    private void onActorDeath(ActorDeath event) {
+        if (activeChallenge != null) {
+            activeChallenge.onActorDeath(event);
+        }
+    }
+
+    @Subscribe(priority = 10)
+    private void onVarbitChanged(VarbitChanged event) {
+        if (activeChallenge != null) {
+            activeChallenge.onVarbitChanged(event);
+        }
+    }
+
+    @Subscribe
+    private void onScriptPreFired(ScriptPreFired event) {
+        if (activeChallenge != null) {
+            activeChallenge.onScriptPreFired(event);
         }
     }
 }
@@ -8317,7 +8407,6 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.client.RuneLiteProperties;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.ConfigChanged;
 import okhttp3.OkHttpClient;
 
@@ -8417,8 +8506,7 @@ public class WebSocketManager {
         }
     }
 
-    @Subscribe
-    private void onConfigChanged(ConfigChanged changed) {
+    public void onConfigChanged(ConfigChanged changed) {
         if (!changed.getGroup().equals("blert")) {
             return;
         }
@@ -11905,6 +11993,56 @@ public enum Skill {
 }
 
 /*
+ * Copyright (c) 2026 Alexei Frolov
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to use,
+ * copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the
+ * Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+ * EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+ * OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+ * NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+ * HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+ * OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+package io.blert.core;
+
+import net.runelite.api.events.*;
+
+/**
+ * Interface for components that receive RuneLite events routed from the central plugin.
+ */
+public interface RuneliteEventHandler {
+    default void onGameStateChanged(GameStateChanged event) {}
+    default void onNpcSpawned(NpcSpawned event) {}
+    default void onNpcDespawned(NpcDespawned event) {}
+    default void onNpcChanged(NpcChanged event) {}
+    default void onAnimationChanged(AnimationChanged event) {}
+    default void onProjectileMoved(ProjectileMoved event) {}
+    default void onChatMessage(ChatMessage event) {}
+    default void onHitsplatApplied(HitsplatApplied event) {}
+    default void onGameObjectSpawned(GameObjectSpawned event) {}
+    default void onGameObjectDespawned(GameObjectDespawned event) {}
+    default void onGroundObjectSpawned(GroundObjectSpawned event) {}
+    default void onGroundObjectDespawned(GroundObjectDespawned event) {}
+    default void onGraphicChanged(GraphicChanged event) {}
+    default void onGraphicsObjectCreated(GraphicsObjectCreated event) {}
+    default void onActorDeath(ActorDeath event) {}
+    default void onVarbitChanged(VarbitChanged event) {}
+    default void onScriptPreFired(ScriptPreFired event) {}
+}
+
+/*
  * Copyright (c) 2024 Alexei Frolov
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy of
@@ -12448,8 +12586,8 @@ import lombok.*;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.util.Text;
 
 import javax.annotation.Nullable;
@@ -12458,16 +12596,13 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 
 @Slf4j
-public abstract class RecordableChallenge {
+public abstract class RecordableChallenge implements RuneliteEventHandler {
     @Getter
     private final Challenge challenge;
     @Getter
     private @NonNull ChallengeMode challengeMode;
 
     protected final Client client;
-
-    @Getter(AccessLevel.PROTECTED)
-    private final EventBus eventBus;
 
     @Getter
     private final ClientThread clientThread;
@@ -12512,11 +12647,10 @@ public abstract class RecordableChallenge {
      */
     private final Map<String, Raider> party = new LinkedHashMap<>();
 
-    protected RecordableChallenge(Challenge challenge, Client client, EventBus eventBus, ClientThread clientThread) {
+    protected RecordableChallenge(Challenge challenge, Client client, ClientThread clientThread) {
         this.challenge = challenge;
         this.challengeMode = ChallengeMode.NO_MODE;
         this.client = client;
-        this.eventBus = eventBus;
         this.clientThread = clientThread;
     }
 
@@ -12665,6 +12799,148 @@ public abstract class RecordableChallenge {
 
     private Status currentStatus() {
         return new Status(challenge, challengeMode, getStage(), new ArrayList<>(party.keySet()));
+    }
+
+    /**
+     * Returns the currently active data tracker for this challenge, if any.
+     */
+    @Nullable
+    protected abstract DataTracker getActiveTracker();
+
+    @Override
+    public void onGameStateChanged(GameStateChanged event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onGameStateChanged(event);
+        }
+    }
+
+    @Override
+    public void onNpcSpawned(NpcSpawned event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onNpcSpawned(event);
+        }
+    }
+
+    @Override
+    public void onNpcDespawned(NpcDespawned event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onNpcDespawned(event);
+        }
+    }
+
+    @Override
+    public void onNpcChanged(NpcChanged event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onNpcChanged(event);
+        }
+    }
+
+    @Override
+    public void onAnimationChanged(AnimationChanged event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onAnimationChanged(event);
+        }
+    }
+
+    @Override
+    public void onProjectileMoved(ProjectileMoved event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onProjectileMoved(event);
+        }
+    }
+
+    @Override
+    public void onChatMessage(ChatMessage event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onChatMessage(event);
+        }
+    }
+
+    @Override
+    public void onHitsplatApplied(HitsplatApplied event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onHitsplatApplied(event);
+        }
+    }
+
+    @Override
+    public void onGameObjectSpawned(GameObjectSpawned event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onGameObjectSpawned(event);
+        }
+    }
+
+    @Override
+    public void onGameObjectDespawned(GameObjectDespawned event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onGameObjectDespawned(event);
+        }
+    }
+
+    @Override
+    public void onGroundObjectSpawned(GroundObjectSpawned event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onGroundObjectSpawned(event);
+        }
+    }
+
+    @Override
+    public void onGroundObjectDespawned(GroundObjectDespawned event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onGroundObjectDespawned(event);
+        }
+    }
+
+    @Override
+    public void onGraphicChanged(GraphicChanged event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onGraphicChanged(event);
+        }
+    }
+
+    @Override
+    public void onGraphicsObjectCreated(GraphicsObjectCreated event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onGraphicsObjectCreated(event);
+        }
+    }
+
+    @Override
+    public void onActorDeath(ActorDeath event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onActorDeath(event);
+        }
+    }
+
+    @Override
+    public void onVarbitChanged(VarbitChanged event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onVarbitChanged(event);
+        }
+    }
+
+    @Override
+    public void onScriptPreFired(ScriptPreFired event) {
+        DataTracker tracker = getActiveTracker();
+        if (tracker != null) {
+            tracker.onScriptPreFired(event);
+        }
     }
 }
 
@@ -13562,14 +13838,13 @@ import net.runelite.api.*;
 import net.runelite.api.coords.WorldPoint;
 import net.runelite.api.events.*;
 import net.runelite.client.callback.ClientThread;
-import net.runelite.client.eventbus.Subscribe;
 
 import javax.annotation.Nullable;
 import java.util.List;
 import java.util.Optional;
 
 @Slf4j
-public abstract class DataTracker {
+public abstract class DataTracker implements RuneliteEventHandler {
     protected enum State {
         NOT_STARTED,
         IN_PROGRESS,
@@ -13751,6 +14026,25 @@ public abstract class DataTracker {
     }
 
     /**
+     * Implementation-specific equivalent of the {@code onGameObjectSpawned} Runelite event handler.
+     * Should be overriden by implementations which require special handling.
+     *
+     * @param event The event.
+     */
+    protected void onGameObjectSpawn(GameObjectSpawned event) {
+    }
+
+    /**
+     * Implementation-specific equivalent of the {@code onGameObjectDespawned} Runelite event handler.
+     * Should be overriden by implementations which require special handling.
+     *
+     * @param event The event.
+     */
+    protected void onGameObjectDespawn(GameObjectDespawned event) {
+    }
+
+
+    /**
      * Implementation-specific equivalent of the {@code onGroundObjectSpawned} Runelite event handler.
      * Should be overriden by implementations which require special handling.
      *
@@ -13766,6 +14060,25 @@ public abstract class DataTracker {
      * @param event The event.
      */
     protected void onGroundObjectDespawn(GroundObjectDespawned event) {
+    }
+
+    /**
+     * Implementation-specific equivalent of the {@code onGraphicChanged}
+     * Runelite event handler.
+     * Should be overriden by implementations which require special handling.
+     *
+     * @param event The event.
+     */
+    protected void onGraphicChange(GraphicChanged event) {
+    }
+
+    /**
+     * Implementation-specific equivalent of the {@code onGraphicsObjectCreated} Runelite event handler.
+     * Should be overriden by implementations which require special handling.
+     *
+     * @param event The event.
+     */
+    protected void onGraphicsObjectCreation(GraphicsObjectCreated event) {
     }
 
     /**
@@ -14181,7 +14494,6 @@ public abstract class DataTracker {
         log.debug("Hit a {} with {} on {}", spec.getDamage(), weapon.getName(), spec.getTarget().getName());
     }
 
-    @Subscribe
     public final void onGameStateChanged(GameStateChanged event) {
         if (terminating()) {
             return;
@@ -14190,7 +14502,6 @@ public abstract class DataTracker {
         onGameState(event);
     }
 
-    @Subscribe
     public final void onNpcSpawned(NpcSpawned event) {
         if (terminating()) {
             return;
@@ -14199,8 +14510,8 @@ public abstract class DataTracker {
         onNpcSpawn(event).ifPresent(this::addTrackedNpc);
     }
 
-    @Subscribe
-    protected final void onNpcDespawned(NpcDespawned event) {
+    @Override
+    public final void onNpcDespawned(NpcDespawned event) {
         if (terminating()) {
             return;
         }
@@ -14211,15 +14522,15 @@ public abstract class DataTracker {
         }
     }
 
-    @Subscribe
-    protected final void onNpcChanged(NpcChanged event) {
+    @Override
+    public final void onNpcChanged(NpcChanged event) {
         if (!terminating()) {
             onNpcChange(event);
         }
     }
 
-    @Subscribe
-    protected final void onAnimationChanged(AnimationChanged event) {
+    @Override
+    public final void onAnimationChanged(AnimationChanged event) {
         if (getState() != State.IN_PROGRESS) {
             return;
         }
@@ -14237,22 +14548,22 @@ public abstract class DataTracker {
         onAnimation(event);
     }
 
-    @Subscribe
-    protected final void onProjectileMoved(ProjectileMoved event) {
+    @Override
+    public final void onProjectileMoved(ProjectileMoved event) {
         if (!terminating()) {
             onProjectile(event);
         }
     }
 
-    @Subscribe(priority = 10)
-    protected final void onChatMessage(ChatMessage event) {
+    @Override
+    public final void onChatMessage(ChatMessage event) {
         if (state == State.IN_PROGRESS || event.getType() == ChatMessageType.GAMEMESSAGE) {
             onMessage(event);
         }
     }
 
-    @Subscribe
-    protected final void onHitsplatApplied(HitsplatApplied hitsplatApplied) {
+    @Override
+    public final void onHitsplatApplied(HitsplatApplied hitsplatApplied) {
         if (getState() != State.IN_PROGRESS) {
             return;
         }
@@ -14276,22 +14587,50 @@ public abstract class DataTracker {
         onHitsplat(hitsplatApplied);
     }
 
-    @Subscribe
-    protected final void onGroundObjectSpawned(GroundObjectSpawned event) {
+    @Override
+    public final void onGameObjectSpawned(GameObjectSpawned event) {
+        if (!terminating()) {
+            onGameObjectSpawn(event);
+        }
+    }
+
+    @Override
+    public final void onGameObjectDespawned(GameObjectDespawned event) {
+        if (!terminating()) {
+            onGameObjectDespawn(event);
+        }
+    }
+
+    @Override
+    public final void onGroundObjectSpawned(GroundObjectSpawned event) {
         if (!terminating()) {
             onGroundObjectSpawn(event);
         }
     }
 
-    @Subscribe
-    protected final void onGroundObjectDespawned(GroundObjectDespawned event) {
+    @Override
+    public final void onGroundObjectDespawned(GroundObjectDespawned event) {
         if (!terminating()) {
             onGroundObjectDespawn(event);
         }
     }
 
-    @Subscribe
-    protected final void onActorDeath(ActorDeath event) {
+    @Override
+    public final void onGraphicChanged(GraphicChanged event) {
+        if (!terminating()) {
+            onGraphicChange(event);
+        }
+    }
+
+    @Override
+    public final void onGraphicsObjectCreated(GraphicsObjectCreated event) {
+        if (!terminating()) {
+            onGraphicsObjectCreation(event);
+        }
+    }
+
+    @Override
+    public final void onActorDeath(ActorDeath event) {
         if (terminating()) {
             return;
         }
@@ -14309,8 +14648,8 @@ public abstract class DataTracker {
         onDeath(event);
     }
 
-    @Subscribe
-    protected final void onVarbitChanged(VarbitChanged varbitChanged) {
+    @Override
+    public final void onVarbitChanged(VarbitChanged varbitChanged) {
         if (getState() != State.IN_PROGRESS) {
             return;
         }
@@ -14590,6 +14929,9 @@ public class TickTest extends TestCase {
         assertEquals("2:57.60", Tick.asTimeString(296));
         assertEquals("9:59.40", Tick.asTimeString(999));
         assertEquals("10:00.00", Tick.asTimeString(1000));
+        assertEquals("1:00:00.00", Tick.asTimeString(6000));
+        assertEquals("5:59:59.40", Tick.asTimeString(35999));
+        assertEquals("16:39:59.40", Tick.asTimeString(99999));
     }
 
     public void testFromTimeString() {
@@ -14603,6 +14945,9 @@ public class TickTest extends TestCase {
         assertEquals(Pair.of(296, true), Tick.fromTimeString("2:57.60").orElseThrow());
         assertEquals(Pair.of(999, true), Tick.fromTimeString("9:59.40").orElseThrow());
         assertEquals(Pair.of(1000, true), Tick.fromTimeString("10:00.00").orElseThrow());
+        assertEquals(Pair.of(6000, true), Tick.fromTimeString("1:00:00.00").orElseThrow());
+        assertEquals(Pair.of(35999, true), Tick.fromTimeString("5:59:59.40").orElseThrow());
+        assertEquals(Pair.of(99999, true), Tick.fromTimeString("16:39:59.40").orElseThrow());
 
         // Non-precise time strings without centiseconds.
         assertEquals(Pair.of(0, false), Tick.fromTimeString("0:00").orElseThrow());
@@ -14615,8 +14960,12 @@ public class TickTest extends TestCase {
         assertEquals(Pair.of(297, false), Tick.fromTimeString("2:58").orElseThrow());
         assertEquals(Pair.of(999, false), Tick.fromTimeString("9:59").orElseThrow());
         assertEquals(Pair.of(1000, false), Tick.fromTimeString("10:00").orElseThrow());
+        assertEquals(Pair.of(6000, false), Tick.fromTimeString("1:00:00").orElseThrow());
+        assertEquals(Pair.of(35997, false), Tick.fromTimeString("5:59:58").orElseThrow());
+        assertEquals(Pair.of(99999, false), Tick.fromTimeString("16:39:59").orElseThrow());
     }
 }
+
 /*
  * Copyright (c) 2024 Alexei Frolov
  *
