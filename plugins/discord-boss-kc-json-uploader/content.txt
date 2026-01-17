@@ -209,12 +209,12 @@ public class LeaderboardPlugin extends Plugin
 		StringBuilder leaderboard = new StringBuilder();
 		leaderboard.append("{");
         for (String bossName : bossNames) {
-            leaderboard.append("\n\"").append(bossName).append("\": {");
+            leaderboard.append("\"").append(bossName).append("\": {");
             leaderboard.append("\"count\": ").append(getKc(bossName)).append(",");
-            leaderboard.append("\"pb\": ").append(getPb(bossName)).append("},\n");
+            leaderboard.append("\"pb\": ").append(getPb(bossName)).append("},");
         }
 		leaderboard.setLength(leaderboard.length() - 1); //removes the last comma
-		leaderboard.append("\n}"); // cap off the JSON
+		leaderboard.append("}"); // cap off the JSON
 		return leaderboard.toString();
 	}
 
