@@ -921,7 +921,7 @@ public class ChatSpacingManager
         // Restore scroll position based on how many lines the user was scrolled up from bottom
         boolean atBottom = this.scrolledUpPixels == 0.0;
 
-        float scrolledUpPixelsLocal = atBottom ? this.scrolledUpPixels : this.scrolledUpPixels + this.config.chatMessageSpacing();
+        float scrolledUpPixelsLocal = atBottom ? this.scrolledUpPixels : this.scrolledUpPixels;
 
         int newScrollY = (int) (newScrollHeight - visibleHeight - scrolledUpPixelsLocal);
         newScrollY = Math.max(0, newScrollY);
@@ -2192,15 +2192,15 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.URL;
 import java.nio.file.Files;
-import java.nio.file.WatchService;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
+import java.util.stream.Collectors;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -2280,6 +2280,8 @@ public class CustomEmojiPlugin extends Plugin
 
 	private static final Pattern WHITESPACE_REGEXP = Pattern.compile("[\\s\\u00A0]");
 	private static final String IMG_TAG_PREFIX = "<img=";
+	private static final int MAX_REGISTRATION_RETRIES = 10;
+	private static final String UNKNOWN_EMOJI_PLACEHOLDER = "[?]";
 
 	@Inject
 	private EventBus eventBus;
@@ -2356,12 +2358,11 @@ public class CustomEmojiPlugin extends Plugin
 		boolean animated;
 	}
 
-	private WatchService watchService;
-	private ExecutorService watcherExecutor;
 	private ScheduledExecutorService debounceExecutor;
 	private ScheduledFuture<?> pendingReload;
 	private CustomEmojiPanel panel;
 	private NavigationButton navButton;
+	private boolean shownSoundojiDeprecationWarning;
 
 	private void setup()
 	{
@@ -2421,6 +2422,7 @@ public class CustomEmojiPlugin extends Plugin
 	protected void startUp() throws Exception
 	{
 		setup();
+		this.animationManager.initialize();
 
 		this.githubDownloader = new GitHubEmojiDownloader(this.okHttpClient, this.gson, this.executor);
 
@@ -2428,12 +2430,15 @@ public class CustomEmojiPlugin extends Plugin
 		this.emojiStateManager.setOnEmojiDisabled(this::replaceDisabledEmojiInChat);
 		this.emojiStateManager.setOnEmojiResizingToggled(this::handleEmojiResizingToggled);
 
-		this.loadEmojisAsync(this::replaceAllTextWithEmojis);
 		loadSoundojis();
 
 		if (this.isGitHubDownloadConfigured())
 		{
-			this.triggerGitHubDownload();
+			this.triggerGitHubDownloadForStartup();
+		}
+		else
+		{
+			this.loadEmojisAsync(this::replaceAllTextWithEmojis);
 		}
 
 		if (config.showPanel())
@@ -2481,7 +2486,7 @@ public class CustomEmojiPlugin extends Plugin
 		this.replaceAllEmojisWithText();
 
 		this.githubDownloader.shutdown();
-		shutdownFileWatcher();
+		this.shutdownDebounceExecutor();
 		emojis.clear();
 		errors.clear();
 		chatSpacingManager.clearStoredPositions();
@@ -2494,6 +2499,7 @@ public class CustomEmojiPlugin extends Plugin
 
 		// Clean up animation overlays
 		this.teardownAnimationOverlays();
+		this.animationManager.shutdown();
 
 		if (panel != null)
 		{
@@ -2506,12 +2512,20 @@ public class CustomEmojiPlugin extends Plugin
 		log.debug("Plugin shutdown complete - all containers cleared");
 	}
 
-	public void triggerGitHubDownload()
+	private void triggerGitHubDownloadForStartup()
 	{
-		this.triggerGitHubDownload(false);
+		this.githubDownloader.downloadEmojis(this.config.githubRepoUrl(), null, result ->
+		{
+			StatusMessagePanel.MessageType messageType = result.isSuccess()
+				? StatusMessagePanel.MessageType.SUCCESS
+				: StatusMessagePanel.MessageType.ERROR;
+			this.showPanelStatus(result.formatPanelMessage(), messageType);
+
+			this.loadEmojisAsync(this::replaceAllTextWithEmojis);
+		});
 	}
 
-	public void triggerGitHubDownload(boolean openPanelOnStart)
+	public void triggerGitHubDownloadAndReload()
 	{
 		if (!this.isGitHubDownloadConfigured())
 		{
@@ -2519,28 +2533,28 @@ public class CustomEmojiPlugin extends Plugin
 			return;
 		}
 
-		Runnable onStarted = openPanelOnStart ? () ->
+		Runnable onStarted = () ->
 		{
 			if (this.navButton != null)
 			{
 				SwingUtilities.invokeLater(() -> this.clientToolbar.openPanel(this.navButton));
 			}
-		} : null;
+		};
 
 		boolean hadPreviousDownload = this.githubDownloader.hasDownloadedBefore();
 
+		this.replaceAllEmojisWithText();
+
 		this.githubDownloader.downloadEmojis(this.config.githubRepoUrl(), onStarted, result ->
 		{
-			if (openPanelOnStart && !result.isSuccess())
+			if (!result.isSuccess())
 			{
 				this.clientThread.invokeLater(() ->
 					this.client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", result.formatMessage(), null));
 			}
 			else
 			{
-				StatusMessagePanel.MessageType messageType = result.isSuccess()
-					? StatusMessagePanel.MessageType.SUCCESS
-					: StatusMessagePanel.MessageType.ERROR;
+				StatusMessagePanel.MessageType messageType = StatusMessagePanel.MessageType.SUCCESS;
 				this.showPanelStatus(result.formatPanelMessage(), messageType);
 			}
 
@@ -2553,6 +2567,8 @@ public class CustomEmojiPlugin extends Plugin
 				}
 				this.forceReloadChangedEmojis(changedNames);
 			}
+
+			this.replaceAllTextWithEmojis();
 		});
 	}
 
@@ -2652,52 +2668,19 @@ public class CustomEmojiPlugin extends Plugin
 		log.debug("Animation overlays torn down");
 	}
 
-	private void shutdownFileWatcher()
+	private void shutdownDebounceExecutor()
 	{
-		log.debug("Starting file watcher shutdown");
-
-		// Cancel any pending reload debounce task first to prevent new reloads
-		if (pendingReload != null)
+		if (this.pendingReload != null)
 		{
-			boolean cancelled = pendingReload.cancel(true); // Use true to interrupt if running
-			log.debug("Pending reload task cancelled: {}", cancelled);
-			pendingReload = null; // Clear reference
+			this.pendingReload.cancel(true);
+			this.pendingReload = null;
 		}
 
-		shutdownExecutor(debounceExecutor, "debounce executor");
-		shutdownExecutor(watcherExecutor, "watcher executor");
-
-		// Close watch service first to interrupt the blocking take() call
-		if (watchService != null)
+		if (this.debounceExecutor != null)
 		{
-			try
-			{
-				watchService.close();
-				log.debug("Watch service closed");
-			}
-			catch (IOException e)
-			{
-				log.error("Failed to close watch service", e);
-			}
-			watchService = null; // Clear reference
+			this.debounceExecutor.shutdownNow();
+			this.debounceExecutor = null;
 		}
-
-		// Clear executor references
-		debounceExecutor = null;
-		watcherExecutor = null;
-
-		log.debug("File watcher shutdown complete");
-	}
-
-	private void shutdownExecutor(ExecutorService executor, String executorName)
-	{
-		if (executor == null)
-		{
-			return;
-		}
-
-		log.debug("Shutting down {}", executorName);
-		executor.shutdownNow();
 	}
 
 	@Subscribe
@@ -2759,6 +2742,7 @@ public class CustomEmojiPlugin extends Plugin
 
 		switch (event.getKey())
 		{
+			case CustomEmojiConfig.KEY_DYNAMIC_EMOJI_SPACING:
 			case CustomEmojiConfig.KEY_CHAT_MESSAGE_SPACING:
 				clientThread.invokeLater(chatSpacingManager::applyChatSpacing);
 				break;
@@ -2772,6 +2756,7 @@ public class CustomEmojiPlugin extends Plugin
 				this.animationManager.clearAllAnimations();
 				this.clientThread.invokeLater(this.chatSpacingManager::applyChatSpacing);
 				break;
+			case CustomEmojiConfig.KEY_ANIMATION_LOADING_MODE:
 			case CustomEmojiConfig.KEY_ENABLE_ANIMATED_EMOJIS:
 				this.animationManager.clearAllAnimations();
 				break;
@@ -2786,7 +2771,7 @@ public class CustomEmojiPlugin extends Plugin
 				}
 				break;
 			case CustomEmojiConfig.KEY_GITHUB_ADDRESS:
-				this.triggerGitHubDownload(true);
+				this.triggerGitHubDownloadAndReload();
 				break;
 			default:
 				break;
@@ -2804,6 +2789,7 @@ public class CustomEmojiPlugin extends Plugin
 	{
 		switch (event.getIndex())
 		{
+			case VarClientID.CHAT_FORCE_CHATBOX_REBUILD:
 			case VarClientID.CHAT_LASTREBUILD:
 				this.chatSpacingManager.clearStoredPositions();
 				this.clientThread.invokeAtTickEnd(this.chatSpacingManager::applyChatSpacing);
@@ -2868,6 +2854,7 @@ public class CustomEmojiPlugin extends Plugin
 					try
 					{
 						this.audioPlayer.play(soundoji.getFile(), volumeToGain(this.config.volume()));
+						this.showSoundojiDeprecationWarning();
 					}
 					catch (IOException | UnsupportedAudioFileException | LineUnavailableException e)
 					{
@@ -3301,11 +3288,11 @@ public class CustomEmojiPlugin extends Plugin
 			return;
 		}
 
-		int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
-		String imageTag = IMG_TAG_PREFIX + imageId + ">";
-
-		this.clientThread.invokeLater(() ->
+		this.waitForRegistration(emoji, () ->
 		{
+			int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
+			String imageTag = IMG_TAG_PREFIX + imageId + ">";
+
 			this.processAllChatMessages(value ->
 			{
 				if (showAsImage)
@@ -3326,7 +3313,12 @@ public class CustomEmojiPlugin extends Plugin
 			{
 				int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
 				String imageTag = IMG_TAG_PREFIX + imageId + ">";
-				updated = updated.replace(imageTag, emoji.getText());
+
+				String emojiText = emoji.getText();
+				boolean hasValidText = emojiText != null && !emojiText.isEmpty();
+				String replacement = hasValidText ? emojiText : UNKNOWN_EMOJI_PLACEHOLDER;
+
+				updated = updated.replace(imageTag, replacement);
 			}
 			return updated;
 		});
@@ -3334,21 +3326,23 @@ public class CustomEmojiPlugin extends Plugin
 
 	private void replaceAllTextWithEmojis()
 	{
-		this.processAllChatMessages(value ->
+		List<Emoji> enabledEmojis = this.emojis.values().stream()
+			.filter(emoji -> this.emojiStateManager.isEmojiEnabled(emoji.getText()))
+			.collect(Collectors.toList());
+
+		this.waitForRegistration(enabledEmojis, () ->
 		{
-			String updated = value;
-			for (Emoji emoji : this.emojis.values())
+			this.processAllChatMessages(message ->
 			{
-				boolean isEnabled = this.emojiStateManager.isEmojiEnabled(emoji.getText());
-				if (!isEnabled)
+				String updated = message;
+				for (Emoji emoji : enabledEmojis)
 				{
-					continue;
+					int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
+					String imageTag = IMG_TAG_PREFIX + imageId + ">";
+					updated = this.replaceTextWithImage(updated, emoji.getText(), imageTag);
 				}
-				int imageId = this.chatIconManager.chatIconIndex(emoji.getId());
-				String imageTag = IMG_TAG_PREFIX + imageId + ">";
-				updated = this.replaceTextWithImage(updated, emoji.getText(), imageTag);
-			}
-			return updated;
+				return updated;
+			});
 		});
 	}
 
@@ -3391,6 +3385,36 @@ public class CustomEmojiPlugin extends Plugin
 		}
 
 		return modified ? String.join(" ", words) : message;
+	}
+
+	private void waitForRegistration(Emoji emoji, Runnable onRegistered)
+	{
+		this.waitForRegistration(List.of(emoji), onRegistered, 0);
+	}
+
+	private void waitForRegistration(Collection<Emoji> emojis, Runnable onRegistered)
+	{
+		this.waitForRegistration(emojis, onRegistered, 0);
+	}
+
+	private void waitForRegistration(Collection<Emoji> emojis, Runnable onRegistered, int retryCount)
+	{
+		boolean allRegistered = emojis.stream()
+			.allMatch(emoji -> this.chatIconManager.chatIconIndex(emoji.getId()) >= 0);
+
+		if (allRegistered)
+		{
+			onRegistered.run();
+			return;
+		}
+
+		if (retryCount >= MAX_REGISTRATION_RETRIES)
+		{
+			log.warn("Max retries reached waiting for {} emoji(s) registration", emojis.size());
+			return;
+		}
+
+		this.clientThread.invokeLater(() -> this.waitForRegistration(emojis, onRegistered, retryCount + 1));
 	}
 
 	private void handleEmojiResizingToggled(String emojiName)
@@ -3660,6 +3684,21 @@ public class CustomEmojiPlugin extends Plugin
 	{
 		// We don't have access to the ConfigPlugin so let's just emulate an overlay click
 		this.eventBus.post(new OverlayMenuClicked(new OverlayMenuEntry(RUNELITE_OVERLAY_CONFIG, null, null), this.overlay));
+	}
+
+	private void showSoundojiDeprecationWarning()
+	{
+		if (this.shownSoundojiDeprecationWarning)
+		{
+			return;
+		}
+		this.shownSoundojiDeprecationWarning = true;
+		this.client.addChatMessage(
+			ChatMessageType.GAMEMESSAGE,
+			"",
+			"[Custom Emoji] Soundojis may be removed in a future update. If you use this feature, please contact the plugin developers on GitHub.",
+			null
+		);
 	}
 }
 
@@ -4054,6 +4093,7 @@ public interface CustomEmojiConfig extends Config
 	String KEY_OVERLAY_MAX_SUGGESTIONS = "overlay_max_suggestions";
 	String KEY_SHOW_EMOJI_TOOLTIPS = "show_emoji_tooltips";
 	String KEY_ENABLE_ANIMATED_EMOJIS = "enable_animated_emojis";
+	String KEY_ANIMATION_LOADING_MODE = "animation_loading_mode";
 	String KEY_VOLUME = "volume";
 	String KEY_CHAT_MESSAGE_SPACING = "chat_message_spacing";
 	String KEY_DYNAMIC_EMOJI_SPACING = "dynamic_emoji_spacing";
@@ -4118,6 +4158,16 @@ public interface CustomEmojiConfig extends Config
 	)
 	default boolean enableAnimatedEmojis() { return true; }
 
+	@ConfigItem(
+		keyName = KEY_ANIMATION_LOADING_MODE,
+		name = "Animation Loading Mode",
+		description = "<b>Lazy:</b> Loads animation frames progressively as needed. <b>[Recommended]</b><br>" +
+					  "<b>Eager:</b> Loads all animation frames immediately.",
+		section = EMOJI_SECTION,
+		position = 5
+	)
+	default AnimationLoadingMode animationLoadingMode() { return AnimationLoadingMode.LAZY; }
+
 	// Soundoji section
 	@ConfigSection(
 			name = "Soundoji",
@@ -4177,7 +4227,7 @@ public interface CustomEmojiConfig extends Config
 			name = "Show Emoji Panel",
 			description = "Show the emoji selection panel in the sidebar",
 			section = EMOJI_SECTION,
-			position = 5
+			position = 6
 	)
 	default boolean showPanel()
 	{
@@ -4224,6 +4274,13 @@ public interface CustomEmojiConfig extends Config
 	default String resizingDisabledEmojis()
 	{
 		return "";
+	}
+
+	enum AnimationLoadingMode
+	{
+		LAZY,
+		EAGER,
+		;
 	}
 }
 
@@ -6996,7 +7053,7 @@ public class CustomEmojiPanel extends PluginPanel
 
 		this.searchPanel = new SearchPanel(this::onSearchChanged);
 		this.emojiTreePanel = emojiTreePanelProvider.get();
-		this.emojiTreePanel.setOnDownloadClicked(this.plugin::triggerGitHubDownload);
+		this.emojiTreePanel.setOnDownloadClicked(this.plugin::triggerGitHubDownloadAndReload);
 		this.emojiTreePanel.setOnReloadClicked(() -> this.plugin.scheduleReload(true));
 		this.emojiTreePanel.setDownloadButtonVisible(this.plugin.isGitHubDownloadConfigured());
 
@@ -7107,88 +7164,7 @@ public class CustomEmojiPanel extends PluginPanel
 
 package com.customemoji.animation;
 
-import java.awt.image.BufferedImage;
-
-import lombok.Getter;
-
-@Getter
-public class GifAnimation
-{
-	private final BufferedImage[] frames;
-	private final int[] frameDelays;
-	private final int totalDuration;
-
-	private int currentFrameIndex;
-	private long animationStartTime;
-
-	public GifAnimation(BufferedImage[] frames, int[] frameDelays)
-	{
-		this.frames = frames;
-		this.frameDelays = frameDelays;
-		this.currentFrameIndex = 0;
-		this.animationStartTime = System.currentTimeMillis();
-
-		int duration = 0;
-		for (int delay : frameDelays)
-		{
-			duration += delay;
-		}
-		this.totalDuration = duration;
-	}
-
-	public BufferedImage getCurrentFrame()
-	{
-		if (this.frames.length == 0)
-		{
-			return null;
-		}
-
-		if (this.frames.length == 1)
-		{
-			return this.frames[0];
-		}
-
-		this.updateCurrentFrameIndex();
-		return this.frames[this.currentFrameIndex];
-	}
-
-	private void updateCurrentFrameIndex()
-	{
-		if (this.totalDuration <= 0)
-		{
-			this.currentFrameIndex = 0;
-			return;
-		}
-
-		long elapsed = System.currentTimeMillis() - this.animationStartTime;
-		long timeInCycle = elapsed % this.totalDuration;
-
-		int accumulatedTime = 0;
-		for (int i = 0; i < this.frameDelays.length; i++)
-		{
-			accumulatedTime += this.frameDelays[i];
-			if (timeInCycle < accumulatedTime)
-			{
-				this.currentFrameIndex = i;
-				return;
-			}
-		}
-
-		this.currentFrameIndex = this.frames.length - 1;
-	}
-
-	public int getFrameCount()
-	{
-		return this.frames.length;
-	}
-}
-
-package com.customemoji.animation;
-
-import com.customemoji.CustomEmojiConfig;
 import com.customemoji.PluginUtils;
-import com.customemoji.model.AnimatedEmoji;
-import com.customemoji.service.EmojiStateManager;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -7197,81 +7173,668 @@ import javax.imageio.ImageReader;
 import javax.imageio.metadata.IIOMetadata;
 import javax.imageio.metadata.IIOMetadataNode;
 import javax.imageio.stream.ImageInputStream;
+
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
+import java.io.Closeable;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Iterator;
+import java.util.List;
+
+import org.w3c.dom.NodeList;
+
+@Slf4j
+public class GifAnimation implements Closeable
+{
+	private static final int DEFAULT_FRAME_DELAY_MS = 100;
+	private static final int INITIAL_CAPACITY = 16;
+
+	private static final String DISPOSAL_NONE = "none";
+	private static final String DISPOSAL_DO_NOT_DISPOSE = "doNotDispose";
+	private static final String DISPOSAL_RESTORE_TO_BACKGROUND = "restoreToBackgroundColor";
+	private static final String DISPOSAL_RESTORE_TO_PREVIOUS = "restoreToPrevious";
+
+	private byte[] gifData;
+	private final int maxHeight;
+	private final boolean shouldResize;
+	private final boolean useLazyLoading;
+
+	private ImageInputStream imageStream;
+	private ImageReader reader;
+
+	private BufferedImage canvas;
+	private BufferedImage savedCanvas;
+	private int canvasWidth;
+	private int canvasHeight;
+	private String previousDisposalMethod;
+	private Rectangle previousFrameBounds;
+
+	private final List<BufferedImage> frames = new ArrayList<>(INITIAL_CAPACITY);
+	private final List<Integer> frameDelays = new ArrayList<>(INITIAL_CAPACITY);
+
+	private int currentFrameIndex;
+	private long lastFrameChangeTime;
+
+	private boolean initialized;
+	private boolean disposed;
+	private boolean allFramesLoaded;
+	private boolean backgroundLoadingStarted;
+	private boolean preloadingInProgress;
+
+	public GifAnimation(byte[] gifData, int maxHeight, boolean shouldResize, boolean useLazyLoading)
+	{
+		this.gifData = gifData;
+		this.maxHeight = maxHeight;
+		this.shouldResize = shouldResize;
+		this.useLazyLoading = useLazyLoading;
+		this.lastFrameChangeTime = System.currentTimeMillis();
+		this.currentFrameIndex = 0;
+		this.initialized = false;
+		this.disposed = false;
+		this.allFramesLoaded = false;
+		this.backgroundLoadingStarted = false;
+		this.preloadingInProgress = false;
+	}
+
+	public synchronized BufferedImage getCurrentFrame()
+	{
+		if (!this.ensureInitialized())
+		{
+			return null;
+		}
+
+		if (this.frames.isEmpty())
+		{
+			return null;
+		}
+
+		if (this.allFramesLoaded && this.frames.size() == 1)
+		{
+			return this.frames.get(0);
+		}
+
+		int frameIndex = this.calculateCurrentFrameIndex();
+		return this.frames.get(frameIndex);
+	}
+
+	public synchronized boolean needsPreloading()
+	{
+		if (!this.useLazyLoading || this.allFramesLoaded || this.preloadingInProgress)
+		{
+			return false;
+		}
+
+		int loadedCount = this.frames.size();
+		int framesRemaining = loadedCount - this.currentFrameIndex - 1;
+		boolean needsMoreFrames = framesRemaining < 5;
+
+		return needsMoreFrames;
+	}
+
+	public void preloadFrames()
+	{
+		synchronized (this)
+		{
+			if (this.preloadingInProgress || this.allFramesLoaded)
+			{
+				return;
+			}
+			this.preloadingInProgress = true;
+		}
+
+		try
+		{
+			for (int i = 0; i < 5 && !this.allFramesLoaded; i++)
+			{
+				this.loadNextFrame();
+			}
+		}
+		finally
+		{
+			synchronized (this)
+			{
+				this.preloadingInProgress = false;
+			}
+		}
+	}
+
+	public synchronized boolean needsBackgroundLoading()
+	{
+		if (this.useLazyLoading)
+		{
+			return false;
+		}
+		if (!this.initialized || this.disposed || this.allFramesLoaded)
+		{
+			return false;
+		}
+		if (this.backgroundLoadingStarted)
+		{
+			return false;
+		}
+		this.backgroundLoadingStarted = true;
+		return true;
+	}
+
+	public void loadAllFrames()
+	{
+		while (!this.allFramesLoaded && !this.disposed)
+		{
+			this.loadNextFrame();
+		}
+	}
+
+	@Override
+	public synchronized void close()
+	{
+		this.disposed = true;
+		this.closeReader();
+		this.frames.clear();
+		this.frameDelays.clear();
+	}
+
+	private synchronized boolean ensureInitialized()
+	{
+		if (this.disposed)
+		{
+			return false;
+		}
+
+		if (this.initialized)
+		{
+			return true;
+		}
+
+		try
+		{
+			ByteArrayInputStream byteArrayInputStream = new ByteArrayInputStream(this.gifData);
+			this.imageStream = ImageIO.createImageInputStream(byteArrayInputStream);
+			if (this.imageStream == null)
+			{
+				return false;
+			}
+
+			Iterator<ImageReader> readers = ImageIO.getImageReadersByFormatName("gif");
+			if (!readers.hasNext())
+			{
+				this.imageStream.close();
+				return false;
+			}
+
+			this.reader = readers.next();
+			this.reader.setInput(this.imageStream);
+
+			this.initializeCanvas();
+
+			boolean loaded = this.loadNextFrame();
+			if (!loaded)
+			{
+				this.close();
+				return false;
+			}
+
+			this.initialized = true;
+			return true;
+		}
+		catch (IOException e)
+		{
+			log.debug("Failed to initialize GIF animation", e);
+			return false;
+		}
+	}
+
+	private void initializeCanvas() throws IOException
+	{
+		IIOMetadata streamMetadata = this.reader.getStreamMetadata();
+		if (streamMetadata != null)
+		{
+			String formatName = streamMetadata.getNativeMetadataFormatName();
+			IIOMetadataNode root = (IIOMetadataNode) streamMetadata.getAsTree(formatName);
+
+			NodeList screenDescList = root.getElementsByTagName("LogicalScreenDescriptor");
+			if (screenDescList.getLength() > 0)
+			{
+				IIOMetadataNode screenDesc = (IIOMetadataNode) screenDescList.item(0);
+				String widthStr = screenDesc.getAttribute("logicalScreenWidth");
+				String heightStr = screenDesc.getAttribute("logicalScreenHeight");
+
+				if (widthStr != null && !widthStr.isEmpty())
+				{
+					this.canvasWidth = Integer.parseInt(widthStr);
+				}
+				if (heightStr != null && !heightStr.isEmpty())
+				{
+					this.canvasHeight = Integer.parseInt(heightStr);
+				}
+			}
+		}
+
+		if (this.canvasWidth == 0 || this.canvasHeight == 0)
+		{
+			BufferedImage firstFrame = this.reader.read(0);
+			this.canvasWidth = firstFrame.getWidth();
+			this.canvasHeight = firstFrame.getHeight();
+		}
+
+		this.canvas = new BufferedImage(this.canvasWidth, this.canvasHeight, BufferedImage.TYPE_INT_ARGB);
+		this.previousDisposalMethod = DISPOSAL_NONE;
+		this.previousFrameBounds = null;
+	}
+
+	private boolean loadNextFrame()
+	{
+		int nextIndex;
+		synchronized (this)
+		{
+			if (this.allFramesLoaded || this.disposed)
+			{
+				return false;
+			}
+			nextIndex = this.frames.size();
+		}
+
+		BufferedImage compositedFrame;
+		int delay;
+		try
+		{
+			BufferedImage rawFrame = this.reader.read(nextIndex);
+
+			FrameMetadata metadata = this.getFrameMetadata(nextIndex);
+			delay = metadata.delayMs;
+
+			this.applyDisposalMethod();
+
+			boolean needsSaveState = DISPOSAL_RESTORE_TO_PREVIOUS.equals(metadata.disposalMethod);
+			if (needsSaveState)
+			{
+				this.savedCanvas = this.copyCanvas();
+			}
+
+			Graphics2D g = this.canvas.createGraphics();
+			try
+			{
+				g.drawImage(rawFrame, metadata.x, metadata.y, null);
+			}
+			finally
+			{
+				g.dispose();
+			}
+
+			this.previousDisposalMethod = metadata.disposalMethod;
+			this.previousFrameBounds = new Rectangle(metadata.x, metadata.y, rawFrame.getWidth(), rawFrame.getHeight());
+
+			BufferedImage canvasCopy = this.copyCanvas();
+
+			compositedFrame = canvasCopy;
+			if (this.shouldResize)
+			{
+				compositedFrame = PluginUtils.resizeImage(canvasCopy, this.maxHeight);
+			}
+		}
+		catch (IndexOutOfBoundsException e)
+		{
+			synchronized (this)
+			{
+				this.allFramesLoaded = true;
+				this.closeReader();
+			}
+			return false;
+		}
+		catch (IOException e)
+		{
+			log.debug("Failed to load frame {}", nextIndex, e);
+			synchronized (this)
+			{
+				this.allFramesLoaded = true;
+				this.closeReader();
+			}
+			return false;
+		}
+
+		synchronized (this)
+		{
+			if (this.disposed)
+			{
+				return false;
+			}
+			this.frames.add(compositedFrame);
+			this.frameDelays.add(delay);
+		}
+
+		return true;
+	}
+
+	private void applyDisposalMethod()
+	{
+		if (this.previousFrameBounds == null)
+		{
+			return;
+		}
+
+		switch (this.previousDisposalMethod)
+		{
+			case DISPOSAL_RESTORE_TO_BACKGROUND:
+				this.clearPreviousFrameArea();
+				break;
+			case DISPOSAL_RESTORE_TO_PREVIOUS:
+				this.restoreToPreviousCanvas();
+				break;
+			case DISPOSAL_NONE:
+			case DISPOSAL_DO_NOT_DISPOSE:
+			default:
+				break;
+		}
+	}
+
+	private void clearPreviousFrameArea()
+	{
+		Graphics2D g = this.canvas.createGraphics();
+		try
+		{
+			g.setBackground(new Color(0, 0, 0, 0));
+			g.clearRect(
+				this.previousFrameBounds.x,
+				this.previousFrameBounds.y,
+				this.previousFrameBounds.width,
+				this.previousFrameBounds.height
+			);
+		}
+		finally
+		{
+			g.dispose();
+		}
+	}
+
+	private void restoreToPreviousCanvas()
+	{
+		if (this.savedCanvas == null)
+		{
+			return;
+		}
+
+		Graphics2D g = this.canvas.createGraphics();
+		try
+		{
+			g.setBackground(new Color(0, 0, 0, 0));
+			g.clearRect(0, 0, this.canvasWidth, this.canvasHeight);
+			g.drawImage(this.savedCanvas, 0, 0, null);
+		}
+		finally
+		{
+			g.dispose();
+		}
+	}
+
+	private BufferedImage copyCanvas()
+	{
+		BufferedImage copy = new BufferedImage(this.canvasWidth, this.canvasHeight, BufferedImage.TYPE_INT_ARGB);
+		Graphics2D g = copy.createGraphics();
+		try
+		{
+			g.drawImage(this.canvas, 0, 0, null);
+		}
+		finally
+		{
+			g.dispose();
+		}
+		return copy;
+	}
+
+	private FrameMetadata getFrameMetadata(int frameIndex)
+	{
+		FrameMetadata metadata = new FrameMetadata();
+		metadata.x = 0;
+		metadata.y = 0;
+		metadata.delayMs = DEFAULT_FRAME_DELAY_MS;
+		metadata.disposalMethod = DISPOSAL_NONE;
+
+		try
+		{
+			IIOMetadata frameMetadata = this.reader.getImageMetadata(frameIndex);
+			if (frameMetadata == null)
+			{
+				return metadata;
+			}
+
+			String formatName = frameMetadata.getNativeMetadataFormatName();
+			IIOMetadataNode root = (IIOMetadataNode) frameMetadata.getAsTree(formatName);
+
+			this.parseImageDescriptor(root, metadata);
+			this.parseGraphicControlExtension(root, metadata);
+		}
+		catch (Exception e)
+		{
+			log.debug("Failed to get frame metadata for frame {}", frameIndex, e);
+		}
+
+		return metadata;
+	}
+
+	private void parseImageDescriptor(IIOMetadataNode root, FrameMetadata metadata)
+	{
+		NodeList imageDescList = root.getElementsByTagName("ImageDescriptor");
+		if (imageDescList.getLength() == 0)
+		{
+			return;
+		}
+
+		IIOMetadataNode imageDesc = (IIOMetadataNode) imageDescList.item(0);
+		metadata.x = this.parseIntAttribute(imageDesc, "imageLeftPosition", 0);
+		metadata.y = this.parseIntAttribute(imageDesc, "imageTopPosition", 0);
+	}
+
+	private void parseGraphicControlExtension(IIOMetadataNode root, FrameMetadata metadata)
+	{
+		NodeList gceList = root.getElementsByTagName("GraphicControlExtension");
+		if (gceList.getLength() == 0)
+		{
+			return;
+		}
+
+		IIOMetadataNode gce = (IIOMetadataNode) gceList.item(0);
+
+		int delayHundredths = this.parseIntAttribute(gce, "delayTime", 0);
+		int delayMs = delayHundredths * 10;
+		metadata.delayMs = delayMs > 0 ? delayMs : DEFAULT_FRAME_DELAY_MS;
+
+		String disposalStr = gce.getAttribute("disposalMethod");
+		if (disposalStr != null && !disposalStr.isEmpty())
+		{
+			metadata.disposalMethod = disposalStr;
+		}
+	}
+
+	private int parseIntAttribute(IIOMetadataNode node, String attributeName, int defaultValue)
+	{
+		String value = node.getAttribute(attributeName);
+		if (value == null || value.isEmpty())
+		{
+			return defaultValue;
+		}
+		return Integer.parseInt(value);
+	}
+
+	private int calculateCurrentFrameIndex()
+	{
+		int loadedCount = this.frames.size();
+		if (loadedCount == 0)
+		{
+			return 0;
+		}
+
+		if (loadedCount == 1)
+		{
+			return 0;
+		}
+
+		long now = System.currentTimeMillis();
+		int currentDelay = this.frameDelays.get(this.currentFrameIndex);
+		long elapsed = now - this.lastFrameChangeTime;
+
+		while (elapsed >= currentDelay)
+		{
+			elapsed -= currentDelay;
+			int nextIndex = this.currentFrameIndex + 1;
+
+			if (nextIndex >= loadedCount)
+			{
+				if (this.allFramesLoaded)
+				{
+					nextIndex = 0;
+				}
+				else
+				{
+					this.lastFrameChangeTime = now;
+					return this.currentFrameIndex;
+				}
+			}
+
+			this.currentFrameIndex = nextIndex;
+			this.lastFrameChangeTime = now - elapsed;
+			currentDelay = this.frameDelays.get(this.currentFrameIndex);
+		}
+
+		return this.currentFrameIndex;
+	}
+
+	private void closeReader()
+	{
+		if (this.reader != null)
+		{
+			this.reader.dispose();
+			this.reader = null;
+		}
+
+		if (this.imageStream != null)
+		{
+			try
+			{
+				this.imageStream.close();
+			}
+			catch (IOException e)
+			{
+				log.debug("Error closing image stream", e);
+			}
+			this.imageStream = null;
+		}
+
+		this.canvas = null;
+		this.savedCanvas = null;
+		this.gifData = null;
+	}
+
+	private static class FrameMetadata
+	{
+		int x;
+		int y;
+		int delayMs;
+		String disposalMethod;
+	}
+}
+
+package com.customemoji.animation;
+
+import com.customemoji.CustomEmojiConfig;
+import com.customemoji.CustomEmojiConfig.AnimationLoadingMode;
+import com.customemoji.model.AnimatedEmoji;
+import com.customemoji.service.EmojiStateManager;
+
+import lombok.extern.slf4j.Slf4j;
+
 import javax.inject.Inject;
 import javax.inject.Singleton;
 
 import java.awt.image.BufferedImage;
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
 import java.io.IOException;
-import java.util.Iterator;
+import java.nio.file.Files;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ScheduledExecutorService;
-
-import org.w3c.dom.NodeList;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 @Slf4j
 @Singleton
 public class AnimationManager
 {
 	private static final long STALE_ANIMATION_TIMEOUT_MS = 500;
-	private static final int DEFAULT_FRAME_DELAY_MS = 100;
+	private static final int FRAME_LOADER_THREAD_COUNT = 2;
 
 	private final Map<Integer, GifAnimation> animationCache = new ConcurrentHashMap<>();
 	private final Map<Integer, Long> animationLastSeenTime = new ConcurrentHashMap<>();
 	private final Set<Integer> pendingAnimationLoads = ConcurrentHashMap.newKeySet();
 
 	private final CustomEmojiConfig config;
-	private final ScheduledExecutorService executor;
 	private final EmojiStateManager emojiStateManager;
+	private ExecutorService frameLoaderPool;
 
 	@Inject
-	public AnimationManager(CustomEmojiConfig config, ScheduledExecutorService executor, EmojiStateManager emojiStateManager)
+	public AnimationManager(CustomEmojiConfig config, EmojiStateManager emojiStateManager)
 	{
 		this.config = config;
-		this.executor = executor;
 		this.emojiStateManager = emojiStateManager;
 	}
 
-	public void markAnimationVisible(int emojiId)
+	public void initialize()
 	{
-		this.animationLastSeenTime.put(emojiId, System.currentTimeMillis());
+		if (this.frameLoaderPool == null || this.frameLoaderPool.isShutdown())
+		{
+			this.frameLoaderPool = Executors.newFixedThreadPool(FRAME_LOADER_THREAD_COUNT, this::createLoaderThread);
+		}
 	}
 
 	public GifAnimation getOrLoadAnimation(AnimatedEmoji emoji)
 	{
 		int emojiId = emoji.getId();
+
 		GifAnimation cached = this.animationCache.get(emojiId);
 		if (cached != null)
 		{
+			this.startBackgroundLoadingIfNeeded(cached);
+			this.startPreloadingIfNeeded(cached);
 			return cached;
 		}
 
-		// Already loading - return null and wait for next frame
-		boolean isAlreadyLoading = this.pendingAnimationLoads.contains(emojiId);
-		if (isAlreadyLoading)
+		synchronized (this.pendingAnimationLoads)
 		{
-			return null;
+			cached = this.animationCache.get(emojiId);
+			if (cached != null)
+			{
+				this.startBackgroundLoadingIfNeeded(cached);
+				this.startPreloadingIfNeeded(cached);
+				return cached;
+			}
+
+			boolean isAlreadyLoading = this.pendingAnimationLoads.contains(emojiId);
+			if (isAlreadyLoading)
+			{
+				return null;
+			}
+
+			this.pendingAnimationLoads.add(emojiId);
 		}
 
-		// Start async load
-		this.pendingAnimationLoads.add(emojiId);
-		File file = emoji.getFile();
 		String emojiText = emoji.getText();
 
-		this.executor.submit(() ->
+		this.frameLoaderPool.submit(() ->
 		{
 			try
 			{
 				GifAnimation animation = this.loadAnimation(emoji);
 				if (animation != null)
 				{
-					this.animationCache.put(emojiId, animation);
-					log.debug("Loaded animation: {} (id={}, frames={})", emojiText, emojiId, animation.getFrameCount());
+					GifAnimation replaced = this.animationCache.put(emojiId, animation);
+					if (replaced != null)
+					{
+						replaced.close();
+					}
+					log.debug("Loaded animation: {} (id={})", emojiText, emojiId);
+					this.startBackgroundLoadingIfNeeded(animation);
 				}
 			}
 			finally
@@ -7283,12 +7846,18 @@ public class AnimationManager
 		return null;
 	}
 
+	public void markAnimationVisible(int emojiId)
+	{
+		this.animationLastSeenTime.put(emojiId, System.currentTimeMillis());
+	}
+
 	public void unloadStaleAnimations(Set<Integer> currentlyVisibleIds)
 	{
 		long currentTime = System.currentTimeMillis();
 
-		this.animationCache.keySet().removeIf(emojiId ->
+		this.animationCache.entrySet().removeIf(entry ->
 		{
+			int emojiId = entry.getKey();
 			boolean isCurrentlyVisible = currentlyVisibleIds.contains(emojiId);
 			if (isCurrentlyVisible)
 			{
@@ -7298,6 +7867,7 @@ public class AnimationManager
 			Long lastSeen = this.animationLastSeenTime.get(emojiId);
 			if (lastSeen == null)
 			{
+				entry.getValue().close();
 				return true;
 			}
 
@@ -7305,6 +7875,7 @@ public class AnimationManager
 			if (isStale)
 			{
 				this.animationLastSeenTime.remove(emojiId);
+				entry.getValue().close();
 				log.debug("Unloading stale animation for emoji id: {}", emojiId);
 			}
 			return isStale;
@@ -7313,15 +7884,50 @@ public class AnimationManager
 
 	public void clearAllAnimations()
 	{
+		this.animationCache.values().forEach(GifAnimation::close);
 		this.animationCache.clear();
 		this.animationLastSeenTime.clear();
 	}
 
+	public void shutdown()
+	{
+		this.clearAllAnimations();
+		this.frameLoaderPool.shutdownNow();
+	}
+
 	public void invalidateAnimation(int emojiId)
 	{
-		this.animationCache.remove(emojiId);
+		GifAnimation animation = this.animationCache.remove(emojiId);
+		if (animation != null)
+		{
+			animation.close();
+		}
 		this.animationLastSeenTime.remove(emojiId);
 		this.pendingAnimationLoads.remove(emojiId);
+	}
+
+		private Thread createLoaderThread(Runnable runnable)
+	{
+		Thread thread = new Thread(runnable);
+		thread.setName("CustomEmoji-FrameLoader");
+		thread.setDaemon(true);
+		return thread;
+	}
+
+	private void startBackgroundLoadingIfNeeded(GifAnimation animation)
+	{
+		if (animation.needsBackgroundLoading())
+		{
+			this.frameLoaderPool.submit(animation::loadAllFrames);
+		}
+	}
+
+	private void startPreloadingIfNeeded(GifAnimation animation)
+	{
+		if (animation.needsPreloading())
+		{
+			this.frameLoaderPool.submit(animation::preloadFrames);
+		}
 	}
 
 	private GifAnimation loadAnimation(AnimatedEmoji emoji)
@@ -7331,122 +7937,28 @@ public class AnimationManager
 
 		try
 		{
-			byte[] gifData = this.loadFileToMemory(file);
-			if (gifData == null)
+			byte[] gifData = Files.readAllBytes(file.toPath());
+
+			int maxHeight = this.config.maxImageHeight();
+			boolean shouldResize = this.emojiStateManager.isResizingEnabled(emojiName);
+			boolean useLazyLoading = this.config.animationLoadingMode() == AnimationLoadingMode.LAZY;
+
+			GifAnimation animation = new GifAnimation(gifData, maxHeight, shouldResize, useLazyLoading);
+
+			BufferedImage firstFrame = animation.getCurrentFrame();
+			if (firstFrame == null)
 			{
+				animation.close();
 				return null;
 			}
 
-			return this.extractFramesFromGifData(gifData, emojiName);
+			return animation;
 		}
 		catch (IOException e)
 		{
 			log.error("Failed to load animation for emoji: {}", emojiName, e);
 			return null;
 		}
-	}
-
-	private byte[] loadFileToMemory(File file) throws IOException
-	{
-		try (FileInputStream fis = new FileInputStream(file);
-			 ByteArrayOutputStream baos = new ByteArrayOutputStream())
-		{
-			byte[] buffer = new byte[8192];
-			int bytesRead;
-			while ((bytesRead = fis.read(buffer)) != -1)
-			{
-				baos.write(buffer, 0, bytesRead);
-			}
-			return baos.toByteArray();
-		}
-	}
-
-	private GifAnimation extractFramesFromGifData(byte[] gifData, String emojiName) throws IOException
-	{
-		try (ByteArrayInputStream bais = new ByteArrayInputStream(gifData);
-			 ImageInputStream stream = ImageIO.createImageInputStream(bais))
-		{
-			if (stream == null)
-			{
-				return null;
-			}
-
-			Iterator<ImageReader> readers = ImageIO.getImageReadersByFormatName("gif");
-			if (!readers.hasNext())
-			{
-				return null;
-			}
-
-			ImageReader reader = readers.next();
-			try
-			{
-				reader.setInput(stream);
-				int frameCount = reader.getNumImages(true);
-				if (frameCount <= 0)
-				{
-					return null;
-				}
-
-				BufferedImage[] frames = new BufferedImage[frameCount];
-				int[] delays = new int[frameCount];
-
-				int maxHeight = this.config.maxImageHeight();
-				boolean shouldResize = this.emojiStateManager.isResizingEnabled(emojiName);
-
-				for (int i = 0; i < frameCount; i++)
-				{
-					BufferedImage frame = reader.read(i);
-					delays[i] = this.getFrameDelay(reader, i);
-
-					BufferedImage processedFrame = frame;
-					if (shouldResize)
-					{
-						processedFrame = PluginUtils.resizeImage(frame, maxHeight);
-					}
-					frames[i] = processedFrame;
-				}
-
-				return new GifAnimation(frames, delays);
-			}
-			finally
-			{
-				reader.dispose();
-			}
-		}
-	}
-
-	private int getFrameDelay(ImageReader reader, int frameIndex)
-	{
-		try
-		{
-			IIOMetadata metadata = reader.getImageMetadata(frameIndex);
-			if (metadata == null)
-			{
-				return DEFAULT_FRAME_DELAY_MS;
-			}
-
-			String formatName = metadata.getNativeMetadataFormatName();
-			IIOMetadataNode root = (IIOMetadataNode) metadata.getAsTree(formatName);
-
-			NodeList gceList = root.getElementsByTagName("GraphicControlExtension");
-			if (gceList.getLength() > 0)
-			{
-				IIOMetadataNode gce = (IIOMetadataNode) gceList.item(0);
-				String delayStr = gce.getAttribute("delayTime");
-				if (delayStr != null && !delayStr.isEmpty())
-				{
-					int delayHundredths = Integer.parseInt(delayStr);
-					int delayMs = delayHundredths * 10;
-					return delayMs > 0 ? delayMs : DEFAULT_FRAME_DELAY_MS;
-				}
-			}
-		}
-		catch (Exception e)
-		{
-			log.debug("Failed to get frame delay for frame {}", frameIndex, e);
-		}
-
-		return DEFAULT_FRAME_DELAY_MS;
 	}
 }
 

@@ -126,6 +126,7 @@ import gg.embargo.eastereggs.NPCRenameManager;
 import gg.embargo.manifest.ManifestManager;
 import gg.embargo.ui.EmbargoPanel;
 import gg.embargo.eastereggs.ItemRenameManager;
+import gg.embargo.ui.MissingRequirementsPanel;
 import gg.embargo.ui.SyncButtonManager;
 import gg.embargo.noticeboard.NoticeBoardManager;
 import gg.embargo.untrackables.UntrackableItemManager;
@@ -290,6 +291,9 @@ public class EmbargoPlugin extends Plugin {
 		}
 	}
 
+	@Inject
+	private MissingRequirementsPanel missingRequirementsPanel;
+
 	@Override
 	protected void shutDown() {
 		log.info("Embargo Clan plugin stopped!");
@@ -297,6 +301,11 @@ public class EmbargoPlugin extends Plugin {
 		dataManager.clearData();
 		embargoPanel.reset();
 		clientToolbar.removeNavigation(navButton);
+
+		// Cleanup MissingRequirementsPanel to prevent timer and cache leaks
+		if (missingRequirementsPanel != null) {
+			missingRequirementsPanel.shutdown();
+		}
 
 		shutDownManagers();
 
@@ -609,7 +618,6 @@ public class NPCRenameManager {
         this.manifestManager = manifestManager;
     }
 
-    private final HashMap<String, String> npcListHashMap = new HashMap<>();
     private static final Set<MenuAction> NPC_MENU_ACTIONS = ImmutableSet.of(
             MenuAction.NPC_FIRST_OPTION,
             MenuAction.NPC_SECOND_OPTION,
@@ -683,20 +691,15 @@ public class NPCRenameManager {
             return;
         }
 
-        // Clear both maps
+        // Clear and repopulate custom remaps
         customNPCRemaps.clear();
-        npcListHashMap.clear();
-        
-        // Add default renames
         customNPCRemaps.putAll(DEFAULT_NPC_RENAMES);
 
-        // Add manifest renames to both maps
+        // Add manifest renames
         for (Map.Entry<String, String> entry : manifestManager.getManifest().getNpcRenames().entrySet()) {
             String originalName = entry.getKey();
             String newName = entry.getValue();
             customNPCRemaps.put(originalName, newName);
-            npcListHashMap.put(originalName, newName);
-            //log.debug("NPCRename: Setting {} to {}", originalName, newName);
         }
     }
 
@@ -824,6 +827,10 @@ public class ItemRenameManager {
             return;
         }
 
+        // Clear and repopulate to prevent unbounded accumulation
+        customItemRemap.clear();
+        customItemRemap.putAll(DEFAULT_ITEM_REMAP);
+
         for (Map.Entry<String, String> entry : manifestManager.getManifest().getItemRenames().entrySet()) {
             String originalName = entry.getKey();
             String newName = entry.getValue();
@@ -893,7 +900,14 @@ public class UntrackableItemManager {
 
     private static final String UNTRACKABLE_ENDPOINT = "https://embargo.gg/api/untrackables";
 
-    private final HashMap<String, LocalDateTime> lastLootTime = new HashMap<>();
+    // Limit size to prevent unbounded growth - LRU eviction for player loot timestamps
+    private static final int MAX_LOOT_TIME_CACHE_SIZE = 50;
+    private final Map<String, LocalDateTime> lastLootTime = new LinkedHashMap<String, LocalDateTime>(MAX_LOOT_TIME_CACHE_SIZE, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<String, LocalDateTime> eldest) {
+            return size() > MAX_LOOT_TIME_CACHE_SIZE;
+        }
+    };
 
     @Getter
     enum UntrackableItems {
@@ -995,7 +1009,11 @@ public class UntrackableItemManager {
     public void startUp() {
         eventBus.register(this);
     }
-    public void shutDown() { eventBus.unregister(this);}
+
+    public void shutDown() {
+        eventBus.unregister(this);
+        lastLootTime.clear();
+    }
 
     @Subscribe
     public void onScriptPostFired(ScriptPostFired event) {
@@ -1168,7 +1186,8 @@ public class DataManager {
     private static final String CLOG_UNLOCK_ENDPOINT = API_URI + APIRoutes.UPLOAD_CLOG;
     private static final String GET_MEMBER_INFO_ENDPOINT = API_URI + APIRoutes.GET_MEMBER_INFO;
 
-    public static ArrayList BossesToTrack = null;
+    // Boss list from API - use volatile for thread safety and instance field for proper cleanup
+    private volatile List<String> bossesToTrack = null;
 
     public void storeVarbitChanged(int varbIndex, int varbValue) {
         synchronized (this) {
@@ -1190,20 +1209,17 @@ public class DataManager {
             return false;
         }
 
-        var bosses = getTrackableBosses();
-
-        for (Object boss : bosses) {
-            if (boss.equals(bossName)) {
-                return true;
-            }
+        List<String> bosses = getTrackableBosses();
+        if (bosses == null) {
+            return false;
         }
 
-        return false;
+        return bosses.contains(bossName);
     }
 
-    public ArrayList getTrackableBosses() {
-        if (BossesToTrack != null) {
-            return BossesToTrack;
+    public List<String> getTrackableBosses() {
+        if (bossesToTrack != null) {
+            return bossesToTrack;
         }
         okHttpClient.newCall(new Request.Builder().url(TRACK_MONSTERS_ENDPOINT).build()).enqueue(new Callback() {
             @Override
@@ -1213,21 +1229,28 @@ public class DataManager {
 
             @Override
             public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException {
-                // Update what we want to track on the fly
-                if (response.isSuccessful()) {
-                    // convert response.body().string() to ArrayList<String>
-                    BufferedSource source = response.body().source();
-                    String json = source.readUtf8();
+                try {
+                    if (response.isSuccessful() && response.body() != null) {
+                        String json = response.body().string();
+                        // Parse as List<String> with proper type safety
+                        List<String> parsed = gson.fromJson(json, new com.google.gson.reflect.TypeToken<List<String>>(){}.getType());
+                        if (parsed != null) {
+                            bossesToTrack = parsed;
+                        }
+                    }
+                } finally {
                     response.close();
-
-                    // convert json to an ArrayList<String>
-                    BossesToTrack = gson.fromJson(json, ArrayList.class);
                 }
-
-                response.close();
             }
         });
         return null;
+    }
+
+    /**
+     * Clears the cached boss list. Called during cleanup.
+     */
+    public void clearBossCache() {
+        bossesToTrack = null;
     }
 
     public void uploadCollectionLogUnlock(String item, String player) {
@@ -1441,12 +1464,7 @@ public class DataManager {
                     .get()
                     .build();
 
-            // Create a client with shorter timeout for this specific check
-            OkHttpClient shortTimeoutClient = okHttpClient.newBuilder()
-                    .callTimeout(5, TimeUnit.SECONDS)
-                    .build();
-
-            shortTimeoutClient.newCall(request).enqueue(new Callback() {
+            okHttpClient.newCall(request).enqueue(new Callback() {
                 @Override
                 public void onFailure(@NonNull Call call, @NonNull IOException e) {
                     log.error("Failed to check if {} is registered with Embargo's database", username);
@@ -2281,8 +2299,10 @@ import java.awt.event.MouseEvent;
 import java.awt.image.BufferedImage;
 import java.util.*;
 import java.util.List;
-import java.util.Timer;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Slf4j
 public class MissingRequirementsPanel extends PluginPanel {
@@ -2293,12 +2313,30 @@ public class MissingRequirementsPanel extends PluginPanel {
     private static final Color HOVER_COLOR = ColorScheme.DARKER_GRAY_HOVER_COLOR;
     private static final Color NORMAL_COLOR = ColorScheme.DARKER_GRAY_COLOR;
 
-    // Cache for item icons to avoid recreating them
-    private final Map<Integer, BufferedImage> iconCache = new ConcurrentHashMap<>();
-    private final Map<String, BufferedImage> letterIconCache = new ConcurrentHashMap<>();
+    // Cache for item icons to avoid recreating them - bounded LRU cache to prevent memory bloat
+    private static final int MAX_ICON_CACHE_SIZE = 100;
+    private static final int MAX_LETTER_ICON_CACHE_SIZE = 50;
+    private final Map<Integer, BufferedImage> iconCache = Collections.synchronizedMap(
+            new LinkedHashMap<Integer, BufferedImage>(MAX_ICON_CACHE_SIZE, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<Integer, BufferedImage> eldest) {
+                    return size() > MAX_ICON_CACHE_SIZE;
+                }
+            });
+    private final Map<String, BufferedImage> letterIconCache = Collections.synchronizedMap(
+            new LinkedHashMap<String, BufferedImage>(MAX_LETTER_ICON_CACHE_SIZE, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, BufferedImage> eldest) {
+                    return size() > MAX_LETTER_ICON_CACHE_SIZE;
+                }
+            });
     private volatile boolean isUpdating = false;
 
+    // Track scheduled futures for cleanup to prevent memory leaks
+    private final List<ScheduledFuture<?>> scheduledFutures = Collections.synchronizedList(new ArrayList<>());
+
     private final ItemManager itemManager;
+    private final ScheduledExecutorService executorService;
     private final JPanel itemsContainer;
     private final List<MissingItem> missingItems = new ArrayList<>();
     private final MouseAdapter itemMouseAdapter = createMouseAdapter();
@@ -2328,9 +2366,10 @@ public class MissingRequirementsPanel extends PluginPanel {
     }
 
     @Inject
-    public MissingRequirementsPanel(ItemManager itemManager) {
+    public MissingRequirementsPanel(ItemManager itemManager, ScheduledExecutorService executorService) {
         super(false);
         this.itemManager = itemManager;
+        this.executorService = executorService;
 
         setLayout(new BorderLayout());
         setBackground(ColorScheme.DARK_GRAY_COLOR);
@@ -2553,7 +2592,7 @@ public class MissingRequirementsPanel extends PluginPanel {
      */
     public void clearItems() {
         synchronized (lock) {
-
+            cancelAllScheduledFutures();
             if (!missingItems.isEmpty()) {
                 missingItems.clear();
                 updatePanel();
@@ -2562,10 +2601,36 @@ public class MissingRequirementsPanel extends PluginPanel {
     }
 
     /**
+     * Cancels all scheduled futures to prevent memory leaks.
+     * Must be called before recreating panels or during cleanup.
+     */
+    private void cancelAllScheduledFutures() {
+        synchronized (scheduledFutures) {
+            for (ScheduledFuture<?> future : scheduledFutures) {
+                future.cancel(true);
+            }
+            scheduledFutures.clear();
+        }
+    }
+
+    /**
+     * Cleanup method to be called when the plugin is shutting down.
+     * Cancels all scheduled futures and clears caches to prevent memory leaks.
+     */
+    public void shutdown() {
+        synchronized (lock) {
+            cancelAllScheduledFutures();
+            missingItems.clear();
+            iconCache.clear();
+            letterIconCache.clear();
+            itemsContainer.removeAll();
+        }
+    }
+
+    /**
      * Updates the panel with the current list of missing items
      */
     private void updatePanel() {
-
         if (isUpdating) {
             return; // Prevent concurrent updates
         }
@@ -2574,6 +2639,8 @@ public class MissingRequirementsPanel extends PluginPanel {
             isUpdating = true;
             SwingUtilities.invokeLater(() -> {
                 synchronized (lock) {
+                    // Cancel existing scheduled futures before rebuilding panels to prevent leaks
+                    cancelAllScheduledFutures();
                     itemsContainer.removeAll();
                     for (MissingItem item : missingItems) {
                         JPanel itemPanel = createItemPanel(item);
@@ -2608,27 +2675,23 @@ public class MissingRequirementsPanel extends PluginPanel {
             dynamicPanel.add(iconLabel, BorderLayout.CENTER);
 
             // Track the current index for click events
-            final int[] currentIdx = { 0 };
+            final AtomicInteger currentIdx = new AtomicInteger(0);
 
-            Timer timer = new Timer();
-            timer.scheduleAtFixedRate(new TimerTask() {
-                int idx = 0;
+            ScheduledFuture<?> future = executorService.scheduleAtFixedRate(() -> {
+                SwingUtilities.invokeLater(() -> {
+                    int idx = currentIdx.updateAndGet(i -> (i + 1) % dyn.names.length);
+                    iconLabel.setIcon(new ImageIcon(dyn.icons.get(idx)));
+                    String tooltip = buildTooltipText(
+                            new MissingItem(dyn.names[idx], dyn.itemIds[idx], dyn.icons.get(idx)));
+                    iconLabel.setToolTipText(tooltip);
+                    dynamicPanel.setToolTipText(tooltip);
+                    dynamicPanel.revalidate();
+                    dynamicPanel.repaint();
+                });
+            }, dyn.intervalMs, dyn.intervalMs, TimeUnit.MILLISECONDS);
 
-                @Override
-                public void run() {
-                    SwingUtilities.invokeLater(() -> {
-                        idx = (idx + 1) % dyn.names.length;
-                        currentIdx[0] = idx;
-                        iconLabel.setIcon(new ImageIcon(dyn.icons.get(idx)));
-                        String tooltip = buildTooltipText(
-                                new MissingItem(dyn.names[idx], dyn.itemIds[idx], dyn.icons.get(idx)));
-                        iconLabel.setToolTipText(tooltip);
-                        dynamicPanel.setToolTipText(tooltip);
-                        dynamicPanel.revalidate();
-                        dynamicPanel.repaint();
-                    });
-                }
-            }, dyn.intervalMs, dyn.intervalMs);
+            // Track future for cleanup when panel is rebuilt or cleared
+            scheduledFutures.add(future);
 
             MouseAdapter hoverAndClick = new MouseAdapter() {
                 @Override
@@ -2645,7 +2708,7 @@ public class MissingRequirementsPanel extends PluginPanel {
 
                 @Override
                 public void mouseClicked(MouseEvent e) {
-                    int idx = currentIdx[0];
+                    int idx = currentIdx.get();
                     int itemId = dyn.itemIds[idx];
                     String itemName = dyn.names[idx];
                     if (itemId == -1) {
@@ -3094,7 +3157,7 @@ public class EmbargoPanel extends PluginPanel {
         actionsContainer.setBorder(new EmptyBorder(10, 0, 0, 0));
         actionsContainer.setLayout(new GridLayout(0, 1, 0, 10));
 
-        actionsContainer.add(buildLinkPanel(DISCORD_ICON, "Join us on our", "Discord", "https://discord.gg/embargo"));
+        actionsContainer.add(buildLinkPanel(DISCORD_ICON, "Join us on our", "Discord", "https://discord.gg/YDGGyP3VEq"));
         actionsContainer.add(buildLinkPanel(WEBSITE_ICON, "Go to our", "clan website", "https://embargo.gg/"));
         actionsContainer.add(buildLinkPanel(GITHUB_ICON, "Report a bug or", "inspect the plugin code",
                 "https://github.com/Sharpienero/Embargo-Plugin"));
@@ -3352,6 +3415,7 @@ public class EmbargoPanel extends PluginPanel {
 
     public void reset() {
         eventBus.unregister(this);
+        missingRequirementsPanelX.shutdown();
         this.updateLoggedIn(false);
     }
 
@@ -3946,9 +4010,18 @@ public class CollectionLogManager {
 
     private static final String SUBMIT_URL = "https://embargo.gg/api/runelite/uploadcollectionlog";
     private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
-    private final Map<PlayerProfile, PlayerData> playerDataMap = new HashMap<>();
+
+    // Limit playerDataMap size to prevent unbounded growth - LRU eviction
+    private static final int MAX_PLAYER_DATA_CACHE_SIZE = 10;
+    private final Map<PlayerProfile, PlayerData> playerDataMap = new LinkedHashMap<PlayerProfile, PlayerData>(MAX_PLAYER_DATA_CACHE_SIZE, 0.75f, true) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<PlayerProfile, PlayerData> eldest) {
+            return size() > MAX_PLAYER_DATA_CACHE_SIZE;
+        }
+    };
     private int cyclesSinceSuccessfulCall = 0;
-    private static List<Map<String, Map<String, Object>>> rawClogItems = new ArrayList<>();
+    // Use instance field instead of static to allow proper cleanup per instance
+    private final List<Map<String, Map<String, Object>>> rawClogItems = new ArrayList<>();
     private int tickCollectionLogScriptFired = -1;
 
     private SyncButtonManager syncButtonManager;
@@ -4009,6 +4082,7 @@ public class CollectionLogManager {
     public void shutDown() {
         eventBus.unregister(this);
         rawClogItems.clear();
+        playerDataMap.clear();
         syncButtonManager.shutDown();
     }
 
