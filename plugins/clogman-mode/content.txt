@@ -3,12 +3,10 @@ package com.clogman;
 import net.runelite.api.Client;
 import net.runelite.api.widgets.Widget;
 import net.runelite.api.widgets.WidgetItem;
-import net.runelite.client.game.ItemManager;
 import net.runelite.client.ui.overlay.WidgetItemOverlay;
 
 import javax.inject.Inject;
 import java.awt.*;
-import java.awt.image.BufferedImage;
 
 /**
  * Overlay that dims locked items in inventory and bank
@@ -18,15 +16,13 @@ public class ClogmanOverlay extends WidgetItemOverlay
     private final Client client;
     private final ClogmanPlugin plugin;
     private final ClogmanConfig config;
-    private final ItemManager itemManager;
 
     @Inject
-    public ClogmanOverlay(Client client, ClogmanPlugin plugin, ClogmanConfig config, ItemManager itemManager)
+    public ClogmanOverlay(Client client, ClogmanPlugin plugin, ClogmanConfig config)
     {
         this.client = client;
         this.plugin = plugin;
         this.config = config;
-        this.itemManager = itemManager;
 
         showOnInventory();
         showOnBank();
@@ -190,7 +186,7 @@ public interface ClogmanConfig extends Config
     @Range(min = 0, max = 255)
     default int inventoryOpacity()
     {
-        return 70;
+        return 100;
     }
 
     @ConfigItem(
@@ -203,7 +199,19 @@ public interface ClogmanConfig extends Config
     @Range(min = 0, max = 255)
     default int bankOpacity()
     {
-        return 70;
+        return 100;
+    }
+
+    @ConfigItem(
+        keyName = "showChatIcon",
+        name = "Show Chat Icon",
+        description = "Display the Clogman icon before your name in chat",
+        section = visualSection,
+        position = 2
+    )
+    default boolean showChatIcon()
+    {
+        return true;
     }
 }
 
@@ -257,9 +265,17 @@ public class ClogmanPlugin extends Plugin
 {
     private static final String CONFIG_GROUP = "clogman";
     private static final String UNLOCKED_ITEMS_KEY = "unlockedItems";
+    private static final String MANUALLY_ADDED_KEY = "manuallyAdded";
+    private static final String MANUALLY_REMOVED_KEY = "manuallyRemoved";
 
     // Script ID for collection log draw (fires when changing tabs/pages)
     private static final int COLLECTION_LOG_DRAW_LIST_SCRIPT = 2731;
+
+    // Actions that should be restricted for locked items (O(1) lookup)
+    private static final Set<String> RESTRICTED_ACTIONS = Set.of(
+        "wear", "wield", "equip", "eat", "drink", "use",
+        "read", "open", "check", "rub", "break", "activate", "commune"
+    );
 
     @Inject
     private Client client;
@@ -306,8 +322,15 @@ public class ClogmanPlugin extends Plugin
     private Map<String, DerivedItem> derivedItems = new HashMap<>();
 
     // Set of unlocked collection log item IDs for the current player
-    @Getter
     private Set<Integer> unlockedClogItems = new HashSet<>();
+
+    // Track manually added unlocks (user added via panel, not from clog scan)
+    @Getter
+    private Set<Integer> manuallyAdded = new HashSet<>();
+
+    // Track manually removed/locked items (user locked via panel despite being in clog)
+    @Getter
+    private Set<Integer> manuallyRemoved = new HashSet<>();
 
     // Cache of items that are currently available (unlocked or dependencies met)
     @Getter
@@ -322,11 +345,11 @@ public class ClogmanPlugin extends Plugin
     // Derived items by ID for quick lookups
     private Map<Integer, DerivedItem> derivedItemsById = new HashMap<>();
 
-    // Track if we've done initial sync from collection log
-    private boolean hasScannedCollectionLog = false;
-
     // Track collection log interface state
     private boolean collectionLogOpen = false;
+
+    // Chat icon offset in the modIcons array (-1 means not loaded yet)
+    private int chatIconOffset = -1;
 
     @Override
     protected void startUp() throws Exception
@@ -363,9 +386,12 @@ public class ClogmanPlugin extends Plugin
         overlayManager.remove(overlay);
         clientToolbar.removeNavigation(navButton);
         unlockedClogItems.clear();
+        manuallyAdded.clear();
+        manuallyRemoved.clear();
         availableItems.clear();
         panel = null;
         navButton = null;
+        chatIconOffset = -1;
     }
 
     @Provides
@@ -384,54 +410,56 @@ public class ClogmanPlugin extends Plugin
                 return;
             }
 
-            InputStreamReader reader = new InputStreamReader(is);
-            Type type = new TypeToken<RestrictionData>(){}.getType();
-            RestrictionData data = gson.fromJson(reader, type);
-
-            if (data != null)
+            try (InputStreamReader reader = new InputStreamReader(is))
             {
-                if (data.collectionLogItems != null)
+                Type type = new TypeToken<RestrictionData>(){}.getType();
+                RestrictionData data = gson.fromJson(reader, type);
+
+                if (data != null)
                 {
-                    collectionLogItems = data.collectionLogItems;
-                    // Build name to ID mapping and all-IDs to primary mapping
-                    int totalClogIdMappings = 0;
-                    for (Map.Entry<Integer, ClogItem> entry : collectionLogItems.entrySet())
+                    if (data.collectionLogItems != null)
                     {
-                        Integer primaryId = entry.getKey();
-                        ClogItem clogItem = entry.getValue();
-
-                        itemNameToId.put(clogItem.name.toLowerCase(), primaryId);
-
-                        // Map all variant IDs to this primary ID
-                        for (Integer variantId : clogItem.getAllIds())
+                        collectionLogItems = data.collectionLogItems;
+                        // Build name to ID mapping and all-IDs to primary mapping
+                        int totalClogIdMappings = 0;
+                        for (Map.Entry<Integer, ClogItem> entry : collectionLogItems.entrySet())
                         {
-                            clogIdToPrimaryId.put(variantId, primaryId);
-                            totalClogIdMappings++;
+                            Integer primaryId = entry.getKey();
+                            ClogItem clogItem = entry.getValue();
+
+                            itemNameToId.put(clogItem.name.toLowerCase(), primaryId);
+
+                            // Map all variant IDs to this primary ID
+                            for (Integer variantId : clogItem.getAllIds())
+                            {
+                                clogIdToPrimaryId.put(variantId, primaryId);
+                                totalClogIdMappings++;
+                            }
+                            // Also ensure primary ID is mapped
+                            if (!clogIdToPrimaryId.containsKey(primaryId))
+                            {
+                                clogIdToPrimaryId.put(primaryId, primaryId);
+                                totalClogIdMappings++;
+                            }
                         }
-                        // Also ensure primary ID is mapped
-                        if (!clogIdToPrimaryId.containsKey(primaryId))
-                        {
-                            clogIdToPrimaryId.put(primaryId, primaryId);
-                            totalClogIdMappings++;
-                        }
+                        log.info("Loaded {} collection log items ({} ID mappings)", collectionLogItems.size(), totalClogIdMappings);
                     }
-                    log.info("Loaded {} collection log items ({} ID mappings)", collectionLogItems.size(), totalClogIdMappings);
-                }
 
-                if (data.derivedItems != null)
-                {
-                    derivedItems = data.derivedItems;
-                    // Build ID to derived item mapping (including all variant IDs)
-                    int totalIdMappings = 0;
-                    for (DerivedItem derived : derivedItems.values())
+                    if (data.derivedItems != null)
                     {
-                        for (Integer id : derived.getAllItemIds())
+                        derivedItems = data.derivedItems;
+                        // Build ID to derived item mapping (including all variant IDs)
+                        int totalIdMappings = 0;
+                        for (DerivedItem derived : derivedItems.values())
                         {
-                            derivedItemsById.put(id, derived);
-                            totalIdMappings++;
+                            for (Integer id : derived.getAllItemIds())
+                            {
+                                derivedItemsById.put(id, derived);
+                                totalIdMappings++;
+                            }
                         }
+                        log.info("Loaded {} derived items ({} ID mappings)", derivedItems.size(), totalIdMappings);
                     }
-                    log.info("Loaded {} derived items ({} ID mappings)", derivedItems.size(), totalIdMappings);
                 }
             }
         }
@@ -441,19 +469,63 @@ public class ClogmanPlugin extends Plugin
         }
     }
 
+    /**
+     * Loads the clogman chat icon into the client's mod icons array.
+     * This allows using <img=X> tags in chat/widget text.
+     */
+    private void loadChatIcon()
+    {
+        final IndexedSprite[] modIcons = client.getModIcons();
+
+        // Already loaded or not ready
+        if (chatIconOffset != -1 || modIcons == null)
+        {
+            return;
+        }
+
+        BufferedImage image = ImageUtil.loadImageResource(getClass(), "/clogman-chat-icon.png");
+        if (image == null)
+        {
+            log.warn("Could not load clogman chat icon");
+            return;
+        }
+
+        IndexedSprite indexedSprite = ImageUtil.getImageIndexedSprite(image, client);
+        if (indexedSprite == null)
+        {
+            log.warn("Could not convert chat icon to IndexedSprite");
+            return;
+        }
+
+        chatIconOffset = modIcons.length;
+
+        final IndexedSprite[] newModIcons = Arrays.copyOf(modIcons, modIcons.length + 1);
+        newModIcons[newModIcons.length - 1] = indexedSprite;
+        client.setModIcons(newModIcons);
+
+        log.debug("Loaded clogman chat icon at offset {}", chatIconOffset);
+    }
+
     @Subscribe
     public void onGameStateChanged(GameStateChanged event)
     {
         if (event.getGameState() == GameState.LOGGED_IN)
         {
+            // Load chat icon when client is ready
+            clientThread.invokeLater(() -> {
+                loadChatIcon();
+                return true;
+            });
+
             // Use invokeLater with retry - player object may not be ready immediately
             clientThread.invokeLater(this::tryLoadUnlockedItems);
         }
         else if (event.getGameState() == GameState.LOGIN_SCREEN)
         {
             unlockedClogItems.clear();
+            manuallyAdded.clear();
+            manuallyRemoved.clear();
             availableItems.clear();
-            hasScannedCollectionLog = false;
         }
     }
 
@@ -474,6 +546,62 @@ public class ClogmanPlugin extends Plugin
                 panel.refresh();
             }
         }
+    }
+
+    @Subscribe
+    public void onScriptCallbackEvent(ScriptCallbackEvent event)
+    {
+        if (!config.showChatIcon())
+        {
+            return;
+        }
+
+        if (!event.getEventName().equals("setChatboxInput"))
+        {
+            return;
+        }
+
+        // Ensure icon is loaded
+        if (chatIconOffset == -1)
+        {
+            loadChatIcon();
+            if (chatIconOffset == -1)
+            {
+                return; // Still failed to load
+            }
+        }
+
+        Widget chatboxInput = client.getWidget(ComponentID.CHATBOX_INPUT);
+        if (chatboxInput == null)
+        {
+            return;
+        }
+
+        Player player = client.getLocalPlayer();
+        if (player == null || player.getName() == null)
+        {
+            return;
+        }
+
+        String text = chatboxInput.getText();
+        int colonIdx = text.indexOf(':');
+        if (colonIdx == -1)
+        {
+            return;
+        }
+
+        // Get the current name portion (may include channel prefix like "[CC]")
+        String namePortion = text.substring(0, colonIdx);
+
+        // Avoid adding icon if already present
+        if (namePortion.contains("<img=" + chatIconOffset + ">"))
+        {
+            return;
+        }
+
+        // Insert icon at the beginning of the name
+        String newText = "<img=" + chatIconOffset + ">" + namePortion + text.substring(colonIdx);
+        chatboxInput.setText(newText);
     }
 
     /**
@@ -524,6 +652,9 @@ public class ClogmanPlugin extends Plugin
     private void loadUnlockedItems()
     {
         unlockedClogItems.clear();
+        manuallyAdded.clear();
+        manuallyRemoved.clear();
+
         String playerName = getPlayerConfigKey();
         if (playerName == null)
         {
@@ -531,20 +662,19 @@ public class ClogmanPlugin extends Plugin
             return;
         }
 
-        String configKey = playerName + "." + UNLOCKED_ITEMS_KEY;
-        String savedData = configManager.getConfiguration(CONFIG_GROUP, configKey);
-        log.debug("Loading config from key: {}.{}", CONFIG_GROUP, configKey);
+        // Load unlocked items
+        String unlockedKey = playerName + "." + UNLOCKED_ITEMS_KEY;
+        String savedUnlocked = configManager.getConfiguration(CONFIG_GROUP, unlockedKey);
 
-        if (savedData != null && !savedData.isEmpty())
+        if (savedUnlocked != null && !savedUnlocked.isEmpty())
         {
             try
             {
                 Type type = new TypeToken<Set<Integer>>(){}.getType();
-                Set<Integer> loaded = gson.fromJson(savedData, type);
+                Set<Integer> loaded = gson.fromJson(savedUnlocked, type);
                 if (loaded != null)
                 {
                     unlockedClogItems.addAll(loaded);
-                    log.info("Loaded {} unlocked items for player {} from saved config", unlockedClogItems.size(), playerName);
                 }
             }
             catch (Exception e)
@@ -552,10 +682,51 @@ public class ClogmanPlugin extends Plugin
                 log.error("Failed to load unlocked items", e);
             }
         }
-        else
+
+        // Load manually added items
+        String manualAddKey = playerName + "." + MANUALLY_ADDED_KEY;
+        String savedManualAdd = configManager.getConfiguration(CONFIG_GROUP, manualAddKey);
+
+        if (savedManualAdd != null && !savedManualAdd.isEmpty())
         {
-            log.info("No saved unlocked items found for player {} (first run or data cleared)", playerName);
+            try
+            {
+                Type type = new TypeToken<Set<Integer>>(){}.getType();
+                Set<Integer> loaded = gson.fromJson(savedManualAdd, type);
+                if (loaded != null)
+                {
+                    manuallyAdded.addAll(loaded);
+                }
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to load manually added items", e);
+            }
         }
+
+        // Load manually removed items
+        String manualRemoveKey = playerName + "." + MANUALLY_REMOVED_KEY;
+        String savedManualRemove = configManager.getConfiguration(CONFIG_GROUP, manualRemoveKey);
+
+        if (savedManualRemove != null && !savedManualRemove.isEmpty())
+        {
+            try
+            {
+                Type type = new TypeToken<Set<Integer>>(){}.getType();
+                Set<Integer> loaded = gson.fromJson(savedManualRemove, type);
+                if (loaded != null)
+                {
+                    manuallyRemoved.addAll(loaded);
+                }
+            }
+            catch (Exception e)
+            {
+                log.error("Failed to load manually removed items", e);
+            }
+        }
+
+        log.info("Loaded {} unlocked items ({} manual, {} locked) for player {}",
+            unlockedClogItems.size(), manuallyAdded.size(), manuallyRemoved.size(), playerName);
     }
 
     private void saveUnlockedItems()
@@ -567,10 +738,23 @@ public class ClogmanPlugin extends Plugin
             return;
         }
 
-        String configKey = playerName + "." + UNLOCKED_ITEMS_KEY;
-        String json = gson.toJson(unlockedClogItems);
-        configManager.setConfiguration(CONFIG_GROUP, configKey, json);
-        log.debug("Saved {} unlocked items to config key: {}.{}", unlockedClogItems.size(), CONFIG_GROUP, configKey);
+        // Save unlocked items
+        String unlockedKey = playerName + "." + UNLOCKED_ITEMS_KEY;
+        String unlockedJson = gson.toJson(unlockedClogItems);
+        configManager.setConfiguration(CONFIG_GROUP, unlockedKey, unlockedJson);
+
+        // Save manually added items
+        String manualAddKey = playerName + "." + MANUALLY_ADDED_KEY;
+        String manualAddJson = gson.toJson(manuallyAdded);
+        configManager.setConfiguration(CONFIG_GROUP, manualAddKey, manualAddJson);
+
+        // Save manually removed items
+        String manualRemoveKey = playerName + "." + MANUALLY_REMOVED_KEY;
+        String manualRemoveJson = gson.toJson(manuallyRemoved);
+        configManager.setConfiguration(CONFIG_GROUP, manualRemoveKey, manualRemoveJson);
+
+        log.debug("Saved {} unlocked items ({} manual, {} locked) for {}",
+            unlockedClogItems.size(), manuallyAdded.size(), manuallyRemoved.size(), playerName);
     }
 
     private String getPlayerConfigKey()
@@ -696,7 +880,7 @@ public class ClogmanPlugin extends Plugin
     /**
      * Unlocks a collection log item
      */
-    public void unlockItem(int itemId)
+    public void unlockItem(int itemId, boolean isManual)
     {
         if (!collectionLogItems.containsKey(itemId))
         {
@@ -707,6 +891,15 @@ public class ClogmanPlugin extends Plugin
         {
             ClogItem item = collectionLogItems.get(itemId);
             log.info("Unlocked collection log item: {} (ID: {})", item.name, itemId);
+
+            // Remove from manually removed if it was there
+            boolean wasManuallyLocked = manuallyRemoved.remove(itemId);
+
+            // Only track as manual addition if this is actually a manual unlock
+            if (isManual && !wasManuallyLocked)
+            {
+                manuallyAdded.add(itemId);
+            }
 
             // Capture items available before recalculation
             Set<Integer> previouslyAvailable = new HashSet<>(availableItems);
@@ -817,16 +1010,33 @@ public class ClogmanPlugin extends Plugin
     }
 
     /**
-     * Removes an unlock from the collection (for panel use)
+     * Locks an item (moves from unlocked to manually locked)
+     * Used when user wants to lock an item they actually have in their clog
      */
-    public void removeUnlock(int itemId)
+    public void lockItem(int itemId)
     {
         if (unlockedClogItems.remove(itemId))
         {
             ClogItem item = collectionLogItems.get(itemId);
-            log.info("Removed unlock: {} (ID: {})", item != null ? item.name : "Unknown", itemId);
+            log.info("Locked item: {} (ID: {})", item != null ? item.name : "Unknown", itemId);
+
+            // Check if this was a manual unlock (not from clog)
+            boolean wasManuallyAdded = manuallyAdded.remove(itemId);
+
+            // Only add to manually removed if it wasn't a manual unlock
+            // (i.e., it's from the actual collection log)
+            if (!wasManuallyAdded)
+            {
+                manuallyRemoved.add(itemId);
+            }
+
             saveUnlockedItems();
             recalculateAvailableItems();
+
+            if (panel != null)
+            {
+                panel.refresh();
+            }
         }
     }
 
@@ -837,10 +1047,46 @@ public class ClogmanPlugin extends Plugin
     {
         int count = unlockedClogItems.size();
         unlockedClogItems.clear();
-        availableItems.clear();
+        manuallyAdded.clear();
+        manuallyRemoved.clear();
         saveUnlockedItems();
         recalculateAvailableItems();
         log.info("Reset all unlocks. Cleared {} items.", count);
+
+        if (panel != null)
+        {
+            panel.refresh();
+        }
+    }
+
+    /**
+     * Resets only manual changes (re-adds locked items, removes manual additions)
+     */
+    public void resetManualChanges()
+    {
+        int addedCount = manuallyAdded.size();
+        int removedCount = manuallyRemoved.size();
+
+        // Re-add manually locked items (they're back in the unlocked list)
+        unlockedClogItems.addAll(manuallyRemoved);
+
+        // Remove manual additions (they weren't real)
+        unlockedClogItems.removeAll(manuallyAdded);
+
+        // Clear manual tracking
+        manuallyAdded.clear();
+        manuallyRemoved.clear();
+
+        saveUnlockedItems();
+        recalculateAvailableItems();
+
+        log.info("Reset manual changes. Re-added {} locked items, removed {} manual additions.",
+            removedCount, addedCount);
+
+        if (panel != null)
+        {
+            panel.refresh();
+        }
     }
 
     private void sendUnlockMessage(String itemName)
@@ -967,43 +1213,32 @@ public class ClogmanPlugin extends Plugin
 
     private int getItemIdFromMenuEntry(MenuEntry entry)
     {
-        int itemId = entry.getIdentifier();
+        // Check the direct item ID field first (works for most item interactions)
+        int itemId = entry.getItemId();
+        if (itemId > 0)
+        {
+            return itemId;
+        }
 
-        // Try to get item ID from widget
+        // Try to get item ID from widget (for inventory/bank/equipment items)
         Widget widget = entry.getWidget();
         if (widget != null)
         {
             int widgetItemId = widget.getItemId();
             if (widgetItemId > 0)
             {
-                itemId = widgetItemId;
+                return widgetItemId;
             }
         }
 
-        // Also check itemId field directly
-        if (itemId <= 0)
-        {
-            itemId = entry.getItemId();
-        }
-
-        return itemId;
+        // Return -1 if no valid item ID found
+        // Don't fall back to getIdentifier() as it could be an object/NPC ID
+        return -1;
     }
 
     private boolean isRestrictedAction(String option)
     {
-        return option.equals("wear") ||
-               option.equals("wield") ||
-               option.equals("equip") ||
-               option.equals("eat") ||
-               option.equals("drink") ||
-               option.equals("use") ||
-               option.equals("read") ||
-               option.equals("open") ||
-               option.equals("check") ||
-               option.equals("rub") ||
-               option.equals("break") ||
-               option.equals("activate") ||
-               option.equals("commune");
+        return RESTRICTED_ACTIONS.contains(option);
     }
 
     // === GRAND EXCHANGE RESTRICTION ===
@@ -1058,7 +1293,8 @@ public class ClogmanPlugin extends Plugin
 
     private void sendLockedMessage(String action, int itemId)
     {
-        String itemName = itemManager.getItemComposition(itemId).getName();
+        ItemComposition itemComp = itemManager.getItemComposition(itemId);
+        String itemName = itemComp != null ? itemComp.getName() : "Unknown item";
         String message = new ChatMessageBuilder()
             .append(ChatColorType.HIGHLIGHT)
             .append("Clogman: ")
@@ -1171,30 +1407,74 @@ public class ClogmanPlugin extends Plugin
     @Subscribe
     public void onChatMessage(ChatMessage event)
     {
-        if (event.getType() != ChatMessageType.GAMEMESSAGE)
+        // Handle game messages for collection log unlocks
+        if (event.getType() == ChatMessageType.GAMEMESSAGE)
+        {
+            String message = event.getMessage();
+            // Check for collection log unlock message
+            if (message.contains("New item added to your collection log:"))
+            {
+                // Extract item name from message
+                int startIdx = message.indexOf(":") + 2;
+                String itemName = Text.removeTags(message.substring(startIdx)).trim();
+
+                // Find and unlock the item
+                Integer itemId = itemNameToId.get(itemName.toLowerCase());
+                if (itemId != null)
+                {
+                    unlockItem(itemId, false);
+                }
+                else
+                {
+                    log.warn("Could not find item ID for unlocked item: {}", itemName);
+                }
+            }
+            return;
+        }
+
+        // Handle chat messages to add icon to local player's messages
+        if (!config.showChatIcon() || chatIconOffset == -1)
         {
             return;
         }
 
-        String message = event.getMessage();
-        // Check for collection log unlock message
-        if (message.contains("New item added to your collection log:"))
+        // Only process player chat types
+        ChatMessageType type = event.getType();
+        if (type != ChatMessageType.PUBLICCHAT &&
+            type != ChatMessageType.MODCHAT &&
+            type != ChatMessageType.CLAN_CHAT &&
+            type != ChatMessageType.CLAN_GUEST_CHAT &&
+            type != ChatMessageType.FRIENDSCHAT &&
+            type != ChatMessageType.PRIVATECHAT &&
+            type != ChatMessageType.MODPRIVATECHAT)
         {
-            // Extract item name from message
-            int startIdx = message.indexOf(":") + 2;
-            String itemName = Text.removeTags(message.substring(startIdx)).trim();
-
-            // Find and unlock the item
-            Integer itemId = itemNameToId.get(itemName.toLowerCase());
-            if (itemId != null)
-            {
-                unlockItem(itemId);
-            }
-            else
-            {
-                log.warn("Could not find item ID for unlocked item: {}", itemName);
-            }
+            return;
         }
+
+        // Check if this message is from the local player
+        Player localPlayer = client.getLocalPlayer();
+        if (localPlayer == null || localPlayer.getName() == null)
+        {
+            return;
+        }
+
+        String messageName = Text.removeTags(event.getName());
+        if (!localPlayer.getName().equals(messageName))
+        {
+            return;
+        }
+
+        // Add icon to the message
+        String name = event.getName();
+        // Don't add icon if name already has tags (ironman icon, etc.)
+        if (!name.equals(Text.removeTags(name)))
+        {
+            return;
+        }
+
+        final MessageNode messageNode = event.getMessageNode();
+        messageNode.setName("<img=" + chatIconOffset + ">" + name);
+        client.refreshChat();
     }
 
     /**
@@ -1219,6 +1499,7 @@ public class ClogmanPlugin extends Plugin
         }
 
         int newUnlocks = 0;
+        int migratedItems = 0;
         int scannedItems = 0;
 
         for (Widget item : items)
@@ -1236,31 +1517,61 @@ public class ClogmanPlugin extends Plugin
 
             if (isObtained && collectionLogItems.containsKey(itemId))
             {
-                if (unlockedClogItems.add(itemId))
+                // Respect manual removals - don't auto-add if user has locked this item
+                if (!manuallyRemoved.contains(itemId))
                 {
+                    if (unlockedClogItems.add(itemId))
+                    {
+                        ClogItem clogItem = collectionLogItems.get(itemId);
+                        log.debug("Found obtained item: {} (ID: {})", clogItem.name, itemId);
+                        newUnlocks++;
+                    }
+
+                    // If this was manually added before, it's now a real unlock
+                    manuallyAdded.remove(itemId);
+                }
+            }
+            else if (!isObtained && collectionLogItems.containsKey(itemId))
+            {
+                // Migration: If item is unlocked but not obtained, it must be a manual addition
+                // This handles upgrading from pre-manual-tracking versions
+                if (unlockedClogItems.contains(itemId) && !manuallyAdded.contains(itemId))
+                {
+                    manuallyAdded.add(itemId);
                     ClogItem clogItem = collectionLogItems.get(itemId);
-                    log.debug("Found obtained item: {} (ID: {})", clogItem.name, itemId);
-                    newUnlocks++;
+                    log.debug("Migrated to manual unlock: {} (ID: {})", clogItem.name, itemId);
+                    migratedItems++;
                 }
             }
         }
 
-        log.debug("Scanned {} items, found {} new unlocks", scannedItems, newUnlocks);
+        log.debug("Scanned {} items, found {} new unlocks, migrated {} items", scannedItems, newUnlocks, migratedItems);
 
-        if (newUnlocks > 0)
+        if (newUnlocks > 0 || migratedItems > 0)
         {
-            log.info("Scanned collection log page, found {} new unlocks (total: {})", newUnlocks, unlockedClogItems.size());
+            if (newUnlocks > 0)
+            {
+                log.info("Scanned collection log page, found {} new unlocks (total: {})", newUnlocks, unlockedClogItems.size());
+            }
+
+            if (migratedItems > 0)
+            {
+                log.info("Migrated {} unlocked items to manual unlocks", migratedItems);
+            }
+
             saveUnlockedItems();
             recalculateAvailableItems();
-            sendSyncMessage(newUnlocks);
+
+            if (newUnlocks > 0)
+            {
+                sendSyncMessage(newUnlocks);
+            }
 
             if (panel != null)
             {
                 panel.refresh();
             }
         }
-
-        hasScannedCollectionLog = true;
     }
 
     private void sendSyncMessage(int count)
@@ -1284,6 +1595,16 @@ public class ClogmanPlugin extends Plugin
     public int getUnlockedCount()
     {
         return unlockedClogItems.size();
+    }
+
+    /**
+     * Returns a copy of the unlocked collection log item IDs.
+     * Returns a defensive copy to prevent ConcurrentModificationException
+     * when iterating from EDT while client thread modifies the set.
+     */
+    public Set<Integer> getUnlockedClogItems()
+    {
+        return new HashSet<>(unlockedClogItems);
     }
 
     /**
@@ -1357,9 +1678,13 @@ import net.runelite.client.game.chatbox.ChatboxItemSearch;
 import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 
+import net.runelite.client.ui.components.IconTextField;
+
 import javax.inject.Inject;
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
+import javax.swing.event.DocumentEvent;
+import javax.swing.event.DocumentListener;
 import java.awt.*;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
@@ -1377,7 +1702,15 @@ public class ClogmanPanel extends PluginPanel
 
     private final JList<UnlockEntry> unlockList;
     private final DefaultListModel<UnlockEntry> listModel;
+    private final JList<UnlockEntry> lockedList;
+    private final DefaultListModel<UnlockEntry> lockedListModel;
     private final JLabel statsLabel;
+    private final IconTextField searchField;
+    private final JCheckBox manualOnlyCheckbox;
+
+    // All entries (unfiltered) - source of truth for display
+    private List<UnlockEntry> allEntries = new ArrayList<>();
+    private List<UnlockEntry> allLockedEntries = new ArrayList<>();
 
     public ClogmanPanel(
         ClogmanPlugin plugin,
@@ -1399,7 +1732,29 @@ public class ClogmanPanel extends PluginPanel
         // Stats label at top
         statsLabel = new JLabel("Unlocked: 0 / 0");
         statsLabel.setForeground(Color.WHITE);
-        statsLabel.setBorder(new EmptyBorder(0, 0, 10, 0));
+        statsLabel.setBorder(new EmptyBorder(0, 0, 5, 0));
+
+        // Search field
+        searchField = new IconTextField();
+        searchField.setIcon(IconTextField.Icon.SEARCH);
+        searchField.setPreferredSize(new Dimension(0, 30));
+        searchField.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        searchField.setHoverBackgroundColor(ColorScheme.DARK_GRAY_HOVER_COLOR);
+        searchField.getDocument().addDocumentListener(new DocumentListener()
+        {
+            @Override
+            public void insertUpdate(DocumentEvent e) { filterLists(); }
+            @Override
+            public void removeUpdate(DocumentEvent e) { filterLists(); }
+            @Override
+            public void changedUpdate(DocumentEvent e) { filterLists(); }
+        });
+
+        // Manual-only filter checkbox
+        manualOnlyCheckbox = new JCheckBox("Show only manual unlocks");
+        manualOnlyCheckbox.setForeground(Color.WHITE);
+        manualOnlyCheckbox.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        manualOnlyCheckbox.addActionListener(e -> filterLists());
 
         // List of unlocked items
         listModel = new DefaultListModel<>();
@@ -1408,14 +1763,25 @@ public class ClogmanPanel extends PluginPanel
         unlockList.setBackground(ColorScheme.DARKER_GRAY_COLOR);
         unlockList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
 
-        JScrollPane scrollPane = new JScrollPane(unlockList);
-        scrollPane.setPreferredSize(new Dimension(0, 300));
-        scrollPane.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
+        JScrollPane unlockScrollPane = new JScrollPane(unlockList);
+        unlockScrollPane.setPreferredSize(new Dimension(0, 250));
+        unlockScrollPane.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
 
-        // Button panel
-        JPanel buttonPanel = new JPanel(new GridBagLayout());
-        buttonPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-        buttonPanel.setBorder(new EmptyBorder(10, 0, 0, 0));
+        // List of manually locked items
+        lockedListModel = new DefaultListModel<>();
+        lockedList = new JList<>(lockedListModel);
+        lockedList.setCellRenderer(new UnlockRenderer());
+        lockedList.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+        lockedList.setSelectionMode(ListSelectionModel.MULTIPLE_INTERVAL_SELECTION);
+
+        JScrollPane lockedScrollPane = new JScrollPane(lockedList);
+        lockedScrollPane.setPreferredSize(new Dimension(0, 120));
+        lockedScrollPane.setBorder(BorderFactory.createLineBorder(ColorScheme.MEDIUM_GRAY_COLOR));
+
+        // Unlock list buttons
+        JPanel unlockButtonPanel = new JPanel(new GridBagLayout());
+        unlockButtonPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        unlockButtonPanel.setBorder(new EmptyBorder(5, 0, 5, 0));
 
         GridBagConstraints gbc = new GridBagConstraints();
         gbc.fill = GridBagConstraints.HORIZONTAL;
@@ -1426,34 +1792,81 @@ public class ClogmanPanel extends PluginPanel
         JButton addButton = new JButton("Add Unlock");
         addButton.addActionListener(e -> onAdd());
         gbc.gridy = 0;
-        buttonPanel.add(addButton, gbc);
+        unlockButtonPanel.add(addButton, gbc);
 
-        JButton removeButton = new JButton("Remove Selected");
-        removeButton.addActionListener(e -> onRemove());
+        JButton lockButton = new JButton("Remove Unlock");
+        lockButton.addActionListener(e -> onLock());
         gbc.gridy = 1;
-        buttonPanel.add(removeButton, gbc);
+        unlockButtonPanel.add(lockButton, gbc);
+
+        // Locked items label
+        JLabel lockedLabel = new JLabel("Manually Locked Items");
+        lockedLabel.setForeground(Color.WHITE);
+        lockedLabel.setBorder(new EmptyBorder(10, 0, 5, 0));
+
+        // Locked list buttons
+        JPanel lockedButtonPanel = new JPanel(new GridBagLayout());
+        lockedButtonPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        lockedButtonPanel.setBorder(new EmptyBorder(5, 0, 5, 0));
+
+        JButton unlockButton = new JButton("Unlock Selected");
+        unlockButton.addActionListener(e -> onUnlock());
+        gbc.gridy = 0;
+        lockedButtonPanel.add(unlockButton, gbc);
+
+        // Reset buttons
+        JPanel resetButtonPanel = new JPanel(new GridBagLayout());
+        resetButtonPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        resetButtonPanel.setBorder(new EmptyBorder(10, 0, 0, 0));
+
+        JButton resetManualButton = new JButton("Reset Manual Changes");
+        resetManualButton.addActionListener(e -> onResetManual());
+        gbc.gridy = 0;
+        resetButtonPanel.add(resetManualButton, gbc);
 
         JButton clearButton = new JButton("Reset All Unlocks");
         clearButton.addActionListener(e -> onClearAll());
-        gbc.gridy = 2;
-        buttonPanel.add(clearButton, gbc);
+        gbc.gridy = 1;
+        resetButtonPanel.add(clearButton, gbc);
 
         // Help text
-        JLabel helpLabel = new JLabel("<html><small>Browse your Collection Log in-game to sync unlocks automatically.</small></html>");
+        JLabel helpLabel = new JLabel("<html>Browse your Collection Log in-game to sync unlocks automatically.</html>");
         helpLabel.setForeground(ColorScheme.LIGHT_GRAY_COLOR);
         helpLabel.setBorder(new EmptyBorder(10, 0, 0, 0));
 
         // Layout
-        JPanel topPanel = new JPanel(new BorderLayout());
-        topPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-        topPanel.add(statsLabel, BorderLayout.NORTH);
-        topPanel.add(scrollPane, BorderLayout.CENTER);
+        JPanel headerPanel = new JPanel(new BorderLayout(0, 5));
+        headerPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        headerPanel.add(statsLabel, BorderLayout.NORTH);
+        headerPanel.add(searchField, BorderLayout.CENTER);
+        headerPanel.add(manualOnlyCheckbox, BorderLayout.SOUTH);
 
-        add(topPanel, BorderLayout.CENTER);
+        // Unlock section
+        JPanel unlockSection = new JPanel(new BorderLayout());
+        unlockSection.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        unlockSection.add(unlockScrollPane, BorderLayout.CENTER);
+        unlockSection.add(unlockButtonPanel, BorderLayout.SOUTH);
 
+        // Locked section
+        JPanel lockedSection = new JPanel(new BorderLayout());
+        lockedSection.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        lockedSection.add(lockedLabel, BorderLayout.NORTH);
+        lockedSection.add(lockedScrollPane, BorderLayout.CENTER);
+        lockedSection.add(lockedButtonPanel, BorderLayout.SOUTH);
+
+        // Center panel with both lists
+        JPanel centerPanel = new JPanel(new BorderLayout());
+        centerPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
+        centerPanel.add(headerPanel, BorderLayout.NORTH);
+        centerPanel.add(unlockSection, BorderLayout.CENTER);
+        centerPanel.add(lockedSection, BorderLayout.SOUTH);
+
+        add(centerPanel, BorderLayout.CENTER);
+
+        // Bottom panel with reset buttons and help
         JPanel bottomPanel = new JPanel(new BorderLayout());
         bottomPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-        bottomPanel.add(buttonPanel, BorderLayout.NORTH);
+        bottomPanel.add(resetButtonPanel, BorderLayout.NORTH);
         bottomPanel.add(helpLabel, BorderLayout.SOUTH);
         add(bottomPanel, BorderLayout.SOUTH);
     }
@@ -1468,30 +1881,83 @@ public class ClogmanPanel extends PluginPanel
 
     private void updateFromPlugin()
     {
-        listModel.clear();
-
         Map<Integer, ClogmanPlugin.ClogItem> clogItems = plugin.getCollectionLogItems();
-        List<UnlockEntry> entries = new ArrayList<>();
+        allEntries = new ArrayList<>();
+        allLockedEntries = new ArrayList<>();
 
+        // Build unlocked items list
         for (Integer itemId : plugin.getUnlockedClogItems())
         {
             ClogmanPlugin.ClogItem clogItem = clogItems.get(itemId);
             String name = clogItem != null ? clogItem.name : "Unknown (ID: " + itemId + ")";
-            entries.add(new UnlockEntry(itemId, name));
+
+            // Pre-load and cache icon
+            BufferedImage img = itemManager.getImage(itemId);
+            ImageIcon icon = img != null ? new ImageIcon(img) : null;
+
+            allEntries.add(new UnlockEntry(itemId, name, icon));
+        }
+
+        // Build locked items list
+        for (Integer itemId : plugin.getManuallyRemoved())
+        {
+            ClogmanPlugin.ClogItem clogItem = clogItems.get(itemId);
+            String name = clogItem != null ? clogItem.name : "Unknown (ID: " + itemId + ")";
+
+            // Pre-load and cache icon
+            BufferedImage img = itemManager.getImage(itemId);
+            ImageIcon icon = img != null ? new ImageIcon(img) : null;
+
+            allLockedEntries.add(new UnlockEntry(itemId, name, icon));
         }
 
         // Sort alphabetically
-        entries.sort(Comparator.comparing(e -> e.name.toLowerCase()));
-
-        for (UnlockEntry entry : entries)
-        {
-            listModel.addElement(entry);
-        }
+        allEntries.sort(Comparator.comparing(e -> e.name.toLowerCase()));
+        allLockedEntries.sort(Comparator.comparing(e -> e.name.toLowerCase()));
 
         // Update stats
         int unlocked = plugin.getUnlockedCount();
         int total = plugin.getTotalClogItems();
         statsLabel.setText("Unlocked: " + unlocked + " / " + total);
+
+        // Apply current filter
+        filterLists();
+    }
+
+    private void filterLists()
+    {
+        String search = searchField.getText().toLowerCase().trim();
+        boolean manualOnly = manualOnlyCheckbox.isSelected();
+
+        // Filter unlock list
+        listModel.clear();
+        for (UnlockEntry entry : allEntries)
+        {
+            // Check search filter
+            if (!search.isEmpty() && !entry.name.toLowerCase().contains(search))
+            {
+                continue;
+            }
+
+            // Check manual-only filter
+            if (manualOnly && !plugin.getManuallyAdded().contains(entry.itemId))
+            {
+                continue;
+            }
+
+            listModel.addElement(entry);
+        }
+
+        // Filter locked list
+        lockedListModel.clear();
+        for (UnlockEntry entry : allLockedEntries)
+        {
+            // Only apply search filter to locked list (manual-only doesn't apply here)
+            if (search.isEmpty() || entry.name.toLowerCase().contains(search))
+            {
+                lockedListModel.addElement(entry);
+            }
+        }
     }
 
     private void onAdd()
@@ -1520,7 +1986,7 @@ public class ClogmanPanel extends PluginPanel
                         Integer clogId = findClogItemId(itemId);
                         if (clogId != null)
                         {
-                            plugin.unlockItem(clogId);
+                            plugin.unlockItem(clogId, true);
                             refresh();
                         }
                         else
@@ -1564,7 +2030,7 @@ public class ClogmanPanel extends PluginPanel
         return null;
     }
 
-    private void onRemove()
+    private void onLock()
     {
         List<UnlockEntry> selected = unlockList.getSelectedValuesList();
         if (selected.isEmpty())
@@ -1573,16 +2039,62 @@ public class ClogmanPanel extends PluginPanel
         }
 
         int confirm = JOptionPane.showConfirmDialog(this,
-            "Remove " + selected.size() + " unlock(s)?",
-            "Confirm Removal",
+            "Remove unlock for " + selected.size() + " item(s)?",
+            "Confirm Remove",
             JOptionPane.YES_NO_OPTION);
 
         if (confirm == JOptionPane.YES_OPTION)
         {
             for (UnlockEntry entry : selected)
             {
-                plugin.removeUnlock(entry.itemId);
+                plugin.lockItem(entry.itemId);
             }
+            refresh();
+        }
+    }
+
+    private void onUnlock()
+    {
+        List<UnlockEntry> selected = lockedList.getSelectedValuesList();
+        if (selected.isEmpty())
+        {
+            return;
+        }
+
+        int confirm = JOptionPane.showConfirmDialog(this,
+            "Unlock " + selected.size() + " item(s)?",
+            "Confirm Unlock",
+            JOptionPane.YES_NO_OPTION);
+
+        if (confirm == JOptionPane.YES_OPTION)
+        {
+            for (UnlockEntry entry : selected)
+            {
+                // Re-add to unlocked items
+                plugin.unlockItem(entry.itemId, true);
+            }
+            refresh();
+        }
+    }
+
+    private void onResetManual()
+    {
+        if (plugin.getManuallyAdded().isEmpty() && plugin.getManuallyRemoved().isEmpty())
+        {
+            return;
+        }
+
+        int confirm = JOptionPane.showConfirmDialog(this,
+            "Reset all manual changes?\n" +
+            "- " + plugin.getManuallyAdded().size() + " manually added unlock(s) will be removed\n" +
+            "- " + plugin.getManuallyRemoved().size() + " manually locked item(s) will be unlocked",
+            "Confirm Reset Manual Changes",
+            JOptionPane.YES_NO_OPTION,
+            JOptionPane.WARNING_MESSAGE);
+
+        if (confirm == JOptionPane.YES_OPTION)
+        {
+            plugin.resetManualChanges();
             refresh();
         }
     }
@@ -1639,16 +2151,8 @@ public class ClogmanPanel extends PluginPanel
         {
             nameLabel.setText(value.name);
 
-            // Load item icon asynchronously
-            BufferedImage icon = itemManager.getImage(value.itemId);
-            if (icon != null)
-            {
-                iconLabel.setIcon(new ImageIcon(icon));
-            }
-            else
-            {
-                iconLabel.setIcon(null);
-            }
+            // Use pre-cached icon (loaded once in updateFromPlugin)
+            iconLabel.setIcon(value.icon);
 
             if (isSelected)
             {
@@ -1664,17 +2168,19 @@ public class ClogmanPanel extends PluginPanel
     }
 
     /**
-     * Data class for unlock entries
+     * Data class for unlock entries with cached icon
      */
     private static class UnlockEntry
     {
         final int itemId;
         final String name;
+        final ImageIcon icon;
 
-        UnlockEntry(int itemId, String name)
+        UnlockEntry(int itemId, String name, ImageIcon icon)
         {
             this.itemId = itemId;
             this.name = name;
+            this.icon = icon;
         }
     }
 }
