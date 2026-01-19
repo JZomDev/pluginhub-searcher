@@ -1,0 +1,862 @@
+package com.puddingpants.uniquenpc;
+
+import net.runelite.api.coords.WorldPoint;
+
+public final class SpawnKeyUtil
+{
+    private SpawnKeyUtil() {}
+
+    public static long spawnKey(int npcId, WorldPoint p)
+    {
+        // Normalize instance coordinates
+        WorldPoint base = WorldPoint.fromRegion(
+                p.getRegionID(),
+                p.getRegionX(),
+                p.getRegionY(),
+                p.getPlane()
+        );
+
+        return (((long) npcId) << 32)
+                | (((long) base.getX() & 0x7FFF) << 15)
+                | ((long) base.getY() & 0x7FFF);
+    }
+}
+
+package com.puddingpants.uniquenpc;
+
+import net.runelite.client.config.*;
+
+import java.awt.*;
+
+@ConfigGroup("uniquenpc")
+public interface UniqueNPCConfig extends Config
+{
+	@ConfigItem(
+			keyName = "tagColor",
+			name = "Tag Color",
+			description = "Color used to mask hidden NPCs"
+	)
+	default Color tagColor()
+	{
+		return new Color(0, 0, 0, 255);
+	}
+
+	@ConfigItem(
+			keyName = "idNpc",
+			name = "Show Unique ID",
+			description = "Display unique ID numbers above NPCs",
+			position = 1
+	)
+	default boolean idNpc()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "tagNpc",
+			name = "Tag NPCs",
+			description = "Visually overlays hulls on NPCs that have unique IDs"
+	)
+	default boolean tagNpc()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "tagAggressiveNpc",
+			name = "Tag Aggressive NPCs",
+			description = "Visually overlays hulls on Aggressive NPCs that have unique IDs"
+	)
+	default boolean tagAggressiveNpc()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "matchRadius",
+			name = "Spawn match radius",
+			description = "Maximum distance to match an NPC to a known spawn"
+	)
+	default int matchRadius()
+	{
+		return 50;
+	}
+
+	@ConfigItem(
+			keyName = "resetSpawnIds",
+			name = "Reset Unique NPC IDs",
+			description = "Toggle ON to reset all learned NPC IDs"
+	)
+	default boolean resetSpawnIds()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+			keyName = "disableNpcInteractions",
+			name = "Disable NPC interactions",
+			description = "Remove attack/interact options for NPCs with a unique ID"
+	)
+	default boolean disableNpcInteractions()
+	{
+		return false;
+	}
+}
+
+package com.puddingpants.uniquenpc;
+
+import lombok.Getter;
+import net.runelite.api.Actor;
+import net.runelite.api.NPC;
+import net.runelite.api.Player;
+import net.runelite.api.coords.WorldPoint;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.*;
+
+@Singleton
+public class UniqueNPCManager
+{
+    @Inject
+    private UniqueNPCConfig config;
+
+    // Persistent identity (saved)
+    @Getter
+    private final Map<Long, SpawnRecord> knownSpawns = new HashMap<>();
+    private boolean dirty = false;
+
+    // Session identity
+    private final Map<Integer, Long> entityToUniqueId = new HashMap<>();
+    private final Map<Long, Integer> uniqueIdToEntity = new HashMap<>();
+
+    // Learning helpers
+    private final Map<Integer, Long> playerDamagedNpc = new HashMap<>();
+    private final Map<Integer, NPC> pendingSpawns = new HashMap<>();
+
+    private static final long PLAYER_DAMAGE_TTL_MS = 15_000;
+    private static final int SPECIAL_NPC_ID = 5007;
+    private static final int SPECIAL_NPC_RADIUS = 200;
+
+    // -------------------------------------------------
+    // Lifecycle
+    // -------------------------------------------------
+
+    public void loadKnownSpawns(Map<Long, SpawnRecord> data)
+    {
+        knownSpawns.clear();
+        if (data != null)
+        {
+            knownSpawns.putAll(data);
+        }
+    }
+
+    public void resetRuntimeState()
+    {
+        entityToUniqueId.clear();
+        uniqueIdToEntity.clear();
+        pendingSpawns.clear();
+        playerDamagedNpc.clear();
+        dirty = false;
+    }
+
+    public boolean consumeDirty()
+    {
+        boolean wasDirty = dirty;
+        dirty = false;
+        return wasDirty;
+    }
+
+    // -------------------------------------------------
+    // NPC Tracking
+    // -------------------------------------------------
+
+    public void recordPlayerDamage(NPC npc)
+    {
+        playerDamagedNpc.put(npc.getIndex(), System.currentTimeMillis());
+    }
+
+    private boolean wasKilledByPlayer(int entityIndex)
+    {
+        Long t = playerDamagedNpc.get(entityIndex);
+        return t != null && System.currentTimeMillis() - t <= PLAYER_DAMAGE_TTL_MS;
+    }
+
+    public void handleNpcSpawn(NPC npc)
+    {
+        int index = npc.getIndex();
+        if (!entityToUniqueId.containsKey(index))
+        {
+            pendingSpawns.put(index, npc);
+        }
+    }
+
+    public void handleNpcDespawn(NPC npc)
+    {
+        int index = npc.getIndex();
+
+        if (wasKilledByPlayer(index))
+        {
+            WorldPoint deathLoc = npc.getWorldLocation();
+            WorldPoint uniqueLoc = findFreeDeathLocation(npc.getId(), deathLoc);
+            long spawnKey = SpawnKeyUtil.spawnKey(npc.getId(), uniqueLoc);
+
+            SpawnRecord record = knownSpawns.computeIfAbsent(spawnKey, k -> {
+                dirty = true;
+                return new SpawnRecord(npc.getId(), uniqueLoc, spawnKey);
+            });
+
+            if (!entityToUniqueId.containsKey(index) && !uniqueIdToEntity.containsKey(record.uniqueId))
+            {
+                entityToUniqueId.put(index, record.uniqueId);
+                uniqueIdToEntity.put(record.uniqueId, index);
+            }
+        }
+        pendingSpawns.remove(index);
+        playerDamagedNpc.remove(index);
+    }
+
+    public void resolvePendingSpawns()
+    {
+        if (pendingSpawns.isEmpty() || knownSpawns.isEmpty())
+        {
+            pendingSpawns.clear();
+            return;
+        }
+
+        for (NPC npc : pendingSpawns.values())
+        {
+            int index = npc.getIndex();
+            if (entityToUniqueId.containsKey(index)) continue;
+
+            SpawnRecord best = findBestMatch(npc);
+            int radius = getMatchRadius(npc.getId());
+
+            if (best != null && best.location.distanceTo(npc.getWorldLocation()) <= radius)
+            {
+                entityToUniqueId.put(index, best.uniqueId);
+                uniqueIdToEntity.put(best.uniqueId, index);
+            }
+        }
+
+        pendingSpawns.clear();
+    }
+
+    private int getMatchRadius(int npcId)
+    {
+        if (npcId == SPECIAL_NPC_ID)
+        {
+            return SPECIAL_NPC_RADIUS;
+        }
+        return config.matchRadius();
+    }
+    
+    private SpawnRecord findBestMatch(NPC npc)
+    {
+        WorldPoint loc = npc.getWorldLocation();
+        SpawnRecord best = null;
+        int bestDist = Integer.MAX_VALUE;
+
+        for (SpawnRecord record : knownSpawns.values())
+        {
+            if (record.npcId != npc.getId()) continue;
+            if (uniqueIdToEntity.containsKey(record.uniqueId)) continue;
+
+            int dist = record.location.distanceTo(loc);
+            if (dist < bestDist)
+            {
+                bestDist = dist;
+                best = record;
+            }
+        }
+
+        return best;
+    }
+
+    private WorldPoint findFreeDeathLocation(int npcId, WorldPoint base)
+    {
+        for (int dx = 0; dx <= 5; dx++)
+        {
+            for (int dy = 0; dy <= 5; dy++)
+            {
+                WorldPoint candidate = base.dx(dx).dy(dy);
+                long key = SpawnKeyUtil.spawnKey(npcId, candidate);
+                if (!knownSpawns.containsKey(key))
+                {
+                    return candidate;
+                }
+            }
+        }
+        return base;
+    }
+
+    // -------------------------------------------------
+    // Query API
+    // -------------------------------------------------
+
+    public Long getUniqueId(NPC npc)
+    {
+        return entityToUniqueId.get(npc.getIndex());
+    }
+
+    public Collection<Integer> getTaggedNpcIndices()
+    {
+        return entityToUniqueId.keySet();
+    }
+
+    public boolean isNpcAggressive(NPC npc)
+    {
+        Actor interacting = npc.getInteracting();
+
+        return (interacting instanceof Player)
+                || npc.getAnimation() != -1;
+    }
+
+    public int countTaggedNpcsForNpcId(int npcId)
+    {
+        int count = 0;
+        for (Long uniqueId : entityToUniqueId.values())
+        {
+            for (SpawnRecord record : knownSpawns.values())
+            {
+                if (record.uniqueId == uniqueId && record.npcId == npcId)
+                {
+                    count++;
+                    break;
+                }
+            }
+        }
+        return count;
+    }
+}
+
+package com.puddingpants.uniquenpc;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import net.runelite.client.config.ConfigManager;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.lang.reflect.Type;
+import java.util.Collections;
+import java.util.Map;
+
+@Singleton
+public class SpawnStore
+{
+    private static final String GROUP = "uniquenpc";
+    private static final String KEY = "spawnRecords";
+
+    private static final Type TYPE =
+            new TypeToken<Map<Long, SpawnRecord>>() {}.getType();
+
+    @Inject
+    private Gson gson;
+
+    @Inject
+    private ConfigManager configManager;
+
+    public void save(Map<Long, SpawnRecord> data)
+    {
+        if (data == null || data.isEmpty())
+        {
+            configManager.unsetConfiguration(GROUP, KEY);
+            return;
+        }
+
+        String json = gson.toJson(data, TYPE);
+        configManager.setConfiguration(GROUP, KEY, json);
+    }
+
+    public Map<Long, SpawnRecord> load()
+    {
+        String json = configManager.getConfiguration(GROUP, KEY);
+
+        if (json == null || json.isEmpty())
+        {
+            return Collections.emptyMap();
+        }
+
+        return gson.fromJson(json, TYPE);
+    }
+
+    public void clear()
+    {
+        configManager.unsetConfiguration(GROUP, KEY);
+    }
+}
+
+package com.puddingpants.uniquenpc;
+
+import com.google.inject.Provides;
+import javax.inject.Inject;
+import java.util.Map;
+import java.util.Set;
+import java.util.HashSet;
+
+import net.runelite.api.*;
+import net.runelite.api.events.*;
+
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.events.ConfigChanged;
+
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@PluginDescriptor(
+		name = "Unique NPC",
+		description = "Unique NPC ID Creation and Assignment")
+
+public class UniqueNPCPlugin extends Plugin
+{
+	private static final Logger log = LoggerFactory.getLogger(UniqueNPCPlugin.class);
+
+	@Inject	private OverlayManager overlayManager;
+	@Inject	private UniqueNPCOverlay overlay;
+	@Inject	private UniqueNPCManager manager;
+	@Inject	private UniqueNPCConfig config;
+	@Inject	private Client client;
+	@Inject	private ChatMessageManager chatMessageManager;
+	@Inject	private SpawnStore spawnStore;
+	@Inject private ConfigManager configManager;
+
+	private final Set<Integer> npcsPreviouslyHidden = new HashSet<>();
+
+	@Provides
+	UniqueNPCConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(UniqueNPCConfig.class);
+	}
+
+	// Lifecycle
+
+	@Override
+	protected void startUp()
+	{
+		Map<Long, SpawnRecord> loadedSpawns = spawnStore.load();
+		manager.loadKnownSpawns(loadedSpawns);
+		manager.resetRuntimeState();
+		overlayManager.add(overlay);
+
+		log.info(
+				"NPC Identity: loaded {} known spawns",
+				loadedSpawns == null ? 0 : loadedSpawns.size());
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		spawnStore.save(manager.getKnownSpawns());
+
+		// Reset all hidden NPCs when plugin shuts down
+		for (NPC npc : client.getTopLevelWorldView().npcs())
+		{
+			npc.setDead(false);
+		}
+
+		npcsPreviouslyHidden.clear();
+		manager.resetRuntimeState();
+		overlayManager.remove(overlay);
+
+		log.info("NPC Identity: saved {} known spawns", manager.getKnownSpawns().size());
+	}
+
+	// NPC Events
+
+	@Subscribe
+	public void onNpcSpawned(NpcSpawned event)
+	{
+		NPC npc = event.getNpc();
+		manager.handleNpcSpawn(npc);
+
+		if (shouldHideNpc(npc))
+		{
+			npc.setDead(true);
+		}
+	}
+
+	@Subscribe
+	public void onNpcDespawned(NpcDespawned event)
+	{
+
+		manager.handleNpcDespawn(event.getNpc());
+	}
+
+	@Subscribe
+	public void onHitsplatApplied(HitsplatApplied event)
+	{
+		if (event.getActor() instanceof NPC && event.getHitsplat().isMine())
+		{
+			manager.recordPlayerDamage((NPC) event.getActor());
+		}
+	}
+
+	// Game tick driver
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		manager.resolvePendingSpawns();
+
+		if (manager.consumeDirty())
+		{
+			spawnStore.save(manager.getKnownSpawns());
+		}
+		updateNpcVisibility();
+	}
+
+	private void updateNpcVisibility()
+	{
+		Set<Integer> currentlyHidden = new HashSet<>();
+
+		for (NPC npc : client.getTopLevelWorldView().npcs())
+		{
+			int index = npc.getIndex();
+			boolean shouldHide = shouldHideNpc(npc);
+
+			if (shouldHide)
+			{
+				currentlyHidden.add(index);
+				if (!npcsPreviouslyHidden.contains(index))
+				{
+					npc.setDead(true);
+				}
+			}
+			else if (npcsPreviouslyHidden.contains(index))
+			{
+				npc.setDead(false);
+			}
+		}
+
+		npcsPreviouslyHidden.clear();
+		npcsPreviouslyHidden.addAll(currentlyHidden);
+	}
+
+	private boolean shouldHideNpc(NPC npc)
+	{
+		return config.disableNpcInteractions()
+				&& manager.getTaggedNpcIndices().contains(npc.getIndex())
+				&& !manager.isNpcAggressive(npc);
+	}
+
+	// Config
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged event)
+	{
+		if (!"uniquenpc".equals(event.getGroup()))
+		{
+			return;
+		}
+
+		if ("resetSpawnIds".equals(event.getKey()) && config.resetSpawnIds())
+		{
+			log.info("Reset toggle activated - clearing all data");
+
+			manager.getKnownSpawns().clear();
+			manager.resetRuntimeState();
+
+			spawnStore.clear();
+
+			npcsPreviouslyHidden.clear();
+			for (NPC npc : client.getTopLevelWorldView().npcs())
+			{
+				npc.setDead(false);
+			}
+
+			configManager.setConfiguration("uniquenpc", "resetSpawnIds", false);
+
+			log.info("Reset complete - all spawn data cleared");
+			return;
+		}
+		npcsPreviouslyHidden.clear();
+		updateNpcVisibility();
+	}
+
+	// Menu filtering
+
+	@Subscribe
+	public void onMenuEntryAdded(MenuEntryAdded event)
+	{
+		if (!config.disableNpcInteractions())
+		{
+			return;
+		}
+
+		MenuEntry menuEntry = event.getMenuEntry();
+		int type = event.getType();
+
+		if (type != MenuAction.NPC_FIRST_OPTION.getId()
+				&& type != MenuAction.NPC_SECOND_OPTION.getId()
+				&& type != MenuAction.NPC_THIRD_OPTION.getId()
+				&& type != MenuAction.NPC_FOURTH_OPTION.getId()
+				&& type != MenuAction.NPC_FIFTH_OPTION.getId())
+		{
+			return;
+		}
+
+		if (!manager.getTaggedNpcIndices().contains(event.getIdentifier()))
+		{
+			return;
+		}
+
+		menuEntry.setDeprioritized(true);
+	}
+
+	// Chat Commands
+
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted event)
+	{
+		String command = event.getCommand();
+		String[] args = event.getArguments();
+
+		if (command.equalsIgnoreCase("npccount"))
+		{
+			handleNpcCountCommand(args);
+		}
+		else if (command.equalsIgnoreCase("npcstats"))
+		{
+			handleNpcStatsCommand();
+		}
+	}
+
+	private void handleNpcCountCommand(String[] args)
+	{
+		if (args.length != 1)
+		{
+			sendChatMessage("Usage: ::npccount <npcId>");
+			return;
+		}
+
+		try
+		{
+			int npcId = Integer.parseInt(args[0]);
+			int savedSpawns = countSpawnsForNpcId(npcId);
+			int taggedNpcs = manager.countTaggedNpcsForNpcId(npcId);
+
+			sendChatMessage("NPC ID " + npcId + ":");
+			sendChatMessage("  Unique IDs assigned: " + savedSpawns);
+			sendChatMessage("  Currently tagged in world: " + taggedNpcs);
+		}
+		catch (NumberFormatException e)
+		{
+			sendChatMessage("Invalid NPC ID. Usage: ::npccount <npcId>");
+		}
+	}
+
+	private void handleNpcStatsCommand()
+	{
+		int totalSpawns = manager.getKnownSpawns().size();
+		int taggedNpcs = manager.getTaggedNpcIndices().size();
+
+		sendChatMessage("Total saved spawns: " + totalSpawns);
+		sendChatMessage("Currently tagged NPCs: " + taggedNpcs);
+	}
+
+	private int countSpawnsForNpcId(int npcId)
+	{
+		int count = 0;
+		for (SpawnRecord record : manager.getKnownSpawns().values())
+		{
+			if (record.npcId == npcId)
+			{
+				count++;
+			}
+		}
+		return count;
+	}
+
+	private void sendChatMessage(String message)
+	{
+		chatMessageManager.queue(QueuedMessage.builder()
+				.type(ChatMessageType.CONSOLE)
+				.runeLiteFormattedMessage(
+						new ChatMessageBuilder()
+								.append(ChatColorType.HIGHLIGHT)
+								.append("[NPC Identity] ")
+								.append(ChatColorType.NORMAL)
+								.append(message)
+								.build()
+				)
+				.build());
+	}
+}
+
+package com.puddingpants.uniquenpc;
+
+import net.runelite.api.Client;
+import net.runelite.api.NPC;
+import net.runelite.api.Perspective;
+import net.runelite.api.Point;
+import net.runelite.api.coords.LocalPoint;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+import javax.inject.Inject;
+import java.awt.*;
+
+public class UniqueNPCOverlay extends Overlay
+{
+    private final Client client;
+    private final UniqueNPCManager manager;
+    private final UniqueNPCConfig config;
+
+    @Inject
+    public UniqueNPCOverlay(Client client, UniqueNPCManager manager, UniqueNPCConfig config)
+    {
+        this.client = client;
+        this.manager = manager;
+        this.config = config;
+
+        setLayer(OverlayLayer.ABOVE_SCENE);
+        setPosition(OverlayPosition.DYNAMIC);
+    }
+
+    @Override
+    public Dimension render(Graphics2D g)
+    {
+        if (!config.idNpc() && !config.tagNpc() && !config.tagAggressiveNpc())
+        {
+            return null;
+        }
+
+        for (NPC npc : client.getTopLevelWorldView().npcs())
+        {
+            Long uniqueId = manager.getUniqueId(npc);
+            if (uniqueId == null) continue;
+
+            boolean isAggressive = manager.isNpcAggressive(npc);
+
+            if (config.tagNpc())
+            {
+                renderTag(g, npc, isAggressive);
+            }
+
+            if (config.tagAggressiveNpc() && isAggressive)
+            {
+                renderAggressiveTag(g, npc);
+            }
+
+            if (config.idNpc())
+            {
+                renderIdText(g, npc, uniqueId, isAggressive);
+            }
+        }
+
+        return null;
+    }
+
+    // Tag NPC (visual mask/highlight for all tagged NPCs)
+
+    private void renderTag(Graphics2D g, NPC npc, boolean isAggressive)
+    {
+        if (client.getLocalPlayer().getInteracting() == npc) return;
+
+        Shape hull = npc.getConvexHull();
+        if (hull == null) return;
+
+        Composite oldComposite = g.getComposite();
+
+        if (isAggressive)
+        {
+            g.setColor(Color.GRAY);
+            g.setStroke(new BasicStroke(1));
+            g.draw(hull);
+
+            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.3f));
+            g.setColor(new Color(151, 139, 139, 100));
+            g.fill(hull);
+        }
+        else
+        {
+            g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.5f));
+            g.setColor(config.tagColor());
+            g.fill(hull);
+        }
+
+        g.setComposite(oldComposite);
+    }
+
+    // Tag only aggressive NPCs (separate highlighting)
+
+    private void renderAggressiveTag(Graphics2D g, NPC npc)
+    {
+        Shape hull = npc.getConvexHull();
+        if (hull == null) return;
+
+        g.setColor(Color.LIGHT_GRAY);
+        g.setStroke(new BasicStroke(1));
+        g.draw(hull);
+
+        Composite oldComposite = g.getComposite();
+        g.setComposite(AlphaComposite.getInstance(AlphaComposite.SRC_OVER, 0.4f));
+        g.setColor(new Color(246, 232, 232, 120));
+        g.fill(hull);
+        g.setComposite(oldComposite);
+    }
+
+    // Display ID number
+
+    private void renderIdText(Graphics2D g, NPC npc, long uniqueId, boolean isAggressive)
+    {
+        LocalPoint lp = npc.getLocalLocation();
+        if (lp == null) return;
+
+        String displayText = isAggressive ? uniqueId + " [AGG]" : String.valueOf(uniqueId);
+
+        Point textLocation = Perspective.getCanvasTextLocation(
+                client,
+                g,
+                lp,
+                displayText,
+                npc.getLogicalHeight() + 20
+        );
+
+        if (textLocation == null) return;
+
+        g.setColor(isAggressive ? Color.RED : config.tagColor());
+        g.drawString(displayText, textLocation.getX(), textLocation.getY());
+    }
+}
+package com.puddingpants.uniquenpc;
+
+import net.runelite.api.coords.WorldPoint;
+
+public class SpawnRecord
+{
+    public final int npcId;
+    public final WorldPoint location;
+    public final long uniqueId;
+
+    public SpawnRecord(int npcId, WorldPoint location, long uniqueId)
+    {
+        this.npcId = npcId;
+        this.location = location;
+        this.uniqueId = uniqueId;
+    }
+}
+package com.puddingpants.uniquenpc;
+
+import com.puddingpants.uniquenpc.UniqueNPCPlugin;
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class PluginLauncher
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(UniqueNPCPlugin.class);
+		RuneLite.main(args);
+	}
+}
