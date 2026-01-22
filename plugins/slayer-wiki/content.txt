@@ -58,7 +58,8 @@ public class SlayerWikiPlugin extends Plugin
 		 .put("banshees", NpcID.BANSHEE)
 		 .put("basilisks", NpcID.BASILISK)
 		 .put("birds", NpcID.BIRD)
-		 .put("bears", NpcID.BLACK_BEAR)
+         //Remove from list so that it uses the fallback name since bears is a generic slayer task with multiple possible monsters
+		 //.put("bears", NpcID.BLACK_BEAR)
 		 .put("black demons", NpcID.BLACK_DEMON)
 		 .put("black dragons", NpcID.BLACK_DRAGON)
 		 .put("black knights", NpcID.BLACK_KNIGHT)
@@ -179,7 +180,7 @@ public class SlayerWikiPlugin extends Plugin
 		 .put("dust devils", NpcID.DUST_DEVIL)
 		 .build();
 
-	static final HttpUrl WIKI_BASE = HttpUrl.parse("https://oldschool.runescape.wiki/w/Special:Lookup?type=npc&id=");
+	static final HttpUrl WIKI_BASE = HttpUrl.parse("https://oldschool.runescape.wiki/w/Special:Lookup?type=npc");
 
 	@Inject
 	private Client client;
