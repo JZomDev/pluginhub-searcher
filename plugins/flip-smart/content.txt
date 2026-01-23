@@ -1,5 +1,168 @@
 package com.flipsmart;
 
+import com.google.gson.annotations.SerializedName;
+import lombok.Data;
+
+/**
+ * Represents a market dump event from the Flip Smart API.
+ * A dump is a sudden price drop (≥5%) with high trading volume.
+ */
+@Data
+public class DumpEvent
+{
+	/**
+	 * Unique identifier for this dump event
+	 */
+	private int id;
+
+	/**
+	 * OSRS item ID
+	 */
+	@SerializedName("item_id")
+	private int itemId;
+
+	/**
+	 * Item name
+	 */
+	@SerializedName("item_name")
+	private String itemName;
+
+	/**
+	 * Price before the dump
+	 */
+	@SerializedName("previous_price")
+	private int previousPrice;
+
+	/**
+	 * Price after the dump (current instant-sell price)
+	 */
+	@SerializedName("current_price")
+	private int currentPrice;
+
+	/**
+	 * Percentage drop (e.g., 5.5 for a 5.5% drop)
+	 */
+	@SerializedName("price_drop_percent")
+	private double priceDropPercent;
+
+	/**
+	 * Type of price change: "dump" (decrease) or "pump" (increase)
+	 */
+	@SerializedName("price_change_type")
+	private String priceChangeType;
+
+	/**
+	 * Current instant-sell price (buy price for players)
+	 */
+	@SerializedName("buy_price")
+	private int buyPrice;
+
+	/**
+	 * Current instant-buy price (sell price for players)
+	 */
+	@SerializedName("sell_price")
+	private int sellPrice;
+
+	/**
+	 * Net margin after GE tax
+	 */
+	private int margin;
+
+	/**
+	 * 1-hour average price (may be null)
+	 */
+	@SerializedName("price_1h_avg")
+	private Integer price1hAvg;
+
+	/**
+	 * 24-hour average price (may be null)
+	 */
+	@SerializedName("price_24h_avg")
+	private Integer price24hAvg;
+
+	/**
+	 * Estimated 24-hour trading volume
+	 */
+	@SerializedName("volume_24h")
+	private int volume24h;
+
+	/**
+	 * GE buy limit for this item (may be null)
+	 */
+	@SerializedName("buy_limit")
+	private Integer buyLimit;
+
+	/**
+	 * Estimated profit (margin × buy_limit, may be null)
+	 */
+	@SerializedName("estimated_profit")
+	private Integer estimatedProfit;
+
+	/**
+	 * When the dump was detected (ISO 8601 timestamp string)
+	 */
+	@SerializedName("dump_detected_at")
+	private String dumpDetectedAt;
+
+	/**
+	 * Format the dump as a chat message
+	 */
+	public String toChatMessage()
+	{
+		String profitStr = estimatedProfit != null
+			? String.format("~%s", formatGP(estimatedProfit))
+			: "Unknown";
+
+		String eventType = "pump".equalsIgnoreCase(priceChangeType) ? "PUMP" : "DUMP";
+		String changeSymbol = "pump".equalsIgnoreCase(priceChangeType) ? "+" : "-";
+
+		return String.format(
+			"%s: %s (%s%.1f%%) - Buy: %s | Sell: %s | Limit: %s | Profit: %s",
+			eventType,
+			itemName,
+			changeSymbol,
+			priceDropPercent,
+			formatGP(buyPrice),
+			formatGP(sellPrice),
+			buyLimit != null ? String.format("%,d", buyLimit) : "Unknown",
+			profitStr
+		);
+	}
+
+	/**
+	 * Format GP with commas
+	 */
+	private static String formatGP(int value)
+	{
+		return String.format("%,d", value);
+	}
+}
+
+package com.flipsmart;
+
+import com.google.gson.annotations.SerializedName;
+import lombok.Data;
+
+/**
+ * Response from checking bank snapshot rate limit status
+ */
+@Data
+public class BankSnapshotStatusResponse
+{
+	@SerializedName("can_snapshot")
+	private boolean canSnapshot;
+
+	@SerializedName("next_snapshot_available")
+	private String nextSnapshotAvailable;
+
+	@SerializedName("hours_until_available")
+	private Double hoursUntilAvailable;
+
+	private String message;
+}
+
+package com.flipsmart;
+
 import net.runelite.api.Client;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
@@ -582,6 +745,262 @@ public class GrandExchangeOverlay extends Overlay
 
 package com.flipsmart;
 
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Service for polling market dumps and posting chat alerts
+ */
+@Slf4j
+@Singleton
+public class DumpAlertService
+{
+	private final Client client;
+	private final FlipSmartConfig config;
+	private final FlipSmartApiClient apiClient;
+	private final ChatMessageManager chatMessageManager;
+
+	// Track when we last alerted for each item (itemId -> timestamp)
+	private final Map<Integer, Long> itemAlertCooldowns = new HashMap<>();
+
+	private ScheduledExecutorService executor;
+	private ScheduledFuture<?> pollingTask;
+
+	@Inject
+	public DumpAlertService(
+		Client client,
+		FlipSmartConfig config,
+		FlipSmartApiClient apiClient,
+		ChatMessageManager chatMessageManager
+	)
+	{
+		this.client = client;
+		this.config = config;
+		this.apiClient = apiClient;
+		this.chatMessageManager = chatMessageManager;
+	}
+
+	/**
+	 * Start the dump alert service
+	 */
+	public void start()
+	{
+		if (!config.enableDumpAlerts())
+		{
+			log.debug("Dump alerts disabled in config, not starting");
+			return;
+		}
+
+		// Stop any existing task
+		stop();
+
+		int intervalSeconds = Math.max(30, Math.min(300, config.dumpAlertInterval()));
+
+		log.info("Starting dump alert service with {}s interval", intervalSeconds);
+
+		if (executor == null || executor.isShutdown())
+		{
+			executor = Executors.newSingleThreadScheduledExecutor();
+		}
+
+		pollingTask = executor.scheduleAtFixedRate(() ->
+		{
+			try
+			{
+				checkForDumps();
+			}
+			catch (Exception e)
+			{
+				log.error("Error checking for dumps", e);
+			}
+		}, 5, intervalSeconds, TimeUnit.SECONDS);
+	}
+
+	/**
+	 * Stop the dump alert service
+	 */
+	public void stop()
+	{
+		if (pollingTask != null)
+		{
+			log.info("Stopping dump alert service");
+			pollingTask.cancel(false);
+			pollingTask = null;
+		}
+		if (executor != null)
+		{
+			executor.shutdownNow();
+			executor = null;
+		}
+	}
+
+	/**
+	 * Restart the service (called when config changes)
+	 */
+	public void restart()
+	{
+		stop();
+		start();
+	}
+
+	/**
+	 * Check for new dumps and post alerts
+	 */
+	private void checkForDumps()
+	{
+		if (!config.enableDumpAlerts() || client.getGameState() != GameState.LOGGED_IN)
+		{
+			return;
+		}
+
+		int minProfit = config.dumpAlertMinProfit();
+		int maxCount = Math.max(1, Math.min(50, config.dumpAlertMaxCount()));
+		int cooldownMinutes = Math.max(0, Math.min(1440, config.dumpAlertCooldownMinutes()));
+		long cooldownMs = cooldownMinutes * 60 * 1000L;
+		long currentTime = System.currentTimeMillis();
+
+		log.debug("Checking for dumps (minProfit: {}, maxCount: {}, cooldown: {}m)",
+			minProfit, maxCount, cooldownMinutes);
+
+		// Cleanup expired cooldowns first
+		itemAlertCooldowns.entrySet().removeIf(entry ->
+			currentTime - entry.getValue() > cooldownMs);
+
+		// Sort by profit or recency based on config
+		String sortBy = config.dumpAlertSortByProfit() ? "profit" : "recency";
+
+		apiClient.getDumpsAsync(
+			sortBy,
+			minProfit,
+			50, // Fetch up to 50 recent dumps
+			dumps ->
+			{
+				if (dumps == null || dumps.length == 0)
+				{
+					log.debug("No dumps returned from API");
+					return;
+				}
+
+				log.debug("Received {} dumps from API", dumps.length);
+
+				FlipSmartConfig.PriceAlertType alertType = config.priceAlertType();
+
+				int alertCount = 0;
+				for (DumpEvent dump : dumps)
+				{
+					// Stop once we've alerted on the max count
+					if (alertCount >= maxCount)
+					{
+						break;
+					}
+
+					// Filter by price change type based on config
+					String changeType = dump.getPriceChangeType();
+					boolean isDump = "dump".equalsIgnoreCase(changeType);
+					boolean isPump = "pump".equalsIgnoreCase(changeType);
+
+					// Skip if it doesn't match the configured alert type
+					if (alertType == FlipSmartConfig.PriceAlertType.DUMPS_ONLY && !isDump)
+					{
+						log.debug("Skipping {} - is a pump but alerts set to dumps only", dump.getItemName());
+						continue;
+					}
+					if (alertType == FlipSmartConfig.PriceAlertType.PUMPS_ONLY && !isPump)
+					{
+						log.debug("Skipping {} - is a dump but alerts set to pumps only", dump.getItemName());
+						continue;
+					}
+
+					int itemId = dump.getItemId();
+
+					// Check if item is on cooldown
+					if (itemAlertCooldowns.containsKey(itemId))
+					{
+						long lastAlertTime = itemAlertCooldowns.get(itemId);
+						long timeSinceAlert = currentTime - lastAlertTime;
+
+						if (timeSinceAlert < cooldownMs)
+						{
+							long minutesRemaining = (cooldownMs - timeSinceAlert) / 60000;
+							log.debug("Skipping {} - on cooldown for {} more minutes",
+								dump.getItemName(), minutesRemaining);
+							continue;
+						}
+					}
+
+					// Mark item as alerted with current timestamp
+					itemAlertCooldowns.put(itemId, currentTime);
+
+					// Post to game chat
+					postDumpAlert(dump);
+					alertCount++;
+				}
+
+				log.debug("Posted {} new dump alerts", alertCount);
+
+				// Cleanup if map gets too large (shouldn't happen often with cooldown cleanup)
+				if (itemAlertCooldowns.size() > 500)
+				{
+					log.debug("Cleaning up item cooldowns (size: {})", itemAlertCooldowns.size());
+					// Remove oldest entries
+					long cutoffTime = currentTime - cooldownMs;
+					itemAlertCooldowns.entrySet().removeIf(entry -> entry.getValue() < cutoffTime);
+				}
+			},
+			error -> log.warn("Failed to fetch dumps: {}", error)
+		);
+	}
+
+	/**
+	 * Post a dump alert to game chat
+	 */
+	private void postDumpAlert(DumpEvent dump)
+	{
+		String message = new ChatMessageBuilder()
+			.append(ChatColorType.HIGHLIGHT)
+			.append("[Flip Smart] ")
+			.append(ChatColorType.NORMAL)
+			.append(dump.toChatMessage())
+			.build();
+
+		chatMessageManager.queue(QueuedMessage.builder()
+			.type(ChatMessageType.CONSOLE)
+			.runeLiteFormattedMessage(message)
+			.build());
+
+		log.info("Posted dump alert: {} ({}% drop, {} profit)",
+			dump.getItemName(),
+			String.format("%.1f", dump.getPriceDropPercent()),
+			dump.getEstimatedProfit() != null ? dump.getEstimatedProfit() + "gp" : "unknown");
+	}
+
+	/**
+	 * Clear the item cooldown tracking (useful for testing or after long periods)
+	 */
+	public void clearItemCooldowns()
+	{
+		itemAlertCooldowns.clear();
+		log.debug("Cleared item cooldowns");
+	}
+}
+
+package com.flipsmart;
+
 import com.google.gson.annotations.SerializedName;
 import lombok.Data;
 
@@ -828,13 +1247,13 @@ import net.runelite.client.ui.ColorScheme;
 import net.runelite.client.ui.PluginPanel;
 import net.runelite.client.ui.components.PluginErrorPanel;
 import net.runelite.client.util.AsyncBufferedImage;
+import net.runelite.client.util.LinkBrowser;
 
 import javax.swing.*;
 import javax.swing.border.EmptyBorder;
 import java.awt.*;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
-import java.net.URI;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeParseException;
@@ -870,6 +1289,8 @@ public class FlipFinderPanel extends PluginPanel
 	private static final String UNKNOWN_RATING = "Unknown";
 	private static final String LIQUIDITY_NA = "Liquidity: N/A";
 	private static final String RISK_NA = "Risk: N/A";
+	private static final String MSG_LOGIN_TO_RUNESCAPE = "Log in to RuneScape";
+	private static final String MSG_LOGIN_INSTRUCTION = "<html><center>Log in to the game to get<br>flip suggestions and track your flips</center></html>";
 	
 	// Colors for focused/selected items
 	private static final Color COLOR_FOCUSED_BORDER = new Color(0, 200, 220);
@@ -1142,8 +1563,8 @@ public class FlipFinderPanel extends PluginPanel
 		mainPanel = new JPanel(new BorderLayout());
 		mainPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
 
-		// Header panel
-		JPanel headerPanel = new JPanel(new BorderLayout());
+		// Header panel with even spacing between title and buttons
+		JPanel headerPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 8, 0));
 		headerPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
 		headerPanel.setBorder(new EmptyBorder(10, 10, 10, 10));
 
@@ -1151,28 +1572,20 @@ public class FlipFinderPanel extends PluginPanel
 		titleLabel.setForeground(Color.WHITE);
 		titleLabel.setFont(FONT_BOLD_16);
 
-		// Right side buttons panel (logout + refresh)
-		JPanel rightButtonsPanel = new JPanel(new FlowLayout(FlowLayout.RIGHT, 5, 0));
-		rightButtonsPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-
-		// Logout button
+		// Logout button with compact styling
 		JButton logoutButton = new JButton("Logout");
 		logoutButton.setFocusable(false);
-		logoutButton.setFont(new Font(FONT_ARIAL, Font.PLAIN, 11));
-		logoutButton.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		logoutButton.setForeground(Color.LIGHT_GRAY);
-		logoutButton.setBorder(BorderFactory.createEmptyBorder(3, 8, 3, 8));
-		logoutButton.setCursor(new Cursor(Cursor.HAND_CURSOR));
+		logoutButton.setMargin(new Insets(2, 4, 2, 4));
 		logoutButton.addActionListener(e -> handleLogout());
 
+		// Refresh button with compact styling
 		refreshButton.setFocusable(false);
+		refreshButton.setMargin(new Insets(2, 4, 2, 4));
 		refreshButton.addActionListener(e -> refresh(true));
 
-		rightButtonsPanel.add(logoutButton);
-		rightButtonsPanel.add(refreshButton);
-
-		headerPanel.add(titleLabel, BorderLayout.WEST);
-		headerPanel.add(rightButtonsPanel, BorderLayout.EAST);
+		headerPanel.add(titleLabel);
+		headerPanel.add(logoutButton);
+		headerPanel.add(refreshButton);
 
 		// Controls panel (flip style dropdown)
 		JPanel controlsPanel = new JPanel(new BorderLayout());
@@ -1344,8 +1757,30 @@ public class FlipFinderPanel extends PluginPanel
 			}
 		});
 
+		// Footer panel with website link
+		JPanel footerPanel = new JPanel(new FlowLayout(FlowLayout.CENTER, 0, 5));
+		footerPanel.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		footerPanel.setBorder(new EmptyBorder(0, 0, 5, 0));
+
+		JLabel websiteLink = new JLabel("Flip Smart Website");
+		websiteLink.setForeground(new Color(100, 180, 255));
+		websiteLink.setFont(new Font(FONT_ARIAL, Font.PLAIN, 14));
+		websiteLink.setCursor(new Cursor(Cursor.HAND_CURSOR));
+		websiteLink.setToolTipText("Visit our website to view your flips and track your performance");
+		websiteLink.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				LinkBrowser.browse("https://flipsmart.net");
+			}
+		});
+
+		footerPanel.add(websiteLink);
+
 		mainPanel.add(topPanel, BorderLayout.NORTH);
 		mainPanel.add(tabbedPane, BorderLayout.CENTER);
+		mainPanel.add(footerPanel, BorderLayout.SOUTH);
 	}
 
 	/**
@@ -1510,26 +1945,15 @@ public class FlipFinderPanel extends PluginPanel
 			// Store device code for polling
 			currentDeviceCode = response.getDeviceCode();
 			
-			// Open browser with verification URL
-			try
-			{
-				Desktop.getDesktop().browse(new URI(response.getVerificationUrl()));
-				
-				SwingUtilities.invokeLater(() ->
-					showLoginStatus("Complete login in your browser...", true));
-				
-				// Start polling for completion
-				startDeviceAuthPolling(response.getDeviceCode(), response.getPollInterval(), response.getExpiresIn());
-			}
-			catch (Exception e)
-			{
-				log.error("Failed to open browser: {}", e.getMessage());
-				SwingUtilities.invokeLater(() ->
-				{
-					setLoginButtonsEnabled(true);
-					showLoginStatus("Failed to open browser", false);
-				});
-			}
+			// Open browser with verification URL using RuneLite's LinkBrowser
+            // which properly handles sandboxed environments (Flatpak, etc.)
+            LinkBrowser.browse(response.getVerificationUrl());
+
+        	SwingUtilities.invokeLater(() ->
+            	showLoginStatus("Complete login in your browser...", true));
+
+		   // Start polling for completion
+		   startDeviceAuthPolling(response.getDeviceCode(), response.getPollInterval(), response.getExpiresIn());
 		});
 	}
 	
@@ -1723,6 +2147,15 @@ public class FlipFinderPanel extends PluginPanel
 	 */
 	public void refresh(boolean shuffleSuggestions)
 	{
+		// Skip API calls if player is not logged into RuneScape
+		// This saves API requests and battery when at the login screen
+		if (!plugin.isLoggedIntoRunescape())
+		{
+			log.debug("Skipping refresh - player not logged into RuneScape");
+			showLoggedOutOfGameState();
+			return;
+		}
+		
 		// Skip recommendations refresh during auto-refresh if user is focused on a flip
 		// This prevents the focused item from disappearing while user is mid-transaction
 		// Manual refresh (shuffleSuggestions=true) always refreshes
@@ -2052,35 +2485,12 @@ public class FlipFinderPanel extends PluginPanel
 	private void showNoCompletedFlips()
 	{
 		completedFlipsListContainer.removeAll();
-
-		JPanel emptyPanel = new JPanel();
-		emptyPanel.setLayout(new BoxLayout(emptyPanel, BoxLayout.Y_AXIS));
-		emptyPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		emptyPanel.setBorder(new EmptyBorder(60, 15, 60, 15));
-		// Ensure panel fills width in BoxLayout
-		emptyPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		emptyPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
-
-		JLabel titleLabel = new JLabel("No completed flips");
-		titleLabel.setForeground(Color.WHITE);
-		titleLabel.setFont(FONT_BOLD_16);
-		titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
-		titleLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-
-		JLabel instructionLabel = new JLabel("<html><center>Complete your first flip to see<br>it here! Buy and sell items to<br>track your profits</center></html>");
-		instructionLabel.setForeground(COLOR_TEXT_DIM_GRAY);
-		instructionLabel.setFont(FONT_PLAIN_12);
-		instructionLabel.setHorizontalAlignment(SwingConstants.CENTER);
-		instructionLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-
-		emptyPanel.add(titleLabel);
-		emptyPanel.add(Box.createRigidArea(new Dimension(0, 15)));
-		emptyPanel.add(instructionLabel);
-
-		completedFlipsListContainer.add(emptyPanel);
-
+		completedFlipsListContainer.add(createEmptyStatePanel(
+			"No completed flips",
+			"<html><center>Complete your first flip to see<br>it here! Buy and sell items to<br>track your profits</center></html>",
+			60
+		));
 		statusLabel.setText("0 completed flips");
-
 		completedFlipsListContainer.revalidate();
 		completedFlipsListContainer.repaint();
 	}
@@ -2247,29 +2657,30 @@ public class FlipFinderPanel extends PluginPanel
 	}
 
 	/**
-	 * Show message when there are no active flips
+	 * Create an empty state panel with a title and instruction message.
+	 * This is a helper to reduce code duplication across empty state displays.
+	 * 
+	 * @param title The main title text
+	 * @param instruction The instruction/explanation HTML text
+	 * @param topPadding Top padding for the panel
+	 * @return A configured empty state panel
 	 */
-	private void showNoActiveFlips()
+	private JPanel createEmptyStatePanel(String title, String instruction, int topPadding)
 	{
-		activeFlipsListContainer.removeAll();
-
 		JPanel emptyPanel = new JPanel();
 		emptyPanel.setLayout(new BoxLayout(emptyPanel, BoxLayout.Y_AXIS));
 		emptyPanel.setBackground(ColorScheme.DARK_GRAY_COLOR);
-		emptyPanel.setBorder(new EmptyBorder(60, 15, 60, 15));
-		// Ensure panel fills width in BoxLayout
+		emptyPanel.setBorder(new EmptyBorder(topPadding, 15, topPadding, 15));
 		emptyPanel.setAlignmentX(Component.LEFT_ALIGNMENT);
 		emptyPanel.setMaximumSize(new Dimension(Integer.MAX_VALUE, Integer.MAX_VALUE));
 
-		// Main message
-		JLabel titleLabel = new JLabel("No active flips");
+		JLabel titleLabel = new JLabel(title);
 		titleLabel.setForeground(Color.WHITE);
 		titleLabel.setFont(FONT_BOLD_16);
 		titleLabel.setHorizontalAlignment(SwingConstants.CENTER);
 		titleLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
 
-		// Instructions - use smaller text to fit better
-		JLabel instructionLabel = new JLabel("<html><center>Buy items from the Recommended<br>tab to start tracking your flips</center></html>");
+		JLabel instructionLabel = new JLabel(instruction);
 		instructionLabel.setForeground(COLOR_TEXT_DIM_GRAY);
 		instructionLabel.setFont(FONT_PLAIN_12);
 		instructionLabel.setHorizontalAlignment(SwingConstants.CENTER);
@@ -2279,11 +2690,46 @@ public class FlipFinderPanel extends PluginPanel
 		emptyPanel.add(Box.createRigidArea(new Dimension(0, 15)));
 		emptyPanel.add(instructionLabel);
 
-		activeFlipsListContainer.add(emptyPanel);
+		return emptyPanel;
+	}
 
-		// Update status label
+	/**
+	 * Show message when player is logged out of RuneScape (at login screen).
+	 * This saves API requests and battery by not polling while the player can't use the GE anyway.
+	 */
+	public void showLoggedOutOfGameState()
+	{
+		statusLabel.setText(MSG_LOGIN_TO_RUNESCAPE);
+		
+		// Update all tabs with logged out message
+		recommendedListContainer.removeAll();
+		recommendedListContainer.add(createEmptyStatePanel(MSG_LOGIN_TO_RUNESCAPE, MSG_LOGIN_INSTRUCTION, 80));
+		recommendedListContainer.revalidate();
+		recommendedListContainer.repaint();
+		
+		activeFlipsListContainer.removeAll();
+		activeFlipsListContainer.add(createEmptyStatePanel(MSG_LOGIN_TO_RUNESCAPE, MSG_LOGIN_INSTRUCTION, 80));
+		activeFlipsListContainer.revalidate();
+		activeFlipsListContainer.repaint();
+		
+		completedFlipsListContainer.removeAll();
+		completedFlipsListContainer.add(createEmptyStatePanel(MSG_LOGIN_TO_RUNESCAPE, MSG_LOGIN_INSTRUCTION, 80));
+		completedFlipsListContainer.revalidate();
+		completedFlipsListContainer.repaint();
+	}
+
+	/**
+	 * Show message when there are no active flips
+	 */
+	private void showNoActiveFlips()
+	{
+		activeFlipsListContainer.removeAll();
+		activeFlipsListContainer.add(createEmptyStatePanel(
+			"No active flips",
+			"<html><center>Buy items from the Recommended<br>tab to start tracking your flips</center></html>",
+			60
+		));
 		statusLabel.setText("0 active flips");
-
 		activeFlipsListContainer.revalidate();
 		activeFlipsListContainer.repaint();
 	}
@@ -5183,6 +5629,101 @@ public interface FlipSmartConfig extends Config
 	}
 
 	// ============================================
+	// Market Dumps Section
+	// ============================================
+	@ConfigSection(
+		name = "Market Dumps",
+		description = "Real-time alerts for sudden price drops in the Grand Exchange",
+		position = 4,
+		closedByDefault = false
+	)
+	String marketDumpsSection = "marketDumps";
+
+	@ConfigItem(
+		keyName = "enableDumpAlerts",
+		name = "Enable Price Alerts",
+		description = "Show chat alerts when significant price changes are detected (≥5% price changes with high volume)",
+		section = marketDumpsSection,
+		position = 0
+	)
+	default boolean enableDumpAlerts()
+	{
+		return false;
+	}
+
+	@ConfigItem(
+		keyName = "priceAlertType",
+		name = "Alert Type",
+		description = "Type of price changes to alert: Dumps (decreases), Pumps (increases), or Both",
+		section = marketDumpsSection,
+		position = 1
+	)
+	default PriceAlertType priceAlertType()
+	{
+		return PriceAlertType.DUMPS_ONLY;
+	}
+
+	@ConfigItem(
+		keyName = "dumpAlertMinProfit",
+		name = "Minimum Profit",
+		description = "Only alert for price changes with estimated profit above this amount (in GP)",
+		section = marketDumpsSection,
+		position = 2
+	)
+	default int dumpAlertMinProfit()
+	{
+		return 0;
+	}
+
+	@ConfigItem(
+		keyName = "dumpAlertInterval",
+		name = "Check Interval (seconds)",
+		description = "How often to check for new price changes (30-300 seconds)",
+		section = marketDumpsSection,
+		position = 3
+	)
+	default int dumpAlertInterval()
+	{
+		return 60;
+	}
+
+	@ConfigItem(
+		keyName = "dumpAlertMaxCount",
+		name = "Max Alerts Per Check",
+		description = "Only show the top X most profitable price changes per check (1-50)",
+		section = marketDumpsSection,
+		position = 4
+	)
+	default int dumpAlertMaxCount()
+	{
+		return 5;
+	}
+
+	@ConfigItem(
+		keyName = "dumpAlertCooldownMinutes",
+		name = "Item Cooldown (minutes)",
+		description = "Don't re-alert for the same item within this many minutes (0-1440)",
+		section = marketDumpsSection,
+		position = 5
+	)
+	default int dumpAlertCooldownMinutes()
+	{
+		return 60;
+	}
+
+	@ConfigItem(
+		keyName = "dumpAlertSortByProfit",
+		name = "Sort by Profit",
+		description = "Sort alerts by estimated profit instead of recency (most recent first)",
+		section = marketDumpsSection,
+		position = 6
+	)
+	default boolean dumpAlertSortByProfit()
+	{
+		return false;
+	}
+
+	// ============================================
 	// General Section
 	// ============================================
 	@ConfigSection(
@@ -5254,6 +5795,29 @@ public interface FlipSmartConfig extends Config
 			return displayName;
 		}
 	}
+
+	// ============================================
+	// Price Alert Type Enum
+	// ============================================
+	enum PriceAlertType
+	{
+		DUMPS_ONLY("Dumps Only"),
+		PUMPS_ONLY("Pumps Only"),
+		BOTH("Both");
+
+		private final String displayName;
+
+		PriceAlertType(String displayName)
+		{
+			this.displayName = displayName;
+		}
+
+		@Override
+		public String toString()
+		{
+			return displayName;
+		}
+	}
 }
 
 
@@ -5264,12 +5828,15 @@ import com.google.gson.reflect.TypeToken;
 import com.google.inject.Provides;
 import lombok.Getter;
 import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
 import net.runelite.api.Client;
 import net.runelite.api.GameState;
 import net.runelite.api.GrandExchangeOffer;
 import net.runelite.api.GrandExchangeOfferState;
+import net.runelite.api.InventoryID;
 import net.runelite.api.Item;
 import net.runelite.api.ItemContainer;
+import net.runelite.api.ItemComposition;
 import net.runelite.api.events.GameStateChanged;
 import net.runelite.api.events.GrandExchangeOfferChanged;
 import net.runelite.api.events.ItemContainerChanged;
@@ -5278,6 +5845,10 @@ import net.runelite.api.ScriptID;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.input.MouseListener;
 import net.runelite.client.input.MouseManager;
@@ -5345,6 +5916,12 @@ public class FlipSmartPlugin extends Plugin
 	@Inject
 	private Gson gson;
 
+	@Inject
+	private DumpAlertService dumpAlertService;
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
 	// Flip Finder panel
 	private FlipFinderPanel flipFinderPanel;
 	private net.runelite.client.ui.NavigationButton flipFinderNavButton;
@@ -5379,12 +5956,21 @@ public class FlipSmartPlugin extends Plugin
 	@Getter
 	private String currentRsn = null;
 	
+	// Track if player is logged into RuneScape (not our API, but the game itself)
+	@Getter
+	private boolean loggedIntoRunescape = false;
+	
 	// Track items collected from GE in current session (waiting to be sold)
 	// These should show as active flips even though they're no longer in GE slots
 	private final java.util.Set<Integer> collectedItemIds = ConcurrentHashMap.newKeySet();
 	
 	// Flip Assist input listener for hotkey handling
 	private FlipAssistInputListener flipAssistInputListener;
+	
+	// Bank snapshot tracking
+	private volatile boolean bankSnapshotInProgress = false;
+	private long lastBankSnapshotAttempt = 0;
+	private static final long BANK_SNAPSHOT_COOLDOWN_MS = 60_000; // 1 minute cooldown between attempts
 
 	/**
 	 * Helper class to track GE offers (serializable for persistence)
@@ -5665,7 +6251,10 @@ public class FlipSmartPlugin extends Plugin
 
 		// Start auto-refresh timer for flip finder
 		startFlipFinderRefreshTimer();
-		
+
+		// Start dump alert service
+		dumpAlertService.start();
+
 		// Note: Cash stack and RSN will be synced when player logs in via onGameStateChanged
 		// Don't access client data during startup - must be on client thread
 	}
@@ -5708,7 +6297,10 @@ public class FlipSmartPlugin extends Plugin
 		
 		// Stop auto-refresh timer
 		stopFlipFinderRefreshTimer();
-		
+
+		// Stop dump alert service
+		dumpAlertService.stop();
+
 		// Clear API client cache
 		apiClient.clearCache();
 	}
@@ -5727,15 +6319,23 @@ public class FlipSmartPlugin extends Plugin
 			log.debug("Login state change detected, setting lastLoginTick to {}", lastLoginTick);
 		}
 		
-		// Persist offer state when logging out
+		// Persist offer state when logging out and show "log in to game" message
 		if (gameState == GameState.LOGIN_SCREEN)
 		{
+			loggedIntoRunescape = false;
 			persistOfferState();
+			
+			// Update panel to show logged out state (saves API requests while at login screen)
+			if (flipFinderPanel != null)
+			{
+				javax.swing.SwingUtilities.invokeLater(() -> flipFinderPanel.showLoggedOutOfGameState());
+			}
 		}
 		
 		if (gameState == GameState.LOGGED_IN)
 		{
 			log.info("Player logged in");
+			loggedIntoRunescape = true;
 			syncRSN();
 			updateCashStack();
 			
@@ -6501,13 +7101,234 @@ public class FlipSmartPlugin extends Plugin
 	@Subscribe
 	public void onItemContainerChanged(ItemContainerChanged event)
 	{
-		// Only process inventory changes
-		if (event.getContainerId() != 93) // 93 is the inventory container ID
+		int containerId = event.getContainerId();
+		
+		// Handle inventory changes
+		if (containerId == INVENTORY_CONTAINER_ID)
+		{
+			updateCashStack();
+			return;
+		}
+		
+		// Handle bank container changes (bank opened/updated)
+		if (containerId == InventoryID.BANK.getId())
+		{
+			onBankContainerChanged();
+		}
+	}
+	
+	/**
+	 * Handle bank container changes - attempt to capture snapshot when bank is opened.
+	 */
+	private void onBankContainerChanged()
+	{
+		// Don't attempt if snapshot is already in progress
+		if (bankSnapshotInProgress)
 		{
 			return;
 		}
-
-		updateCashStack();
+		
+		// Enforce local cooldown to prevent spam
+		long now = System.currentTimeMillis();
+		if (now - lastBankSnapshotAttempt < BANK_SNAPSHOT_COOLDOWN_MS)
+		{
+			return;
+		}
+		
+		// Must be logged in and have RSN
+		String rsn = getCurrentRsnSafe().orElse(null);
+		if (rsn == null)
+		{
+			return;
+		}
+		
+		// Must be authenticated
+		if (!apiClient.isAuthenticated())
+		{
+			return;
+		}
+		
+		lastBankSnapshotAttempt = now;
+		bankSnapshotInProgress = true;
+		
+		// Check rate limit first
+		apiClient.checkBankSnapshotStatusAsync(rsn).thenAccept(status ->
+		{
+			if (status == null)
+			{
+				log.debug("Failed to check bank snapshot status");
+				postBankSnapshotMessage("Failed to check snapshot status - will retry", true);
+				bankSnapshotInProgress = false;
+				// Reset cooldown on failure to allow retry
+				lastBankSnapshotAttempt = 0;
+				return;
+			}
+			
+			if (!status.isCanSnapshot())
+			{
+				log.debug("Bank snapshot not available: {}", status.getMessage());
+				// Don't spam the user - only show message if they might be expecting a snapshot
+				// The rate limit message from server contains the next available time
+				bankSnapshotInProgress = false;
+				return;
+			}
+			
+			// Rate limit passed - capture the snapshot on client thread
+			clientThread.invokeLater(() -> captureBankSnapshot(rsn));
+		}).exceptionally(e ->
+		{
+			log.debug("Error checking bank snapshot status: {}", e.getMessage());
+			postBankSnapshotMessage("Connection error - will retry", true);
+			bankSnapshotInProgress = false;
+			// Reset cooldown on network failure to allow retry
+			lastBankSnapshotAttempt = 0;
+			return null;
+		});
+	}
+	
+	/**
+	 * Capture the current bank contents and send to API.
+	 * Must be called on client thread.
+	 */
+	private void captureBankSnapshot(String rsn)
+	{
+		try
+		{
+			java.util.List<FlipSmartApiClient.BankItem> items = collectTradeableBankItems();
+			
+			if (items == null || items.isEmpty())
+			{
+				bankSnapshotInProgress = false;
+				return;
+			}
+			
+			log.info("Capturing bank snapshot: {} tradeable items for RSN {}", items.size(), rsn);
+			
+			// Send snapshot to API
+			apiClient.createBankSnapshotAsync(rsn, items).thenAccept(response ->
+			{
+				if (response != null)
+				{
+					String valueStr = String.format("%,d", response.getTotalValue());
+					log.info("Bank snapshot captured: {} items worth {} GP", 
+						response.getItemCount(), valueStr);
+					postBankSnapshotMessage(
+						String.format("Bank snapshot saved: %,d items worth %s GP", 
+							response.getItemCount(), valueStr), 
+						false);
+				}
+				else
+				{
+					log.debug("Failed to create bank snapshot");
+					postBankSnapshotMessage("Failed to save bank snapshot", true);
+				}
+				bankSnapshotInProgress = false;
+			}).exceptionally(e ->
+			{
+				log.debug("Error creating bank snapshot: {}", e.getMessage());
+				postBankSnapshotMessage("Connection error - will retry", true);
+				bankSnapshotInProgress = false;
+				// Reset cooldown on network failure to allow retry
+				lastBankSnapshotAttempt = 0;
+				return null;
+			});
+		}
+		catch (Exception e)
+		{
+			log.error("Error capturing bank snapshot: {}", e.getMessage());
+			postBankSnapshotMessage("Error capturing bank data", true);
+			bankSnapshotInProgress = false;
+		}
+	}
+	
+	/**
+	 * Post a bank snapshot message to game chat.
+	 * @param message The message to display (without prefix)
+	 * @param isError Whether this is an error message (changes color)
+	 */
+	private void postBankSnapshotMessage(String message, boolean isError)
+	{
+		ChatMessageBuilder builder = new ChatMessageBuilder()
+			.append(ChatColorType.HIGHLIGHT)
+			.append("[Flip Smart] ")
+			.append(isError ? ChatColorType.HIGHLIGHT : ChatColorType.NORMAL)
+			.append(message);
+		
+		chatMessageManager.queue(QueuedMessage.builder()
+			.type(ChatMessageType.CONSOLE)
+			.runeLiteFormattedMessage(builder.build())
+			.build());
+	}
+	
+	/**
+	 * Collect all tradeable items from the bank with their GE prices.
+	 * @return List of bank items, or null if bank is unavailable/empty
+	 */
+	private java.util.List<FlipSmartApiClient.BankItem> collectTradeableBankItems()
+	{
+		ItemContainer bank = client.getItemContainer(InventoryID.BANK);
+		if (bank == null)
+		{
+			log.debug("Bank container is null - bank may have been closed");
+			return null;
+		}
+		
+		Item[] bankItems = bank.getItems();
+		if (bankItems == null || bankItems.length == 0)
+		{
+			log.debug("Bank is empty");
+			return null;
+		}
+		
+		java.util.List<FlipSmartApiClient.BankItem> items = new java.util.ArrayList<>();
+		
+		for (Item item : bankItems)
+		{
+			FlipSmartApiClient.BankItem bankItem = toTradeableBankItem(item);
+			if (bankItem != null)
+			{
+				items.add(bankItem);
+			}
+		}
+		
+		if (items.isEmpty())
+		{
+			log.debug("No tradeable items with prices found in bank");
+		}
+		
+		return items;
+	}
+	
+	/**
+	 * Convert a bank item to a BankItem if it's tradeable and has a price.
+	 * @return BankItem or null if item should be skipped
+	 */
+	private FlipSmartApiClient.BankItem toTradeableBankItem(Item item)
+	{
+		int itemId = item.getId();
+		int quantity = item.getQuantity();
+		
+		// Skip empty slots and placeholder items
+		if (itemId <= 0 || quantity <= 0)
+		{
+			return null;
+		}
+		
+		// Get item composition to check if tradeable
+		ItemComposition comp = itemManager.getItemComposition(itemId);
+		if (comp == null || !comp.isTradeable())
+		{
+			return null;
+		}
+		
+		// Get GE price - itemManager uses cached wiki prices
+		int gePrice = itemManager.getItemPrice(itemId);
+		if (gePrice <= 0)
+		{
+			return null;
+		}
+		
+		return new FlipSmartApiClient.BankItem(itemId, quantity, gePrice);
 	}
 
 	@Subscribe
@@ -7119,6 +7940,14 @@ public class FlipSmartPlugin extends Plugin
 			@Override
 			public void run()
 			{
+				// Skip API calls if player is not logged into RuneScape
+				// This saves API requests and battery when at the login screen
+				if (!loggedIntoRunescape)
+				{
+					log.debug("Skipping auto-refresh - player not logged into RuneScape");
+					return;
+				}
+				
 				if (flipFinderPanel != null && config.showFlipFinder())
 				{
 					javax.swing.SwingUtilities.invokeLater(() ->
@@ -7245,6 +8074,7 @@ public class FlipSmartApiClient
 	private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
 	private static final String PRODUCTION_API_URL = "https://api.flipsm.art";
 	private static final String ACCESS_TOKEN_KEY = "access_token";
+	private static final String JSON_KEY_ITEM_ID = "item_id";
 	
 	private final OkHttpClient httpClient;
 	private final Gson gson;
@@ -8041,7 +8871,7 @@ public class FlipSmartApiClient
 		
 		// Create JSON body
 		JsonObject jsonBody = new JsonObject();
-		jsonBody.addProperty("item_id", request.itemId);
+		jsonBody.addProperty(JSON_KEY_ITEM_ID, request.itemId);
 		jsonBody.addProperty("item_name", request.itemName);
 		jsonBody.addProperty("is_buy", request.isBuy);
 		jsonBody.addProperty("quantity", request.quantity);
@@ -8251,7 +9081,7 @@ public class FlipSmartApiClient
 		String url = String.format("%s/transactions/active-flips/sync", apiUrl);
 		
 		JsonObject requestBody = new JsonObject();
-		requestBody.addProperty("item_id", itemId);
+		requestBody.addProperty(JSON_KEY_ITEM_ID, itemId);
 		requestBody.addProperty("filled_quantity", filledQuantity);
 		requestBody.addProperty("order_quantity", orderQuantity);
 		requestBody.addProperty("price_per_item", pricePerItem);
@@ -8343,6 +9173,85 @@ public class FlipSmartApiClient
 	}
 
 	/**
+	 * Response wrapper for dumps API
+	 */
+	public static class DumpsResponse
+	{
+		public DumpEvent[] dumps;
+		public int count;
+		public String sort_by;
+	}
+
+	/**
+	 * Fetch market dumps from the API asynchronously
+	 *
+	 * @param sortBy Sort order: "recency" or "profit"
+	 * @param minProfit Minimum profit threshold (0 for all)
+	 * @param limit Maximum number of dumps to return
+	 * @param onSuccess Callback with dumps array
+	 * @param onError Callback for error messages
+	 */
+	public void getDumpsAsync(String sortBy, int minProfit, int limit,
+	                          Consumer<DumpEvent[]> onSuccess,
+	                          Consumer<String> onError)
+	{
+		ensureAuthenticatedAsync().thenAccept(authSuccess ->
+		{
+			if (!authSuccess)
+			{
+				if (onError != null)
+				{
+					onError.accept("Authentication required");
+				}
+				return;
+			}
+
+			// Build query parameters
+			HttpUrl.Builder urlBuilder = HttpUrl.parse(getApiUrl() + "/dumps").newBuilder();
+			if (sortBy != null && !sortBy.isEmpty())
+			{
+				urlBuilder.addQueryParameter("sort_by", sortBy);
+			}
+			if (minProfit > 0)
+			{
+				urlBuilder.addQueryParameter("min_profit", String.valueOf(minProfit));
+			}
+			if (limit > 0)
+			{
+				urlBuilder.addQueryParameter("limit", String.valueOf(limit));
+			}
+
+			Request request = new Request.Builder()
+				.url(urlBuilder.build())
+				.header("Authorization", "Bearer " + jwtToken)
+				.get()
+				.build();
+
+			executeAsync(request,
+				body ->
+				{
+					DumpsResponse response = gson.fromJson(body, DumpsResponse.class);
+					if (onSuccess != null)
+					{
+						onSuccess.accept(response != null ? response.dumps : new DumpEvent[0]);
+					}
+					return null;
+				},
+				onError,
+				true // Retry on 401
+			);
+		});
+	}
+
+	/**
+	 * Fetch market dumps with default parameters (recency sort, no min profit, limit 50)
+	 */
+	public void getDumpsAsync(Consumer<DumpEvent[]> onSuccess, Consumer<String> onError)
+	{
+		getDumpsAsync("recency", 0, 50, onSuccess, onError);
+	}
+
+	/**
 	 * Clear the analysis cache
 	 */
 	public void clearCache()
@@ -8389,6 +9298,82 @@ public class FlipSmartApiClient
 		{
 			return System.currentTimeMillis() - timestamp > CACHE_DURATION_MS;
 		}
+	}
+
+	// ============================================================================
+	// Bank Snapshot API Methods
+	// ============================================================================
+
+	/**
+	 * Data class for bank snapshot item
+	 */
+	public static class BankItem
+	{
+		public final int itemId;
+		public final int quantity;
+		public final int valuePerItem;
+
+		public BankItem(int itemId, int quantity, int valuePerItem)
+		{
+			this.itemId = itemId;
+			this.quantity = quantity;
+			this.valuePerItem = valuePerItem;
+		}
+	}
+
+	/**
+	 * Check if a bank snapshot can be taken (rate limit check)
+	 *
+	 * @param rsn RuneScape Name to check
+	 * @return CompletableFuture with BankSnapshotStatusResponse
+	 */
+	public CompletableFuture<BankSnapshotStatusResponse> checkBankSnapshotStatusAsync(String rsn)
+	{
+		String apiUrl = getApiUrl();
+		String url = String.format("%s/bank/snapshot/status?rsn=%s", apiUrl, rsn);
+
+		Request.Builder requestBuilder = new Request.Builder()
+			.url(url)
+			.get();
+
+		return executeAuthenticatedAsync(requestBuilder, jsonData ->
+			gson.fromJson(jsonData, BankSnapshotStatusResponse.class));
+	}
+
+	/**
+	 * Create a bank snapshot with all items
+	 *
+	 * @param rsn RuneScape Name
+	 * @param items List of bank items with quantities and values
+	 * @return CompletableFuture with BankSnapshotResponse
+	 */
+	public CompletableFuture<BankSnapshotResponse> createBankSnapshotAsync(String rsn, java.util.List<BankItem> items)
+	{
+		String apiUrl = getApiUrl();
+		String url = String.format("%s/bank/snapshot", apiUrl);
+
+		// Build the request body
+		JsonObject requestBody = new JsonObject();
+		requestBody.addProperty("rsn", rsn);
+
+		com.google.gson.JsonArray itemsArray = new com.google.gson.JsonArray();
+		for (BankItem item : items)
+		{
+			JsonObject itemObj = new JsonObject();
+			itemObj.addProperty(JSON_KEY_ITEM_ID, item.itemId);
+			itemObj.addProperty("quantity", item.quantity);
+			itemObj.addProperty("value_per_item", item.valuePerItem);
+			itemsArray.add(itemObj);
+		}
+		requestBody.add("items", itemsArray);
+
+		RequestBody body = RequestBody.create(JSON, requestBody.toString());
+		Request.Builder requestBuilder = new Request.Builder()
+			.url(url)
+			.post(body);
+
+		return executeAuthenticatedAsync(requestBuilder, jsonData ->
+			gson.fromJson(jsonData, BankSnapshotResponse.class));
 	}
 }
 
@@ -8916,6 +9901,33 @@ public class ActiveFlipsResponse
 	private int totalInvested;
 }
 
+
+package com.flipsmart;
+
+import com.google.gson.annotations.SerializedName;
+import lombok.Data;
+
+/**
+ * Response from creating a bank snapshot
+ */
+@Data
+public class BankSnapshotResponse
+{
+	private int id;
+
+	private String rsn;
+
+	@SerializedName("total_value")
+	private long totalValue;
+
+	@SerializedName("item_count")
+	private int itemCount;
+
+	@SerializedName("snapshot_time")
+	private String snapshotTime;
+
+	private String message;
+}
 
 package com.flipsmart;
 
