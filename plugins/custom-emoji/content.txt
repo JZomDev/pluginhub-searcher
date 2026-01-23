@@ -1,290 +1,5 @@
 package com.customemoji;
 
-import com.customemoji.animation.GifAnimation;
-import com.customemoji.model.AnimatedEmoji;
-import com.customemoji.model.Emoji;
-
-import net.runelite.api.Client;
-import net.runelite.api.IndexedSprite;
-import net.runelite.api.Player;
-import net.runelite.api.Point;
-import net.runelite.api.gameval.InterfaceID;
-import net.runelite.api.widgets.Widget;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayLayer;
-import net.runelite.client.ui.overlay.OverlayPosition;
-
-import javax.inject.Inject;
-import javax.inject.Singleton;
-
-import java.awt.Dimension;
-import java.awt.Graphics2D;
-import java.awt.Rectangle;
-import java.awt.image.BufferedImage;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.function.Consumer;
-import java.util.function.Function;
-import java.util.function.Supplier;
-import java.util.stream.Collectors;
-
-@Singleton
-public class OverheadEmojiRenderer extends Overlay
-{
-	private static final long LOAD_DEBOUNCE_MS = 100;
-
-	private final Client client;
-	private final CustomEmojiConfig config;
-
-	private final Map<Integer, Long> emojiFirstSeenTime = new HashMap<>();
-
-	private Supplier<Map<String, Emoji>> emojisSupplier;
-	private Function<AnimatedEmoji, GifAnimation> animationLoader;
-	private Consumer<Integer> markVisibleCallback;
-
-	@Inject
-	public OverheadEmojiRenderer(Client client, CustomEmojiConfig config)
-	{
-		this.client = client;
-		this.config = config;
-
-		this.setPosition(OverlayPosition.DYNAMIC);
-		this.setLayer(OverlayLayer.ABOVE_SCENE);
-	}
-
-	public void setEmojisSupplier(Supplier<Map<String, Emoji>> supplier)
-	{
-		this.emojisSupplier = supplier;
-	}
-
-	public void setAnimationLoader(Function<AnimatedEmoji, GifAnimation> loader)
-	{
-		this.animationLoader = loader;
-	}
-
-	public void setMarkVisibleCallback(Consumer<Integer> callback)
-	{
-		this.markVisibleCallback = callback;
-	}
-
-	@Override
-	public Dimension render(Graphics2D graphics)
-	{
-		if (this.emojisSupplier == null)
-		{
-			return null;
-		}
-
-		if (this.client.getTopLevelWorldView() == null)
-		{
-			return null;
-		}
-
-		List<Player> players = this.client.getTopLevelWorldView().players().stream().collect(Collectors.toList());
-		if (players.isEmpty())
-		{
-			return null;
-		}
-
-		Map<Integer, Emoji> emojiLookup = PluginUtils.buildEmojiLookup(this.emojisSupplier);
-		Set<Integer> visibleEmojiIds = new HashSet<>();
-
-		for (Player player : players)
-		{
-			boolean shouldRender = this.shouldShowOverheadForPlayer(player);
-			if (shouldRender)
-			{
-				this.renderPlayerOverhead(graphics, player, visibleEmojiIds, emojiLookup);
-			}
-		}
-
-		this.emojiFirstSeenTime.keySet().retainAll(visibleEmojiIds);
-
-		return null;
-	}
-
-	private void renderPlayerOverhead(Graphics2D graphics, Player player, Set<Integer> visibleEmojiIds, Map<Integer, Emoji> emojiLookup)
-	{
-		if (player == null)
-		{
-			return;
-		}
-
-		String overheadText = player.getOverheadText();
-		if (overheadText == null || overheadText.isEmpty())
-		{
-			return;
-		}
-
-		Point centerPoint = player.getCanvasTextLocation(graphics, "", player.getLogicalHeight());
-		if (centerPoint == null)
-		{
-			return;
-		}
-
-		int centerX = centerPoint.getX();
-		int baseY = centerPoint.getY();
-
-		IndexedSprite[] modIcons = this.client.getModIcons();
-		EmojiPositionCalculator.DimensionLookup dimensionLookup = imageId -> PluginUtils.getEmojiDimension(modIcons, imageId);
-
-		List<EmojiPosition> positions = EmojiPositionCalculator.calculateOverheadEmojiPositions(graphics, overheadText, centerX, baseY, dimensionLookup);
-
-		PluginUtils.linkZeroWidthEmojisToTarget(positions, emojiLookup);
-
-		for (EmojiPosition position : positions)
-		{
-			Emoji emoji = emojiLookup.get(position.getImageId());
-			if (emoji != null)
-			{
-				this.renderEmoji(graphics, emoji, position, visibleEmojiIds);
-			}
-		}
-	}
-
-	private void renderEmoji(Graphics2D graphics, Emoji emoji, EmojiPosition position, Set<Integer> visibleEmojiIds)
-	{
-		Set<String> disabledEmojis = PluginUtils.parseDisabledEmojis(this.config.disabledEmojis());
-		boolean isDisabled = disabledEmojis.contains(emoji.getText());
-		if (isDisabled)
-		{
-			return;
-		}
-
-		int emojiId = emoji.getId();
-		visibleEmojiIds.add(emojiId);
-
-		BufferedImage image = this.resolveEmojiImage(emoji, emojiId);
-		this.drawEmojiImage(graphics, image, position);
-	}
-
-	private BufferedImage resolveEmojiImage(Emoji emoji, int emojiId)
-	{
-		boolean isAnimatedEmoji = emoji instanceof AnimatedEmoji;
-		if (!isAnimatedEmoji)
-		{
-			return emoji.getStaticImage();
-		}
-
-		AnimatedEmoji animatedEmoji = (AnimatedEmoji) emoji;
-		BufferedImage animatedFrame = this.tryGetAnimatedFrame(animatedEmoji, emojiId);
-		if (animatedFrame != null)
-		{
-			return animatedFrame;
-		}
-
-		return emoji.getStaticImage();
-	}
-
-	private BufferedImage tryGetAnimatedFrame(AnimatedEmoji animatedEmoji, int emojiId)
-	{
-		boolean animationsEnabled = this.config.animationLoadingMode() != CustomEmojiConfig.AnimationLoadingMode.OFF;
-		boolean hasAnimationLoader = this.animationLoader != null;
-		boolean hasPassedDebounce = this.hasPassedLoadDebounce(emojiId);
-		boolean shouldLoadAnimation = animationsEnabled && hasAnimationLoader && hasPassedDebounce;
-		if (!shouldLoadAnimation)
-		{
-			return null;
-		}
-
-		if (this.markVisibleCallback != null)
-		{
-			this.markVisibleCallback.accept(emojiId);
-		}
-
-		GifAnimation animation = this.animationLoader.apply(animatedEmoji);
-		if (animation == null)
-		{
-			return null;
-		}
-
-		return animation.getCurrentFrame();
-	}
-
-	private boolean hasPassedLoadDebounce(int emojiId)
-	{
-		long currentTime = System.currentTimeMillis();
-		long firstSeenTime = this.emojiFirstSeenTime.computeIfAbsent(emojiId, k -> currentTime);
-		long visibleDuration = currentTime - firstSeenTime;
-		return visibleDuration >= LOAD_DEBOUNCE_MS;
-	}
-
-	private void drawEmojiImage(Graphics2D graphics, BufferedImage image, EmojiPosition position)
-	{
-		Rectangle bounds = position.getBounds();
-		int drawX = bounds.x;
-		int drawY = bounds.y;
-		int drawWidth = image.getWidth();
-		int drawHeight = image.getHeight();
-
-		if (position.hasBaseEmojiBounds())
-		{
-			Rectangle baseEmojiBounds = position.getBaseEmojiBounds();
-			drawX = baseEmojiBounds.x + (baseEmojiBounds.width - drawWidth) / 2;
-			drawY = baseEmojiBounds.y + (baseEmojiBounds.height - drawHeight) / 2;
-		}
-
-		graphics.drawImage(image, drawX, drawY, drawWidth, drawHeight, null);
-	}
-	
-	private boolean shouldShowOverheadForPlayer(Player player) // TODO: Find a better way
-	{
-		boolean isLocalPlayer = player == this.client.getLocalPlayer();
-
-		if (isLocalPlayer)
-		{
-			return true; // Overheads are always shown for the local player
-		}
-
-		Widget publicChatFilterWidget = this.client.getWidget(InterfaceID.Chatbox.CHAT_PUBLIC_FILTER);
-		if (publicChatFilterWidget == null)
-		{
-			return true;
-		}
-
-		String filterText = publicChatFilterWidget.getText();
-		if (filterText == null)
-		{
-			return true;
-		}
-
-		boolean isOn = filterText.contains("On");
-		boolean isHide = filterText.contains("Hide");
-		boolean isFriends = filterText.contains("Friends");
-		boolean isOff = filterText.contains("Off");
-		boolean isAutochat = filterText.contains("Autochat");
-
-		if (isOn || isHide)
-		{
-			return true;
-		}
-
-		if (isOff || isAutochat)
-		{
-			return false;
-		}
-
-		if (isFriends)
-		{
-			String playerName = player.getName();
-			if (playerName == null)
-			{
-				return false;
-			}
-
-			boolean isFriend = this.client.isFriended(playerName, false);
-			return isFriend;
-		}
-
-		return true;
-	}
-}
-
-package com.customemoji;
-
 import com.customemoji.model.Emoji;
 
 import net.runelite.api.Client;
@@ -522,19 +237,40 @@ public final class PluginUtils
 	public static boolean getIsMouseInChatWidget(Client client)
 	{
 		Widget chatbox = client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
-		return PluginUtils.getIsMouseInWidget(client, chatbox);
+		boolean inChatbox = PluginUtils.getIsMouseInWidget(client, chatbox);
+		if (inChatbox)
+		{
+			return true;
+		}
+
+		Widget pmChat = client.getWidget(InterfaceID.PmChat.CONTAINER);
+		return PluginUtils.getIsMouseInWidget(client, pmChat);
 	}
 
 	public static List<Widget> getVisibleChatWidgets(Client client)
 	{
-		Widget chatbox = client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
-
 		if (client.getVarcIntValue(VarClientID.CHAT_VIEW) == 1337) // Chatbox is "minimized"
 		{
-			return null; 
+			return null;
 		}
 
-		return PluginUtils.getVisibleChildWidgets(chatbox);
+		List<Widget> result = new ArrayList<>();
+
+		Widget chatbox = client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
+		List<Widget> chatboxWidgets = PluginUtils.getVisibleChildWidgets(chatbox);
+		if (chatboxWidgets != null)
+		{
+			result.addAll(chatboxWidgets);
+		}
+
+		Widget pmChat = client.getWidget(InterfaceID.PmChat.CONTAINER);
+		List<Widget> pmChatWidgets = PluginUtils.getVisibleChildWidgets(pmChat);
+		if (pmChatWidgets != null)
+		{
+			result.addAll(pmChatWidgets);
+		}
+
+		return result.isEmpty() ? null : result;
 	}
 
 	public static List<Widget> getVisibleChildWidgets(Widget parent)
@@ -952,6 +688,7 @@ import net.runelite.api.Client;
 import net.runelite.api.IndexedSprite;
 import net.runelite.api.ScriptID;
 import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.api.widgets.Widget;
 
 import javax.annotation.Nullable;
@@ -981,7 +718,8 @@ public class ChatSpacingManager
 
     private Supplier<Map<Integer, Emoji>> emojiLookupSupplier;
 
-    private final Map<Integer, List<Widget>> originalChatPositions = new HashMap<>();
+    private final Map<Integer, List<Widget>> chatboxPositions = new HashMap<>();
+    private final Map<Integer, List<Widget>> pmChatPositions = new HashMap<>();
     private int scrolledUpPixels = 0;
 
     public void setEmojiLookupSupplier(Supplier<Map<Integer, Emoji>> supplier)
@@ -991,7 +729,8 @@ public class ChatSpacingManager
 
     public void clearStoredPositions()
     {
-        this.originalChatPositions.clear();
+        this.chatboxPositions.clear();
+        this.pmChatPositions.clear();
     }
 
     public void captureScrollPosition()
@@ -1036,26 +775,50 @@ public class ChatSpacingManager
         }
 
         Widget chatbox = this.client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
-        if (chatbox == null || chatbox.isHidden())
+        this.processWidget(chatbox, this.chatboxPositions, spacingAdjustment, dynamicSpacing, false, true);
+
+        boolean splitChatEnabled = this.client.getVarpValue(VarPlayerID.OPTION_PM) == 1;
+        if (splitChatEnabled)
+        {
+            Widget pmChat = this.client.getWidget(InterfaceID.PmChat.CONTAINER);
+            this.processWidget(pmChat, this.pmChatPositions, spacingAdjustment, dynamicSpacing, true, false);
+        }
+    }
+
+    private void processWidget(Widget widget, Map<Integer, List<Widget>> positionMap, int spacing, boolean dynamic, boolean invert, boolean scrollable)
+    {
+        if (widget == null || widget.isHidden())
         {
             return;
         }
 
-        Widget[] dynamicChildren = this.getChildren(chatbox::getDynamicChildren); // Needed for visible stuff
-        Widget[] staticChildren = this.getChildren(chatbox::getStaticChildren); // Needed for right-click context menus
+        Widget[] children = this.getCombinedChildren(widget);
+        Rectangle bounds = this.adjustChildren(children, spacing, dynamic, invert, positionMap);
 
-        // Handle null arrays
-        if (dynamicChildren == null) dynamicChildren = new Widget[0];
-        if (staticChildren == null) staticChildren = new Widget[0];
+        if (scrollable)
+        {
+            this.updateChatBox(widget, bounds);
+        }
+    }
 
-        // Combine dynamic and static children into a single array
+    private Widget[] getCombinedChildren(Widget parent)
+    {
+        Widget[] dynamicChildren = this.getChildren(parent::getDynamicChildren);
+        Widget[] staticChildren = this.getChildren(parent::getStaticChildren);
+
+        if (dynamicChildren == null)
+        {
+            dynamicChildren = new Widget[0];
+        }
+        if (staticChildren == null)
+        {
+            staticChildren = new Widget[0];
+        }
+
         Widget[] allChildren = new Widget[dynamicChildren.length + staticChildren.length];
         System.arraycopy(dynamicChildren, 0, allChildren, 0, dynamicChildren.length);
         System.arraycopy(staticChildren, 0, allChildren, dynamicChildren.length, staticChildren.length);
-
-        Rectangle bounds = this.adjustChildren(allChildren, spacingAdjustment, dynamicSpacing);
-
-        this.updateChatBox(chatbox, bounds);
+        return allChildren;
     }
 
     private void updateChatBox(Widget chatbox, Rectangle bounds)
@@ -1096,7 +859,7 @@ public class ChatSpacingManager
     }
 
     @Nullable
-    private Rectangle adjustChildren(Widget[] children, int spacingAdjustment, boolean dynamicSpacing)
+    private Rectangle adjustChildren(Widget[] children, int spacingAdjustment, boolean dynamicSpacing, boolean invertSpacing, Map<Integer, List<Widget>> positionMap)
     {
         if (children == null)
         {
@@ -1105,7 +868,7 @@ public class ChatSpacingManager
 
         // Sort the array so that we adjust them in the proper order. The parent widget
         // has them in the proper order, but split by static or dynamic widget category.
-        Widget[] sortedChildren = this.sortByYPosition(children);
+        Widget[] sortedChildren = this.sortByYPosition(children, positionMap);
 
         // Reverse the children array so last becomes first.
         // This makes it simpler to adjust the positions of every widget.
@@ -1122,7 +885,7 @@ public class ChatSpacingManager
                 continue;
             }
 
-            int storedY = this.resolveOriginalYPosition(child);
+            int storedY = this.resolveOriginalYPosition(child, positionMap);
             widgetsByOriginalY.computeIfAbsent(storedY, k -> new ArrayList<>()).add(child);
         }
 
@@ -1169,7 +932,7 @@ public class ChatSpacingManager
 
                 // Add extra spacing for THIS row if it has tall emojis on the first line
                 // (first-line emoji extend upward, so push this row down)
-                cumulativeEmojiSpacing += aboveSpacing;
+                cumulativeEmojiSpacing += invertSpacing ? belowSpacing : aboveSpacing;
             }
 
             int newY = originalYPos + (counter * spacingAdjustment) + cumulativeEmojiSpacing;
@@ -1205,7 +968,7 @@ public class ChatSpacingManager
             // (wrapped-line emoji extend downward, so push subsequent rows down)
             if (dynamicSpacing)
             {
-                cumulativeEmojiSpacing += belowSpacing;
+                cumulativeEmojiSpacing += invertSpacing ? aboveSpacing : belowSpacing;
             }
 
             counter++;
@@ -1220,58 +983,56 @@ public class ChatSpacingManager
         return new Rectangle(minX, minY, maxX - minX, maxY - minY);
     }
 
-    private Widget[] sortByYPosition(Widget[] array)
+    private Widget[] sortByYPosition(Widget[] array, Map<Integer, List<Widget>> positionMap)
     {
         // Sort by stored Y position
         Arrays.sort(array, (w1, w2) -> {
             if (w1 == null && w2 == null) return 0;
             if (w1 == null) return 1;
             if (w2 == null) return -1;
-            
-            // Find the stored Y position for each widget by searching through originalChatPositions
-            Integer storedY1 = getStoredYPosition(w1);
-            Integer storedY2 = getStoredYPosition(w2);
-            
+
+            // Find the stored Y position for each widget
+            Integer storedY1 = this.getStoredYPosition(w1, positionMap);
+            Integer storedY2 = this.getStoredYPosition(w2, positionMap);
+
             // Use stored position if available, otherwise use current position
             int y1 = storedY1 != null ? storedY1 : w1.getOriginalY();
             int y2 = storedY2 != null ? storedY2 : w2.getOriginalY();
-            
+
             return Integer.compare(y1, y2);
         });
 
         return array;
     }
-    
-    private Integer getStoredYPosition(Widget widget)
+
+    private Integer getStoredYPosition(Widget widget, Map<Integer, List<Widget>> positionMap)
     {
-        // Search through originalChatPositions to find which Y position this widget belongs to
-        for (Map.Entry<Integer, List<Widget>> entry : this.originalChatPositions.entrySet())
+        for (Map.Entry<Integer, List<Widget>> entry : positionMap.entrySet())
         {
             if (entry.getValue().contains(widget))
             {
                 return entry.getKey();
             }
         }
-        // If not found in stored positions, return null
         return null;
     }
 
-    private int resolveOriginalYPosition(Widget widget)
+    private int resolveOriginalYPosition(Widget widget, Map<Integer, List<Widget>> positionMap)
     {
         int currentY = widget.getOriginalY();
 
-        Integer storedY = this.getStoredYPosition(widget);
+        Integer storedY = this.getStoredYPosition(widget, positionMap);
         if (storedY != null && storedY != currentY)
         {
             return storedY;
         }
 
-        boolean isAlreadyStored = this.originalChatPositions.values().stream()
+        boolean isAlreadyStored = positionMap.values().stream()
             .anyMatch(widgets -> widgets.contains(widget));
 
         if (!isAlreadyStored)
         {
-            this.originalChatPositions
+            positionMap
                 .computeIfAbsent(currentY, k -> new ArrayList<>())
                 .add(widget);
         }
@@ -1303,7 +1064,7 @@ public class ChatSpacingManager
         List<Widget> result = new ArrayList<>();
         for (Widget child : children)
         {
-            int height = child.getOriginalHeight();
+            int height = child.getHeight();
 
             if (height == 0)
             {
@@ -2349,6 +2110,9 @@ import com.customemoji.model.Emoji;
 import com.customemoji.model.Soundoji;
 import com.customemoji.model.StaticEmoji;
 import com.customemoji.io.GitHubEmojiDownloader;
+import com.customemoji.renderer.ChatEmojiRenderer;
+import com.customemoji.renderer.OverheadEmojiRenderer;
+import com.customemoji.renderer.SplitPrivateChatEmojiRenderer;
 import com.customemoji.service.EmojiStateManager;
 import com.google.common.io.Resources;
 import com.google.gson.Gson;
@@ -2407,7 +2171,6 @@ import net.runelite.api.events.VarClientIntChanged;
 import net.runelite.api.events.VarClientStrChanged;
 import net.runelite.api.events.WidgetLoaded;
 import net.runelite.api.gameval.VarClientID;
-import net.runelite.api.gameval.VarPlayerID;
 import net.runelite.api.gameval.InterfaceID;
 import net.runelite.client.RuneLite;
 import net.runelite.client.audio.AudioPlayer;
@@ -2497,6 +2260,9 @@ public class CustomEmojiPlugin extends Plugin
 
 	@Inject
 	private ChatEmojiRenderer chatEmojiRenderer;
+
+	@Inject
+	private SplitPrivateChatEmojiRenderer splitPrivateChatEmojiRenderer;
 
 	@Inject
 	private OverheadEmojiRenderer overheadEmojiRenderer;
@@ -2616,10 +2382,7 @@ public class CustomEmojiPlugin extends Plugin
 			this.loadEmojisAsync(this::replaceAllTextWithEmojis);
 		}
 
-		if (config.showPanel())
-		{
-			showButton();
-		}
+		this.toggleButton(this.config.showPanel());
 
 		overlay.startUp();
 		overlayManager.add(overlay);
@@ -2678,7 +2441,7 @@ public class CustomEmojiPlugin extends Plugin
 
 		if (panel != null)
 		{
-			hideButton();
+			this.toggleButton(false);
 		}
 
 		// Clear soundojis - AudioPlayer handles clip management automatically
@@ -2772,34 +2535,31 @@ public class CustomEmojiPlugin extends Plugin
 		return parts.isEmpty() ? "Already up to date" : String.join(", ", parts);
 	}
 
-	private void showButton()
+	private void toggleButton(boolean show)
 	{
-		// Create panel lazily after emojis are loaded
-		panel = panelProvider.get();
-		panel.setProgressSupplier(this.githubDownloader::getCurrentProgress);
-
-		final BufferedImage icon = ImageUtil.loadImageResource(CustomEmojiPlugin.class, PanelConstants.ICON_SMILEY);
-		navButton = NavigationButton.builder()
-			.tooltip("Custom Emoji")
-			.icon(icon)
-			.priority(5)
-			.panel(panel)
-			.build();
-
-		clientToolbar.addNavigation(navButton);
-	}
-
-	private void hideButton()
-	{
-		if (navButton != null)
+		if (show)
 		{
-			clientToolbar.removeNavigation(navButton);
-			navButton = null;
+			// Create panel lazily after emojis are loaded
+			panel = panelProvider.get();
+			panel.setProgressSupplier(this.githubDownloader::getCurrentProgress);
+
+			final BufferedImage icon = ImageUtil.loadImageResource(CustomEmojiPlugin.class, PanelConstants.ICON_SMILEY);
+			navButton = NavigationButton.builder().tooltip("Custom Emoji").icon(icon).priority(5).panel(panel).build();
+
+			clientToolbar.addNavigation(navButton);
 		}
-		if (panel != null)
+		else
 		{
-			panel.stopProgressPolling();
-			panel = null;
+			if (navButton != null)
+			{
+				clientToolbar.removeNavigation(navButton);
+				navButton = null;
+			}
+			if (panel != null)
+			{
+				panel.stopProgressPolling();
+				panel = null;
+			}
 		}
 	}
 
@@ -2827,6 +2587,12 @@ public class CustomEmojiPlugin extends Plugin
 		this.chatEmojiRenderer.setUnloadStaleCallback(this.animationManager::unloadStaleAnimations);
 		this.overlayManager.add(this.chatEmojiRenderer);
 
+		this.splitPrivateChatEmojiRenderer.setEmojisSupplier(() -> this.emojis);
+		this.splitPrivateChatEmojiRenderer.setAnimationLoader(this.animationManager::getOrLoadAnimation);
+		this.splitPrivateChatEmojiRenderer.setMarkVisibleCallback(this.animationManager::markAnimationVisible);
+		this.splitPrivateChatEmojiRenderer.setUnloadStaleCallback(this.animationManager::unloadStaleAnimations);
+		this.overlayManager.add(this.splitPrivateChatEmojiRenderer);
+
 		this.overheadEmojiRenderer.setEmojisSupplier(() -> this.emojis);
 		this.overheadEmojiRenderer.setAnimationLoader(this.animationManager::getOrLoadAnimation);
 		this.overheadEmojiRenderer.setMarkVisibleCallback(this.animationManager::markAnimationVisible);
@@ -2838,6 +2604,7 @@ public class CustomEmojiPlugin extends Plugin
 	private void teardownAnimationOverlays()
 	{
 		this.overlayManager.remove(this.chatEmojiRenderer);
+		this.overlayManager.remove(this.splitPrivateChatEmojiRenderer);
 		this.overlayManager.remove(this.overheadEmojiRenderer);
 		this.animationManager.clearAllAnimations();
 		log.debug("Animation overlays torn down");
@@ -2943,7 +2710,11 @@ public class CustomEmojiPlugin extends Plugin
 	public void onWidgetLoaded(WidgetLoaded event)
 	{
 		// Apply chat spacing when chat-related widgets are loaded
-		if (event.getGroupId() == InterfaceID.Chatbox.SCROLLAREA)
+		int groupId = event.getGroupId();
+		boolean isChatbox = groupId == InterfaceID.Chatbox.SCROLLAREA;
+		boolean isPmChat = groupId == InterfaceID.PmChat.CONTAINER;
+
+		if (isChatbox || isPmChat)
 		{
 			clientThread.invokeLater(chatSpacingManager::applyChatSpacing);
 		}
@@ -2966,25 +2737,14 @@ public class CustomEmojiPlugin extends Plugin
 			case CustomEmojiConfig.KEY_MAX_IMAGE_HEIGHT:
 				scheduleReload(true);
 				break;
-			case CustomEmojiConfig.KEY_DISABLED_EMOJIS:
-				// Panel refresh handled at end of method
-				break;
 			case CustomEmojiConfig.KEY_RESIZING_DISABLED_EMOJIS:
-				this.animationManager.clearAllAnimations();
 				this.clientThread.invokeLater(this.chatSpacingManager::applyChatSpacing);
-				break;
+				// intentional fallthrough
 			case CustomEmojiConfig.KEY_ANIMATION_LOADING_MODE:
 				this.animationManager.clearAllAnimations();
 				break;
 			case CustomEmojiConfig.KEY_SHOW_SIDE_PANEL:
-				if (this.config.showPanel())
-				{
-					this.showButton();
-				}
-				else
-				{
-					this.hideButton();
-				}
+				this.toggleButton(this.config.showPanel());
 				break;
 			case CustomEmojiConfig.KEY_GITHUB_ADDRESS:
 				this.triggerGitHubDownloadAndReload();
@@ -2999,8 +2759,11 @@ public class CustomEmojiPlugin extends Plugin
 	{
 		switch (event.getIndex())
 		{
+			case VarClientID.MESLAYERMODE:
 			case VarClientID.CHAT_LASTREBUILD:
 				this.chatSpacingManager.clearStoredPositions();
+				// intentional fallthrough
+			case VarClientID.CHAT_FORCE_CHATBOX_REBUILD: // Triggered when a friend logs in/out
 				this.clientThread.invokeAtTickEnd(this.chatSpacingManager::applyChatSpacing);
 				break;
 			case VarClientID.CHAT_LASTSCROLLPOS:
@@ -3020,9 +2783,7 @@ public class CustomEmojiPlugin extends Plugin
 		boolean isNormalChatInput  = index == VarClientID.CHATINPUT;
 		boolean isPrivateChatInput = index == VarClientID.MESLAYERINPUT;
 
-		boolean splitChatEnabled = this.client.getVarpValue(VarPlayerID.OPTION_PM) == 1;
-
-		if (isNormalChatInput || (isPrivateChatInput && !splitChatEnabled)) // Split chat + Private messages unsupported
+		if (isNormalChatInput || isPrivateChatInput)
 		{
 			this.overlay.updateChatInput(value);
 		}
@@ -3939,14 +3700,12 @@ public class CustomEmojiPlugin extends Plugin
 			return false;
 		}
 
-		boolean splitChatEnabled = this.client.getVarpValue(VarPlayerID.OPTION_PM) == 1;
-
 		switch (type)
 		{
 			case PRIVATECHAT:
 			case PRIVATECHATOUT:
 			case MODPRIVATECHAT:
-				return !splitChatEnabled;  // Split chat + Private messages unsupported
+				return this.config.splitPrivateChat();
 			case PUBLICCHAT:
 			case MODCHAT:
 			case FRIENDSCHAT:
@@ -4112,252 +3871,6 @@ public class Soundoji
 }
 package com.customemoji;
 
-import com.customemoji.animation.GifAnimation;
-import com.customemoji.model.AnimatedEmoji;
-import com.customemoji.model.Emoji;
-
-import net.runelite.api.Client;
-import net.runelite.api.gameval.InterfaceID;
-import net.runelite.api.widgets.Widget;
-import net.runelite.client.eventbus.EventBus;
-import net.runelite.client.events.PluginMessage;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayLayer;
-import net.runelite.client.ui.overlay.OverlayPosition;
-
-import javax.inject.Inject;
-import javax.inject.Singleton;
-
-import java.awt.Dimension;
-import java.awt.Graphics2D;
-import java.awt.Rectangle;
-import java.awt.Shape;
-import java.awt.image.BufferedImage;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.function.Consumer;
-import java.util.function.Function;
-import java.util.function.Supplier;
-
-@Singleton
-public class ChatEmojiRenderer extends Overlay
-{
-	private static final String PLUGIN_MESSAGE_NAMESPACE = "custom-emoji";
-	private static final String ANIMATION_COUNT_MESSAGE = "animation-count";
-	private static final String ANIMATION_COUNT_KEY = "count";
-	private static final int MAX_RENDERED_ANIMATIONS = 300;
-	private static final long LOAD_DEBOUNCE_MS = 150;
-
-	private final Client client;
-	private final EventBus eventBus;
-	private final CustomEmojiConfig config;
-
-	private final Map<Integer, Long> emojiFirstSeenTime = new HashMap<>();
-
-	private Supplier<Map<String, Emoji>> emojisSupplier;
-	private Function<AnimatedEmoji, GifAnimation> animationLoader;
-	private Consumer<Integer> markVisibleCallback;
-	private Consumer<Set<Integer>> unloadStaleCallback;
-
-	@Inject
-	public ChatEmojiRenderer(Client client, EventBus eventBus, CustomEmojiConfig config)
-	{
-		this.client = client;
-		this.eventBus = eventBus;
-		this.config = config;
-
-		this.setPosition(OverlayPosition.DYNAMIC);
-		this.setLayer(OverlayLayer.ABOVE_WIDGETS);
-	}
-
-	public void setEmojisSupplier(Supplier<Map<String, Emoji>> supplier)
-	{
-		this.emojisSupplier = supplier;
-	}
-
-	public void setAnimationLoader(Function<AnimatedEmoji, GifAnimation> loader)
-	{
-		this.animationLoader = loader;
-	}
-
-	public void setMarkVisibleCallback(Consumer<Integer> callback)
-	{
-		this.markVisibleCallback = callback;
-	}
-
-	public void setUnloadStaleCallback(Consumer<Set<Integer>> callback)
-	{
-		this.unloadStaleCallback = callback;
-	}
-
-	@Override
-	public Dimension render(Graphics2D graphics)
-	{
-		if (this.emojisSupplier == null)
-		{
-			return null;
-		}
-
-		List<Widget> visibleWidgets = PluginUtils.getVisibleChatWidgets(this.client);
-		if (visibleWidgets == null)
-		{
-			return null;
-		}
-
-		Widget chatbox = this.client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
-
-		if (chatbox == null)
-		{
-			return null;
-		}
-
-		Rectangle visibleBounds = chatbox.getBounds();
-		if (visibleBounds == null)
-		{
-			return null;
-		}
-
-		Shape originalClip = graphics.getClip();
-		graphics.setClip(visibleBounds);
-
-		Map<Integer, Emoji> emojiLookup = PluginUtils.buildEmojiLookup(this.emojisSupplier);
-		Set<String> disabledEmojis = PluginUtils.parseDisabledEmojis(this.config.disabledEmojis());
-
-		Set<Integer> visibleEmojiIds = new HashSet<>();
-		int renderedCount = 0;
-
-		for (Widget widget : visibleWidgets)
-		{
-			renderedCount += this.processWidget(widget, graphics, visibleEmojiIds, emojiLookup, disabledEmojis);
-		}
-
-		graphics.setClip(originalClip);
-
-		this.emojiFirstSeenTime.keySet().retainAll(visibleEmojiIds);
-		if (this.unloadStaleCallback != null)
-		{
-			this.unloadStaleCallback.accept(visibleEmojiIds);
-		}
-		this.broadcastAnimationCount(renderedCount);
-
-		return null;
-	}
-
-	private void broadcastAnimationCount(int count)
-	{
-		Map<String, Object> data = Map.of(ANIMATION_COUNT_KEY, count);
-		PluginMessage message = new PluginMessage(PLUGIN_MESSAGE_NAMESPACE, ANIMATION_COUNT_MESSAGE, data);
-		this.eventBus.post(message);
-	}
-
-	private int processWidget(Widget widget, Graphics2D graphics, Set<Integer> visibleEmojiIds, Map<Integer, Emoji> emojiLookup, Set<String> disabledEmojis)
-	{
-		if (widget == null)
-		{
-			return 0;
-		}
-
-		String text = widget.getText();
-		if (!PluginUtils.hasImgTag(text))
-		{
-			return 0;
-		}
-
-		List<EmojiPosition> positions = EmojiPositionCalculator.calculateEmojiPositions(
-			widget,
-			text,
-			imageId -> PluginUtils.getEmojiDimension(this.client.getModIcons(), imageId)
-		);
-
-		PluginUtils.linkZeroWidthEmojisToTarget(positions, emojiLookup);
-
-		int count = 0;
-		for (EmojiPosition position : positions)
-		{
-			boolean rendered = this.renderEmoji(position, graphics, visibleEmojiIds, emojiLookup, disabledEmojis);
-			if (rendered)
-			{
-				count++;
-			}
-		}
-		return count;
-	}
-
-	private boolean renderEmoji(EmojiPosition position, Graphics2D graphics, Set<Integer> visibleEmojiIds, Map<Integer, Emoji> emojiLookup, Set<String> disabledEmojis)
-	{
-		int imageId = position.getImageId();
-		Emoji emoji = emojiLookup.get(imageId);
-		if (emoji == null)
-		{
-			return false;
-		}
-
-		boolean isDisabled = disabledEmojis.contains(emoji.getText());
-		if (isDisabled)
-		{
-			return false;
-		}
-
-		int emojiId = emoji.getId();
-		visibleEmojiIds.add(emojiId);
-
-		BufferedImage image = emoji.getStaticImage();
-		boolean isAnimating = false;
-
-		boolean isAnimatedEmoji = emoji instanceof AnimatedEmoji;
-		if (isAnimatedEmoji)
-		{
-			AnimatedEmoji animatedEmoji = (AnimatedEmoji) emoji;
-
-			long currentTime = System.currentTimeMillis();
-			long firstSeenTime = this.emojiFirstSeenTime.computeIfAbsent(emojiId, k -> currentTime);
-			long visibleDuration = currentTime - firstSeenTime;
-			boolean hasPassedDebounce = visibleDuration >= LOAD_DEBOUNCE_MS;
-
-			boolean capacityExceeded = visibleEmojiIds.size() > MAX_RENDERED_ANIMATIONS;
-			boolean animationsEnabled = this.config.animationLoadingMode() != CustomEmojiConfig.AnimationLoadingMode.OFF;
-			boolean shouldLoadAnimation = animationsEnabled && !capacityExceeded && hasPassedDebounce && this.animationLoader != null;
-			if (shouldLoadAnimation)
-			{
-				if (this.markVisibleCallback != null)
-				{
-					this.markVisibleCallback.accept(emojiId);
-				}
-				GifAnimation animation = this.animationLoader.apply(animatedEmoji);
-				if (animation != null)
-				{
-					BufferedImage currentFrame = animation.getCurrentFrame();
-					if (currentFrame != null)
-					{
-						image = currentFrame;
-						isAnimating = true;
-					}
-				}
-			}
-		}
-
-		int drawX = position.getX();
-		int drawY = position.getY();
-		int drawWidth = image.getWidth();
-		int drawHeight = image.getHeight();
-
-		if (position.hasBaseEmojiBounds())
-		{
-			Rectangle baseEmojiBounds = position.getBaseEmojiBounds();
-			drawX = baseEmojiBounds.x + (baseEmojiBounds.width - drawWidth) / 2;
-			drawY = baseEmojiBounds.y + (baseEmojiBounds.height - drawHeight) / 2;
-		}
-
-		graphics.drawImage(image, drawX, drawY, drawWidth, drawHeight, null);
-		return isAnimating;
-	}
-}
-
-package com.customemoji;
-
 import java.awt.Rectangle;
 
 /**
@@ -4433,6 +3946,511 @@ public class EmojiPosition
         return this.baseEmojiBounds != null;
     }
 }
+package com.customemoji.renderer;
+
+import com.customemoji.CustomEmojiConfig;
+import com.customemoji.EmojiPosition;
+import com.customemoji.EmojiPositionCalculator;
+import com.customemoji.PluginUtils;
+import com.customemoji.model.Emoji;
+
+import net.runelite.api.Client;
+import net.runelite.api.IndexedSprite;
+import net.runelite.api.Player;
+import net.runelite.api.Point;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.ui.overlay.OverlayLayer;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@Singleton
+public class OverheadEmojiRenderer extends EmojiRendererBase
+{
+	@Inject
+	public OverheadEmojiRenderer(Client client, CustomEmojiConfig config)
+	{
+		super(client, config);
+		this.setLayer(OverlayLayer.ABOVE_SCENE);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (this.emojisSupplier == null)
+		{
+			return null;
+		}
+
+		if (this.client.getTopLevelWorldView() == null)
+		{
+			return null;
+		}
+
+		List<Player> players = this.client.getTopLevelWorldView().players().stream().collect(Collectors.toList());
+		if (players.isEmpty())
+		{
+			return null;
+		}
+
+		Map<Integer, Emoji> emojiLookup = PluginUtils.buildEmojiLookup(this.emojisSupplier);
+		Set<Integer> visibleEmojiIds = new HashSet<>();
+
+		for (Player player : players)
+		{
+			if (!this.shouldShowOverheadForPlayer(player))
+			{
+				continue;
+			}
+
+			this.renderPlayerOverhead(graphics, player, visibleEmojiIds, emojiLookup);
+		}
+
+		this.cleanupStaleEmojis(visibleEmojiIds);
+
+		return null;
+	}
+
+	private void renderPlayerOverhead(Graphics2D graphics, Player player, Set<Integer> visibleEmojiIds, Map<Integer, Emoji> emojiLookup)
+	{
+		if (player == null)
+		{
+			return;
+		}
+
+		String overheadText = player.getOverheadText();
+		if (overheadText == null || overheadText.isEmpty())
+		{
+			return;
+		}
+
+		Point centerPoint = player.getCanvasTextLocation(graphics, "", player.getLogicalHeight());
+		if (centerPoint == null)
+		{
+			return;
+		}
+
+		int centerX = centerPoint.getX();
+		int baseY = centerPoint.getY();
+
+		IndexedSprite[] modIcons = this.client.getModIcons();
+		EmojiPositionCalculator.DimensionLookup dimensionLookup = imageId -> PluginUtils.getEmojiDimension(modIcons, imageId);
+
+		List<EmojiPosition> positions = EmojiPositionCalculator.calculateOverheadEmojiPositions(graphics, overheadText, centerX, baseY, dimensionLookup);
+
+		PluginUtils.linkZeroWidthEmojisToTarget(positions, emojiLookup);
+
+		for (EmojiPosition position : positions)
+		{
+			Emoji emoji = emojiLookup.get(position.getImageId());
+			if (emoji != null)
+			{
+				this.renderEmoji(graphics, emoji, position, visibleEmojiIds);
+			}
+		}
+	}
+
+	private void renderEmoji(Graphics2D graphics, Emoji emoji, EmojiPosition position, Set<Integer> visibleEmojiIds)
+	{
+		if (this.isEmojiDisabled(emoji))
+		{
+			return;
+		}
+
+		int emojiId = emoji.getId();
+		BufferedImage image = this.resolveEmojiImage(emoji, emojiId, visibleEmojiIds);
+		this.drawEmojiImage(graphics, image, position);
+	}
+
+	private boolean shouldShowOverheadForPlayer(Player player)
+	{
+		boolean isLocalPlayer = player == this.client.getLocalPlayer();
+
+		if (isLocalPlayer)
+		{
+			return true;
+		}
+
+		Widget publicChatFilterWidget = this.client.getWidget(InterfaceID.Chatbox.CHAT_PUBLIC_FILTER);
+		if (publicChatFilterWidget == null)
+		{
+			return true;
+		}
+
+		String filterText = publicChatFilterWidget.getText();
+		if (filterText == null)
+		{
+			return true;
+		}
+
+		boolean isOn = filterText.contains("On");
+		boolean isHide = filterText.contains("Hide");
+		boolean isFriends = filterText.contains("Friends");
+		boolean isOff = filterText.contains("Off");
+		boolean isAutochat = filterText.contains("Autochat");
+
+		if (isOn || isHide)
+		{
+			return true;
+		}
+
+		if (isOff || isAutochat)
+		{
+			return false;
+		}
+
+		if (isFriends)
+		{
+			String playerName = player.getName();
+			if (playerName == null)
+			{
+				return false;
+			}
+
+			boolean isFriend = this.client.isFriended(playerName, false);
+			return isFriend;
+		}
+
+		return true;
+	}
+}
+
+package com.customemoji.renderer;
+
+import com.customemoji.CustomEmojiConfig;
+import com.customemoji.EmojiPosition;
+import com.customemoji.PluginUtils;
+import com.customemoji.animation.GifAnimation;
+import com.customemoji.model.AnimatedEmoji;
+import com.customemoji.model.Emoji;
+
+import net.runelite.api.Client;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.image.BufferedImage;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+public abstract class EmojiRendererBase extends Overlay
+{
+	protected static final int MAX_RENDERED_ANIMATIONS = 300;
+	protected static final long LOAD_DEBOUNCE_MS = 150;
+
+	protected final Client client;
+	protected final CustomEmojiConfig config;
+
+	protected final Map<Integer, Long> emojiFirstSeenTime = new HashMap<>();
+
+	protected Supplier<Map<String, Emoji>> emojisSupplier;
+	protected Function<AnimatedEmoji, GifAnimation> animationLoader;
+	protected Consumer<Integer> markVisibleCallback;
+
+	protected EmojiRendererBase(Client client, CustomEmojiConfig config)
+	{
+		this.client = client;
+		this.config = config;
+		this.setPosition(OverlayPosition.DYNAMIC);
+	}
+
+	public void setEmojisSupplier(Supplier<Map<String, Emoji>> supplier)
+	{
+		this.emojisSupplier = supplier;
+	}
+
+	public void setAnimationLoader(Function<AnimatedEmoji, GifAnimation> loader)
+	{
+		this.animationLoader = loader;
+	}
+
+	public void setMarkVisibleCallback(Consumer<Integer> callback)
+	{
+		this.markVisibleCallback = callback;
+	}
+
+	protected BufferedImage resolveEmojiImage(Emoji emoji, int emojiId, Set<Integer> visibleEmojiIds)
+	{
+		visibleEmojiIds.add(emojiId);
+
+		boolean isAnimatedEmoji = emoji instanceof AnimatedEmoji;
+		if (!isAnimatedEmoji)
+		{
+			return emoji.getStaticImage();
+		}
+
+		AnimatedEmoji animatedEmoji = (AnimatedEmoji) emoji;
+		BufferedImage animatedFrame = this.tryGetAnimatedFrame(animatedEmoji, emojiId, visibleEmojiIds);
+		if (animatedFrame != null)
+		{
+			return animatedFrame;
+		}
+
+		return emoji.getStaticImage();
+	}
+
+	protected BufferedImage tryGetAnimatedFrame(AnimatedEmoji animatedEmoji, int emojiId, Set<Integer> visibleEmojiIds)
+	{
+		boolean animationsEnabled = this.config.animationLoadingMode() != CustomEmojiConfig.AnimationLoadingMode.OFF;
+		boolean hasAnimationLoader = this.animationLoader != null;
+		boolean hasPassedDebounce = this.hasPassedLoadDebounce(emojiId);
+		boolean capacityExceeded = visibleEmojiIds.size() > MAX_RENDERED_ANIMATIONS;
+		boolean shouldLoadAnimation = animationsEnabled && hasAnimationLoader && hasPassedDebounce && !capacityExceeded;
+		if (!shouldLoadAnimation)
+		{
+			return null;
+		}
+
+		if (this.markVisibleCallback != null)
+		{
+			this.markVisibleCallback.accept(emojiId);
+		}
+
+		GifAnimation animation = this.animationLoader.apply(animatedEmoji);
+		if (animation == null)
+		{
+			return null;
+		}
+
+		return animation.getCurrentFrame();
+	}
+
+	protected boolean hasPassedLoadDebounce(int emojiId)
+	{
+		long currentTime = System.currentTimeMillis();
+		long firstSeenTime = this.emojiFirstSeenTime.computeIfAbsent(emojiId, k -> currentTime);
+		long visibleDuration = currentTime - firstSeenTime;
+		return visibleDuration >= LOAD_DEBOUNCE_MS;
+	}
+
+	protected void drawEmojiImage(Graphics2D graphics, BufferedImage image, EmojiPosition position)
+	{
+		int drawX = position.getX();
+		int drawY = position.getY();
+		int drawWidth = image.getWidth();
+		int drawHeight = image.getHeight();
+
+		if (position.hasBaseEmojiBounds())
+		{
+			Rectangle baseEmojiBounds = position.getBaseEmojiBounds();
+			drawX = baseEmojiBounds.x + (baseEmojiBounds.width - drawWidth) / 2;
+			drawY = baseEmojiBounds.y + (baseEmojiBounds.height - drawHeight) / 2;
+		}
+
+		graphics.drawImage(image, drawX, drawY, drawWidth, drawHeight, null);
+	}
+
+	protected boolean isEmojiDisabled(Emoji emoji)
+	{
+		Set<String> disabledEmojis = PluginUtils.parseDisabledEmojis(this.config.disabledEmojis());
+		return disabledEmojis.contains(emoji.getText());
+	}
+
+	protected void cleanupStaleEmojis(Set<Integer> visibleEmojiIds)
+	{
+		this.emojiFirstSeenTime.keySet().retainAll(visibleEmojiIds);
+	}
+
+	protected void onRenderComplete()
+	{
+	}
+}
+
+package com.customemoji.renderer;
+
+import com.customemoji.CustomEmojiConfig;
+
+import net.runelite.api.Client;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.client.ui.overlay.OverlayLayer;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Singleton
+public class ChatEmojiRenderer extends EmojiWidgetRenderer
+{
+	@Inject
+	public ChatEmojiRenderer(Client client, CustomEmojiConfig config)
+	{
+		super(client, config, InterfaceID.Chatbox.SCROLLAREA);
+		this.setLayer(OverlayLayer.ABOVE_WIDGETS);
+	}
+}
+
+package com.customemoji.renderer;
+
+import com.customemoji.CustomEmojiConfig;
+
+import net.runelite.api.Client;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.client.ui.overlay.OverlayLayer;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Singleton
+public class SplitPrivateChatEmojiRenderer extends EmojiWidgetRenderer
+{
+	@Inject
+	public SplitPrivateChatEmojiRenderer(Client client, CustomEmojiConfig config)
+	{
+		super(client, config, InterfaceID.PmChat.CONTAINER);
+		this.setLayer(OverlayLayer.ABOVE_SCENE);
+	}
+}
+
+package com.customemoji.renderer;
+
+import com.customemoji.CustomEmojiConfig;
+import com.customemoji.EmojiPosition;
+import com.customemoji.EmojiPositionCalculator;
+import com.customemoji.PluginUtils;
+import com.customemoji.model.Emoji;
+
+import net.runelite.api.Client;
+import net.runelite.api.widgets.Widget;
+
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.awt.Rectangle;
+import java.awt.Shape;
+import java.awt.image.BufferedImage;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.function.Consumer;
+
+public abstract class EmojiWidgetRenderer extends EmojiRendererBase
+{
+	protected final int widgetId;
+	protected Consumer<Set<Integer>> unloadStaleCallback;
+
+	protected EmojiWidgetRenderer(Client client, CustomEmojiConfig config, int widgetId)
+	{
+		super(client, config);
+		this.widgetId = widgetId;
+	}
+
+	public void setUnloadStaleCallback(Consumer<Set<Integer>> callback)
+	{
+		this.unloadStaleCallback = callback;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (this.emojisSupplier == null)
+		{
+			return null;
+		}
+
+		Widget targetWidget = this.client.getWidget(this.widgetId);
+		if (targetWidget == null || targetWidget.isHidden())
+		{
+			return null;
+		}
+
+		Rectangle bounds = targetWidget.getBounds();
+		if (bounds == null)
+		{
+			return null;
+		}
+
+		List<Widget> visibleChildren = PluginUtils.getVisibleChildWidgets(targetWidget);
+		if (visibleChildren == null || visibleChildren.isEmpty())
+		{
+			return null;
+		}
+
+		Map<Integer, Emoji> emojiLookup = PluginUtils.buildEmojiLookup(this.emojisSupplier);
+
+		Set<Integer> visibleEmojiIds = new HashSet<>();
+		Shape originalClip = graphics.getClip();
+
+		graphics.setClip(bounds);
+
+		for (Widget widget : visibleChildren)
+		{
+			this.processWidget(widget, graphics, visibleEmojiIds, emojiLookup);
+		}
+
+		graphics.setClip(originalClip);
+
+		this.cleanupStaleEmojis(visibleEmojiIds);
+		if (this.unloadStaleCallback != null)
+		{
+			this.unloadStaleCallback.accept(visibleEmojiIds);
+		}
+
+		this.onRenderComplete();
+
+		return null;
+	}
+
+	protected void processWidget(Widget widget, Graphics2D graphics, Set<Integer> visibleEmojiIds, Map<Integer, Emoji> emojiLookup)
+	{
+		if (widget == null)
+		{
+			return;
+		}
+
+		String text = widget.getText();
+		if (!PluginUtils.hasImgTag(text))
+		{
+			return;
+		}
+
+		List<EmojiPosition> positions = EmojiPositionCalculator.calculateEmojiPositions(
+			widget,
+			text,
+			imageId -> PluginUtils.getEmojiDimension(this.client.getModIcons(), imageId)
+		);
+
+		PluginUtils.linkZeroWidthEmojisToTarget(positions, emojiLookup);
+
+		for (EmojiPosition position : positions)
+		{
+			this.renderEmoji(position, graphics, visibleEmojiIds, emojiLookup);
+		}
+	}
+
+	protected void renderEmoji(EmojiPosition position, Graphics2D graphics, Set<Integer> visibleEmojiIds, Map<Integer, Emoji> emojiLookup)
+	{
+		int imageId = position.getImageId();
+		Emoji emoji = emojiLookup.get(imageId);
+		if (emoji == null)
+		{
+			return;
+		}
+
+		if (this.isEmojiDisabled(emoji))
+		{
+			return;
+		}
+
+		int emojiId = emoji.getId();
+		BufferedImage image = this.resolveEmojiImage(emoji, emojiId, visibleEmojiIds);
+		this.drawEmojiImage(graphics, image, position);
+	}
+}
+
 package com.customemoji;
 
 import net.runelite.client.config.*;
@@ -4443,6 +4461,7 @@ public interface CustomEmojiConfig extends Config
 	String KEY_CONFIG_GROUP = "custom-emote";
 
 	// Display section
+	String KEY_SPLIT_PRIVATE_CHAT = "split_private_chat";
 	String KEY_DYNAMIC_EMOJI_SPACING = "dynamic_emoji_spacing";
 	String KEY_CHAT_MESSAGE_SPACING = "chat_message_spacing";
 	String KEY_MAX_IMAGE_HEIGHT = "max_image_height";
@@ -4472,11 +4491,23 @@ public interface CustomEmojiConfig extends Config
 	String DISPLAY_SECTION = "displaySection";
 
 	@ConfigItem(
+		keyName = KEY_SPLIT_PRIVATE_CHAT,
+		name = "Split Private Chat",
+		description = "Display emojis in the split private chat window.",
+		section = DISPLAY_SECTION,
+		position = 0
+	)
+	default boolean splitPrivateChat()
+	{
+		return true;
+	}
+
+	@ConfigItem(
 		keyName = KEY_DYNAMIC_EMOJI_SPACING,
 		name = "Dynamic Spacing",
 		description = "Dynamically add extra spacing for lines with tall emojis.",
 		section = DISPLAY_SECTION,
-		position = 0
+		position = 1
 	)
 	default boolean dynamicEmojiSpacing()
 	{
@@ -4488,7 +4519,7 @@ public interface CustomEmojiConfig extends Config
 		name = "Extra Spacing",
 		description = "Extra vertical spacing between chat messages (in pixels).",
 		section = DISPLAY_SECTION,
-		position = 1
+		position = 2
 	)
 	@Range(min = 0, max = 20)
 	default int chatMessageSpacing()
@@ -4501,7 +4532,7 @@ public interface CustomEmojiConfig extends Config
 		name = "Max Emoji Height",
 		description = "Maximum height (in pixels) for emojis with resizing enabled.",
 		section = DISPLAY_SECTION,
-		position = 2
+		position = 3
 	)
 	@Range(min = 0, max = 100)
 	default int maxImageHeight()
@@ -4516,7 +4547,7 @@ public interface CustomEmojiConfig extends Config
 					  "<b>Lazy:</b> Loads frames progressively as needed. <b>[Recommended]</b><br>" +
 					  "<b>Eager:</b> Loads all frames immediately.",
 		section = DISPLAY_SECTION,
-		position = 3
+		position = 4
 	)
 	default AnimationLoadingMode animationLoadingMode()
 	{
@@ -4530,7 +4561,7 @@ public interface CustomEmojiConfig extends Config
 			"<b>Lenient:</b> Hide messages containing only disabled emojis.<br>" +
 			"<b>Strict:</b> Hide messages containing any disabled emoji.",
 		section = DISPLAY_SECTION,
-		position = 4
+		position = 5
 	)
 	default DisabledEmojiFilterMode disabledEmojiFilterMode()
 	{
@@ -8372,6 +8403,7 @@ import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.api.MenuAction;
 import net.runelite.api.gameval.VarClientID;
+import net.runelite.client.ui.overlay.OverlayLayer;
 import net.runelite.client.ui.overlay.OverlayMenuEntry;
 import net.runelite.client.ui.overlay.OverlayPanel;
 import net.runelite.client.ui.overlay.components.*;
