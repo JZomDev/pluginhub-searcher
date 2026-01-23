@@ -1003,6 +1003,20 @@ package com.runeprofile.data;
 
 import lombok.Data;
 
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Data
+public class Manifest {
+    final int version = -1;
+    final Map<String, List<String>> pages = new HashMap<>();
+}
+
+package com.runeprofile.data;
+
+import lombok.Data;
+
 @Data
 public class PlayerClanData {
     private final String name;
@@ -1056,6 +1070,9 @@ public class PlayerData {
 
     @Nullable
     private PlayerClanData clan;
+
+    @Nullable
+    private String groupName;
 
     // skill name -> xp
     private Map<String, Integer> skills = new HashMap<>();
@@ -1347,6 +1364,162 @@ public class CollectionLogWidgetSubscriber {
                 playerDataService.clearItems();
             }
         }
+    }
+}
+
+package com.runeprofile.autosync;
+
+import com.runeprofile.RuneProfileApiClient;
+import com.runeprofile.RuneProfileConfig;
+import com.runeprofile.RuneProfilePlugin;
+import com.runeprofile.data.Manifest;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+
+
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+
+@Slf4j
+@Singleton
+public class ManifestService {
+    @Inject
+    private EventBus eventBus;
+
+    @Inject
+    private ScheduledExecutorService scheduledExecutorService;
+
+    @Inject
+    private RuneProfileConfig config;
+
+    @Inject
+    private RuneProfileApiClient apiClient;
+
+    private ScheduledFuture<?> manifestRefreshFuture;
+    private Manifest cachedManifest;
+
+    public void startUp() {
+        eventBus.register(this);
+        startManifestRefreshTask();
+    }
+
+    public void shutDown() {
+        eventBus.unregister(this);
+        stopManifestRefreshTask();
+    }
+
+    public void reset() {
+        stopManifestRefreshTask();
+        startManifestRefreshTask();
+    }
+
+    public boolean isEnabled() {
+        return config.commandSuggestionOverlay();
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if (!event.getGroup().equals(RuneProfilePlugin.CONFIG_GROUP)) return;
+
+        if (isEnabled()) {
+            reset();
+        } else {
+            shutDown();
+        }
+    }
+
+    public void startManifestRefreshTask() {
+        manifestRefreshFuture = scheduledExecutorService.scheduleAtFixedRate(
+                this::refreshManifest,
+                0,
+                60,
+                TimeUnit.MINUTES
+        );
+    }
+
+    public void stopManifestRefreshTask() {
+        manifestRefreshFuture.cancel(true);
+        manifestRefreshFuture = null;
+    }
+
+    public void refreshManifest() {
+        apiClient.getManifest().thenAccept(manifest -> {
+            if (manifest != null) {
+                cachedManifest = manifest;
+                log.debug("Manifest refreshed successfully");
+            } else {
+                log.debug("Received null manifest from API");
+            }
+        }).exceptionally(ex -> {
+            log.debug("Failed to refresh manifest", ex);
+            return null;
+        });
+    }
+
+    public @Nullable Manifest getManifest() {
+        return cachedManifest;
+    }
+}
+
+package com.runeprofile.autosync;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Nameable;
+import net.runelite.api.events.NameableNameChanged;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import com.google.common.base.Strings;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+@Slf4j
+@Singleton
+public class RsnChangeSubscriber {
+    @Inject
+    private EventBus eventBus;
+
+    @Inject
+    private AutoSyncScheduler autoSyncScheduler;
+
+    public void startUp() {
+        eventBus.register(this);
+    }
+
+    public void shutDown() {
+        eventBus.unregister(this);
+    }
+
+    // Code from: WiseOldMan
+    // Repository: https://github.com/wise-old-man/wiseoldman-runelite-plugin
+    // License: BSD 2-Clause License
+    private boolean isValidNameChange(String prev, String curr) {
+        return !(Strings.isNullOrEmpty(prev)
+                || curr.equals(prev)
+                || prev.startsWith("[#")
+                || curr.startsWith("[#"));
+    }
+
+    @Subscribe
+    public void onNameableNameChanged(NameableNameChanged nameableNameChanged) {
+        final Nameable nameable = nameableNameChanged.getNameable();
+
+        String name = nameable.getName();
+        String prev = nameable.getPrevName();
+
+        if (!isValidNameChange(prev, name)) {
+            log.debug("Ignoring invalid RSN change from '{}' to '{}'", prev, name);
+            return;
+        }
+
+        log.debug("Detected RSN change from '{}' to '{}', scheduling rapid sync", prev, name);
+        autoSyncScheduler.startRapidSync();
     }
 }
 
@@ -1684,16 +1857,14 @@ import com.runeprofile.modelexporter.ModelExporter;
 import com.runeprofile.utils.AccountHash;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.*;
-import net.runelite.api.clan.ClanMember;
-import net.runelite.api.clan.ClanRank;
-import net.runelite.api.clan.ClanSettings;
-import net.runelite.api.clan.ClanTitle;
+import net.runelite.api.clan.*;
 import net.runelite.api.gameval.VarbitID;
 import net.runelite.client.callback.ClientThread;
 import net.runelite.client.eventbus.EventBus;
 import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.events.RuneScapeProfileChanged;
 
+import javax.annotation.Nullable;
 import javax.inject.Inject;
 import javax.inject.Singleton;
 import java.io.IOException;
@@ -1772,6 +1943,9 @@ public class PlayerDataService {
             // clan
             playerData.setClan(getPlayerClanData(player));
 
+            // group
+            playerData.setGroupName(getPlayerGroupName());
+
             // skills
             for (Skill skill : Skill.values()) {
                 String name = skill.getName();
@@ -1818,7 +1992,7 @@ public class PlayerDataService {
         return playerDataFuture;
     }
 
-    public PlayerClanData getPlayerClanData(Player player) {
+    public @Nullable PlayerClanData getPlayerClanData(Player player) {
         if (!config.includeClanData()) return new PlayerClanData("", -1, -1, "");
 
         ClanSettings clanSettings = client.getClanSettings();
@@ -1834,6 +2008,12 @@ public class PlayerDataService {
         if (title == null) return null;
 
         return new PlayerClanData(clanSettings.getName(), rank.getRank(), title.getId(), title.getName());
+    }
+
+    public @Nullable String getPlayerGroupName() {
+        ClanSettings clanSettings = client.getClanSettings(ClanID.GROUP_IRONMAN);
+        if (clanSettings == null) return null;
+        return clanSettings.getName();
     }
 
     public CompletableFuture<PlayerModelData> getPlayerModelDataAsync() {
@@ -2753,6 +2933,316 @@ public class ManualUpdateButtonManager {
 }
 package com.runeprofile.ui;
 
+import com.runeprofile.RuneProfileConfig;
+import com.runeprofile.RuneProfilePlugin;
+import com.runeprofile.utils.Utils;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.IndexedObjectSet;
+import net.runelite.api.MenuAction;
+import net.runelite.api.Player;
+import net.runelite.api.events.MenuOptionClicked;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.menus.MenuManager;
+
+import javax.inject.Inject;
+
+@Slf4j
+public class PlayerMenuOption {
+    @Inject
+    private EventBus eventBus;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private MenuManager menuManager;
+
+    @Inject
+    private RuneProfileConfig config;
+
+    private static final String LOOKUP_OPTION = "RuneProfile";
+
+    public void startUp() {
+        eventBus.register(this);
+        if (isEnabled()) {
+            menuManager.addPlayerMenuItem(LOOKUP_OPTION);
+        }
+    }
+
+    public void shutDown() {
+        eventBus.unregister(this);
+        menuManager.removePlayerMenuItem(LOOKUP_OPTION);
+    }
+
+    public boolean isEnabled() {
+        return config.showPlayerLookupOption();
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if (!event.getGroup().equals(RuneProfilePlugin.CONFIG_GROUP)) return;
+
+        if (isEnabled()) {
+            menuManager.addPlayerMenuItem(LOOKUP_OPTION);
+        } else {
+            menuManager.removePlayerMenuItem(LOOKUP_OPTION);
+        }
+    }
+
+    @Subscribe
+    public void onMenuOptionClicked(MenuOptionClicked event) {
+        if (event.getMenuAction() == MenuAction.RUNELITE_PLAYER && event.getMenuOption().equals(LOOKUP_OPTION)) {
+            IndexedObjectSet<? extends Player> players = client.getTopLevelWorldView().players();
+            Player player = players.byIndex(event.getId());
+
+            if (player == null) {
+                return;
+            }
+            String target = player.getName();
+
+            if (target == null || target.isEmpty()) {
+                return;
+            }
+            Utils.openProfileInBrowser(target);
+        }
+    }
+}
+
+package com.runeprofile.ui;
+
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+import com.runeprofile.RuneProfileConfig;
+
+import com.runeprofile.autosync.ManifestService;
+import com.runeprofile.data.Manifest;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.gameval.VarClientID;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.OverlayPanel;
+import net.runelite.client.ui.overlay.components.LineComponent;
+
+/**
+ * OverlayPanel that suggests commands and possible aliases as the user types a command into the chat.
+ */
+@Slf4j
+@Singleton
+public class CommandSuggestionOverlay extends OverlayPanel {
+    private static final int MAX_SUGGESTIONS = 5;
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private RuneProfileConfig config;
+
+    @Inject
+    private ManifestService manifestService;
+
+    @Inject
+    public CommandSuggestionOverlay() {
+        this.setLayer(OverlayLayer.ABOVE_SCENE);
+        this.setResizable(false);
+    }
+
+    public void startUp() {
+        this.overlayManager.add(this);
+    }
+
+    public void shutDown() {
+        this.overlayManager.remove(this);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        if (!this.config.commandSuggestionOverlay()) {
+            return null;
+        }
+
+        if (this.client.isMenuOpen()) {
+            return null;
+        }
+
+        String currentChatInput = this.client.getVarcStrValue(VarClientID.CHATINPUT);
+
+        List<String> suggestions = this.getSuggestions(currentChatInput);
+        if (suggestions.isEmpty()) {
+            return null;
+        }
+
+        String searchTermForHighlight = this.getSearchTermForHighlight(currentChatInput);
+
+        // Reading the panel gets awkward when the text for a suggestion wraps to a new line
+        // So we update the panel width to fit the longest suggestion
+        this.updatePanelWidth(graphics, suggestions);
+
+        for (int i = suggestions.size() - 1; i >= 0; i--) { // Reverse order to have the nearest suggestions on the bottom
+            this.addSuggestionToOverlay(suggestions.get(i), searchTermForHighlight);
+        }
+
+        return super.render(graphics);
+    }
+
+    // Returns a list of suggestions based on the current chat input
+    private List<String> getSuggestions(String input) {
+        if (input == null || input.trim().isEmpty()) {
+            return new ArrayList<>();
+        }
+
+        if (!this.config.enableLogCommand()) {
+            return new ArrayList<>(); // No suggestions if !log command is disabled
+        }
+
+        String lowerInput = input.toLowerCase().trim();
+        String command = "!log";
+
+        // Only show suggestions after "!log " is typed
+        if (lowerInput.startsWith(command.toLowerCase() + " ")) {
+            // Show page name/alias suggestions
+            return this.getPageSuggestions(input.substring(command.length()).trim());
+        }
+
+        return new ArrayList<>();
+    }
+
+    // Get page name and alias suggestions from manifest
+    private List<String> getPageSuggestions(String searchTerm) {
+        String lowerSearch = searchTerm.toLowerCase();
+
+        Manifest manifest = manifestService.getManifest();
+        if (manifest == null || manifest.getPages() == null) {
+            return new ArrayList<>();
+        }
+
+        List<String> matchingPages = new ArrayList<>();
+
+        // Search through all page names and their aliases
+        for (Map.Entry<String, List<String>> entry : manifest.getPages().entrySet()) {
+            String pageName = entry.getKey();
+            List<String> aliases = entry.getValue();
+
+            // Check page name
+            if (pageName.toLowerCase().contains(lowerSearch)) {
+                matchingPages.add(pageName);
+            }
+
+            // Check aliases
+            if (aliases != null) {
+                for (String alias : aliases) {
+                    if (alias.toLowerCase().contains(lowerSearch) && !matchingPages.contains(alias)) {
+                        matchingPages.add(alias);
+                    }
+                }
+            }
+        }
+
+        this.sortByRelevance(matchingPages, lowerSearch);
+
+        int limit = Math.min(matchingPages.size(), MAX_SUGGESTIONS);
+        return matchingPages.subList(0, limit);
+    }
+
+    private String getSearchTermForHighlight(String input) {
+        if (input == null || input.trim().isEmpty()) {
+            return "";
+        }
+
+        String lowerInput = input.toLowerCase().trim();
+        String command = "!log";
+
+        if (lowerInput.startsWith(command.toLowerCase() + " ")) {
+            return input.substring(command.length()).trim();
+        }
+
+        return input.trim();
+    }
+
+    private void updatePanelWidth(Graphics2D graphics, List<String> suggestions) {
+        int maxWidth = 0;
+        for (String suggestion : suggestions) {
+            int width = graphics.getFontMetrics().stringWidth(suggestion);
+            if (width > maxWidth) {
+                maxWidth = width;
+            }
+        }
+        int panelWidth = maxWidth + 20;
+        this.setPreferredSize(new Dimension(panelWidth, 0));
+    }
+
+    private void addSuggestionToOverlay(String command, String searchTerm) {
+        String highlightedText = this.createHighlightedText(command, searchTerm);
+        LineComponent lineComponent = LineComponent.builder().left(highlightedText).build();
+
+        this.panelComponent.getChildren().add(lineComponent);
+    }
+
+    private String createHighlightedText(String text, String searchTerm) {
+        if (searchTerm.isEmpty()) {
+            return text;
+        }
+
+        String lowerText = text.toLowerCase();
+        String lowerSearch = searchTerm.toLowerCase();
+        int index = lowerText.indexOf(lowerSearch);
+
+        if (index == -1) {
+            return text;
+        }
+
+        StringBuilder result = new StringBuilder();
+        result.append(text.substring(0, index));
+        result.append("<col=00ff00>");  // Green highlight
+        result.append(text.substring(index, index + searchTerm.length()));
+        result.append("<col=ffffff>");  // Reset to white
+        result.append(text.substring(index + searchTerm.length()));
+
+        return result.toString();
+    }
+
+    // Sorts with exact matches first, then prefix matches, then by position and length
+    private void sortByRelevance(List<String> items, String searchTerm) {
+        items.sort((a, b) -> {
+            String termA = a.toLowerCase();
+            String termB = b.toLowerCase();
+
+            boolean exactA = termA.equals(searchTerm);
+            boolean exactB = termB.equals(searchTerm);
+            if (exactA != exactB) {
+                return exactA ? -1 : 1;
+            }
+
+            boolean prefixA = termA.startsWith(searchTerm);
+            boolean prefixB = termB.startsWith(searchTerm);
+            if (prefixA != prefixB) {
+                return prefixA ? -1 : 1;
+            }
+
+            int posA = termA.indexOf(searchTerm);
+            int posB = termB.indexOf(searchTerm);
+            if (posA != posB) {
+                return Integer.compare(posA, posB);
+            }
+
+            return Integer.compare(termA.length(), termB.length());
+        });
+    }
+}
+package com.runeprofile.ui;
+
 import com.google.common.collect.ImmutableList;
 import com.runeprofile.RuneProfileConfig;
 import com.runeprofile.utils.Utils;
@@ -2832,14 +3322,23 @@ package com.runeprofile;
 import net.runelite.client.config.Config;
 import net.runelite.client.config.ConfigGroup;
 import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
 
 @ConfigGroup(RuneProfilePlugin.CONFIG_GROUP)
 public interface RuneProfileConfig extends Config {
+    @ConfigSection(
+            name = "Profile",
+            description = "Settings for your RuneProfile",
+            position = 1
+    )
+    String profileSection = "profileSection";
+
     @ConfigItem(
             keyName = "update_on_logout", // config option was previously used only for update on logout
             name = "Auto-sync Profile",
             description = "Automatically updates your RuneProfile for you.",
-            position = 1
+            position = 1,
+            section = profileSection
     )
     default boolean autosyncProfile() {
         return true;
@@ -2849,7 +3348,8 @@ public interface RuneProfileConfig extends Config {
             keyName = "track_valuable_drops",
             name = "Track Valuable Drops",
             description = "Adds valuable drops to your RuneProfile activities. (Requires auto-sync to be enabled)",
-            position = 2
+            position = 2,
+            section = profileSection
     )
     default boolean trackValuableDrops() {
         return true;
@@ -2859,62 +3359,111 @@ public interface RuneProfileConfig extends Config {
             keyName = "include_clan_data",
             name = "Include Clan in Profile",
             description = "Include your clan on your RuneProfile.",
-            position = 3
+            position = 3,
+            section = profileSection
     )
     default boolean includeClanData() {
         return true;
     }
 
+    @ConfigSection(
+            name = "Commands",
+            description = "Settings for chat commands",
+            position = 2
+    )
+    String commandsSection = "commandsSection";
+
     @ConfigItem(
             keyName = "log_command",
             name = "Enable !log command",
             description = "Enables the !log command in the game chat.",
-            position = 4
+            position = 1,
+            section = commandsSection
     )
     default boolean enableLogCommand() {
         return true;
     }
 
     @ConfigItem(
-            keyName = "enableExtendedItemNames",
-            name = "Show item names for !log",
-            description = "Show item names next to their icons in the collection log command.",
-            position = 5
+            keyName = "command_suggestion_overlay",
+            name = "Command Suggestion Overlay",
+            description = "Displays a list of potential commands in an overlay while you're typing a chat message.",
+            position = 2,
+            section = commandsSection
     )
-    default boolean enableExtendedItemNames()
-    {
+    default boolean commandSuggestionOverlay() {
         return false;
     }
 
     @ConfigItem(
-            keyName = "show_clog_sync_button",
-            name = "Enable RuneProfile Sync button",
-            description = "Shows the RuneProfile button in the Collection Log menu.",
-            position = 6
+            keyName = "enableExtendedItemNames",
+            name = "Show item names for !log",
+            description = "Show item names next to their icons in the collection log command.",
+            position = 3,
+            section = commandsSection
     )
-    default boolean showClogSyncButton() {
-        return true;
+    default boolean enableExtendedItemNames() {
+        return false;
     }
+
+    @ConfigSection(
+            name = "Menu Options",
+            description = "Settings for menu options",
+            position = 3
+    )
+    String menuOptionsSection = "menuOptionsSection";
 
     @ConfigItem(
             keyName = "menu_lookup_option",
             name = "Chat menu option",
             description = "Add RuneProfile option to chat menus",
-            position = 7
+            position = 1,
+            section = menuOptionsSection
     )
     default boolean showMenuLookupOption() {
         return false;
     }
 
     @ConfigItem(
+            keyName = "player_menu_lookup_option",
+            name = "Player menu option",
+            description = "Add RuneProfile option to player menu",
+            position = 2,
+            section = menuOptionsSection
+    )
+    default boolean showPlayerLookupOption() {
+        return false;
+    }
+
+    @ConfigSection(
+            name = "Other",
+            description = "Other plugin settings",
+            position = 4
+    )
+    String otherSection = "otherSection";
+
+    @ConfigItem(
             keyName = "show_side_panel",
             name = "Show the RuneProfile side panel",
             description = "Adds RuneProfile to the RuneLite plugin side bar.",
-            position = 7
+            position = 1,
+            section = otherSection
     )
     default boolean showSidePanel() {
         return true;
     }
+
+    @ConfigItem(
+            keyName = "show_clog_sync_button",
+            name = "Enable RuneProfile Sync button",
+            description = "Shows the RuneProfile button in the Collection Log menu.",
+            position = 2,
+            section = otherSection
+    )
+    default boolean showClogSyncButton() {
+        return true;
+    }
+
 }
 
 package com.runeprofile;
@@ -2925,10 +3474,7 @@ import com.runeprofile.autosync.*;
 import com.runeprofile.data.AddActivities;
 import com.runeprofile.data.activities.Activity;
 import com.runeprofile.data.activities.ActivityData;
-import com.runeprofile.ui.ChatPlayerMenuOption;
-import com.runeprofile.ui.CollectionLogCommand;
-import com.runeprofile.ui.CollectionLogPageMenuOption;
-import com.runeprofile.ui.ManualUpdateButtonManager;
+import com.runeprofile.ui.*;
 import com.runeprofile.utils.PlayerState;
 import com.runeprofile.utils.RuneProfileApiException;
 import com.runeprofile.utils.Utils;
@@ -2972,10 +3518,16 @@ public class RuneProfilePlugin extends Plugin {
     private AutoSyncScheduler autoSyncScheduler;
 
     @Inject
+    private ManifestService manifestService;
+
+    @Inject
     private CollectionLogWidgetSubscriber collectionLogWidgetSubscriber;
 
     @Inject
     private CollectionNotificationSubscriber collectionNotificationSubscriber;
+
+    @Inject
+    private RsnChangeSubscriber rsnChangeSubscriber;
 
     @Inject
     private ValuableDropSubscriber valuableDropSubscriber;
@@ -2987,10 +3539,16 @@ public class RuneProfilePlugin extends Plugin {
     private CollectionLogPageMenuOption collectionLogPageMenuOption;
 
     @Inject
+    private PlayerMenuOption playerMenuOption;
+
+    @Inject
     private ChatPlayerMenuOption chatPlayerMenuOption;
 
     @Inject
     private CollectionLogCommand collectionLogCommand;
+
+    @Inject
+    private CommandSuggestionOverlay commandSuggestionOverlay;
 
     private RuneProfilePanel runeProfilePanel;
 
@@ -3004,34 +3562,42 @@ public class RuneProfilePlugin extends Plugin {
         this.runeProfilePanel = injector.getInstance(RuneProfilePanel.class);
         runeProfilePanel.startUp();
 
+        manifestService.startUp();
         playerDataService.startUp();
 
         autoSyncScheduler.startUp();
         valuableDropSubscriber.startUp();
         collectionLogWidgetSubscriber.startUp();
         collectionNotificationSubscriber.startUp();
+        rsnChangeSubscriber.startUp();
 
         manualUpdateButtonManager.startUp();
         collectionLogPageMenuOption.startUp();
+        playerMenuOption.startUp();
         chatPlayerMenuOption.startUp();
         collectionLogCommand.startUp();
+        commandSuggestionOverlay.startUp();
     }
 
     @Override
     protected void shutDown() {
         runeProfilePanel.shutDown();
 
+        manifestService.shutDown();
         playerDataService.shutDown();
 
         autoSyncScheduler.shutDown();
         valuableDropSubscriber.shutDown();
         collectionLogWidgetSubscriber.shutDown();
         collectionNotificationSubscriber.shutDown();
+        rsnChangeSubscriber.shutDown();
 
         manualUpdateButtonManager.shutDown();
         collectionLogPageMenuOption.shutDown();
+        playerMenuOption.shutDown();
         chatPlayerMenuOption.shutDown();
         collectionLogCommand.shutDown();
+        commandSuggestionOverlay.shutDown();
     }
 
     public void updateProfileAsync(boolean isAutoSync) {
@@ -3753,6 +4319,12 @@ public class RuneProfileApiClient {
         HttpUrl url = buildApiUrl("profiles", "activities");
         return postHttpRequestAsync(url, gson.toJson(data))
                 .thenApplyAsync((response) -> handleResponse(response, null));
+    }
+
+    public CompletableFuture<Manifest> getManifest() {
+        HttpUrl url = buildApiUrl("manifest");
+        return getHttpRequestAsync(url)
+                .thenApplyAsync((response -> handleResponse(response, Manifest.class)));
     }
 }
 
