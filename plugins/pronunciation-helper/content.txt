@@ -15,7 +15,6 @@ import net.runelite.client.eventbus.Subscribe;
 import net.runelite.client.input.KeyListener;
 import net.runelite.client.input.KeyManager;
 import net.runelite.client.menus.MenuManager;
-import net.runelite.client.menus.WidgetMenuOption;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 
@@ -48,8 +47,11 @@ public class PronunciationHelperPlugin extends Plugin
 	private String lastTextProcessed;
 	private boolean showOnlyTranslation = false;
 	private String originalText;
+	private boolean blockMods = false;
 
 	private final String MENU_ENTRY_NAME = "Pronounce";
+
+	private String lastNpcName = "";
 
 	private final KeyListener translationKeyListener = new KeyListener()
 	{
@@ -162,8 +164,29 @@ public class PronunciationHelperPlugin extends Plugin
 	private void handleDialogueWidget(Widget widget)
 	{
 		if (widget == null) return;
-
+		var npcNameWidget = client.getWidget(ComponentID.DIALOG_NPC_NAME);
 		String text = widget.getText();
+		//get npc name
+		if (npcNameWidget != null){
+			String newNPCName = npcNameWidget.getText();
+			if (lastNpcName != newNPCName && !isUnmodifiedText(text)) {
+				//if the npc name changes and the text is modified, do NOT attempt
+				//to modify again untill there is new unmodified text
+				blockMods = true;
+				lastTextProcessed = null;
+			}
+			else if (isUnmodifiedText(text)){
+				blockMods = false;
+			}
+			lastNpcName = newNPCName;
+		}
+		else{
+			lastNpcName = "";
+		}
+
+		if(blockMods){
+			return;
+		}
 		if (isUnmodifiedText(text))
 		{
 			originalText = text;
