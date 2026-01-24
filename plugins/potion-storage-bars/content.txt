@@ -155,9 +155,10 @@ public class PotionBarPlugin extends Plugin  {
 			boolean isUnf = panel.item.getName().contains("(unf)");
 			boolean isMix = panel.item.getName().contains("mix");
 			boolean isWeaponPoison = panel.item.getName().contains("Weapon poison");
+			boolean isPoultice = panel.item.getName().contains("poultice");
 
 			int fullDoses;
-			if (isUnf || isWeaponPoison) {
+			if (isUnf || isWeaponPoison || isPoultice) {
 				fullDoses = 1;
 			} else {
 				//Get how many doses the potion is set to withdraw
@@ -169,7 +170,7 @@ public class PotionBarPlugin extends Plugin  {
 
 			//Get how many doses
 			int doseCount;
-			if (isUnf || isWeaponPoison) {
+			if (isUnf || isWeaponPoison || isPoultice) {
 				doseCount = Integer.parseInt(str.replace("Quantity: ", ""));
 			} else {
 				doseCount = Integer.parseInt(str.replace("Doses: ", ""));
