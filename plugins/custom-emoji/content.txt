@@ -21,6 +21,7 @@ import javax.imageio.ImageReader;
 import javax.imageio.stream.ImageInputStream;
 
 import net.runelite.client.util.ImageUtil;
+import net.runelite.client.util.Text;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
@@ -33,6 +34,7 @@ import java.util.regex.Pattern;
 public final class PluginUtils
 {
 	public static final Pattern IMAGE_TAG_PATTERN = Pattern.compile("<img=(\\d+)>");
+	private static final Pattern WHITESPACE_PATTERN = Pattern.compile("[\\s\\u00A0]");
 
 	private PluginUtils()
 	{
@@ -72,6 +74,36 @@ public final class PluginUtils
 		}
 
 		return imageIds;
+	}
+
+	public static List<String> findEmojiTriggersInMessage(String message, Map<String, Emoji> emojis)
+	{
+		List<String> found = new ArrayList<>();
+
+		if (message == null || message.isEmpty() || emojis == null)
+		{
+			return found;
+		}
+
+		String[] words = WHITESPACE_PATTERN.split(message);
+		for (String word : words)
+		{
+			String trigger = Text.removeFormattingTags(word)
+				.replaceAll("(^\\p{Punct}+)|(\\p{Punct}+$)", "")
+				.toLowerCase();
+
+			if (trigger.isEmpty())
+			{
+				continue;
+			}
+
+			if (emojis.containsKey(trigger))
+			{
+				found.add(trigger);
+			}
+		}
+
+		return found;
 	}
 
 	public static int findMaxEmojiHeightInWidget(Widget widget, IndexedSprite[] modIcons)
@@ -371,6 +403,26 @@ public final class PluginUtils
 		int scaledWidth = (int) Math.round(image.getWidth() * scaleFactor);
 
 		return ImageUtil.resizeImage(image, scaledWidth, maxImageHeight, true);
+	}
+
+	public static int getScrolledUpPixels(Client client)
+	{
+		Widget chatbox = client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
+		if (chatbox == null)
+		{
+			return 0;
+		}
+
+		int scrollY = chatbox.getScrollY();
+		int scrollHeight = chatbox.getScrollHeight();
+		int visibleHeight = chatbox.getHeight();
+
+		if (scrollHeight <= visibleHeight)
+		{
+			return 0;
+		}
+
+		return scrollHeight - (visibleHeight + scrollY);
 	}
 }
 
@@ -702,6 +754,7 @@ import lombok.extern.slf4j.Slf4j;
 import java.util.*;
 import java.util.function.Supplier;
 
+import com.customemoji.EmojiPositionCalculator.SpacingInfo;
 import com.customemoji.model.Emoji;
 
 @Slf4j
@@ -735,24 +788,7 @@ public class ChatSpacingManager
 
     public void captureScrollPosition()
     {
-        Widget chatbox = client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
-        if (chatbox == null)
-        {
-            return;
-        }
-
-        int scrollY = chatbox.getScrollY();
-        int scrollHeight = chatbox.getScrollHeight();
-        int visibleHeight = chatbox.getHeight();
-
-        if (scrollHeight <= visibleHeight) // Cant scroll if there aren't enough messages
-        {
-            this.scrolledUpPixels = 0;
-            return;
-        }
-
-        // Calculate how far up from the bottom the user has scrolled (in pixels)
-        int newValue = scrollHeight - (visibleHeight + scrollY);
+        int newValue = PluginUtils.getScrolledUpPixels(this.client);
 
         if (newValue == this.scrolledUpPixels)
         {
@@ -760,7 +796,6 @@ public class ChatSpacingManager
         }
 
         this.scrolledUpPixels = newValue;
-        log.debug("Captured scroll position: {} pixels from bottom", this.scrolledUpPixels);
     }
 
     public void applyChatSpacing()
@@ -835,6 +870,23 @@ public class ChatSpacingManager
             return;
         }
 
+        if (chatbox.getDynamicChildren() == null || chatbox.getDynamicChildren().length < 2)
+        {
+            return;
+        }
+
+        Widget firstChild = chatbox.getDynamicChildren()[1]; // First message widget
+
+        if (firstChild == null)
+        {
+            return;
+        }
+
+        IndexedSprite[] modIcons = this.client.getModIcons();
+        EmojiPositionCalculator.DimensionLookup dimensionLookup = imageId -> PluginUtils.getEmojiDimension(modIcons, imageId);
+        Set<Integer> customEmojiIds = this.emojiLookupSupplier.get().keySet();
+        SpacingInfo spacingInfo = EmojiPositionCalculator.calculateSpacingForWidget(firstChild, dimensionLookup, customEmojiIds);
+
         // Calculate new scroll height based on the bounds of all widgets
         int newScrollHeight = bounds.height + LAST_MESSAGE_PADDING;
 
@@ -846,7 +898,7 @@ public class ChatSpacingManager
         // Restore scroll position based on how many lines the user was scrolled up from bottom
         boolean atBottom = this.scrolledUpPixels == 0.0;
 
-        float scrolledUpPixelsLocal = atBottom ? this.scrolledUpPixels : this.scrolledUpPixels;
+        float scrolledUpPixelsLocal = atBottom ? this.scrolledUpPixels : this.scrolledUpPixels + firstChild.getHeight() + spacingInfo.aboveSpacing + config.chatMessageSpacing();
 
         int newScrollY = (int) (newScrollHeight - visibleHeight - scrolledUpPixelsLocal);
         newScrollY = Math.max(0, newScrollY);
@@ -2111,9 +2163,11 @@ import com.customemoji.model.Soundoji;
 import com.customemoji.model.StaticEmoji;
 import com.customemoji.io.GitHubEmojiDownloader;
 import com.customemoji.renderer.ChatEmojiRenderer;
+import com.customemoji.renderer.NewMessageBannerRenderer;
 import com.customemoji.renderer.OverheadEmojiRenderer;
 import com.customemoji.renderer.SplitPrivateChatEmojiRenderer;
 import com.customemoji.service.EmojiStateManager;
+import com.customemoji.service.EmojiUsageRecorder;
 import com.google.common.io.Resources;
 import com.google.gson.Gson;
 import com.google.inject.Provides;
@@ -2268,10 +2322,16 @@ public class CustomEmojiPlugin extends Plugin
 	private OverheadEmojiRenderer overheadEmojiRenderer;
 
 	@Inject
+	private NewMessageBannerRenderer newMessageBannerRenderer;
+
+	@Inject
 	private Provider<CustomEmojiPanel> panelProvider;
 
 	@Inject
 	private EmojiStateManager emojiStateManager;
+
+	@Inject
+	private EmojiUsageRecorder usageRecorder;
 
 	@Inject
 	private ScheduledExecutorService executor;
@@ -2371,6 +2431,9 @@ public class CustomEmojiPlugin extends Plugin
 		this.emojiStateManager.setOnEmojiDisabled(this::replaceDisabledEmojiInChat);
 		this.emojiStateManager.setOnEmojiResizingToggled(this::handleEmojiResizingToggled);
 
+		this.usageRecorder.setEmojisSupplier(() -> this.emojis);
+		this.eventBus.register(this.usageRecorder);
+
 		loadSoundojis();
 
 		if (this.isGitHubDownloadConfigured())
@@ -2389,6 +2452,9 @@ public class CustomEmojiPlugin extends Plugin
 
 		tooltip.startUp();
 		overlayManager.add(tooltip);
+
+		this.newMessageBannerRenderer.startUp();
+		this.overlayManager.add(this.newMessageBannerRenderer);
 
 		// Set up animation overlays (they check config.animationLoadingMode() during render)
 		this.setupAnimationOverlays();
@@ -2423,6 +2489,8 @@ public class CustomEmojiPlugin extends Plugin
 	{
 		this.replaceAllEmojisWithText();
 
+		this.eventBus.unregister(this.usageRecorder);
+
 		this.githubDownloader.shutdown();
 		this.shutdownDebounceExecutor();
 		emojis.clear();
@@ -2434,6 +2502,9 @@ public class CustomEmojiPlugin extends Plugin
 
 		tooltip.shutDown();
 		overlayManager.remove(tooltip);
+
+		this.newMessageBannerRenderer.shutDown();
+		this.overlayManager.remove(this.newMessageBannerRenderer);
 
 		// Clean up animation overlays
 		this.teardownAnimationOverlays();
@@ -2628,6 +2699,8 @@ public class CustomEmojiPlugin extends Plugin
 	@Subscribe
 	public void onChatMessage(ChatMessage chatMessage)
 	{
+		this.clientThread.invokeLater(() -> this.newMessageBannerRenderer.onNewMessage());
+
 		if (!this.shouldUpdateChatMessage(chatMessage.getType()))
 		{
 			return;
@@ -2636,7 +2709,6 @@ public class CustomEmojiPlugin extends Plugin
 		final MessageNode messageNode = chatMessage.getMessageNode();
 		final String message = messageNode.getValue();
 		final String updatedMessage = this.updateMessage(message, true);
-
 		if (updatedMessage == null)
 		{
 			return;
@@ -2768,6 +2840,7 @@ public class CustomEmojiPlugin extends Plugin
 				break;
 			case VarClientID.CHAT_LASTSCROLLPOS:
 				this.clientThread.invokeAtTickEnd(this.chatSpacingManager::captureScrollPosition);
+				this.newMessageBannerRenderer.onScrollPositionChanged();
 				break;
 			default:
 				break;
@@ -2779,6 +2852,11 @@ public class CustomEmojiPlugin extends Plugin
 	{
 		int index = event.getIndex();
 		String value = this.client.getVarcStrValue(index);
+
+		if (value.startsWith("!") || value.startsWith("::"))
+		{
+			return; // Skip command messages
+		}
 
 		boolean isNormalChatInput  = index == VarClientID.CHATINPUT;
 		boolean isPrivateChatInput = index == VarClientID.MESLAYERINPUT;
@@ -4128,6 +4206,384 @@ public class OverheadEmojiRenderer extends EmojiRendererBase
 package com.customemoji.renderer;
 
 import com.customemoji.CustomEmojiConfig;
+import com.customemoji.PluginUtils;
+import net.runelite.api.Client;
+import net.runelite.api.ScriptID;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.api.gameval.InterfaceID;
+import net.runelite.api.gameval.VarbitID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetUtil;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.input.MouseAdapter;
+import net.runelite.client.input.MouseManager;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+import lombok.extern.slf4j.Slf4j;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+
+import java.awt.event.MouseEvent;
+
+import java.awt.BasicStroke;
+import java.awt.Color;
+import java.awt.Cursor;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.FontMetrics;
+import java.awt.Graphics2D;
+import java.awt.Point;
+import java.awt.Rectangle;
+import java.awt.RenderingHints;
+import java.awt.Shape;
+import java.awt.geom.Ellipse2D;
+
+@Slf4j
+@Singleton
+public class NewMessageBannerRenderer extends Overlay
+{
+	// Banner mode constants
+	private static final int BAR_HEIGHT = 16;
+	private static final Color BAR_COLOR = new Color(0, 0, 0, 128);
+	private static final Color BAR_HOVER_COLOR = new Color(0, 0, 0, 180);
+	private static final Color TEXT_COLOR = Color.WHITE;
+	private static final String MESSAGE_TEXT = "New Messages Below";
+
+	// Arrow mode constants
+	private static final int CIRCLE_DIAMETER = 21;
+	private static final int CIRCLE_MARGIN = 4;
+	private static final Color CIRCLE_COLOR = new Color(0, 0, 0, 160);
+	private static final Color CIRCLE_HOVER_COLOR = new Color(0, 0, 0, 200);
+	private static final Color ARROW_COLOR = Color.WHITE;
+
+	private final Client client;
+	private final ClientThread clientThread;
+	private final EventBus eventBus;
+	private final CustomEmojiConfig config;
+	private final MouseManager mouseManager;
+
+	private boolean hasNewMessageWhileScrolledUp = false;
+	private Rectangle indicatorBounds = null;
+	private int scrolledUpPixels = 0;
+	private volatile boolean chatboxIsClickThrough = false;
+	private volatile boolean chatboxIsTransparent = false;
+	private boolean consumeNextClick = false;
+
+	private final MouseAdapter mouseListener = new MouseAdapter()
+	{
+		@Override
+		public MouseEvent mousePressed(MouseEvent event)
+		{
+			if (isMouseOverIndicator())
+			{
+				consumeNextClick = true;
+				event.consume();
+			}
+			return event;
+		}
+
+		@Override
+		public MouseEvent mouseReleased(MouseEvent event)
+		{
+			if (consumeNextClick)
+			{
+				consumeNextClick = false;
+				scrollToBottom();
+				event.consume();
+			}
+			return event;
+		}
+	};
+
+	@Inject
+	public NewMessageBannerRenderer(Client client, ClientThread clientThread, EventBus eventBus, CustomEmojiConfig config, MouseManager mouseManager)
+	{
+		this.client = client;
+		this.clientThread = clientThread;
+		this.eventBus = eventBus;
+		this.config = config;
+		this.mouseManager = mouseManager;
+
+		this.setPosition(OverlayPosition.DYNAMIC);
+		this.setLayer(OverlayLayer.MANUAL);
+		this.setPriority(0.6f);
+		int interfaceID = WidgetUtil.componentToInterface(InterfaceID.Chatbox.CHATDISPLAY);
+		this.drawAfterInterface(interfaceID);
+	}
+
+	public void startUp()
+	{
+		this.eventBus.register(this);
+		this.mouseManager.registerMouseListener(this.mouseListener);
+		this.clientThread.invokeLater(() ->
+		{
+			this.chatboxIsClickThrough = this.client.getVarbitValue(VarbitID.TRANSPARENT_CHATBOX_BLOCKCLICK) == 0;
+			this.chatboxIsTransparent = this.client.getVarbitValue(VarbitID.CHATBOX_TRANSPARENCY) == 1;
+
+			this.captureScrollPosition();
+		});
+	}
+
+	public void shutDown()
+	{
+		this.eventBus.unregister(this);
+		this.mouseManager.unregisterMouseListener(this.mouseListener);
+		this.resetIndicator();
+	}
+
+	@Subscribe
+	public void onVarbitChanged(VarbitChanged event)
+	{
+		switch (event.getVarbitId()) {
+			case VarbitID.TRANSPARENT_CHATBOX_BLOCKCLICK:
+				this.chatboxIsClickThrough = event.getValue() == 0;
+				break;
+			case VarbitID.CHATBOX_TRANSPARENCY:
+				this.chatboxIsTransparent = event.getValue() == 1;
+			default:
+				break;
+		}
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		CustomEmojiConfig.NewMessageIndicatorMode mode = this.config.newMessageIndicatorMode();
+
+		if (mode == CustomEmojiConfig.NewMessageIndicatorMode.OFF)
+		{
+			return null;
+		}
+
+		Widget chatbox = this.client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
+
+		if (chatbox == null || chatbox.isHidden())
+		{
+			this.indicatorBounds = null;
+			return null;
+		}
+
+		if (this.scrolledUpPixels <= 0)
+		{
+			this.indicatorBounds = null;
+			return null;
+		}
+
+		Rectangle bounds = chatbox.getBounds();
+		if (bounds == null)
+		{
+			this.indicatorBounds = null;
+			return null;
+		}
+
+		boolean shouldShow = this.hasNewMessageWhileScrolledUp && this.scrolledUpPixels > 0;
+
+		if (!shouldShow)
+		{
+			this.indicatorBounds = null;
+			return null;
+		}
+
+		this.setPreferredLocation(new Point(bounds.x, bounds.y));
+
+		Shape originalClip = graphics.getClip();
+		graphics.setClip(new Rectangle(0, 0, bounds.width, bounds.height));
+
+		boolean isClickable = !(this.chatboxIsClickThrough && this.chatboxIsTransparent);
+
+		Dimension result;
+		if (mode == CustomEmojiConfig.NewMessageIndicatorMode.ARROW)
+		{
+			result = this.renderArrowIndicator(graphics, bounds, isClickable);
+		}
+		else
+		{
+			result = this.renderBannerIndicator(graphics, bounds, isClickable);
+		}
+
+		graphics.setClip(originalClip);
+		return result;
+	}
+
+	private Dimension renderBannerIndicator(Graphics2D graphics, Rectangle bounds, boolean isClickable)
+	{
+		int drawX = 0;
+		int drawY = bounds.height - BAR_HEIGHT;
+
+		this.indicatorBounds = new Rectangle(bounds.x, bounds.y + drawY, bounds.width, BAR_HEIGHT);
+
+		boolean isHovering = this.handleMouseInput(isClickable);
+
+		Rectangle drawRect = new Rectangle(drawX, drawY, bounds.width, BAR_HEIGHT);
+		Color barColor = isHovering ? BAR_HOVER_COLOR : BAR_COLOR;
+		graphics.setColor(barColor);
+		graphics.fill(drawRect);
+
+		graphics.setColor(TEXT_COLOR);
+		Font font = FontManager.getRunescapeSmallFont();
+
+		if (font == null)
+		{
+			return null;
+		}
+
+		graphics.setFont(font);
+
+		FontMetrics fontMetrics = graphics.getFontMetrics();
+		int textWidth = fontMetrics.stringWidth(MESSAGE_TEXT);
+
+		int textX = drawX + (bounds.width - textWidth) / 2;
+		int textY = drawY + (BAR_HEIGHT + fontMetrics.getAscent() - fontMetrics.getDescent()) / 2;
+
+		graphics.drawString(MESSAGE_TEXT, textX, textY);
+
+		return new Dimension(bounds.width, BAR_HEIGHT);
+	}
+
+	private Dimension renderArrowIndicator(Graphics2D graphics, Rectangle bounds, boolean isClickable)
+	{
+		int circleX = bounds.width - CIRCLE_DIAMETER - CIRCLE_MARGIN;
+		int circleY = bounds.height - CIRCLE_DIAMETER - CIRCLE_MARGIN;
+
+		this.indicatorBounds = new Rectangle(
+			bounds.x + circleX,
+			bounds.y + circleY,
+			CIRCLE_DIAMETER,
+			CIRCLE_DIAMETER
+		);
+
+		boolean isHovering = this.handleMouseInput(isClickable);
+
+		graphics.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+
+		Ellipse2D circle = new Ellipse2D.Double(circleX, circleY, CIRCLE_DIAMETER, CIRCLE_DIAMETER);
+		Color circleColor = isHovering ? CIRCLE_HOVER_COLOR : CIRCLE_COLOR;
+		graphics.setColor(circleColor);
+		graphics.fill(circle);
+
+		// Draw down arrow
+		graphics.setColor(ARROW_COLOR);
+		graphics.setStroke(new BasicStroke(2f, BasicStroke.CAP_ROUND, BasicStroke.JOIN_ROUND));
+
+		double centerX = circleX + CIRCLE_DIAMETER / 2.0;
+		double centerY = circleY + CIRCLE_DIAMETER / 2.0;
+		int arrowSize = 5;
+
+		// Vertical line
+		double lineTop = centerY - arrowSize;
+		double lineBottom = centerY + arrowSize - 1;
+		java.awt.geom.Line2D verticalLine = new java.awt.geom.Line2D.Double(centerX, lineTop, centerX, lineBottom);
+		graphics.draw(verticalLine);
+
+		// Arrow head
+		java.awt.geom.Line2D leftHead = new java.awt.geom.Line2D.Double(centerX - arrowSize, centerY, centerX, lineBottom);
+		java.awt.geom.Line2D rightHead = new java.awt.geom.Line2D.Double(centerX + arrowSize, centerY, centerX, lineBottom);
+		graphics.draw(leftHead);
+		graphics.draw(rightHead);
+
+		return new Dimension(CIRCLE_DIAMETER, CIRCLE_DIAMETER);
+	}
+
+	private boolean handleMouseInput(boolean isClickable)
+	{
+		if (this.indicatorBounds == null || !isClickable)
+		{
+			return false;
+		}
+
+		net.runelite.api.Point mousePos = this.client.getMouseCanvasPosition();
+		boolean isOverIndicator = this.indicatorBounds.contains(mousePos.getX(), mousePos.getY());
+
+		Cursor cursor = isOverIndicator ? Cursor.getPredefinedCursor(Cursor.HAND_CURSOR) : Cursor.getDefaultCursor();
+		this.client.getCanvas().setCursor(cursor);
+
+		return isOverIndicator;
+	}
+
+	public void onNewMessage()
+	{
+		log.info("onNewMessage called, scrolledUpPixels={}", this.scrolledUpPixels);
+		this.captureScrollPosition();
+		if (this.scrolledUpPixels > 0)
+		{
+			this.hasNewMessageWhileScrolledUp = true;
+		}
+	}
+
+	public void onScrollPositionChanged()
+	{
+		this.captureScrollPosition();
+
+		if (this.scrolledUpPixels == 0)
+		{
+			this.resetIndicator();
+		}
+	}
+
+	public void resetIndicator()
+	{
+		this.hasNewMessageWhileScrolledUp = false;
+		this.indicatorBounds = null;
+
+		this.client.getCanvas().setCursor(Cursor.getDefaultCursor());
+	}
+
+	public void scrollToBottom()
+	{
+		this.clientThread.invokeLater(() ->
+		{
+			Widget chatbox = this.client.getWidget(InterfaceID.Chatbox.SCROLLAREA);
+
+			if (chatbox == null || chatbox.isHidden())
+			{
+				return;
+			}
+
+			int scrollHeight = chatbox.getScrollHeight();
+			this.client.runScript(ScriptID.UPDATE_SCROLLBAR, InterfaceID.Chatbox.CHATSCROLLBAR, InterfaceID.Chatbox.SCROLLAREA, scrollHeight);
+			this.resetIndicator();
+		});
+	}
+
+	public void captureScrollPosition()
+	{
+		int newValue = PluginUtils.getScrolledUpPixels(this.client);
+
+		if (newValue == this.scrolledUpPixels)
+		{
+			return;
+		}
+
+		this.scrolledUpPixels = newValue;
+	}
+
+	private boolean isMouseOverIndicator()
+	{
+		if (this.indicatorBounds == null)
+		{
+			return false;
+		}
+
+		boolean isClickable = !(this.chatboxIsClickThrough && this.chatboxIsTransparent);
+		if (!isClickable)
+		{
+			return false;
+		}
+
+		net.runelite.api.Point mousePos = this.client.getMouseCanvasPosition();
+		return this.indicatorBounds.contains(mousePos.getX(), mousePos.getY());
+	}
+}
+
+package com.customemoji.renderer;
+
+import com.customemoji.CustomEmojiConfig;
 import com.customemoji.EmojiPosition;
 import com.customemoji.PluginUtils;
 import com.customemoji.animation.GifAnimation;
@@ -4277,7 +4733,6 @@ import com.customemoji.CustomEmojiConfig;
 
 import net.runelite.api.Client;
 import net.runelite.api.gameval.InterfaceID;
-import net.runelite.client.ui.overlay.OverlayLayer;
 
 import javax.inject.Inject;
 import javax.inject.Singleton;
@@ -4289,7 +4744,7 @@ public class ChatEmojiRenderer extends EmojiWidgetRenderer
 	public ChatEmojiRenderer(Client client, CustomEmojiConfig config)
 	{
 		super(client, config, InterfaceID.Chatbox.SCROLLAREA);
-		this.setLayer(OverlayLayer.ABOVE_WIDGETS);
+		this.setPriority(0.5f);
 	}
 }
 
@@ -4311,7 +4766,6 @@ public class SplitPrivateChatEmojiRenderer extends EmojiWidgetRenderer
 	public SplitPrivateChatEmojiRenderer(Client client, CustomEmojiConfig config)
 	{
 		super(client, config, InterfaceID.PmChat.CONTAINER);
-		this.setLayer(OverlayLayer.ABOVE_SCENE);
 	}
 }
 
@@ -4325,6 +4779,9 @@ import com.customemoji.model.Emoji;
 
 import net.runelite.api.Client;
 import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetUtil;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
 
 import java.awt.Dimension;
 import java.awt.Graphics2D;
@@ -4346,6 +4803,12 @@ public abstract class EmojiWidgetRenderer extends EmojiRendererBase
 	{
 		super(client, config);
 		this.widgetId = widgetId;
+
+		this.setPosition(OverlayPosition.DYNAMIC);
+		this.setLayer(OverlayLayer.MANUAL);
+		this.setPriority(0.9f);
+		int interfaceID = WidgetUtil.componentToInterface(this.widgetId);
+		this.drawAfterInterface(interfaceID);
 	}
 
 	public void setUnloadStaleCallback(Consumer<Set<Integer>> callback)
@@ -4472,6 +4935,7 @@ public interface CustomEmojiConfig extends Config
 	String KEY_SHOW_SIDE_PANEL = "show_panel";
 	String KEY_SHOW_EMOJI_TOOLTIPS = "show_emoji_tooltips";
 	String KEY_OVERLAY_MAX_SUGGESTIONS = "overlay_max_suggestions";
+	String KEY_NEW_MESSAGE_INDICATOR_MODE = "new_message_indicator_mode";
 
 	// GitHub section
 	String KEY_GITHUB_ADDRESS = "github_repo_address";
@@ -4611,6 +5075,23 @@ public interface CustomEmojiConfig extends Config
 		return 10;
 	}
 
+	@ConfigItem(
+		keyName = KEY_NEW_MESSAGE_INDICATOR_MODE,
+		name = "New Message Indicator",
+		description = "<b>Off:</b> No indicator shown.<br>" +
+					  "<b>Banner:</b> Shows a banner at the bottom of the chat.<br>" +
+					  "<b>Arrow:</b> Shows a circular arrow button at the bottom-right.<br><br>" +
+					  "When clicked, the chat will scroll to the latest message.<br>" +
+					  "<b>Note:</b> The indicator is not clickable when <u>Transparent chatbox</u> and<br>" +
+					  "<u>Click through transparent chatbox</u> are enabled.",
+		section = UI_COMPONENTS_SECTION,
+		position = 4
+	)
+	default NewMessageIndicatorMode newMessageIndicatorMode()
+	{
+		return NewMessageIndicatorMode.BANNER;
+	}
+
 	@ConfigSection(
 		name = "GitHub Emoji Pack",
 		description = "Download emojis from a GitHub repository",
@@ -4710,6 +5191,140 @@ public interface CustomEmojiConfig extends Config
 		{
 			return this.name;
 		}
+	}
+
+	enum NewMessageIndicatorMode
+	{
+		OFF("Off"),
+		BANNER("Banner"),
+		ARROW("Arrow");
+
+		private final String name;
+
+		NewMessageIndicatorMode(String name)
+		{
+			this.name = name;
+		}
+
+		@Override
+		public String toString()
+		{
+			return this.name;
+		}
+	}
+}
+
+package com.customemoji.service;
+
+import com.customemoji.CustomEmojiConfig;
+import com.customemoji.PluginUtils;
+import com.customemoji.model.Emoji;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.Player;
+import net.runelite.api.events.ChatMessage;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.time.Year;
+import java.util.List;
+import java.util.Map;
+import java.util.function.Supplier;
+
+@Slf4j
+@Singleton
+public class EmojiUsageRecorder
+{
+	private static final String USAGE_KEY_PREFIX = "usage_";
+
+	private final ConfigManager configManager;
+	private final Client client;
+	private Supplier<Map<String, Emoji>> emojisSupplier;
+
+	@Inject
+	public EmojiUsageRecorder(ConfigManager configManager, Client client)
+	{
+		this.configManager = configManager;
+		this.client = client;
+	}
+
+	public void setEmojisSupplier(Supplier<Map<String, Emoji>> supplier)
+	{
+		this.emojisSupplier = supplier;
+	}
+
+	@Subscribe
+	public void onChatMessage(ChatMessage event)
+	{
+		if (this.emojisSupplier == null)
+		{
+			return;
+		}
+
+		boolean isRecordableType = this.isRecordableMessageType(event.getType());
+		if (!isRecordableType)
+		{
+			return;
+		}
+
+		boolean isFromLocalPlayer = this.isFromLocalPlayer(event.getName());
+		if (!isFromLocalPlayer)
+		{
+			return;
+		}
+
+		String message = event.getMessage();
+		this.recordUsage(message);
+	}
+
+	private boolean isRecordableMessageType(ChatMessageType type)
+	{
+		return type == ChatMessageType.PUBLICCHAT
+			|| type == ChatMessageType.PRIVATECHATOUT
+			|| type == ChatMessageType.FRIENDSCHAT
+			|| type == ChatMessageType.CLAN_CHAT;
+	}
+
+	private boolean isFromLocalPlayer(String senderName)
+	{
+		Player localPlayer = this.client.getLocalPlayer();
+		if (localPlayer == null)
+		{
+			return false;
+		}
+
+		String localPlayerName = localPlayer.getName();
+		if (localPlayerName == null)
+		{
+			return false;
+		}
+
+		String normalizedSender = Text.toJagexName(Text.removeTags(senderName));
+		return localPlayerName.equals(normalizedSender);
+	}
+
+	private void recordUsage(String message)
+	{
+		Map<String, Emoji> emojis = this.emojisSupplier.get();
+		List<String> emojisFound = PluginUtils.findEmojiTriggersInMessage(message, emojis);
+
+		for (String emojiName : emojisFound)
+		{
+			this.incrementCount(emojiName);
+		}
+	}
+
+	private void incrementCount(String emojiName)
+	{
+		String key = USAGE_KEY_PREFIX + Year.now().getValue() + "_" + emojiName;
+		String current = this.configManager.getConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, key);
+		int count = (current != null) ? Integer.parseInt(current) : 0;
+		this.configManager.setConfiguration(CustomEmojiConfig.KEY_CONFIG_GROUP, key, String.valueOf(count + 1));
+		log.debug("Incremented usage count for {}: {}", emojiName, count + 1);
 	}
 }
 
