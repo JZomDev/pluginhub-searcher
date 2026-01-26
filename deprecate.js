@@ -33,14 +33,34 @@ async function readPluginApi(manifest) {
 	return text;
 }
 
-async function getConent(user, repo, internalName) {
-  
-	let res = await fetch(`plugins/` + internalName + '/content.txt'),
-    		ret = await res.text(); 
-	fileContent.get(internalName).push(ret);
-	return true;
-  
+async function getConent(user, repo, internalName, files) {
+    const fetchCache = getConent._cache ||= new Map();
 
+    // bucket where results for this plugin are stored
+    if (!fileContent.has(internalName)) fileContent.set(internalName, []);
+    const bucket = fileContent.get(internalName);
+
+    // allow passing a list of file paths; fall back to single content.txt
+    const urls = (Array.isArray(files) && files.length)
+        ? files.map(p => p)
+        : [`plugins/${internalName}/content.txt`];
+
+    // limit concurrent network requests (uses existing amap)
+    await amap(12, urls, async (url) => {
+        const key = url;
+        let promise = fetchCache.get(key);
+        if (!promise) {
+            promise = fetch(key, { cache: "force-cache" })
+                .then(res => res.ok ? res.text() : "")
+                .catch(() => "");
+            fetchCache.set(key, promise);
+        }
+        const text = await promise;
+        bucket.push(text);
+        return true;
+    });
+
+    return true;
 }
 
 async function amap(limit, array, asyncMapper) {
@@ -90,10 +110,14 @@ class AutoMap extends Map {
 }
 
 (async () => {
+	const sd = new Date();
 	let mf = await manifest;
+
 	let usages = await byUsage;
 	let installMap = await installs;
+	const differenceInMs = new Date() - sd;
 
+	console.log(`Loaded manifest v${mf.version} with ${mf.jars.length} plugins and ${usages.length} symbols in ${differenceInMs}ms`);
 	document.body.addEventListener("click", async ev => {
 		if (ev?.target?.classList?.contains("plugin")) {
 			ev.preventDefault();
