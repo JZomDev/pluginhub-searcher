@@ -442,6 +442,9 @@ public class WhitelistPlayerCache
     private final Map<String, Long> lookupCache = new ConcurrentHashMap<>();
     private static final long LOOKUP_CACHE_TTL_MS = 10 * 60 * 1000L; // 10 minutes
     
+    // Timestamp of last successful whitelist refresh (used for comparing freshness vs API-fetched data)
+    private volatile long lastRefreshMs = 0L;
+    
     @Inject
     public WhitelistPlayerCache()
     {
@@ -539,7 +542,18 @@ public class WhitelistPlayerCache
             playerRanks.put(canonicalize(entry.getKey()), entry.getValue());
         }
         
-        log.debug("[WhitelistCache] Cache updated: {} -> {} players (lookup cache cleared)", oldSize, playerRanks.size());
+        lastRefreshMs = System.currentTimeMillis();
+        log.debug("[WhitelistCache] Cache updated: {} -> {} players (lookup cache cleared, refreshMs={})", 
+            oldSize, playerRanks.size(), lastRefreshMs);
+    }
+    
+    /**
+     * Get timestamp of last successful whitelist refresh.
+     * Used to compare freshness against API-fetched data.
+     */
+    public long getLastRefreshMs()
+    {
+        return lastRefreshMs;
     }
     
     /**
@@ -1370,10 +1384,9 @@ public class FightMonitor
                     log.debug("[PostFight] opponentName is null, skipping opponent refresh");
                 }
                 
-                // Trigger overlay refresh after API calls complete
-                if (rankOverlay != null) {
-                    rankOverlay.scheduleSelfRankRefresh(0L);
-                }
+                // NOTE: No need to call scheduleSelfRankRefresh here.
+                // fetchTierWithRetry already calls setRankFromApi which updates displayedRanks directly.
+                // Calling scheduleSelfRankRefresh would just trigger another redundant API call.
             } catch(Exception e){
                 log.debug("[PostFight] API refresh exception: {}", e.getMessage());
             }
@@ -2977,7 +2990,29 @@ public class DashboardPanel extends PluginPanel
             pvpDataService.getUserProfile(playerId, clientUniqueId).thenAccept(stats -> {
                 if (stats == null) return;
                 SwingUtilities.invokeLater(() -> updateProgressBars(stats));
-                        });
+                
+                // Extract and pass cumulative stats to PerformanceStatsPanel
+                if (stats.has("cumulative_stats")) {
+                    JsonObject cs = stats.getAsJsonObject("cumulative_stats");
+                    SwingUtilities.invokeLater(() -> {
+                        performanceStatsPanel.setCumulativeStats(cs);
+                    });
+                }
+                
+                // Extract and pass opponent rank stats to PerformanceStatsPanel
+                // Prefer new per-bucket format, fallback to flat format
+                if (stats.has("opponent_rank_stats_by_bucket")) {
+                    JsonObject ors = stats.getAsJsonObject("opponent_rank_stats_by_bucket");
+                    SwingUtilities.invokeLater(() -> {
+                        performanceStatsPanel.setOpponentRankStats(ors);
+                    });
+                } else if (stats.has("opponent_rank_stats")) {
+                    JsonObject ors = stats.getAsJsonObject("opponent_rank_stats");
+                    SwingUtilities.invokeLater(() -> {
+                        performanceStatsPanel.setOpponentRankStats(ors);
+                    });
+                }
+            });
         } catch (Exception ignore) {}
     }
     
@@ -3641,15 +3676,25 @@ import com.google.gson.JsonObject;
 import javax.swing.*;
 import javax.swing.table.DefaultTableModel;
 import java.awt.*;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
 public class PerformanceStatsPanel extends JPanel
 {
     private JLabel winPercentLabel;
+    private JLabel cumulativeStatsLabel;
+    private JPanel bucketSelectorPanel;
     
     private DefaultTableModel rankBreakdownModel;
     private JTable rankBreakdownTable;
+    
+    // Per-bucket cumulative stats: bucket -> [kills, deaths, ties]
+    private Map<String, int[]> bucketStats;
+    private String currentBucket = "overall";
+    
+    // Cumulative opponent rank stats per bucket: bucket -> (rank -> [wins, losses])
+    private Map<String, Map<String, int[]>> opponentRankStatsByBucket;
 
     public PerformanceStatsPanel()
     {
@@ -3661,14 +3706,40 @@ public class PerformanceStatsPanel extends JPanel
 
     private void initUI()
     {
-        JPanel summaryRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
-        winPercentLabel = new JLabel("- % Winrate");
-        
-        Font baseFont = winPercentLabel.getFont();
+        Font baseFont = UIManager.getFont("Label.font");
+        if (baseFont == null) baseFont = new Font("SansSerif", Font.PLAIN, 12);
         Font small = baseFont.deriveFont(Font.PLAIN, Math.max(10f, baseFont.getSize2D() - 1f));
-        winPercentLabel.setFont(small);
         
+        // Bucket selector row
+        bucketSelectorPanel = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 2));
+        String[] buckets = {"Overall", "NH", "Veng", "Multi", "DMM"};
+        for (String b : buckets) {
+            JButton btn = new JButton(b);
+            btn.setFont(small);
+            btn.setMargin(new Insets(2, 6, 2, 6));
+            final String bucketKey = b.toLowerCase();
+            btn.addActionListener(e -> setBucket(bucketKey));
+            // Highlight the default (Overall)
+            if ("overall".equals(bucketKey)) {
+                btn.setEnabled(false);
+            }
+            bucketSelectorPanel.add(btn);
+        }
+        add(bucketSelectorPanel);
+        
+        // Summary row with cumulative stats and win rate
+        JPanel summaryRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 6, 0));
+        
+        cumulativeStatsLabel = new JLabel("- Kills / - Deaths (- total)");
+        cumulativeStatsLabel.setFont(small);
+        summaryRow.add(cumulativeStatsLabel);
+        
+        summaryRow.add(Box.createHorizontalStrut(12));
+        
+        winPercentLabel = new JLabel("- % Winrate");
+        winPercentLabel.setFont(small);
         summaryRow.add(winPercentLabel);
+        
         add(summaryRow);
 
         // Rank breakdown table
@@ -3701,18 +3772,194 @@ public class PerformanceStatsPanel extends JPanel
         return p;
     }
 
-    public void updateStats(int wins, int losses, int ties)
+    /**
+     * Receive all bucket stats from the /user API response.
+     * Called from DashboardPanel.loadPlayerStats() after getUserProfile.
+     */
+    public void setCumulativeStats(JsonObject cumulativeStats)
     {
+        bucketStats = new HashMap<>();
+        for (String bucket : new String[]{"overall", "nh", "veng", "multi", "dmm"}) {
+            if (cumulativeStats != null && cumulativeStats.has(bucket)) {
+                JsonObject bs = cumulativeStats.getAsJsonObject(bucket);
+                int kills = bs.has("wins") ? bs.get("wins").getAsInt() : 0;
+                int deaths = bs.has("losses") ? bs.get("losses").getAsInt() : 0;
+                int ties = bs.has("ties") ? bs.get("ties").getAsInt() : 0;
+                bucketStats.put(bucket, new int[]{kills, deaths, ties});
+            } else {
+                bucketStats.put(bucket, new int[]{0, 0, 0});
+            }
+        }
+        updateCumulativeDisplay();
+    }
+    
+    /**
+     * Switch to a different bucket for cumulative stats display.
+     */
+    public void setBucket(String bucket)
+    {
+        this.currentBucket = bucket;
+        updateCumulativeDisplay();
+        updateRankBreakdownDisplay();  // Also update opponent rank table for selected bucket
+        // Update button states
         SwingUtilities.invokeLater(() -> {
-            int total = wins + losses + ties;
-            double winRate = total > 0 ? (double) wins / total * 100 : 0;
-            
+            for (Component c : bucketSelectorPanel.getComponents()) {
+                if (c instanceof JButton) {
+                    JButton btn = (JButton) c;
+                    boolean isSelected = btn.getText().equalsIgnoreCase(bucket);
+                    btn.setEnabled(!isSelected);
+                }
+            }
+        });
+    }
+    
+    /**
+     * Update the cumulative stats display based on selected bucket.
+     */
+    private void updateCumulativeDisplay()
+    {
+        int[] stats = bucketStats != null ? bucketStats.getOrDefault(currentBucket, new int[]{0, 0, 0}) : new int[]{0, 0, 0};
+        int kills = stats[0];
+        int deaths = stats[1];
+        int ties = stats[2];
+        int total = kills + deaths + ties;  // Include ties in denominator
+        double winRate = total > 0 ? (double) kills / total * 100 : 0;
+        
+        SwingUtilities.invokeLater(() -> {
+            cumulativeStatsLabel.setText(String.format("%d Kills / %d Deaths (%d total)", kills, deaths, total));
             winPercentLabel.setText(String.format("%.1f%% Winrate", winRate));
         });
     }
 
+    /**
+     * @deprecated Use setCumulativeStats() instead. Kept for backward compatibility.
+     */
+    @Deprecated
+    public void updateStats(int wins, int losses, int ties)
+    {
+        // No longer used - cumulative stats come from API now
+    }
+
+    /**
+     * Helper method to parse rank stats from a JsonObject containing rank -> {wins, losses} entries.
+     */
+    private Map<String, int[]> parseRankStats(JsonObject rankData)
+    {
+        Map<String, int[]> result = new HashMap<>();
+        if (rankData == null) return result;
+        for (String key : rankData.keySet()) {
+            try {
+                JsonObject rs = rankData.getAsJsonObject(key);
+                int wins = rs.has("wins") ? rs.get("wins").getAsInt() : 0;
+                int losses = rs.has("losses") ? rs.get("losses").getAsInt() : 0;
+                if (wins > 0 || losses > 0) {
+                    result.put(key, new int[]{wins, losses});
+                }
+            } catch (Exception ignored) {}
+        }
+        return result;
+    }
+
+    /**
+     * Receive opponent rank stats from the /user API response.
+     * Called from DashboardPanel.loadPlayerStats() after getUserProfile.
+     * Updates the rank breakdown table with all-time stats per opponent tier+division.
+     * 
+     * Handles two formats:
+     * - New format: nested by bucket {"overall": {...}, "nh": {...}, ...}
+     * - Old format: flat {rank -> stats} (wrapped in "overall" for all buckets)
+     */
+    public void setOpponentRankStats(JsonObject opponentStats)
+    {
+        opponentRankStatsByBucket = new HashMap<>();
+        
+        if (opponentStats != null) {
+            // Detect new format: has "overall" key with nested object
+            if (opponentStats.has("overall") && 
+                opponentStats.get("overall").isJsonObject()) {
+                // New format: parse each bucket
+                for (String bucket : opponentStats.keySet()) {
+                    try {
+                        JsonObject bucketData = opponentStats.getAsJsonObject(bucket);
+                        opponentRankStatsByBucket.put(bucket, parseRankStats(bucketData));
+                    } catch (Exception ignored) {}
+                }
+            } else {
+                // Old format: wrap in "overall" and copy to all buckets
+                Map<String, int[]> overall = parseRankStats(opponentStats);
+                for (String b : new String[]{"overall", "nh", "veng", "multi", "dmm"}) {
+                    opponentRankStatsByBucket.put(b, overall);
+                }
+            }
+        }
+        updateRankBreakdownDisplay();
+    }
+    
+    /**
+     * Update the rank breakdown table from cumulative opponent rank stats for current bucket.
+     * Sorts by rank tier (highest first) then by division (1, 2, 3).
+     */
+    private void updateRankBreakdownDisplay()
+    {
+        SwingUtilities.invokeLater(() -> {
+            if (rankBreakdownModel == null) return;
+            rankBreakdownModel.setRowCount(0);
+            
+            // Get stats for current bucket, fallback to overall
+            Map<String, int[]> currentStats = Collections.emptyMap();
+            if (opponentRankStatsByBucket != null) {
+                currentStats = opponentRankStatsByBucket.getOrDefault(
+                    currentBucket,
+                    opponentRankStatsByBucket.getOrDefault("overall", Collections.emptyMap())
+                );
+            }
+            
+            if (currentStats.isEmpty()) return;
+            
+            // Rank order for sorting (highest first)
+            final String[] RANK_ORDER = {"3rd Age", "Dragon", "Rune", "Adamant", "Mithril", "Black", "Steel", "Iron", "Bronze"};
+            java.util.Map<String, Integer> rankIndex = new HashMap<>();
+            for (int i = 0; i < RANK_ORDER.length; i++) {
+                rankIndex.put(RANK_ORDER[i], i);
+            }
+            
+            // Sort keys by rank tier then division
+            java.util.List<String> sortedKeys = new java.util.ArrayList<>(currentStats.keySet());
+            sortedKeys.sort((a, b) -> {
+                String[] partsA = a.split(" ");
+                String[] partsB = b.split(" ");
+                String rankA = partsA[0].equals("3rd") ? "3rd Age" : partsA[0];
+                String rankB = partsB[0].equals("3rd") ? "3rd Age" : partsB[0];
+                int idxA = rankIndex.getOrDefault(rankA, 999);
+                int idxB = rankIndex.getOrDefault(rankB, 999);
+                if (idxA != idxB) return idxA - idxB;
+                // Same rank tier, sort by division (1, 2, 3)
+                int divA = partsA.length > 1 ? Integer.parseInt(partsA[partsA.length - 1]) : 0;
+                int divB = partsB.length > 1 ? Integer.parseInt(partsB[partsB.length - 1]) : 0;
+                return divA - divB;
+            });
+            
+            for (String key : sortedKeys) {
+                int[] stats = currentStats.get(key);
+                if (stats != null && (stats[0] > 0 || stats[1] > 0)) {
+                    rankBreakdownModel.addRow(new Object[]{key, stats[0], stats[1]});
+                }
+            }
+        });
+    }
+
+    /**
+     * @deprecated Use setOpponentRankStats() instead. Kept for backward compatibility.
+     * Update rank breakdown table from match history.
+     */
+    @Deprecated
     public void updateBreakdown(JsonArray matches)
     {
+        // Only use if opponentRankStatsByBucket not set (legacy fallback)
+        if (opponentRankStatsByBucket != null && !opponentRankStatsByBucket.isEmpty()) {
+            return;
+        }
+        
         SwingUtilities.invokeLater(() -> {
             if (rankBreakdownModel == null || matches == null) return;
             rankBreakdownModel.setRowCount(0);
@@ -3738,9 +3985,20 @@ public class PerformanceStatsPanel extends JPanel
 
     public void reset()
     {
-        updateStats(0, 0, 0);
+        bucketStats = null;
+        opponentRankStatsByBucket = null;
+        currentBucket = "overall";
         SwingUtilities.invokeLater(() -> {
+            cumulativeStatsLabel.setText("- Kills / - Deaths (- total)");
+            winPercentLabel.setText("- % Winrate");
             if (rankBreakdownModel != null) rankBreakdownModel.setRowCount(0);
+            // Reset button states
+            for (Component c : bucketSelectorPanel.getComponents()) {
+                if (c instanceof JButton) {
+                    JButton btn = (JButton) c;
+                    btn.setEnabled(!"Overall".equalsIgnoreCase(btn.getText()));
+                }
+            }
         });
     }
 }
@@ -4732,13 +4990,17 @@ public class RankOverlay extends Overlay
     
     /**
      * Render ranks for whitelisted players in the scene.
-     * Data comes from cache (fetched separately by WhitelistService).
+     * Only shows ranks for players on the whitelist (opt-in system).
+     * Uses whichever data was fetched most recently:
+     *   - API-fetched rank from a fight (stored in displayedRanks with timestamp)
+     *   - Whitelist cache (refreshed every ~9.5 minutes)
      * Uses current bucket setting, with fallback to overall if bucket not found.
      */
     private void renderWhitelistPlayers(Graphics2D graphics, Player localPlayer, String bucket,
                                         PvPLeaderboardConfig.RankDisplayMode mode, int heightOffset)
     {
         String localName = localPlayer.getName();
+        long whitelistRefreshMs = whitelistPlayerCache.getLastRefreshMs();
         
         for (Player player : client.getPlayers())
         {
@@ -4747,20 +5009,51 @@ public class RankOverlay extends Overlay
             String playerName = player.getName();
             if (playerName == null || playerName.equals(localName)) continue;
             
-            // Get rank from cache for current bucket (falls back to overall)
-            WhitelistPlayerCache.BucketRank rank = whitelistPlayerCache.getRank(playerName, bucket);
-            if (rank == null) continue;
+            // Only show ranks for whitelisted players (opt-in system)
+            if (!whitelistPlayerCache.isWhitelisted(playerName)) continue;
             
-            // Format for display
-            String displayRank;
-            if (mode == PvPLeaderboardConfig.RankDisplayMode.RANK_NUMBER)
+            String displayRank = null;
+            String nameKey = NameUtils.canonicalKey(playerName);
+            
+            // Get API-fetched rank and its timestamp
+            String apiRank = displayedRanks.get(nameKey);
+            Long apiTimestamp = displayedRanksTimestamp.get(nameKey);
+            
+            // Get whitelist cache rank
+            WhitelistPlayerCache.BucketRank whitelistRank = whitelistPlayerCache.getRank(playerName, bucket);
+            String formattedWhitelistRank = null;
+            if (whitelistRank != null)
             {
-                displayRank = rank.rank > 0 ? "Rank " + rank.rank : null;
+                if (mode == PvPLeaderboardConfig.RankDisplayMode.RANK_NUMBER)
+                {
+                    formattedWhitelistRank = whitelistRank.rank > 0 ? "Rank " + whitelistRank.rank : null;
+                }
+                else
+                {
+                    formattedWhitelistRank = whitelistRank.getFormattedTier();
+                }
             }
-            else
+            
+            // Use whichever was fetched most recently
+            if (apiRank != null && apiTimestamp != null)
             {
-                displayRank = rank.getFormattedTier();
+                if (whitelistRefreshMs > apiTimestamp && formattedWhitelistRank != null)
+                {
+                    // Whitelist was refreshed after API fetch - use whitelist (newer)
+                    displayRank = formattedWhitelistRank;
+                }
+                else
+                {
+                    // API fetch is more recent - use API data
+                    displayRank = apiRank;
+                }
             }
+            else if (formattedWhitelistRank != null)
+            {
+                // No API data - use whitelist cache
+                displayRank = formattedWhitelistRank;
+            }
+            
             if (displayRank == null) continue;
             
             // Get player's screen position
@@ -4781,6 +5074,59 @@ public class RankOverlay extends Overlay
         PvPLeaderboardConfig.RankDisplayMode mode = config.rankDisplayMode();
         String key = NameUtils.canonicalKey(selfName);
 
+        // Use API as the primary source of truth (fresh data)
+        // Fall back to shard only if API fails
+        pvpDataService.getTierFromProfile(selfName, bucket)
+            .thenAccept(apiTier -> {
+                long fetchCompletedAt = System.currentTimeMillis();
+                
+                if (apiTier != null)
+                {
+                    // API returned fresh data - use it
+                    String displayRank = apiTier;
+                    
+                    // For RANK_NUMBER mode, we need to also fetch the rank number from shard
+                    if (mode == PvPLeaderboardConfig.RankDisplayMode.RANK_NUMBER)
+                    {
+                        // Fetch shard for rank number but keep API tier as authoritative
+                        pvpDataService.getShardRankByName(selfName, bucket)
+                            .thenAccept(sr -> {
+                                String rankDisplay = (sr != null && sr.rank > 0) ? "Rank " + sr.rank : apiTier;
+                                displayedRanks.put(key, rankDisplay);
+                                displayedRanksTimestamp.put(key, System.currentTimeMillis());
+                                apiSetRanks.put(key, rankDisplay);
+                                log.debug("[Overlay] Self rank fetched from API: {} = {} (rank mode)", selfName, rankDisplay);
+                            });
+                    }
+                    else
+                    {
+                        displayedRanks.put(key, displayRank);
+                        displayedRanksTimestamp.put(key, fetchCompletedAt);
+                        apiSetRanks.put(key, displayRank);
+                        log.debug("[Overlay] Self rank fetched from API: {} = {}", selfName, displayRank);
+                    }
+                    nextSelfRankAllowedAtMs = fetchCompletedAt + 60_000L;
+                }
+                else
+                {
+                    // API failed - fall back to shard
+                    log.debug("[Overlay] API returned null for self {}, falling back to shard", selfName);
+                    fetchRankForSelfFromShard(selfName, bucket, mode, key);
+                }
+            })
+            .exceptionally(ex -> {
+                log.debug("[Overlay] API error fetching self rank: {}, falling back to shard", ex.getMessage());
+                fetchRankForSelfFromShard(selfName, bucket, mode, key);
+                return null;
+            });
+    }
+    
+    /**
+     * Fallback method to fetch self rank from shard when API fails.
+     */
+    private void fetchRankForSelfFromShard(String selfName, String bucket, 
+                                           PvPLeaderboardConfig.RankDisplayMode mode, String key)
+    {
         pvpDataService.getShardRankByName(selfName, bucket)
             .thenAccept(sr -> {
                 if (sr == null)
@@ -4827,13 +5173,13 @@ public class RankOverlay extends Overlay
                         // No API override - use shard data
                         displayedRanks.put(key, shardRank);
                         displayedRanksTimestamp.put(key, fetchCompletedAt);
-                        log.debug("[Overlay] Self rank fetched: {} = {}", selfName, shardRank);
+                        log.debug("[Overlay] Self rank fetched from shard (fallback): {} = {}", selfName, shardRank);
                     }
                     nextSelfRankAllowedAtMs = fetchCompletedAt + 60_000L;
                 }
             })
             .exceptionally(ex -> {
-                log.debug("[Overlay] Error fetching self rank: {}", ex.getMessage());
+                log.debug("[Overlay] Error fetching self rank from shard: {}", ex.getMessage());
                 nextSelfRankAllowedAtMs = System.currentTimeMillis() + 60_000L;
                 return null;
             });
