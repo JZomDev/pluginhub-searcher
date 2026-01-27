@@ -38,7 +38,7 @@ async function getConent(user, repo, internalName, files) {
     if (!getConent._bundlePromise) {
         getConent._bundlePromise = (async () => {
             try {
-                const res = await fetch("/plugins/plugins.json");
+                const res = await fetch("plugins/plugins.json");
                 if (!res.ok) {
                     getConent._bundle = {};
                     return;
