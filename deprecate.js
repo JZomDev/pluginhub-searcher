@@ -34,33 +34,36 @@ async function readPluginApi(manifest) {
 }
 
 async function getConent(user, repo, internalName, files) {
-    const fetchCache = getConent._cache ||= new Map();
+    // ensure we fetch /plugins/plugins.json only once (dedupe concurrent callers)
+    if (!getConent._bundlePromise) {
+        getConent._bundlePromise = (async () => {
+            try {
+                const res = await fetch("/plugins/plugins.json");
+                if (!res.ok) {
+                    getConent._bundle = {};
+                    return;
+                }
+                const arr = await res.json();
+                const map = Object.create(null);
+                for (const p of arr) {
+                    if (!p || !p.internalName) continue;
+                    map[p.internalName] = p.content ? [p.content] : [];
+                }
+                getConent._bundle = map;
+            } catch (e) {
+                getConent._bundle = {};
+            }
+        })();
+    }
 
-    // bucket where results for this plugin are stored
-    if (!fileContent.has(internalName)) fileContent.set(internalName, []);
-    const bucket = fileContent.get(internalName);
+    await getConent._bundlePromise;
 
-    // allow passing a list of file paths; fall back to single content.txt
-    const urls = (Array.isArray(files) && files.length)
-        ? files.map(p => p)
-        : [`plugins/${internalName}/content.txt`];
-
-    // limit concurrent network requests (uses existing amap)
-    await amap(12, urls, async (url) => {
-        const key = url;
-        let promise = fetchCache.get(key);
-        if (!promise) {
-            promise = fetch(key, { cache: "force-cache" })
-                .then(res => res.ok ? res.text() : "")
-                .catch(() => "");
-            fetchCache.set(key, promise);
-        }
-        const text = await promise;
-        bucket.push(text);
+    const bundle = getConent._bundle || {};
+    if (bundle[internalName]) {
+        fileContent.set(internalName, bundle[internalName]);
         return true;
-    });
-
-    return true;
+    }
+    return false;
 }
 
 async function amap(limit, array, asyncMapper) {
