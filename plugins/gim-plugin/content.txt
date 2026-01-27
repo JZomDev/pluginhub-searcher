@@ -22,418 +22,216 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-package com.gimp.map;
-
-import com.gimp.GimPlugin;
-import net.runelite.client.ui.FontManager;
-import net.runelite.client.util.ImageUtil;
-
-import java.awt.*;
-import java.awt.font.FontRenderContext;
-import java.awt.geom.Rectangle2D;
-import java.awt.image.BufferedImage;
-import java.util.HashMap;
-import java.util.Map;
-
-/**
- * Utility for constructing and caching GIM world map icons.
- */
-public class GimIconProvider
-{
-	final static Font FONT = FontManager.getRunescapeBoldFont();
-
-	final private Map<String, BufferedImage> icons;
-
-	public GimIconProvider()
-	{
-		icons = new HashMap<>(5);
-	}
-
-	public BufferedImage getIcon(String name)
-	{
-		return icons.computeIfAbsent(name, this::generateIcon);
-	}
-
-	private BufferedImage generateIcon(String name)
-	{
-		// Compute some info about username text size
-		final Rectangle2D textBounds = FONT.getStringBounds(name,
-			new FontRenderContext(null, true, true));
-		final int textHeight = (int) textBounds.getHeight();
-		final int textWidth = (int) textBounds.getWidth();
-
-		// Load the GIMP logo
-		final BufferedImage gimpLogo = ImageUtil.loadImageResource(GimPlugin.class, "gimpoint.png");
-
-		// Initialize the resulting icon, must be large enough to fit everything with the GIMP logo centered
-		final BufferedImage icon = new BufferedImage(textWidth + 4,
-			gimpLogo.getHeight() + 2 * textHeight,
-			BufferedImage.TYPE_INT_ARGB);
-
-		// First, draw the GIMP logo onto the center of the icon
-		final Graphics2D graphics = (Graphics2D) icon.getGraphics();
-		graphics.drawImage(gimpLogo, (icon.getWidth() - gimpLogo.getWidth()) / 2, (icon.getHeight() - gimpLogo.getHeight()) / 2, null);
-		// Then, draw the shadow of the username text (TODO: is there a proper way to do this?)
-		final int textX = (icon.getWidth() - textWidth) / 2;
-		final int textY = textHeight;
-		graphics.setFont(FontManager.getRunescapeBoldFont());
-		graphics.setColor(Color.BLACK);
-		graphics.drawString(name, textX + 1, textY + 1);
-
-		// Finally, draw the username text centered horizontally above the GIMP logo
-		graphics.setColor(Color.WHITE);
-		graphics.drawString(name, textX, textY);
-
-		return icon;
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.map;
+package com.gimp;
 
 import com.gimp.gimps.GimPlayer;
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.HashMap;
-import java.util.LinkedList;
-import java.util.Map;
-import javax.inject.Inject;
+import com.gimp.requests.*;
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+import io.socket.client.Socket;
+import io.socket.emitter.Emitter;
+import java.lang.reflect.Type;
+import java.util.concurrent.CompletableFuture;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
-import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
+import java.util.Map;
+import okhttp3.OkHttpClient;
 
-/**
- * Wrapper around the built-in {@link WorldMapPointManager}.
- * Primarily adds support for tracking and fetching map points by name.
- */
 @Slf4j
-public class GimWorldMapPointManager
+public class GimBroadcastManager
 {
-	@Inject
-	private WorldMapPointManager _worldMapPointManager;
-
-	private final Map<String, GimWorldMapPoint> points;
-	private final Map<String, Collection<WorldMapPoint>> associatedPoints;
-	private final GimIconProvider iconProvider;
-
-	public GimWorldMapPointManager()
+	private static final Type pingDataTypeForJson = new TypeToken<Map<String, GimPlayer>>()
 	{
-		points = new HashMap<>();
-		associatedPoints = new HashMap<>();
-		iconProvider = new GimIconProvider();
-	}
+	}.getType();
 
-	public GimWorldMapPoint getPoint(String gimpName)
-	{
-		if (!points.containsKey(gimpName))
-		{
-			throw new IllegalArgumentException("WorldMapPoint does not exist for user " + gimpName);
-		}
-		return points.get(gimpName);
-	}
+	private static final String EVENT_BROADCAST = "broadcast";
 
-	public boolean hasPoint(String gimpName)
+	private final HttpClient httpClient;
+
+	private final SocketClient socketClient;
+
+	private final Gson gson;
+
+	public GimBroadcastManager(String groupName, OkHttpClient okHttpClient, GimPluginConfig config, Gson gson)
 	{
-		return points.containsKey(gimpName);
+		this.gson = gson;
+		httpClient = new HttpClient(groupName, okHttpClient, config);
+		socketClient = new SocketClient(groupName, config);
 	}
 
 	/**
-	 * Add the given map point to the world map for the given player.
+	 * Parses JSON string of the ping data and adds to a GimPlayer Map.
 	 *
-	 * @param gimpName      name of the player
-	 * @param worldMapPoint world map point to add
+	 * @param dataJson JSON string of ping data
+	 * @return map: name => GimPlayer
 	 */
-	public void addPoint(String gimpName, GimWorldMapPoint worldMapPoint)
+	private Map<String, GimPlayer> parsePingData(String dataJson)
 	{
-		if (!points.containsKey(gimpName))
+		return gson.fromJson(dataJson, pingDataTypeForJson);
+	}
+
+	/**
+	 * Parses JSON string of the broadcast data and maps to a GimPlayer instance.
+	 *
+	 * @param dataJson JSON string of broadcast data
+	 * @return GimPlayer
+	 */
+	public GimPlayer parseBroadcastData(String dataJson)
+	{
+		return gson.fromJson(dataJson, GimPlayer.class);
+	}
+
+	/**
+	 * Checks if socket client is connected.
+	 *
+	 * @return whether socket is connected
+	 */
+	public boolean isSocketConnected()
+	{
+		return socketClient.isConnected();
+	}
+
+	/**
+	 * Connects socket client to the server and joins the group's room.
+	 */
+	public void connectSocketClient()
+	{
+		socketClient.connect();
+	}
+
+	/**
+	 * Registers a "connect" listener.
+	 *
+	 * @param handleConnect listener for the connect event
+	 */
+	public void onBroadcastConnect(Emitter.Listener handleConnect)
+	{
+		Socket client = socketClient.getClient();
+		if (client != null)
 		{
-			points.put(gimpName, worldMapPoint);
-			associatedPoints.put(gimpName, new LinkedList<>());
-			_worldMapPointManager.add(worldMapPoint.getWorldMapPoint());
-			log.debug("Add world map point for {}", gimpName);
-		}
-		else
-		{
-			throw new IllegalStateException("WorldMapPoint for user " + gimpName + " already exists");
+			client.on(Socket.EVENT_CONNECT, handleConnect);
 		}
 	}
 
 	/**
-	 * For the given player, create and add a map point to the world map.
+	 * Registers a "disconnect" listener.
 	 *
-	 * @param gimp player for whom to create and add a map point
+	 * @param handleDisconnect listener for the disconnect event
 	 */
-	public void addPoint(GimPlayer gimp)
+	public void onBroadcastDisconnect(Emitter.Listener handleDisconnect)
 	{
-		final String name = gimp.getName();
-		if (gimp.getLocation() != null)
+		Socket client = socketClient.getClient();
+		if (client != null)
 		{
-			final WorldPoint p = new WorldPoint(gimp.getLocation().getX(),
-				gimp.getLocation().getY(),
-				gimp.getLocation().getPlane());
-			final WorldMapPoint worldMapPoint = new WorldMapPoint(p, iconProvider.getIcon(name));
-			// Configure world map point
-			worldMapPoint.setTarget(p);
-			// Snaps to edge if outside of current map frame
-			worldMapPoint.setSnapToEdge(true);
-			// Jumps to location if clicked on
-			worldMapPoint.setJumpOnClick(true);
-			// Name is necessary for jumpOnClick behavior
-			worldMapPoint.setName(name);
-
-			addPoint(name, new GimWorldMapPoint(gimp, worldMapPoint));
+			client.on(Socket.EVENT_DISCONNECT, handleDisconnect);
 		}
 	}
 
-	public void removePoint(String gimpName)
+	/**
+	 * Registers a "connect_error" listener.
+	 *
+	 * @param handleError listener for the connect_error event
+	 */
+	public void onBroadcastConnectError(Emitter.Listener handleError)
 	{
-		if (points.containsKey(gimpName))
+		Socket client = socketClient.getClient();
+		if (client != null)
 		{
-			// Remove the user's primary WMP
-			_worldMapPointManager.remove(points.get(gimpName).getWorldMapPoint());
-			points.remove(gimpName);
+			client.on(Socket.EVENT_CONNECT_ERROR, handleError);
+		}
+	}
 
-			// Remove the user's associated WMPs
-			for (WorldMapPoint point : associatedPoints.get(gimpName))
-			{
-				_worldMapPointManager.removeIf(wmp -> wmp == point);
-			}
-			associatedPoints.remove(gimpName);
+	/**
+	 * Disconnects socket client from the server.
+	 */
+	public void disconnectSocketClient()
+	{
+		socketClient.disconnect();
+	}
 
-			log.debug("Remove map point for {}", gimpName);
+	/**
+	 * Gets broadcast client, using the socket client if it's
+	 * connected and falling back on the HTTP client.
+	 *
+	 * @return a SocketClient or HTTPClient
+	 */
+	private RequestClient getRequestClient()
+	{
+		if (socketClient.isConnected())
+		{
+			return socketClient;
 		}
 		else
 		{
-			throw new IllegalStateException("Cannot remove nonexistent WorldMapPoint for user " + gimpName);
+			return httpClient;
 		}
 	}
 
-	public void addAssociatedPoint(String gimpName, WorldMapPoint associatedPoint)
+	/**
+	 * Starts listening for the "broadcast" socket event and passes in a listener
+	 * to handle the broadcast data.
+	 *
+	 * @param handleBroadcast handler for processing the broadcast data
+	 */
+	public void listen(Emitter.Listener handleBroadcast)
 	{
-		associatedPoints.get(gimpName).add(associatedPoint);
-		_worldMapPointManager.add(associatedPoint);
-		// Re-add the gimp's WMP to ensure it's rendered on top (this might be expensive, so avoid if possible)
-		_worldMapPointManager.remove(points.get(gimpName).getWorldMapPoint());
-		_worldMapPointManager.add(points.get(gimpName).getWorldMapPoint());
-	}
-
-	public void removeAssociatedPoint(String gimpName, WorldMapPoint worldMapPoint)
-	{
-		associatedPoints.get(gimpName).removeIf(wmp -> wmp == worldMapPoint);
-		_worldMapPointManager.removeIf(wmp -> wmp == worldMapPoint);
-	}
-
-	public void clear()
-	{
-		// Use key collection rather than iterator to avoid concurrent modification
-		final Collection<String> gimpNames = new ArrayList<>(points.keySet());
-
-		for (String gimpName : gimpNames)
+		Socket client = socketClient.getClient();
+		if (client != null)
 		{
-			if (hasPoint(gimpName))
-			{
-				removePoint(gimpName);
-			}
+			client.on(EVENT_BROADCAST, handleBroadcast);
 		}
 	}
-}
 
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.map;
-
-import com.gimp.gimps.GimLocation;
-import com.gimp.gimps.GimPlayer;
-import java.awt.Graphics2D;
-import java.awt.image.BufferedImage;
-import java.util.LinkedList;
-import java.util.Queue;
-import lombok.Getter;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
-
-/**
- * Wrapper around the built-in {@link WorldMapPoint}.
- * Creates abstraction for "moving" the world map point by altering the underlying map point location.
- * <p>
- * Supports fractional locations which allows for map points to be moved more slowly.
- * TODO: The current implementation doesn't actually need this due to the "frame toggle" approach; delete when sure.
- */
-public class GimWorldMapPoint
-{
-	private final GimPlayer gimp;
-	@Getter
-	private final WorldMapPoint worldMapPoint;
-	private double x;
-	private double y;
-
-	private final Queue<WorldMapPoint> footsteps;
-	private final BufferedImage mmIcon;
-
-	public GimWorldMapPoint(GimPlayer gimp, WorldMapPoint worldMapPoint)
+	/**
+	 * Turns off the listener for the "broadcast" event.
+	 */
+	public void stopListening()
 	{
-		this.gimp = gimp;
-		this.worldMapPoint = worldMapPoint;
-		x = this.worldMapPoint.getWorldPoint().getX();
-		y = this.worldMapPoint.getWorldPoint().getY();
-		footsteps = new LinkedList<>();
-
-		// Initialize the footstep icon to be used
-		final BufferedImage icon = new BufferedImage(12, 12, BufferedImage.TYPE_INT_ARGB);
-		final Graphics2D g = icon.createGraphics();
-		g.setColor(gimp.getColor());
-		g.fillOval(0, 0, 12, 12);
-		mmIcon = icon;
-
-	}
-
-	public void setX(double x)
-	{
-		this.x = x;
-		refreshWorldPoint();
-	}
-
-	public void setY(double y)
-	{
-		this.y = y;
-		refreshWorldPoint();
-	}
-
-	public void move(double dx, double dy)
-	{
-		x += dx;
-		y += dy;
-		refreshWorldPoint();
-	}
-
-	public void setWorldPoint(WorldPoint worldPoint)
-	{
-		worldMapPoint.setWorldPoint(worldPoint);
-		x = worldPoint.getX();
-		y = worldPoint.getY();
-	}
-
-	public WorldPoint getWorldPoint()
-	{
-		return worldMapPoint.getWorldPoint();
-	}
-
-	private void refreshWorldPoint()
-	{
-		if ((int) x != worldMapPoint.getWorldPoint().getX()
-			|| (int) y != worldMapPoint.getWorldPoint().getY())
+		Socket client = socketClient.getClient();
+		if (client != null)
 		{
-			final WorldPoint newWorldPoint = new WorldPoint((int) x, (int) y, worldMapPoint.getWorldPoint().getPlane());
-			worldMapPoint.setWorldPoint(newWorldPoint);
+			client.off(EVENT_BROADCAST);
 		}
 	}
 
-	public boolean moveTowardPlayer(boolean frameToggle)
+	/**
+	 * Sends broadcast request to the server via HTTP or socket.
+	 *
+	 * @param data gimp data
+	 */
+	public void broadcast(Map<String, Object> data)
 	{
-		final WorldPoint shownLocation = getWorldPoint();
-		final GimLocation targetLocation = gimp.getLocation();
-		if (shownLocation != null && targetLocation != null)
+		try
 		{
-			int dx = targetLocation.getX() - shownLocation.getX();
-			int dy = targetLocation.getY() - shownLocation.getY();
-			if (Math.abs(dx) > 30 || Math.abs(dy) > 30)
-			{
-				// If the target location is too far, instantly change the map point
-				setWorldPoint(targetLocation.toWorldPoint());
-				return true;
-			}
-			else if (dx != 0 || dy != 0)
-			{
-				// Otherwise if it's moved at all, smoothly move it toward the target location.
-				// If moving fast (e.g. running), move every frame; otherwise, move every other frame.
-				if (frameToggle || gimp.getSpeed() > 2.25)
-				{
-					// Only move by a max of 1 tile in a given axis (keeps it consistent/smooth)
-					move(Math.min(1, Math.max(dx, -1)), Math.min(1, Math.max(dy, -1)));
-					// If the plane has changed, update it while preserving the shown x/y coordinates
-					if (shownLocation.getPlane() != targetLocation.getPlane())
-					{
-						setWorldPoint(new WorldPoint(shownLocation.getX(), shownLocation.getY(), targetLocation.getPlane()));
-					}
-					return true;
-				}
-			}
+			RequestClient requestClient = getRequestClient();
+			String dataJson = gson.toJson(data);
+			requestClient.broadcast(dataJson).thenAccept((result) -> log.debug("Broadcast data: {}", result));
 		}
-		return false;
+		catch (Exception e)
+		{
+			log.error("Broadcast error: {}", String.valueOf(e));
+		}
 	}
 
-	public void addFootstep(GimWorldMapPointManager gimWorldMapPointManager, int maxLength)
+	/**
+	 * Sends ping request to the server via HTTP or socket.
+	 *
+	 * @return future of map: name => GimPlayer
+	 */
+	public CompletableFuture<Map<String, GimPlayer>> ping()
 	{
-		final WorldPoint worldPoint = worldMapPoint.getWorldPoint().dx(0);
-
-		if (maxLength > 0)
+		RequestClient requestClient = getRequestClient();
+		try
 		{
-			// Optimization to reuse the tail WMP as the head WMP (since altering the underlying WMP ArrayList is expensive)
-			if (footsteps.size() == maxLength)
-			{
-				final WorldMapPoint popped = footsteps.remove();
-				popped.setWorldPoint(worldPoint);
-				footsteps.add(popped);
-				return;
-			}
-
-			final WorldMapPoint worldMapPoint = new WorldMapPoint(worldPoint, mmIcon);
-			gimWorldMapPointManager.addAssociatedPoint(gimp.getName(), worldMapPoint);
-			footsteps.add(worldMapPoint);
+			return requestClient.ping().thenApply((result) -> {
+				log.debug("Ping data: {}", result);
+				return parsePingData(result);
+			});
 		}
-
-		while (footsteps.size() > maxLength)
+		catch (Exception e)
 		{
-			final WorldMapPoint popped = footsteps.remove();
-			gimWorldMapPointManager.removeAssociatedPoint(gimp.getName(), popped);
+			log.error("Ping error: {}", String.valueOf(e));
+			return null;
 		}
-
 	}
 }
 
@@ -542,394 +340,6 @@ class GimPingOverlay extends Overlay
 
 		OverlayUtil.renderPolygon(graphics, poly, color);
 	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.requests;
-
-import com.gimp.GimPluginConfig;
-import java.io.IOException;
-import java.util.concurrent.CompletableFuture;
-import lombok.NonNull;
-import okhttp3.Call;
-import okhttp3.Callback;
-import okhttp3.MediaType;
-import okhttp3.Request;
-import okhttp3.RequestBody;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
-import okhttp3.OkHttpClient;
-import lombok.AccessLevel;
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
-public class HttpClient extends RequestClient
-{
-	@Getter(AccessLevel.PACKAGE)
-	public OkHttpClient client;
-
-	public static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
-
-	public static final int OK = 200;
-
-	public static final String EMPTY_BODY = "";
-
-	public HttpClient(String namespace, OkHttpClient client, GimPluginConfig config)
-	{
-		this.config = config;
-		this.namespace = namespace;
-		this.client = client;
-	}
-
-	/**
-	 * Makes an HTTP request with the given method to the URI at the client's
-	 * base URL. Accepts on optional body argument for appropriate request methods.
-	 *
-	 * @param method HTTP method
-	 * @param uri    URI path following base URL
-	 * @param body   request body data
-	 * @return future of response data in JSON
-	 */
-	private CompletableFuture<String> request(String method, String uri, RequestBody body)
-	{
-		CompletableFuture<String> result = new CompletableFuture<>();
-		Request request = new Request.Builder()
-			.url(getBaseUrl() + uri)
-			.method(method, body)
-			.build();
-		client.newCall(request).enqueue(new Callback()
-		{
-			@Override
-			public void onFailure(@NonNull Call call, @NonNull IOException e)
-			{
-				log.error("Request failed: {}", String.valueOf(e));
-			}
-
-			@Override
-			public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException
-			{
-				try (ResponseBody bodyJson = response.body())
-				{
-					if (!response.isSuccessful())
-					{
-						throw new IOException(response.code() + ": " + bodyJson);
-					}
-					if (bodyJson == null)
-					{
-						throw new RuntimeException("Response body is null: " + response);
-					}
-					result.complete(bodyJson.string());
-				}
-			}
-		});
-		return result;
-	}
-
-	/**
-	 * Makes an HTTP GET request to the ping endpoint at the URL injected
-	 * from the plugin config. A future of the JSON response body is returned.
-	 *
-	 * @return future of response data in JSON
-	 */
-	public CompletableFuture<String> ping()
-	{
-		return request("GET", "/ping/" + namespace, null);
-	}
-
-	/**
-	 * Makes an HTTP POST request to the broadcast endpoint at the
-	 * URL injected from the plugin config. The JSON data is sent
-	 * in the request body. Times out after 5 seconds.
-	 *
-	 * @param dataJson request data in JSON
-	 */
-	public CompletableFuture<String> broadcast(String dataJson)
-	{
-		RequestBody body = RequestBody.create(JSON, dataJson);
-		return request("POST", "/broadcast/" + namespace, body);
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.requests;
-
-import com.gimp.GimPluginConfig;
-import io.socket.client.Ack;
-import io.socket.client.Socket;
-import io.socket.engineio.client.transports.Polling;
-import io.socket.engineio.client.transports.WebSocket;
-import java.net.URI;
-import io.socket.client.IO;
-import java.util.concurrent.CompletableFuture;
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
-import org.json.JSONObject;
-
-@Getter
-@Slf4j
-public class SocketClient extends RequestClient
-{
-	public Socket client;
-
-	private static final String EVENT_CONNECTION_ACK = "connection-ack";
-
-	public SocketClient(String namespace, GimPluginConfig config)
-	{
-		this.namespace = namespace;
-		this.config = config;
-	}
-
-	/**
-	 * Connects the socket to the server at the base URL, using default config
-	 * for the connection. On connection, sets up socket listeners for socket
-	 * lifecycle events, e.g. connect, disconnect, connect_error.
-	 */
-	public void connect()
-	{
-		if (!validateUrl())
-		{
-			log.warn("Invalid socket URL, aborting");
-			return;
-		}
-		URI uri = URI.create(getBaseUrl());
-		IO.Options options = IO.Options.builder()
-			// IO factory options
-			.setForceNew(false).setMultiplex(true)
-
-			// low-level engine options
-			.setTransports(new String[]{Polling.NAME, WebSocket.NAME}).setUpgrade(true).setRememberUpgrade(false).setPath("/socket.io/").setQuery(null).setExtraHeaders(null)
-
-			// Manager options
-			.setReconnection(true).setReconnectionAttempts(Integer.MAX_VALUE).setReconnectionDelay(1_000).setReconnectionDelayMax(5_000).setRandomizationFactor(0.5).setTimeout(20_000)
-
-			// Socket options
-			.setAuth(null).build();
-		if (client != null)
-		{
-			client.close();
-		}
-		client = IO.socket(uri, options);
-		client.connect();
-
-		client.on(Socket.EVENT_CONNECT, args -> {
-			log.debug("Socket connected");
-			String roomId = namespace;
-			client.emit(EVENT_CONNECTION_ACK, roomId);
-		});
-
-		client.on(Socket.EVENT_DISCONNECT, args -> {
-			log.debug("Socket disconnected");
-		});
-
-		client.on(Socket.EVENT_CONNECT_ERROR, args -> {
-			log.warn("Failed to connect to socket server, closing");
-			client.close();
-		});
-	}
-
-	/**
-	 * Disconnects the client from the socket server.
-	 */
-	public void disconnect()
-	{
-		if (client != null)
-		{
-			client.disconnect();
-		}
-	}
-
-	/**
-	 * Checks if the client is connected to a socket server.
-	 *
-	 * @return whether socket is connected
-	 */
-	public boolean isConnected()
-	{
-		if (client != null)
-		{
-			return client.connected();
-		}
-		return false;
-	}
-
-	/**
-	 * Sends a socket message to the ping listener. Expects an acknowledgement
-	 * from the server, and returns the JSON data in that acknowledgement.
-	 *
-	 * @return future of ack data in JSON
-	 */
-	public CompletableFuture<String> ping()
-	{
-		String EVENT_PING = "ping";
-		CompletableFuture<String> socketResponse = new CompletableFuture<>();
-		client.emit(EVENT_PING, (Ack) args -> {
-			JSONObject data = (JSONObject) args[0];
-			socketResponse.complete(data.toString());
-		});
-		return socketResponse;
-	}
-
-	/**
-	 * Sends a socket message to the broadcast listener. Passes the JSON data
-	 * as the data parameter and expects an acknowledgement from the server.
-	 *
-	 * @param dataJson future of ack data in JSON
-	 * @return future of ack data in JSON
-	 */
-	public CompletableFuture<String> broadcast(String dataJson)
-	{
-		String EVENT_BROADCAST = "broadcast";
-		CompletableFuture<String> socketResponse = new CompletableFuture<>();
-		client.emit(EVENT_BROADCAST, dataJson, (Ack) args -> {
-			JSONObject data = (JSONObject) args[0];
-			socketResponse.complete(data.toString());
-		});
-		return socketResponse;
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.requests;
-
-import com.gimp.GimPluginConfig;
-import java.net.URL;
-import java.util.concurrent.CompletableFuture;
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
-public abstract class RequestClient
-{
-	public GimPluginConfig config;
-
-	/* Used to join a server-side socket room and/or namespace HTTP requests. */
-	public String namespace;
-
-	/**
-	 * Gets the base URL from the address injected from the plugin config.
-	 *
-	 * @return server base URL
-	 */
-	public String getBaseUrl()
-	{
-		String configServerAddress = config.serverAddress();
-		// Remove trailing slash(es) if exists
-		String trailingSlashes = "/+$";
-		configServerAddress = configServerAddress.replaceAll(trailingSlashes, "");
-		if (!configServerAddress.contains("http"))
-		{
-			return "http://" + configServerAddress;
-		}
-		return configServerAddress;
-	}
-
-	/**
-	 * Validates the URL from the config server address.
-	 *
-	 * @return whether the URL is valid
-	 */
-	public boolean validateUrl()
-	{
-		final URL url;
-		if (config.serverAddress().isEmpty())
-		{
-			return false;
-		}
-		try
-		{
-			url = new URL(getBaseUrl());
-		}
-		catch (Exception e)
-		{
-			return false;
-		}
-		// URL must use HTTP/S protocol
-		return url.getProtocol().contains("http");
-	}
-
-	/**
-	 * Sends a /ping request or emits "ping" to the server.
-	 *
-	 * @return future of response data in JSON
-	 */
-	abstract public CompletableFuture<String> ping();
-
-	/**
-	 * Send a /broadcast request or emits "broadcast" to the server.
-	 *
-	 * @param dataJson request data in JSON
-	 * @return future of response data in JSON
-	 */
-	abstract public CompletableFuture<String> broadcast(String dataJson);
 }
 
 /*
@@ -2086,1630 +1496,6 @@ public interface GimPluginConfig extends Config
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
  * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-package com.gimp.gimps;
-
-import com.gimp.GimPlugin;
-import com.gimp.GimPluginConfig;
-import java.awt.Color;
-import java.io.IOException;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.api.Player;
-import net.runelite.api.Skill;
-import net.runelite.api.clan.*;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.hiscore.HiscoreEndpoint;
-import net.runelite.client.hiscore.HiscoreManager;
-import net.runelite.client.hiscore.HiscoreResult;
-import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
-import javax.inject.Inject;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.concurrent.CompletableFuture;
-
-@Slf4j
-public class Group
-{
-	// TODO: Let the player choose their own color?
-	private final static Color[] GIMP_COLORS = new Color[]{new Color(48, 227, 192), new Color(241, 120, 68), new Color(78, 54, 236), new Color(239, 208, 21), new Color(201, 21, 217)};
-
-	@Getter
-	final private List<GimPlayer> gimps = new ArrayList<>();
-
-	@Inject
-	private Client client;
-
-	@Inject
-	private ClientThread clientThread;
-
-	@Inject
-	public GimPluginConfig config;
-
-	@Inject
-	private WorldMapPointManager worldMapPointManager;
-
-	@Inject
-	private HiscoreManager hiscoreManager;
-
-	@Getter
-	private boolean loaded = false;
-
-	@Getter
-	private String name;
-
-	final private ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
-
-	/**
-	 * Poll for completion of future containing result of loaded clan settings.
-	 *
-	 * @return future of result of loaded clan settings
-	 */
-	private CompletableFuture<Void> waitForClan()
-	{
-		CompletableFuture<Void> completionFuture = new CompletableFuture<>();
-		final ScheduledFuture<?> checkFuture = executor.scheduleAtFixedRate(() -> {
-			if (client.getClanSettings(ClanID.GROUP_IRONMAN) != null)
-			{
-				completionFuture.complete(null);
-			}
-		}, 0, 1, TimeUnit.SECONDS);
-		completionFuture.whenComplete((result, ex) -> {
-			checkFuture.cancel(true);
-		});
-		return completionFuture;
-	}
-
-	/**
-	 * Loads player data to the Group once the client has finished loading clan
-	 * data. Initializes data for the local gimp.
-	 *
-	 * @return result of loading gimps
-	 */
-	public CompletableFuture<Void> load()
-	{
-		CompletableFuture<Void> loadingResult = new CompletableFuture<>();
-		// Call executor to poll for clan settings
-		waitForClan().whenCompleteAsync((result, ex) -> {
-			ClanSettings gimClanSettings = client.getClanSettings(ClanID.GROUP_IRONMAN);
-			assert gimClanSettings != null;
-			name = gimClanSettings.getName();
-			List<ClanMember> clanMembers = gimClanSettings.getMembers();
-			for (int i = 0; i < clanMembers.size(); i++)
-			{
-				final ClanMember member = clanMembers.get(i);
-				// For some reason, clan member names with spaces use the no-break
-				// space character, so we must sanitize it
-				String name = sanitize(member.getName());
-				int world = getCurrentWorld(name);
-				gimps.add(new GimPlayer(name, world, GIMP_COLORS[i]));
-			}
-			// Load local gimp data, including hiscores
-			localLoad().whenCompleteAsync((r, e) -> {
-				loaded = true;
-				loadingResult.complete(null);
-			});
-		});
-		return loadingResult;
-	}
-
-	/**
-	 * Loads data for the local GimPlayer, including fetching its hiscores.
-	 *
-	 * @return result of loading local gimp data
-	 */
-	public CompletableFuture<Void> localLoad()
-	{
-		CompletableFuture<Void> loadingResult = new CompletableFuture<>();
-		Player localPlayer = client.getLocalPlayer();
-		GimPlayer localGimp = getLocalGimp();
-		// If no local player or gimp, complete load
-		if (localPlayer == null || localGimp == null)
-		{
-			loadingResult.cancel(true);
-			return loadingResult;
-		}
-		localUpdate();
-		setHiscores(localGimp.getName()).whenCompleteAsync((result, ext) -> {
-			loadingResult.complete(null);
-		});
-		return loadingResult;
-	}
-
-	/**
-	 * Maps a raw GimPlayer data object to a GimPlayer in the Group.
-	 *
-	 * @param gimpData a GimPlayer instance holding broadcast data
-	 */
-	public void update(GimPlayer gimpData)
-	{
-		for (GimPlayer gimp : gimps)
-		{
-			String gimpName = gimpData.getName();
-			if (gimp.getName().equals(gimpName))
-			{
-				if (gimpData.getHp() != null)
-				{
-					gimp.setHp(gimpData.getHp());
-				}
-				if (gimpData.getMaxHp() != null)
-				{
-					gimp.setMaxHp(gimpData.getMaxHp());
-				}
-				if (gimpData.getPrayer() != null)
-				{
-					gimp.setPrayer(gimpData.getPrayer());
-				}
-				if (gimpData.getMaxPrayer() != null)
-				{
-					gimp.setMaxPrayer(gimpData.getMaxPrayer());
-				}
-				if (gimpData.getNotes() != null)
-				{
-					gimp.setNotes(gimpData.getNotes());
-				}
-				// Must set ghost mode before location!
-				if (gimpData.getGhostMode() != null)
-				{
-					setGhostMode(gimpName, gimpData.getGhostMode());
-				}
-				if (gimpData.getLocation() != null)
-				{
-					setLocation(gimpName, gimpData.getLocation());
-				}
-				if (gimpData.getLastActivity() != null)
-				{
-					gimp.setLastActivity(gimpData.getLastActivity());
-				}
-			}
-		}
-	}
-
-	public void unload()
-	{
-		gimps.clear();
-		loaded = false;
-	}
-
-	public GimPlayer getGimp(String name)
-	{
-		for (GimPlayer gimp : gimps)
-		{
-			if (gimp.getName().equals(name))
-			{
-				return gimp;
-			}
-		}
-		return null;
-	}
-
-	public GimPlayer getLocalGimp()
-	{
-		final Player localPlayer = client.getLocalPlayer();
-		if (localPlayer != null)
-		{
-			return getGimp(localPlayer.getName());
-		}
-		return null;
-	}
-
-	/**
-	 * Updates the local GimPlayer if that player exists using data
-	 * available on the client.
-	 */
-	public void localUpdate()
-	{
-		GimPlayer localGimp = getLocalGimp();
-		if (localGimp != null)
-		{
-			localGimp.setHp(client.getBoostedSkillLevel(Skill.HITPOINTS));
-			localGimp.setMaxHp(client.getRealSkillLevel(Skill.HITPOINTS));
-			localGimp.setPrayer(client.getBoostedSkillLevel(Skill.PRAYER));
-			localGimp.setMaxPrayer(client.getRealSkillLevel(Skill.PRAYER));
-			localGimp.setGhostMode(config.ghostMode());
-			setWorld(localGimp.getName(), client.getWorld());
-		}
-	}
-
-	public void localUpdate(WorldPoint playerLocation)
-	{
-		localUpdate();
-		GimPlayer localGimp = getLocalGimp();
-		if (localGimp != null)
-		{
-			setLocation(localGimp.getName(), new GimLocation(playerLocation));
-		}
-	}
-
-	/**
-	 * Hydrates specific data on local GimPlayer, meant to be invoked after
-	 * player has received a local update. These properties might depend on
-	 * data from server before falling back on a local source.
-	 *
-	 * @param gimpData GimPlayer data
-	 */
-	public void localHydrate(GimPlayer gimpData)
-	{
-		Player localPlayer = client.getLocalPlayer();
-		GimPlayer localGimp = getLocalGimp();
-		if (localPlayer != null && localGimp != null)
-		{
-			// Notes must come from the server if they exist
-			String gimpNotes;
-			if (gimpData.getNotes() != null)
-			{
-				gimpNotes = gimpData.getNotes();
-			}
-			// Otherwise, fall back on notes data saved to config
-			else
-			{
-				gimpNotes = config.notesData();
-			}
-			localGimp.setNotes(gimpNotes);
-		}
-	}
-
-	public List<String> getNames()
-	{
-		List<String> names = new ArrayList<>();
-		for (GimPlayer gimp : gimps)
-		{
-			names.add(gimp.getName());
-		}
-		return names;
-	}
-
-	/**
-	 * Sets a GimPlayer's location using the provided location data and
-	 * updates its icon on the world map if the gimp is online and doesn't
-	 * have ghost mode enabled.
-	 *
-	 * @param name     GimPlayer name
-	 * @param location GimPlayer location data
-	 */
-	public void setLocation(String name, GimLocation location)
-	{
-		GimPlayer gimp = getGimp(name);
-		if (gimp == null)
-		{
-			return;
-		}
-		// Create new GimLocation from raw data
-		GimLocation newGimLocation = new GimLocation(location.getX(), location.getY(), location.getPlane());
-		// Set GimPlayer location to new location
-		gimp.setLocation(newGimLocation);
-	}
-
-	/**
-	 * Sets the world number of the GimPlayer by name and removes
-	 * the map point if the world number is 0, e.g. the player is offline.
-	 *
-	 * @param name  GimPlayer name
-	 * @param world world number
-	 */
-	public void setWorld(String name, int world)
-	{
-		GimPlayer gimp = getGimp(name);
-		if (gimp == null)
-		{
-			return;
-		}
-		gimp.setWorld(world);
-	}
-
-	/**
-	 * Sets the ghost mode value of the GimPlayer by name. If the GimPlayer
-	 * has a location stored, either removes the corresponding map point or
-	 * creates one, depending on the new ghost mode setting.
-	 *
-	 * @param name      GimPlayer name
-	 * @param ghostMode ghost mode setting
-	 */
-	public void setGhostMode(String name, boolean ghostMode)
-	{
-		GimPlayer gimp = getGimp(name);
-		if (gimp == null)
-		{
-			return;
-		}
-		gimp.setGhostMode(ghostMode);
-	}
-
-	/**
-	 * Gets the world of a player by name, returns 0 if the player
-	 * is offline.
-	 *
-	 * @param name GimPlayer name
-	 * @return world number
-	 */
-	public int getCurrentWorld(String name)
-	{
-		ClanChannel gimClanChannel = client.getClanChannel(ClanID.GROUP_IRONMAN);
-		if (validateGimpName(name) && gimClanChannel != null)
-		{
-			ClanChannelMember onlineMember = gimClanChannel.findMember(name);
-			GimPlayer gimp = getGimp(name);
-			// If you cannot find member in clan, or GimPlayer is in ghost mode
-			if (onlineMember == null || (gimp != null && gimp.getGhostMode()))
-			{
-				return GimPlugin.OFFLINE_WORLD;
-			}
-			return onlineMember.getWorld();
-		}
-		return GimPlugin.OFFLINE_WORLD;
-	}
-
-	public CompletableFuture<HiscoreResult> setHiscores(String name)
-	{
-		GimPlayer gimp = getGimp(name);
-		return getHiscores(name).whenCompleteAsync((result, ext) -> {
-			gimp.setHiscores(result);
-		});
-	}
-
-	/**
-	 * Fetches player hiscores via HiscoreManager, caching the result
-	 * and returning the pending result to the invoker.
-	 *
-	 * @param name GimPlayer name
-	 * @return player hiscores result
-	 */
-	public CompletableFuture<HiscoreResult> getHiscores(String name)
-	{
-		CompletableFuture<HiscoreResult> hiscoreResult = new CompletableFuture<>();
-		try
-		{
-			HiscoreResult result = hiscoreManager.lookup(name, HiscoreEndpoint.NORMAL);
-			if (result == null)
-			{
-				log.warn("Could not find hiscore data for {}", name);
-			}
-			hiscoreResult.complete(result);
-		}
-		catch (IOException e)
-		{
-			log.error("Error fetching hiscores: {}", String.valueOf(e));
-			hiscoreResult.completeExceptionally(e);
-		}
-		return hiscoreResult;
-	}
-
-	public boolean isEmpty()
-	{
-		return gimps.isEmpty();
-	}
-
-	private static String sanitize(String lookup)
-	{
-		return lookup.replace('\u00A0', ' ');
-	}
-
-	private boolean validateGimpName(String name)
-	{
-		return getGimp(name) != null;
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.gimps;
-
-import lombok.Getter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.coords.WorldPoint;
-
-import java.util.HashMap;
-import java.util.Map;
-
-@Getter
-@Slf4j
-public class GimLocation
-{
-	public enum Coordinate
-	{
-		plane,
-		x,
-		y
-	}
-
-	final int x;
-
-	final int y;
-
-	final int plane;
-
-	public GimLocation(WorldPoint worldPoint)
-	{
-		x = worldPoint.getX();
-		y = worldPoint.getY();
-		plane = worldPoint.getPlane();
-	}
-
-	public GimLocation(int x, int y, int plane)
-	{
-		this.x = x;
-		this.y = y;
-		this.plane = plane;
-	}
-
-	/**
-	 * Maps member coordinates x, y, and plane to HashMap.
-	 *
-	 * @return map: coordinateName => coordinateValue
-	 */
-	public Map<String, Integer> getLocation()
-	{
-		Map<String, Integer> location = new HashMap<>();
-		location.put(Coordinate.x.toString(), x);
-		location.put(Coordinate.y.toString(), y);
-		location.put(Coordinate.plane.toString(), plane);
-		return location;
-	}
-
-	public WorldPoint toWorldPoint()
-	{
-		return new WorldPoint(x, y, plane);
-	}
-
-	public double getDistanceTo(GimLocation other)
-	{
-		return Math.sqrt(Math.pow(other.x - x, 2) + Math.pow(other.y - y, 2));
-	}
-
-	public static boolean compare(GimLocation loc1, GimLocation loc2)
-	{
-		return (loc1.getX() == loc2.getX())
-			&& (loc1.getY() == loc2.getY())
-			&& (loc1.getPlane() == loc2.getPlane());
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.gimps;
-
-import java.awt.Color;
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.hiscore.HiscoreResult;
-import net.runelite.client.plugins.party.messages.TilePing;
-import javax.annotation.Nullable;
-import javax.inject.Inject;
-import java.util.HashMap;
-import java.util.Map;
-
-@Slf4j
-public class GimPlayer
-{
-	@Getter
-	final private String name;
-
-	@Setter
-	@Getter
-	private Integer hp;
-
-	@Setter
-	@Getter
-	private Integer maxHp;
-
-	@Setter
-	@Getter
-	private Integer prayer;
-
-	@Setter
-	@Getter
-	private Integer maxPrayer;
-
-	@Setter
-	@Getter
-	private HiscoreResult hiscores;
-
-	@Setter
-	@Getter
-	private String notes;
-
-	@Setter
-	@Getter
-	private TilePing tilePing;
-
-	@Setter
-	@Getter
-	private Integer world;
-
-	@Nullable
-	@Getter
-	private GimLocation location;
-
-	@Setter
-	@Getter
-	private Boolean ghostMode = false;
-
-	@Setter
-	@Getter
-	private String lastActivity = IN_GAME_ACTIVITY;
-
-	public static final String IN_GAME_ACTIVITY = "IN_GAME_ACTIVITY";
-
-	/**
-	 * Speed of this player in tiles per second.
-	 */
-	@Getter
-	private double speed;
-
-	/**
-	 * Timestamp of the last location update (in system time milliseconds).
-	 * Used for computing the effective "speed" of the player.
-	 */
-	private long locationTimestamp;
-
-	@Getter
-	private final Color color;
-
-	@Inject
-	public GimPlayer(String name, int world, Color color)
-	{
-		this.name = name;
-		this.world = world;
-		this.color = color;
-	}
-
-	public void setLocation(GimLocation location)
-	{
-		// Determine the "speed" of the player
-		if (this.location != null)
-		{
-			final long millisSinceLastLocation = System.currentTimeMillis() - locationTimestamp;
-			final double distance = this.location.getDistanceTo(location);
-			if (this.location.plane != location.plane)
-			{
-				// If switching between planes, keep the speed at zero
-				speed = 0;
-			}
-			else
-			{
-				// Otherwise, compute the speed (doesn't account for teleports, but oh well...)
-				speed = distance * 1000.0 / millisSinceLastLocation;
-			}
-		}
-		// Set location to new GimLocation
-		this.location = location;
-		// Update timestamp
-		locationTimestamp = System.currentTimeMillis();
-	}
-
-	public Map<String, Object> getData()
-	{
-		Map<String, Object> data = new HashMap<>();
-		data.put("name", name);
-		return data;
-	}
-
-	public boolean shouldIncludeLocation()
-	{
-		return ghostMode == null || !ghostMode;
-	}
-
-	/**
-	 * Retrieves GimPlayer data for a broadcast. Suppresses and/or
-	 * modifies data for this purpose.
-	 *
-	 * @return GimPlayer broadcast-ready data
-	 */
-	public Map<String, Object> getGimpData()
-	{
-		Map<String, Object> gimpData = new HashMap<>();
-		gimpData.put("name", name);
-		gimpData.put("hp", hp);
-		gimpData.put("maxHp", maxHp);
-		gimpData.put("prayer", prayer);
-		gimpData.put("maxPrayer", maxPrayer);
-		gimpData.put("notes", notes);
-		gimpData.put("ghostMode", ghostMode);
-		// Don't get location if ghostMode is active
-		if (location != null && this.shouldIncludeLocation())
-		{
-			gimpData.put("location", location.getLocation());
-		}
-		gimpData.put("lastActivity", lastActivity);
-		return gimpData;
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp;
-
-import com.gimp.gimps.GimPlayer;
-import com.gimp.requests.*;
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
-import io.socket.client.Socket;
-import io.socket.emitter.Emitter;
-import java.lang.reflect.Type;
-import java.util.concurrent.CompletableFuture;
-import lombok.extern.slf4j.Slf4j;
-import java.util.Map;
-import okhttp3.OkHttpClient;
-
-@Slf4j
-public class GimBroadcastManager
-{
-	private static final Type pingDataTypeForJson = new TypeToken<Map<String, GimPlayer>>()
-	{
-	}.getType();
-
-	private static final String EVENT_BROADCAST = "broadcast";
-
-	private final HttpClient httpClient;
-
-	private final SocketClient socketClient;
-
-	private final Gson gson;
-
-	public GimBroadcastManager(String groupName, OkHttpClient okHttpClient, GimPluginConfig config, Gson gson)
-	{
-		this.gson = gson;
-		httpClient = new HttpClient(groupName, okHttpClient, config);
-		socketClient = new SocketClient(groupName, config);
-	}
-
-	/**
-	 * Parses JSON string of the ping data and adds to a GimPlayer Map.
-	 *
-	 * @param dataJson JSON string of ping data
-	 * @return map: name => GimPlayer
-	 */
-	private Map<String, GimPlayer> parsePingData(String dataJson)
-	{
-		return gson.fromJson(dataJson, pingDataTypeForJson);
-	}
-
-	/**
-	 * Parses JSON string of the broadcast data and maps to a GimPlayer instance.
-	 *
-	 * @param dataJson JSON string of broadcast data
-	 * @return GimPlayer
-	 */
-	public GimPlayer parseBroadcastData(String dataJson)
-	{
-		return gson.fromJson(dataJson, GimPlayer.class);
-	}
-
-	/**
-	 * Checks if socket client is connected.
-	 *
-	 * @return whether socket is connected
-	 */
-	public boolean isSocketConnected()
-	{
-		return socketClient.isConnected();
-	}
-
-	/**
-	 * Connects socket client to the server and joins the group's room.
-	 */
-	public void connectSocketClient()
-	{
-		socketClient.connect();
-	}
-
-	/**
-	 * Registers a "connect" listener.
-	 *
-	 * @param handleConnect listener for the connect event
-	 */
-	public void onBroadcastConnect(Emitter.Listener handleConnect)
-	{
-		Socket client = socketClient.getClient();
-		if (client != null)
-		{
-			client.on(Socket.EVENT_CONNECT, handleConnect);
-		}
-	}
-
-	/**
-	 * Registers a "disconnect" listener.
-	 *
-	 * @param handleDisconnect listener for the disconnect event
-	 */
-	public void onBroadcastDisconnect(Emitter.Listener handleDisconnect)
-	{
-		Socket client = socketClient.getClient();
-		if (client != null)
-		{
-			client.on(Socket.EVENT_DISCONNECT, handleDisconnect);
-		}
-	}
-
-	/**
-	 * Registers a "connect_error" listener.
-	 *
-	 * @param handleError listener for the connect_error event
-	 */
-	public void onBroadcastConnectError(Emitter.Listener handleError)
-	{
-		Socket client = socketClient.getClient();
-		if (client != null)
-		{
-			client.on(Socket.EVENT_CONNECT_ERROR, handleError);
-		}
-	}
-
-	/**
-	 * Disconnects socket client from the server.
-	 */
-	public void disconnectSocketClient()
-	{
-		socketClient.disconnect();
-	}
-
-	/**
-	 * Gets broadcast client, using the socket client if it's
-	 * connected and falling back on the HTTP client.
-	 *
-	 * @return a SocketClient or HTTPClient
-	 */
-	private RequestClient getRequestClient()
-	{
-		if (socketClient.isConnected())
-		{
-			return socketClient;
-		}
-		else
-		{
-			return httpClient;
-		}
-	}
-
-	/**
-	 * Starts listening for the "broadcast" socket event and passes in a listener
-	 * to handle the broadcast data.
-	 *
-	 * @param handleBroadcast handler for processing the broadcast data
-	 */
-	public void listen(Emitter.Listener handleBroadcast)
-	{
-		Socket client = socketClient.getClient();
-		if (client != null)
-		{
-			client.on(EVENT_BROADCAST, handleBroadcast);
-		}
-	}
-
-	/**
-	 * Turns off the listener for the "broadcast" event.
-	 */
-	public void stopListening()
-	{
-		Socket client = socketClient.getClient();
-		if (client != null)
-		{
-			client.off(EVENT_BROADCAST);
-		}
-	}
-
-	/**
-	 * Sends broadcast request to the server via HTTP or socket.
-	 *
-	 * @param data gimp data
-	 */
-	public void broadcast(Map<String, Object> data)
-	{
-		try
-		{
-			RequestClient requestClient = getRequestClient();
-			String dataJson = gson.toJson(data);
-			requestClient.broadcast(dataJson).thenAccept((result) -> log.debug("Broadcast data: {}", result));
-		}
-		catch (Exception e)
-		{
-			log.error("Broadcast error: {}", String.valueOf(e));
-		}
-	}
-
-	/**
-	 * Sends ping request to the server via HTTP or socket.
-	 *
-	 * @return future of map: name => GimPlayer
-	 */
-	public CompletableFuture<Map<String, GimPlayer>> ping()
-	{
-		RequestClient requestClient = getRequestClient();
-		try
-		{
-			return requestClient.ping().thenApply((result) -> {
-				log.debug("Ping data: {}", result);
-				return parsePingData(result);
-			});
-		}
-		catch (Exception e)
-		{
-			log.error("Ping error: {}", String.valueOf(e));
-			return null;
-		}
-	}
-}
-
-/*
- * Copyright (c) 2022, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.ui;
-
-import com.google.common.base.Strings;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.util.function.BooleanSupplier;
-import javax.swing.BorderFactory;
-import javax.swing.ImageIcon;
-import javax.swing.JLabel;
-import javax.swing.JLayeredPane;
-import javax.swing.SwingConstants;
-import javax.swing.border.Border;
-import javax.swing.border.CompoundBorder;
-import javax.swing.border.EmptyBorder;
-import lombok.Getter;
-import lombok.Setter;
-import net.runelite.client.ui.ColorScheme;
-
-public class GimTab extends JLayeredPane
-{
-	private static final Border SELECTED_BORDER = new CompoundBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.BRAND_ORANGE), BorderFactory.createEmptyBorder(5, 10, 4, 10));
-
-	private static final Border UNSELECTED_BORDER = BorderFactory.createEmptyBorder(5, 10, 5, 10);
-
-	private static final Color ONLINE_COLOR = new Color(0, 146, 54, 230);
-
-	private static final Color OFFLINE_COLOR = Color.RED;
-
-	private static final int STATUS_DOT_SIZE = 5;
-
-	@Getter
-	private final String gimp;
-
-	private final JLabel label;
-
-	private final FilledCircle statusDot;
-
-	/* To be executed when the tab is selected */
-	@Setter
-	private BooleanSupplier onSelectEvent;
-
-	@Getter
-	private boolean selected;
-
-	public GimTab(String string, GimTabGroup group, String gimp)
-	{
-		super();
-
-		this.gimp = gimp;
-
-		setLayout(new BorderLayout());
-
-		this.label = new JLabel(string);
-		// Pad the left side of the icon to account for the status dot
-		this.label.setBorder(new EmptyBorder(0, STATUS_DOT_SIZE, 0, 0));
-		add(this.label, BorderLayout.CENTER);
-		setLayer(this.label, DEFAULT_LAYER);
-
-		this.statusDot = new FilledCircle(STATUS_DOT_SIZE, STATUS_DOT_SIZE, OFFLINE_COLOR);
-		add(this.statusDot, BorderLayout.EAST);
-		setLayer(this.statusDot, PALETTE_LAYER);
-
-		unselect();
-
-		addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mousePressed(MouseEvent mouseEvent)
-			{
-				group.select(GimTab.this);
-			}
-		});
-
-		if (!Strings.isNullOrEmpty(string))
-		{
-			addMouseListener(new MouseAdapter()
-			{
-				@Override
-				public void mouseEntered(MouseEvent e)
-				{
-					GimTab tab = (GimTab) e.getSource();
-					tab.setForeground(Color.WHITE);
-				}
-
-				@Override
-				public void mouseExited(MouseEvent e)
-				{
-					GimTab tab = (GimTab) e.getSource();
-					if (!tab.isSelected())
-					{
-						tab.setForeground(Color.GRAY);
-					}
-				}
-			});
-		}
-	}
-
-	public GimTab(ImageIcon icon, GimTabGroup group, String gimp)
-	{
-		this("", group, gimp);
-		setOpaque(true);
-		setBackground(ColorScheme.DARKER_GRAY_COLOR);
-		this.drawLabel(icon);
-
-		addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseEntered(MouseEvent e)
-			{
-				GimTab tab = (GimTab) e.getSource();
-				tab.setBackground(ColorScheme.DARKER_GRAY_HOVER_COLOR);
-			}
-
-			@Override
-			public void mouseExited(MouseEvent e)
-			{
-				GimTab tab = (GimTab) e.getSource();
-				tab.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-			}
-		});
-
-	}
-
-	private void drawLabel(ImageIcon icon)
-	{
-		this.label.setIcon(icon);
-		this.label.setOpaque(false);
-		this.label.setVerticalAlignment(SwingConstants.CENTER);
-		this.label.setHorizontalAlignment(SwingConstants.CENTER);
-	}
-
-	public void setStatus(boolean isOnline)
-	{
-		Color color = isOnline ? ONLINE_COLOR : OFFLINE_COLOR;
-		this.statusDot.setColor(color);
-		this.statusDot.repaint();
-	}
-
-	public boolean select()
-	{
-		if (onSelectEvent != null)
-		{
-			if (!onSelectEvent.getAsBoolean())
-			{
-				return false;
-			}
-		}
-
-		setBorder(SELECTED_BORDER);
-		setForeground(Color.WHITE);
-		return selected = true;
-	}
-
-	public void unselect()
-	{
-		setBorder(UNSELECTED_BORDER);
-		setForeground(Color.GRAY);
-		selected = false;
-	}
-
-	@Override
-	public void setForeground(Color fg)
-	{
-		super.setForeground(fg);
-	}
-
-	@Override
-	public void setBackground(Color bg)
-	{
-		super.setBackground(bg);
-	}
-}
-
-/*
- * Copyright (c) 2022, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.ui;
-
-import javax.swing.*;
-import java.awt.*;
-import lombok.Setter;
-
-@Setter
-public class FilledCircle extends JPanel
-{
-	private int width;
-
-	private int height;
-
-	private Color color;
-
-	public FilledCircle(int width, int height, Color color)
-	{
-		setWidth(width);
-		setHeight(height);
-		setSize(width, height);
-		setColor(color);
-		setVisible(true);
-	}
-
-	@Override
-	public void paint(Graphics g)
-	{
-		Graphics2D g2d = (Graphics2D) g;
-		g2d.setColor(color);
-		g2d.drawOval(0, 0, width, height);
-		g2d.fillOval(0, 0, width, height);
-	}
-}
-
-/*
- * Copyright (c) 2022, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.ui;
-
-import java.awt.BorderLayout;
-import java.awt.FlowLayout;
-import java.util.ArrayList;
-import java.util.List;
-import javax.swing.JPanel;
-
-public class GimTabGroup extends JPanel
-{
-	/* The panel on which the content tab's content will be displayed on. */
-	private final JPanel display;
-	/* A list of all the tabs contained in this group. */
-	private final List<GimTab> tabs = new ArrayList<>();
-
-	public GimTabGroup(JPanel display)
-	{
-		this.display = display;
-		if (display != null)
-		{
-			this.display.setLayout(new BorderLayout());
-		}
-		setLayout(new FlowLayout(FlowLayout.CENTER, 8, 0));
-		setOpaque(false);
-	}
-
-	public GimTabGroup()
-	{
-		this(null);
-	}
-
-	/* Returns the tab on a certain index. */
-	public GimTab getTab(int index)
-	{
-
-		if (tabs == null || tabs.isEmpty())
-		{
-			return null;
-		}
-
-		return tabs.get(index);
-	}
-
-	public GimTab getTab(String gimp)
-	{
-		if (tabs == null || tabs.isEmpty())
-		{
-			return null;
-		}
-		// Get a tab by the associated gimp
-		for (GimTab tab : tabs)
-		{
-			if (tab.getGimp().equals(gimp))
-			{
-				return tab;
-			}
-		}
-		return null;
-	}
-
-	public void addTab(GimTab tab)
-	{
-		tabs.add(tab);
-		add(tab, BorderLayout.NORTH);
-	}
-
-	/***
-	 * Selects a tab from the group, and sets the display's content to the
-	 * tab's associated content.
-	 * @param selectedTab - The tab to select
-	 */
-	public void select(GimTab selectedTab)
-	{
-		if (!tabs.contains(selectedTab))
-		{
-			return;
-		}
-
-		// If the OnTabSelected returned false, exit the method to prevent tab switching
-		if (!selectedTab.select())
-		{
-			return;
-		}
-
-		// If the display is available, switch from the old to the new display
-		if (display != null)
-		{
-			display.removeAll();
-			display.revalidate();
-			display.repaint();
-		}
-
-		// Unselected all other tabs
-		for (GimTab tab : tabs)
-		{
-			if (!tab.equals(selectedTab))
-			{
-				tab.unselect();
-			}
-		}
-
-	}
-}
-
-/*
- * Copyright (c) 2023, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.ui;
-
-import com.gimp.GimPlugin;
-import java.awt.BorderLayout;
-import java.awt.event.ActionEvent;
-import java.awt.event.FocusEvent;
-import java.awt.event.FocusListener;
-import javax.swing.AbstractAction;
-import javax.swing.BorderFactory;
-import javax.swing.JPanel;
-import javax.swing.JTextArea;
-import javax.swing.KeyStroke;
-import javax.swing.border.EmptyBorder;
-import javax.swing.text.BadLocationException;
-import javax.swing.text.Document;
-import javax.swing.undo.CannotUndoException;
-import javax.swing.undo.UndoManager;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.ui.ColorScheme;
-
-@Slf4j
-public class GimNotes extends JPanel
-{
-	private final JTextArea notesEditor = new JTextArea();
-	private final UndoManager undoRedo = new UndoManager();
-
-	public void init(GimPlugin plugin)
-	{
-		setLayout(new BorderLayout());
-		setBorder(BorderFactory.createEmptyBorder(5, 0, 10, 0));
-		setBackground(ColorScheme.DARK_GRAY_COLOR);
-
-		notesEditor.setTabSize(2);
-		notesEditor.setLineWrap(true);
-		notesEditor.setWrapStyleWord(true);
-
-		JPanel notesContainer = new JPanel();
-		notesContainer.setLayout(new BorderLayout());
-		notesContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
-
-		notesEditor.setOpaque(false);
-
-		// setting the limit to a 500 as UndoManager registers every key press,
-		// which means that be default we would be able to undo only a sentence.
-		// note: the default limit is 100
-		undoRedo.setLimit(500);
-		notesEditor.getDocument().addUndoableEditListener(e -> undoRedo.addEdit(e.getEdit()));
-
-		notesEditor.getInputMap().put(KeyStroke.getKeyStroke("control Z"), "Undo");
-		notesEditor.getInputMap().put(KeyStroke.getKeyStroke("control Y"), "Redo");
-
-		notesEditor.getActionMap().put("Undo", new AbstractAction("Undo")
-		{
-			@Override
-			public void actionPerformed(ActionEvent e)
-			{
-				try
-				{
-					if (undoRedo.canUndo())
-					{
-						undoRedo.undo();
-					}
-				}
-				catch (CannotUndoException ex)
-				{
-					log.warn("Notes Document Unable To Undo: {}", String.valueOf(ex));
-				}
-			}
-		});
-
-		notesEditor.getActionMap().put("Redo", new AbstractAction("Redo")
-		{
-			@Override
-			public void actionPerformed(ActionEvent e)
-			{
-				try
-				{
-					if (undoRedo.canRedo())
-					{
-						undoRedo.redo();
-					}
-				}
-				catch (CannotUndoException ex)
-				{
-					log.warn("Notes Document Unable To Redo: {}", String.valueOf(ex));
-				}
-			}
-		});
-
-		notesEditor.addFocusListener(new FocusListener()
-		{
-			@Override
-			public void focusGained(FocusEvent e)
-			{
-
-			}
-
-			@Override
-			public void focusLost(FocusEvent e)
-			{
-				notesChanged(notesEditor.getDocument());
-			}
-
-			private void notesChanged(Document doc)
-			{
-				try
-				{
-					// get document text and save to config whenever editor is changed
-					String data = doc.getText(0, doc.getLength());
-					plugin.updateNotes(data);
-				}
-				catch (BadLocationException ex)
-				{
-					log.warn("Notes Document Bad Location: {}", String.valueOf(ex));
-				}
-			}
-		});
-
-		notesContainer.add(notesEditor, BorderLayout.CENTER);
-		notesContainer.setBorder(new EmptyBorder(10, 10, 10, 10));
-
-		add(notesContainer, BorderLayout.CENTER);
-	}
-
-	public void setNotes(String data)
-	{
-		notesEditor.setText(data);
-	}
-
-	public void setEnabled(boolean enabled)
-	{
-		notesEditor.setEnabled(enabled);
-	}
-
-	public void setToolTipText(String text)
-	{
-		notesEditor.setToolTipText(text);
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.tasks;
-
-import java.util.Timer;
-import java.util.TimerTask;
-import javax.inject.Inject;
-import lombok.extern.slf4j.Slf4j;
-
-@Slf4j
-public class TaskManager
-{
-	@Inject
-	private Timer timer;
-
-	/**
-	 * Schedules a task to run after the delay and then schedules
-	 * it again after calculating the next delay.
-	 *
-	 * @param task  task to run after a delay and then reschedule
-	 * @param delay initial duration in milliseconds by which to delay task
-	 */
-	public void schedule(Task task, long delay)
-	{
-		TimerTask timerTask = new TimerTask()
-		{
-			@Override
-			public void run()
-			{
-				task.run();
-				long nextDelay = task.delay();
-				if (nextDelay != 0)
-				{
-					schedule(task, nextDelay);
-				}
-			}
-		};
-		timer.schedule(timerTask, delay);
-	}
-
-	/**
-	 * Purges any canceled tasks and cancels the timer, then
-	 * creates a new one.
-	 */
-	public void resetTasks()
-	{
-		timer.purge();
-		timer.cancel();
-		timer = new Timer();
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.gimp.tasks;
-
-interface TaskRunner
-{
-	void run();
-
-	long delay();
-}
-
-public class Task implements TaskRunner
-{
-	final public long period;
-
-	public Task(long defaultPeriod)
-	{
-		period = defaultPeriod;
-	}
-
-	/**
-	 * Runs code that can be overridden, meant to be called
-	 * after a delay.
-	 */
-	public void run()
-	{
-	}
-
-	/**
-	 * Returns the delay, can be overridden for a dynamic delay.
-	 *
-	 * @return duration in milliseconds by which to delay task
-	 */
-	public long delay()
-	{
-		return period;
-	}
-}
-
-/*
- * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
 package com.gimp;
 
 import com.gimp.gimps.*;
@@ -4751,6 +2537,2220 @@ public class GimPluginPanel extends PluginPanel
 		// Left pad label text to keep labels aligned
 		int pad = type == HiscoreSkillType.BOSS ? 4 : 2;
 		return StringUtils.leftPad(str, pad);
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.gimps;
+
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.coords.WorldPoint;
+
+import java.util.HashMap;
+import java.util.Map;
+
+@Getter
+@Slf4j
+public class GimLocation
+{
+	public enum Coordinate
+	{
+		plane,
+		x,
+		y
+	}
+
+	final int x;
+
+	final int y;
+
+	final int plane;
+
+	public GimLocation(WorldPoint worldPoint)
+	{
+		x = worldPoint.getX();
+		y = worldPoint.getY();
+		plane = worldPoint.getPlane();
+	}
+
+	public GimLocation(int x, int y, int plane)
+	{
+		this.x = x;
+		this.y = y;
+		this.plane = plane;
+	}
+
+	/**
+	 * Maps member coordinates x, y, and plane to HashMap.
+	 *
+	 * @return map: coordinateName => coordinateValue
+	 */
+	public Map<String, Integer> getLocation()
+	{
+		Map<String, Integer> location = new HashMap<>();
+		location.put(Coordinate.x.toString(), x);
+		location.put(Coordinate.y.toString(), y);
+		location.put(Coordinate.plane.toString(), plane);
+		return location;
+	}
+
+	public WorldPoint toWorldPoint()
+	{
+		return new WorldPoint(x, y, plane);
+	}
+
+	public double getDistanceTo(GimLocation other)
+	{
+		return Math.sqrt(Math.pow(other.x - x, 2) + Math.pow(other.y - y, 2));
+	}
+
+	public static boolean compare(GimLocation loc1, GimLocation loc2)
+	{
+		return (loc1.getX() == loc2.getX())
+			&& (loc1.getY() == loc2.getY())
+			&& (loc1.getPlane() == loc2.getPlane());
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.gimps;
+
+import java.awt.Color;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.hiscore.HiscoreResult;
+import net.runelite.client.plugins.party.messages.TilePing;
+import javax.annotation.Nullable;
+import javax.inject.Inject;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+public class GimPlayer
+{
+	@Getter
+	final private String name;
+
+	@Setter
+	@Getter
+	private Integer hp;
+
+	@Setter
+	@Getter
+	private Integer maxHp;
+
+	@Setter
+	@Getter
+	private Integer prayer;
+
+	@Setter
+	@Getter
+	private Integer maxPrayer;
+
+	@Setter
+	@Getter
+	private HiscoreResult hiscores;
+
+	@Setter
+	@Getter
+	private String notes;
+
+	@Setter
+	@Getter
+	private TilePing tilePing;
+
+	@Setter
+	@Getter
+	private Integer world;
+
+	@Nullable
+	@Getter
+	private GimLocation location;
+
+	@Setter
+	@Getter
+	private Boolean ghostMode = false;
+
+	@Setter
+	@Getter
+	private String lastActivity = IN_GAME_ACTIVITY;
+
+	public static final String IN_GAME_ACTIVITY = "IN_GAME_ACTIVITY";
+
+	/**
+	 * Speed of this player in tiles per second.
+	 */
+	@Getter
+	private double speed;
+
+	/**
+	 * Timestamp of the last location update (in system time milliseconds).
+	 * Used for computing the effective "speed" of the player.
+	 */
+	private long locationTimestamp;
+
+	@Getter
+	private final Color color;
+
+	@Inject
+	public GimPlayer(String name, int world, Color color)
+	{
+		this.name = name;
+		this.world = world;
+		this.color = color;
+	}
+
+	public void setLocation(GimLocation location)
+	{
+		// Determine the "speed" of the player
+		if (this.location != null)
+		{
+			final long millisSinceLastLocation = System.currentTimeMillis() - locationTimestamp;
+			final double distance = this.location.getDistanceTo(location);
+			if (this.location.plane != location.plane)
+			{
+				// If switching between planes, keep the speed at zero
+				speed = 0;
+			}
+			else
+			{
+				// Otherwise, compute the speed (doesn't account for teleports, but oh well...)
+				speed = distance * 1000.0 / millisSinceLastLocation;
+			}
+		}
+		// Set location to new GimLocation
+		this.location = location;
+		// Update timestamp
+		locationTimestamp = System.currentTimeMillis();
+	}
+
+	public Map<String, Object> getData()
+	{
+		Map<String, Object> data = new HashMap<>();
+		data.put("name", name);
+		return data;
+	}
+
+	public boolean shouldIncludeLocation()
+	{
+		return ghostMode == null || !ghostMode;
+	}
+
+	/**
+	 * Retrieves GimPlayer data for a broadcast. Suppresses and/or
+	 * modifies data for this purpose.
+	 *
+	 * @return GimPlayer broadcast-ready data
+	 */
+	public Map<String, Object> getGimpData()
+	{
+		Map<String, Object> gimpData = new HashMap<>();
+		gimpData.put("name", name);
+		gimpData.put("hp", hp);
+		gimpData.put("maxHp", maxHp);
+		gimpData.put("prayer", prayer);
+		gimpData.put("maxPrayer", maxPrayer);
+		gimpData.put("notes", notes);
+		gimpData.put("ghostMode", ghostMode);
+		// Don't get location if ghostMode is active
+		if (location != null && this.shouldIncludeLocation())
+		{
+			gimpData.put("location", location.getLocation());
+		}
+		gimpData.put("lastActivity", lastActivity);
+		return gimpData;
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.gimps;
+
+import com.gimp.GimPlugin;
+import com.gimp.GimPluginConfig;
+import java.awt.Color;
+import java.io.IOException;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.Player;
+import net.runelite.api.Skill;
+import net.runelite.api.clan.*;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.hiscore.HiscoreEndpoint;
+import net.runelite.client.hiscore.HiscoreManager;
+import net.runelite.client.hiscore.HiscoreResult;
+import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
+import javax.inject.Inject;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+
+@Slf4j
+public class Group
+{
+	// TODO: Let the player choose their own color?
+	private final static Color[] GIMP_COLORS = new Color[]{new Color(48, 227, 192), new Color(241, 120, 68), new Color(78, 54, 236), new Color(239, 208, 21), new Color(201, 21, 217)};
+
+	@Getter
+	final private List<GimPlayer> gimps = new ArrayList<>();
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	public GimPluginConfig config;
+
+	@Inject
+	private WorldMapPointManager worldMapPointManager;
+
+	@Inject
+	private HiscoreManager hiscoreManager;
+
+	@Getter
+	private boolean loaded = false;
+
+	@Getter
+	private String name;
+
+	final private ScheduledExecutorService executor = Executors.newSingleThreadScheduledExecutor();
+
+	/**
+	 * Poll for completion of future containing result of loaded clan settings.
+	 *
+	 * @return future of result of loaded clan settings
+	 */
+	private CompletableFuture<Void> waitForClan()
+	{
+		CompletableFuture<Void> completionFuture = new CompletableFuture<>();
+		final ScheduledFuture<?> checkFuture = executor.scheduleAtFixedRate(() -> {
+			if (client.getClanSettings(ClanID.GROUP_IRONMAN) != null)
+			{
+				completionFuture.complete(null);
+			}
+		}, 0, 1, TimeUnit.SECONDS);
+		completionFuture.whenComplete((result, ex) -> {
+			checkFuture.cancel(true);
+		});
+		return completionFuture;
+	}
+
+	/**
+	 * Loads player data to the Group once the client has finished loading clan
+	 * data. Initializes data for the local gimp.
+	 *
+	 * @return result of loading gimps
+	 */
+	public CompletableFuture<Void> load()
+	{
+		CompletableFuture<Void> loadingResult = new CompletableFuture<>();
+		// Call executor to poll for clan settings
+		waitForClan().whenCompleteAsync((result, ex) -> {
+			ClanSettings gimClanSettings = client.getClanSettings(ClanID.GROUP_IRONMAN);
+			assert gimClanSettings != null;
+			name = gimClanSettings.getName();
+			List<ClanMember> clanMembers = gimClanSettings.getMembers();
+			for (int i = 0; i < clanMembers.size(); i++)
+			{
+				final ClanMember member = clanMembers.get(i);
+				// For some reason, clan member names with spaces use the no-break
+				// space character, so we must sanitize it
+				String name = sanitize(member.getName());
+				int world = getCurrentWorld(name);
+				gimps.add(new GimPlayer(name, world, GIMP_COLORS[i]));
+			}
+			// Load local gimp data, including hiscores
+			localLoad().whenCompleteAsync((r, e) -> {
+				loaded = true;
+				loadingResult.complete(null);
+			});
+		});
+		return loadingResult;
+	}
+
+	/**
+	 * Loads data for the local GimPlayer, including fetching its hiscores.
+	 *
+	 * @return result of loading local gimp data
+	 */
+	public CompletableFuture<Void> localLoad()
+	{
+		CompletableFuture<Void> loadingResult = new CompletableFuture<>();
+		Player localPlayer = client.getLocalPlayer();
+		GimPlayer localGimp = getLocalGimp();
+		// If no local player or gimp, complete load
+		if (localPlayer == null || localGimp == null)
+		{
+			loadingResult.cancel(true);
+			return loadingResult;
+		}
+		localUpdate();
+		setHiscores(localGimp.getName()).whenCompleteAsync((result, ext) -> {
+			loadingResult.complete(null);
+		});
+		return loadingResult;
+	}
+
+	/**
+	 * Maps a raw GimPlayer data object to a GimPlayer in the Group.
+	 *
+	 * @param gimpData a GimPlayer instance holding broadcast data
+	 */
+	public void update(GimPlayer gimpData)
+	{
+		for (GimPlayer gimp : gimps)
+		{
+			String gimpName = gimpData.getName();
+			if (gimp.getName().equals(gimpName))
+			{
+				if (gimpData.getHp() != null)
+				{
+					gimp.setHp(gimpData.getHp());
+				}
+				if (gimpData.getMaxHp() != null)
+				{
+					gimp.setMaxHp(gimpData.getMaxHp());
+				}
+				if (gimpData.getPrayer() != null)
+				{
+					gimp.setPrayer(gimpData.getPrayer());
+				}
+				if (gimpData.getMaxPrayer() != null)
+				{
+					gimp.setMaxPrayer(gimpData.getMaxPrayer());
+				}
+				if (gimpData.getNotes() != null)
+				{
+					gimp.setNotes(gimpData.getNotes());
+				}
+				// Must set ghost mode before location!
+				if (gimpData.getGhostMode() != null)
+				{
+					setGhostMode(gimpName, gimpData.getGhostMode());
+				}
+				if (gimpData.getLocation() != null)
+				{
+					setLocation(gimpName, gimpData.getLocation());
+				}
+				if (gimpData.getLastActivity() != null)
+				{
+					gimp.setLastActivity(gimpData.getLastActivity());
+				}
+			}
+		}
+	}
+
+	public void unload()
+	{
+		gimps.clear();
+		loaded = false;
+	}
+
+	public GimPlayer getGimp(String name)
+	{
+		for (GimPlayer gimp : gimps)
+		{
+			if (gimp.getName().equals(name))
+			{
+				return gimp;
+			}
+		}
+		return null;
+	}
+
+	public GimPlayer getLocalGimp()
+	{
+		final Player localPlayer = client.getLocalPlayer();
+		if (localPlayer != null)
+		{
+			return getGimp(localPlayer.getName());
+		}
+		return null;
+	}
+
+	/**
+	 * Updates the local GimPlayer if that player exists using data
+	 * available on the client.
+	 */
+	public void localUpdate()
+	{
+		GimPlayer localGimp = getLocalGimp();
+		if (localGimp != null)
+		{
+			localGimp.setHp(client.getBoostedSkillLevel(Skill.HITPOINTS));
+			localGimp.setMaxHp(client.getRealSkillLevel(Skill.HITPOINTS));
+			localGimp.setPrayer(client.getBoostedSkillLevel(Skill.PRAYER));
+			localGimp.setMaxPrayer(client.getRealSkillLevel(Skill.PRAYER));
+			localGimp.setGhostMode(config.ghostMode());
+			setWorld(localGimp.getName(), client.getWorld());
+		}
+	}
+
+	public void localUpdate(WorldPoint playerLocation)
+	{
+		localUpdate();
+		GimPlayer localGimp = getLocalGimp();
+		if (localGimp != null)
+		{
+			setLocation(localGimp.getName(), new GimLocation(playerLocation));
+		}
+	}
+
+	/**
+	 * Hydrates specific data on local GimPlayer, meant to be invoked after
+	 * player has received a local update. These properties might depend on
+	 * data from server before falling back on a local source.
+	 *
+	 * @param gimpData GimPlayer data
+	 */
+	public void localHydrate(GimPlayer gimpData)
+	{
+		Player localPlayer = client.getLocalPlayer();
+		GimPlayer localGimp = getLocalGimp();
+		if (localPlayer != null && localGimp != null)
+		{
+			// Notes must come from the server if they exist
+			String gimpNotes;
+			if (gimpData.getNotes() != null)
+			{
+				gimpNotes = gimpData.getNotes();
+			}
+			// Otherwise, fall back on notes data saved to config
+			else
+			{
+				gimpNotes = config.notesData();
+			}
+			localGimp.setNotes(gimpNotes);
+		}
+	}
+
+	public List<String> getNames()
+	{
+		List<String> names = new ArrayList<>();
+		for (GimPlayer gimp : gimps)
+		{
+			names.add(gimp.getName());
+		}
+		return names;
+	}
+
+	/**
+	 * Sets a GimPlayer's location using the provided location data and
+	 * updates its icon on the world map if the gimp is online and doesn't
+	 * have ghost mode enabled.
+	 *
+	 * @param name     GimPlayer name
+	 * @param location GimPlayer location data
+	 */
+	public void setLocation(String name, GimLocation location)
+	{
+		GimPlayer gimp = getGimp(name);
+		if (gimp == null)
+		{
+			return;
+		}
+		// Create new GimLocation from raw data
+		GimLocation newGimLocation = new GimLocation(location.getX(), location.getY(), location.getPlane());
+		// Set GimPlayer location to new location
+		gimp.setLocation(newGimLocation);
+	}
+
+	/**
+	 * Sets the world number of the GimPlayer by name and removes
+	 * the map point if the world number is 0, e.g. the player is offline.
+	 *
+	 * @param name  GimPlayer name
+	 * @param world world number
+	 */
+	public void setWorld(String name, int world)
+	{
+		GimPlayer gimp = getGimp(name);
+		if (gimp == null)
+		{
+			return;
+		}
+		gimp.setWorld(world);
+	}
+
+	/**
+	 * Sets the ghost mode value of the GimPlayer by name. If the GimPlayer
+	 * has a location stored, either removes the corresponding map point or
+	 * creates one, depending on the new ghost mode setting.
+	 *
+	 * @param name      GimPlayer name
+	 * @param ghostMode ghost mode setting
+	 */
+	public void setGhostMode(String name, boolean ghostMode)
+	{
+		GimPlayer gimp = getGimp(name);
+		if (gimp == null)
+		{
+			return;
+		}
+		gimp.setGhostMode(ghostMode);
+	}
+
+	/**
+	 * Gets the world of a player by name, returns 0 if the player
+	 * is offline.
+	 *
+	 * @param name GimPlayer name
+	 * @return world number
+	 */
+	public int getCurrentWorld(String name)
+	{
+		ClanChannel gimClanChannel = client.getClanChannel(ClanID.GROUP_IRONMAN);
+		if (validateGimpName(name) && gimClanChannel != null)
+		{
+			ClanChannelMember onlineMember = gimClanChannel.findMember(name);
+			GimPlayer gimp = getGimp(name);
+			// If you cannot find member in clan, or GimPlayer is in ghost mode
+			if (onlineMember == null || (gimp != null && gimp.getGhostMode()))
+			{
+				return GimPlugin.OFFLINE_WORLD;
+			}
+			return onlineMember.getWorld();
+		}
+		return GimPlugin.OFFLINE_WORLD;
+	}
+
+	public CompletableFuture<HiscoreResult> setHiscores(String name)
+	{
+		GimPlayer gimp = getGimp(name);
+		return getHiscores(name).whenCompleteAsync((result, ext) -> {
+			gimp.setHiscores(result);
+		});
+	}
+
+	/**
+	 * Fetches player hiscores via HiscoreManager, caching the result
+	 * and returning the pending result to the invoker.
+	 *
+	 * @param name GimPlayer name
+	 * @return player hiscores result
+	 */
+	public CompletableFuture<HiscoreResult> getHiscores(String name)
+	{
+		CompletableFuture<HiscoreResult> hiscoreResult = new CompletableFuture<>();
+		try
+		{
+			HiscoreResult result = hiscoreManager.lookup(name, HiscoreEndpoint.NORMAL);
+			if (result == null)
+			{
+				log.warn("Could not find hiscore data for {}", name);
+			}
+			hiscoreResult.complete(result);
+		}
+		catch (IOException e)
+		{
+			log.error("Error fetching hiscores: {}", String.valueOf(e));
+			hiscoreResult.completeExceptionally(e);
+		}
+		return hiscoreResult;
+	}
+
+	public boolean isEmpty()
+	{
+		return gimps.isEmpty();
+	}
+
+	private static String sanitize(String lookup)
+	{
+		return lookup.replace('\u00A0', ' ');
+	}
+
+	private boolean validateGimpName(String name)
+	{
+		return getGimp(name) != null;
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.map;
+
+import com.gimp.GimPlugin;
+import net.runelite.client.ui.FontManager;
+import net.runelite.client.util.ImageUtil;
+
+import java.awt.*;
+import java.awt.font.FontRenderContext;
+import java.awt.geom.Rectangle2D;
+import java.awt.image.BufferedImage;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Utility for constructing and caching GIM world map icons.
+ */
+public class GimIconProvider
+{
+	final static Font FONT = FontManager.getRunescapeBoldFont();
+
+	final private Map<String, BufferedImage> icons;
+
+	public GimIconProvider()
+	{
+		icons = new HashMap<>(5);
+	}
+
+	public BufferedImage getIcon(String name)
+	{
+		return icons.computeIfAbsent(name, this::generateIcon);
+	}
+
+	private BufferedImage generateIcon(String name)
+	{
+		// Compute some info about username text size
+		final Rectangle2D textBounds = FONT.getStringBounds(name,
+			new FontRenderContext(null, true, true));
+		final int textHeight = (int) textBounds.getHeight();
+		final int textWidth = (int) textBounds.getWidth();
+
+		// Load the GIMP logo
+		final BufferedImage gimpLogo = ImageUtil.loadImageResource(GimPlugin.class, "gimpoint.png");
+
+		// Initialize the resulting icon, must be large enough to fit everything with the GIMP logo centered
+		final BufferedImage icon = new BufferedImage(textWidth + 4,
+			gimpLogo.getHeight() + 2 * textHeight,
+			BufferedImage.TYPE_INT_ARGB);
+
+		// First, draw the GIMP logo onto the center of the icon
+		final Graphics2D graphics = (Graphics2D) icon.getGraphics();
+		graphics.drawImage(gimpLogo, (icon.getWidth() - gimpLogo.getWidth()) / 2, (icon.getHeight() - gimpLogo.getHeight()) / 2, null);
+		// Then, draw the shadow of the username text (TODO: is there a proper way to do this?)
+		final int textX = (icon.getWidth() - textWidth) / 2;
+		final int textY = textHeight;
+		graphics.setFont(FontManager.getRunescapeBoldFont());
+		graphics.setColor(Color.BLACK);
+		graphics.drawString(name, textX + 1, textY + 1);
+
+		// Finally, draw the username text centered horizontally above the GIMP logo
+		graphics.setColor(Color.WHITE);
+		graphics.drawString(name, textX, textY);
+
+		return icon;
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.map;
+
+import com.gimp.gimps.GimLocation;
+import com.gimp.gimps.GimPlayer;
+import java.awt.Graphics2D;
+import java.awt.image.BufferedImage;
+import java.util.LinkedList;
+import java.util.Queue;
+import lombok.Getter;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
+
+/**
+ * Wrapper around the built-in {@link WorldMapPoint}.
+ * Creates abstraction for "moving" the world map point by altering the underlying map point location.
+ * <p>
+ * Supports fractional locations which allows for map points to be moved more slowly.
+ * TODO: The current implementation doesn't actually need this due to the "frame toggle" approach; delete when sure.
+ */
+public class GimWorldMapPoint
+{
+	private final GimPlayer gimp;
+	@Getter
+	private final WorldMapPoint worldMapPoint;
+	private double x;
+	private double y;
+
+	private final Queue<WorldMapPoint> footsteps;
+	private final BufferedImage mmIcon;
+
+	public GimWorldMapPoint(GimPlayer gimp, WorldMapPoint worldMapPoint)
+	{
+		this.gimp = gimp;
+		this.worldMapPoint = worldMapPoint;
+		x = this.worldMapPoint.getWorldPoint().getX();
+		y = this.worldMapPoint.getWorldPoint().getY();
+		footsteps = new LinkedList<>();
+
+		// Initialize the footstep icon to be used
+		final BufferedImage icon = new BufferedImage(12, 12, BufferedImage.TYPE_INT_ARGB);
+		final Graphics2D g = icon.createGraphics();
+		g.setColor(gimp.getColor());
+		g.fillOval(0, 0, 12, 12);
+		mmIcon = icon;
+
+	}
+
+	public void setX(double x)
+	{
+		this.x = x;
+		refreshWorldPoint();
+	}
+
+	public void setY(double y)
+	{
+		this.y = y;
+		refreshWorldPoint();
+	}
+
+	public void move(double dx, double dy)
+	{
+		x += dx;
+		y += dy;
+		refreshWorldPoint();
+	}
+
+	public void setWorldPoint(WorldPoint worldPoint)
+	{
+		worldMapPoint.setWorldPoint(worldPoint);
+		x = worldPoint.getX();
+		y = worldPoint.getY();
+	}
+
+	public WorldPoint getWorldPoint()
+	{
+		return worldMapPoint.getWorldPoint();
+	}
+
+	private void refreshWorldPoint()
+	{
+		if ((int) x != worldMapPoint.getWorldPoint().getX()
+			|| (int) y != worldMapPoint.getWorldPoint().getY())
+		{
+			final WorldPoint newWorldPoint = new WorldPoint((int) x, (int) y, worldMapPoint.getWorldPoint().getPlane());
+			worldMapPoint.setWorldPoint(newWorldPoint);
+		}
+	}
+
+	public boolean moveTowardPlayer(boolean frameToggle)
+	{
+		final WorldPoint shownLocation = getWorldPoint();
+		final GimLocation targetLocation = gimp.getLocation();
+		if (shownLocation != null && targetLocation != null)
+		{
+			int dx = targetLocation.getX() - shownLocation.getX();
+			int dy = targetLocation.getY() - shownLocation.getY();
+			if (Math.abs(dx) > 30 || Math.abs(dy) > 30)
+			{
+				// If the target location is too far, instantly change the map point
+				setWorldPoint(targetLocation.toWorldPoint());
+				return true;
+			}
+			else if (dx != 0 || dy != 0)
+			{
+				// Otherwise if it's moved at all, smoothly move it toward the target location.
+				// If moving fast (e.g. running), move every frame; otherwise, move every other frame.
+				if (frameToggle || gimp.getSpeed() > 2.25)
+				{
+					// Only move by a max of 1 tile in a given axis (keeps it consistent/smooth)
+					move(Math.min(1, Math.max(dx, -1)), Math.min(1, Math.max(dy, -1)));
+					// If the plane has changed, update it while preserving the shown x/y coordinates
+					if (shownLocation.getPlane() != targetLocation.getPlane())
+					{
+						setWorldPoint(new WorldPoint(shownLocation.getX(), shownLocation.getY(), targetLocation.getPlane()));
+					}
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	public void addFootstep(GimWorldMapPointManager gimWorldMapPointManager, int maxLength)
+	{
+		final WorldPoint worldPoint = worldMapPoint.getWorldPoint().dx(0);
+
+		if (maxLength > 0)
+		{
+			// Optimization to reuse the tail WMP as the head WMP (since altering the underlying WMP ArrayList is expensive)
+			if (footsteps.size() == maxLength)
+			{
+				final WorldMapPoint popped = footsteps.remove();
+				popped.setWorldPoint(worldPoint);
+				footsteps.add(popped);
+				return;
+			}
+
+			final WorldMapPoint worldMapPoint = new WorldMapPoint(worldPoint, mmIcon);
+			gimWorldMapPointManager.addAssociatedPoint(gimp.getName(), worldMapPoint);
+			footsteps.add(worldMapPoint);
+		}
+
+		while (footsteps.size() > maxLength)
+		{
+			final WorldMapPoint popped = footsteps.remove();
+			gimWorldMapPointManager.removeAssociatedPoint(gimp.getName(), popped);
+		}
+
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.map;
+
+import com.gimp.gimps.GimPlayer;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.LinkedList;
+import java.util.Map;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
+import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
+
+/**
+ * Wrapper around the built-in {@link WorldMapPointManager}.
+ * Primarily adds support for tracking and fetching map points by name.
+ */
+@Slf4j
+public class GimWorldMapPointManager
+{
+	@Inject
+	private WorldMapPointManager _worldMapPointManager;
+
+	private final Map<String, GimWorldMapPoint> points;
+	private final Map<String, Collection<WorldMapPoint>> associatedPoints;
+	private final GimIconProvider iconProvider;
+
+	public GimWorldMapPointManager()
+	{
+		points = new HashMap<>();
+		associatedPoints = new HashMap<>();
+		iconProvider = new GimIconProvider();
+	}
+
+	public GimWorldMapPoint getPoint(String gimpName)
+	{
+		if (!points.containsKey(gimpName))
+		{
+			throw new IllegalArgumentException("WorldMapPoint does not exist for user " + gimpName);
+		}
+		return points.get(gimpName);
+	}
+
+	public boolean hasPoint(String gimpName)
+	{
+		return points.containsKey(gimpName);
+	}
+
+	/**
+	 * Add the given map point to the world map for the given player.
+	 *
+	 * @param gimpName      name of the player
+	 * @param worldMapPoint world map point to add
+	 */
+	public void addPoint(String gimpName, GimWorldMapPoint worldMapPoint)
+	{
+		if (!points.containsKey(gimpName))
+		{
+			points.put(gimpName, worldMapPoint);
+			associatedPoints.put(gimpName, new LinkedList<>());
+			_worldMapPointManager.add(worldMapPoint.getWorldMapPoint());
+			log.debug("Add world map point for {}", gimpName);
+		}
+		else
+		{
+			throw new IllegalStateException("WorldMapPoint for user " + gimpName + " already exists");
+		}
+	}
+
+	/**
+	 * For the given player, create and add a map point to the world map.
+	 *
+	 * @param gimp player for whom to create and add a map point
+	 */
+	public void addPoint(GimPlayer gimp)
+	{
+		final String name = gimp.getName();
+		if (gimp.getLocation() != null)
+		{
+			final WorldPoint p = new WorldPoint(gimp.getLocation().getX(),
+				gimp.getLocation().getY(),
+				gimp.getLocation().getPlane());
+			final WorldMapPoint worldMapPoint = new WorldMapPoint(p, iconProvider.getIcon(name));
+			// Configure world map point
+			worldMapPoint.setTarget(p);
+			// Snaps to edge if outside of current map frame
+			worldMapPoint.setSnapToEdge(true);
+			// Jumps to location if clicked on
+			worldMapPoint.setJumpOnClick(true);
+			// Name is necessary for jumpOnClick behavior
+			worldMapPoint.setName(name);
+
+			addPoint(name, new GimWorldMapPoint(gimp, worldMapPoint));
+		}
+	}
+
+	public void removePoint(String gimpName)
+	{
+		if (points.containsKey(gimpName))
+		{
+			// Remove the user's primary WMP
+			_worldMapPointManager.remove(points.get(gimpName).getWorldMapPoint());
+			points.remove(gimpName);
+
+			// Remove the user's associated WMPs
+			for (WorldMapPoint point : associatedPoints.get(gimpName))
+			{
+				_worldMapPointManager.removeIf(wmp -> wmp == point);
+			}
+			associatedPoints.remove(gimpName);
+
+			log.debug("Remove map point for {}", gimpName);
+		}
+		else
+		{
+			throw new IllegalStateException("Cannot remove nonexistent WorldMapPoint for user " + gimpName);
+		}
+	}
+
+	public void addAssociatedPoint(String gimpName, WorldMapPoint associatedPoint)
+	{
+		associatedPoints.get(gimpName).add(associatedPoint);
+		_worldMapPointManager.add(associatedPoint);
+		// Re-add the gimp's WMP to ensure it's rendered on top (this might be expensive, so avoid if possible)
+		_worldMapPointManager.remove(points.get(gimpName).getWorldMapPoint());
+		_worldMapPointManager.add(points.get(gimpName).getWorldMapPoint());
+	}
+
+	public void removeAssociatedPoint(String gimpName, WorldMapPoint worldMapPoint)
+	{
+		associatedPoints.get(gimpName).removeIf(wmp -> wmp == worldMapPoint);
+		_worldMapPointManager.removeIf(wmp -> wmp == worldMapPoint);
+	}
+
+	public void clear()
+	{
+		// Use key collection rather than iterator to avoid concurrent modification
+		final Collection<String> gimpNames = new ArrayList<>(points.keySet());
+
+		for (String gimpName : gimpNames)
+		{
+			if (hasPoint(gimpName))
+			{
+				removePoint(gimpName);
+			}
+		}
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.requests;
+
+import com.gimp.GimPluginConfig;
+import java.io.IOException;
+import java.util.concurrent.CompletableFuture;
+import lombok.NonNull;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+import okhttp3.OkHttpClient;
+import lombok.AccessLevel;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public class HttpClient extends RequestClient
+{
+	@Getter(AccessLevel.PACKAGE)
+	public OkHttpClient client;
+
+	public static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
+
+	public static final int OK = 200;
+
+	public static final String EMPTY_BODY = "";
+
+	public HttpClient(String namespace, OkHttpClient client, GimPluginConfig config)
+	{
+		this.config = config;
+		this.namespace = namespace;
+		this.client = client;
+	}
+
+	/**
+	 * Makes an HTTP request with the given method to the URI at the client's
+	 * base URL. Accepts on optional body argument for appropriate request methods.
+	 *
+	 * @param method HTTP method
+	 * @param uri    URI path following base URL
+	 * @param body   request body data
+	 * @return future of response data in JSON
+	 */
+	private CompletableFuture<String> request(String method, String uri, RequestBody body)
+	{
+		CompletableFuture<String> result = new CompletableFuture<>();
+		Request request = new Request.Builder()
+			.url(getBaseUrl() + uri)
+			.method(method, body)
+			.build();
+		client.newCall(request).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(@NonNull Call call, @NonNull IOException e)
+			{
+				log.error("Request failed: {}", String.valueOf(e));
+			}
+
+			@Override
+			public void onResponse(@NonNull Call call, @NonNull Response response) throws IOException
+			{
+				try (ResponseBody bodyJson = response.body())
+				{
+					if (!response.isSuccessful())
+					{
+						throw new IOException(response.code() + ": " + bodyJson);
+					}
+					if (bodyJson == null)
+					{
+						throw new RuntimeException("Response body is null: " + response);
+					}
+					result.complete(bodyJson.string());
+				}
+			}
+		});
+		return result;
+	}
+
+	/**
+	 * Makes an HTTP GET request to the ping endpoint at the URL injected
+	 * from the plugin config. A future of the JSON response body is returned.
+	 *
+	 * @return future of response data in JSON
+	 */
+	public CompletableFuture<String> ping()
+	{
+		return request("GET", "/ping/" + namespace, null);
+	}
+
+	/**
+	 * Makes an HTTP POST request to the broadcast endpoint at the
+	 * URL injected from the plugin config. The JSON data is sent
+	 * in the request body. Times out after 5 seconds.
+	 *
+	 * @param dataJson request data in JSON
+	 */
+	public CompletableFuture<String> broadcast(String dataJson)
+	{
+		RequestBody body = RequestBody.create(JSON, dataJson);
+		return request("POST", "/broadcast/" + namespace, body);
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.requests;
+
+import com.gimp.GimPluginConfig;
+import java.net.URL;
+import java.util.concurrent.CompletableFuture;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public abstract class RequestClient
+{
+	public GimPluginConfig config;
+
+	/* Used to join a server-side socket room and/or namespace HTTP requests. */
+	public String namespace;
+
+	/**
+	 * Gets the base URL from the address injected from the plugin config.
+	 *
+	 * @return server base URL
+	 */
+	public String getBaseUrl()
+	{
+		String configServerAddress = config.serverAddress();
+		// Remove trailing slash(es) if exists
+		String trailingSlashes = "/+$";
+		configServerAddress = configServerAddress.replaceAll(trailingSlashes, "");
+		if (!configServerAddress.contains("http"))
+		{
+			return "http://" + configServerAddress;
+		}
+		return configServerAddress;
+	}
+
+	/**
+	 * Validates the URL from the config server address.
+	 *
+	 * @return whether the URL is valid
+	 */
+	public boolean validateUrl()
+	{
+		final URL url;
+		if (config.serverAddress().isEmpty())
+		{
+			return false;
+		}
+		try
+		{
+			url = new URL(getBaseUrl());
+		}
+		catch (Exception e)
+		{
+			return false;
+		}
+		// URL must use HTTP/S protocol
+		return url.getProtocol().contains("http");
+	}
+
+	/**
+	 * Sends a /ping request or emits "ping" to the server.
+	 *
+	 * @return future of response data in JSON
+	 */
+	abstract public CompletableFuture<String> ping();
+
+	/**
+	 * Send a /broadcast request or emits "broadcast" to the server.
+	 *
+	 * @param dataJson request data in JSON
+	 * @return future of response data in JSON
+	 */
+	abstract public CompletableFuture<String> broadcast(String dataJson);
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.requests;
+
+import com.gimp.GimPluginConfig;
+import io.socket.client.Ack;
+import io.socket.client.Socket;
+import io.socket.engineio.client.transports.Polling;
+import io.socket.engineio.client.transports.WebSocket;
+import java.net.URI;
+import io.socket.client.IO;
+import java.util.concurrent.CompletableFuture;
+import lombok.Getter;
+import lombok.extern.slf4j.Slf4j;
+import org.json.JSONObject;
+
+@Getter
+@Slf4j
+public class SocketClient extends RequestClient
+{
+	public Socket client;
+
+	private static final String EVENT_CONNECTION_ACK = "connection-ack";
+
+	public SocketClient(String namespace, GimPluginConfig config)
+	{
+		this.namespace = namespace;
+		this.config = config;
+	}
+
+	/**
+	 * Connects the socket to the server at the base URL, using default config
+	 * for the connection. On connection, sets up socket listeners for socket
+	 * lifecycle events, e.g. connect, disconnect, connect_error.
+	 */
+	public void connect()
+	{
+		if (!validateUrl())
+		{
+			log.warn("Invalid socket URL, aborting");
+			return;
+		}
+		URI uri = URI.create(getBaseUrl());
+		IO.Options options = IO.Options.builder()
+			// IO factory options
+			.setForceNew(false).setMultiplex(true)
+
+			// low-level engine options
+			.setTransports(new String[]{Polling.NAME, WebSocket.NAME}).setUpgrade(true).setRememberUpgrade(false).setPath("/socket.io/").setQuery(null).setExtraHeaders(null)
+
+			// Manager options
+			.setReconnection(true).setReconnectionAttempts(Integer.MAX_VALUE).setReconnectionDelay(1_000).setReconnectionDelayMax(5_000).setRandomizationFactor(0.5).setTimeout(20_000)
+
+			// Socket options
+			.setAuth(null).build();
+		if (client != null)
+		{
+			client.close();
+		}
+		client = IO.socket(uri, options);
+		client.connect();
+
+		client.on(Socket.EVENT_CONNECT, args -> {
+			log.debug("Socket connected");
+			String roomId = namespace;
+			client.emit(EVENT_CONNECTION_ACK, roomId);
+		});
+
+		client.on(Socket.EVENT_DISCONNECT, args -> {
+			log.debug("Socket disconnected");
+		});
+
+		client.on(Socket.EVENT_CONNECT_ERROR, args -> {
+			log.warn("Failed to connect to socket server, closing");
+			client.close();
+		});
+	}
+
+	/**
+	 * Disconnects the client from the socket server.
+	 */
+	public void disconnect()
+	{
+		if (client != null)
+		{
+			client.disconnect();
+		}
+	}
+
+	/**
+	 * Checks if the client is connected to a socket server.
+	 *
+	 * @return whether socket is connected
+	 */
+	public boolean isConnected()
+	{
+		if (client != null)
+		{
+			return client.connected();
+		}
+		return false;
+	}
+
+	/**
+	 * Sends a socket message to the ping listener. Expects an acknowledgement
+	 * from the server, and returns the JSON data in that acknowledgement.
+	 *
+	 * @return future of ack data in JSON
+	 */
+	public CompletableFuture<String> ping()
+	{
+		String EVENT_PING = "ping";
+		CompletableFuture<String> socketResponse = new CompletableFuture<>();
+		client.emit(EVENT_PING, (Ack) args -> {
+			JSONObject data = (JSONObject) args[0];
+			socketResponse.complete(data.toString());
+		});
+		return socketResponse;
+	}
+
+	/**
+	 * Sends a socket message to the broadcast listener. Passes the JSON data
+	 * as the data parameter and expects an acknowledgement from the server.
+	 *
+	 * @param dataJson future of ack data in JSON
+	 * @return future of ack data in JSON
+	 */
+	public CompletableFuture<String> broadcast(String dataJson)
+	{
+		String EVENT_BROADCAST = "broadcast";
+		CompletableFuture<String> socketResponse = new CompletableFuture<>();
+		client.emit(EVENT_BROADCAST, dataJson, (Ack) args -> {
+			JSONObject data = (JSONObject) args[0];
+			socketResponse.complete(data.toString());
+		});
+		return socketResponse;
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.tasks;
+
+interface TaskRunner
+{
+	void run();
+
+	long delay();
+}
+
+public class Task implements TaskRunner
+{
+	final public long period;
+
+	public Task(long defaultPeriod)
+	{
+		period = defaultPeriod;
+	}
+
+	/**
+	 * Runs code that can be overridden, meant to be called
+	 * after a delay.
+	 */
+	public void run()
+	{
+	}
+
+	/**
+	 * Returns the delay, can be overridden for a dynamic delay.
+	 *
+	 * @return duration in milliseconds by which to delay task
+	 */
+	public long delay()
+	{
+		return period;
+	}
+}
+
+/*
+ * Copyright (c) 2021, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.tasks;
+
+import java.util.Timer;
+import java.util.TimerTask;
+import javax.inject.Inject;
+import lombok.extern.slf4j.Slf4j;
+
+@Slf4j
+public class TaskManager
+{
+	@Inject
+	private Timer timer;
+
+	/**
+	 * Schedules a task to run after the delay and then schedules
+	 * it again after calculating the next delay.
+	 *
+	 * @param task  task to run after a delay and then reschedule
+	 * @param delay initial duration in milliseconds by which to delay task
+	 */
+	public void schedule(Task task, long delay)
+	{
+		TimerTask timerTask = new TimerTask()
+		{
+			@Override
+			public void run()
+			{
+				task.run();
+				long nextDelay = task.delay();
+				if (nextDelay != 0)
+				{
+					schedule(task, nextDelay);
+				}
+			}
+		};
+		timer.schedule(timerTask, delay);
+	}
+
+	/**
+	 * Purges any canceled tasks and cancels the timer, then
+	 * creates a new one.
+	 */
+	public void resetTasks()
+	{
+		timer.purge();
+		timer.cancel();
+		timer = new Timer();
+	}
+}
+
+/*
+ * Copyright (c) 2022, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.ui;
+
+import javax.swing.*;
+import java.awt.*;
+import lombok.Setter;
+
+@Setter
+public class FilledCircle extends JPanel
+{
+	private int width;
+
+	private int height;
+
+	private Color color;
+
+	public FilledCircle(int width, int height, Color color)
+	{
+		setWidth(width);
+		setHeight(height);
+		setSize(width, height);
+		setColor(color);
+		setVisible(true);
+	}
+
+	@Override
+	public void paint(Graphics g)
+	{
+		Graphics2D g2d = (Graphics2D) g;
+		g2d.setColor(color);
+		g2d.drawOval(0, 0, width, height);
+		g2d.fillOval(0, 0, width, height);
+	}
+}
+
+/*
+ * Copyright (c) 2023, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.ui;
+
+import com.gimp.GimPlugin;
+import java.awt.BorderLayout;
+import java.awt.event.ActionEvent;
+import java.awt.event.FocusEvent;
+import java.awt.event.FocusListener;
+import javax.swing.AbstractAction;
+import javax.swing.BorderFactory;
+import javax.swing.JPanel;
+import javax.swing.JTextArea;
+import javax.swing.KeyStroke;
+import javax.swing.border.EmptyBorder;
+import javax.swing.text.BadLocationException;
+import javax.swing.text.Document;
+import javax.swing.undo.CannotUndoException;
+import javax.swing.undo.UndoManager;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.ui.ColorScheme;
+
+@Slf4j
+public class GimNotes extends JPanel
+{
+	private final JTextArea notesEditor = new JTextArea();
+	private final UndoManager undoRedo = new UndoManager();
+
+	public void init(GimPlugin plugin)
+	{
+		setLayout(new BorderLayout());
+		setBorder(BorderFactory.createEmptyBorder(5, 0, 10, 0));
+		setBackground(ColorScheme.DARK_GRAY_COLOR);
+
+		notesEditor.setTabSize(2);
+		notesEditor.setLineWrap(true);
+		notesEditor.setWrapStyleWord(true);
+
+		JPanel notesContainer = new JPanel();
+		notesContainer.setLayout(new BorderLayout());
+		notesContainer.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+
+		notesEditor.setOpaque(false);
+
+		// setting the limit to a 500 as UndoManager registers every key press,
+		// which means that be default we would be able to undo only a sentence.
+		// note: the default limit is 100
+		undoRedo.setLimit(500);
+		notesEditor.getDocument().addUndoableEditListener(e -> undoRedo.addEdit(e.getEdit()));
+
+		notesEditor.getInputMap().put(KeyStroke.getKeyStroke("control Z"), "Undo");
+		notesEditor.getInputMap().put(KeyStroke.getKeyStroke("control Y"), "Redo");
+
+		notesEditor.getActionMap().put("Undo", new AbstractAction("Undo")
+		{
+			@Override
+			public void actionPerformed(ActionEvent e)
+			{
+				try
+				{
+					if (undoRedo.canUndo())
+					{
+						undoRedo.undo();
+					}
+				}
+				catch (CannotUndoException ex)
+				{
+					log.warn("Notes Document Unable To Undo: {}", String.valueOf(ex));
+				}
+			}
+		});
+
+		notesEditor.getActionMap().put("Redo", new AbstractAction("Redo")
+		{
+			@Override
+			public void actionPerformed(ActionEvent e)
+			{
+				try
+				{
+					if (undoRedo.canRedo())
+					{
+						undoRedo.redo();
+					}
+				}
+				catch (CannotUndoException ex)
+				{
+					log.warn("Notes Document Unable To Redo: {}", String.valueOf(ex));
+				}
+			}
+		});
+
+		notesEditor.addFocusListener(new FocusListener()
+		{
+			@Override
+			public void focusGained(FocusEvent e)
+			{
+
+			}
+
+			@Override
+			public void focusLost(FocusEvent e)
+			{
+				notesChanged(notesEditor.getDocument());
+			}
+
+			private void notesChanged(Document doc)
+			{
+				try
+				{
+					// get document text and save to config whenever editor is changed
+					String data = doc.getText(0, doc.getLength());
+					plugin.updateNotes(data);
+				}
+				catch (BadLocationException ex)
+				{
+					log.warn("Notes Document Bad Location: {}", String.valueOf(ex));
+				}
+			}
+		});
+
+		notesContainer.add(notesEditor, BorderLayout.CENTER);
+		notesContainer.setBorder(new EmptyBorder(10, 10, 10, 10));
+
+		add(notesContainer, BorderLayout.CENTER);
+	}
+
+	public void setNotes(String data)
+	{
+		notesEditor.setText(data);
+	}
+
+	public void setEnabled(boolean enabled)
+	{
+		notesEditor.setEnabled(enabled);
+	}
+
+	public void setToolTipText(String text)
+	{
+		notesEditor.setToolTipText(text);
+	}
+}
+
+/*
+ * Copyright (c) 2022, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.ui;
+
+import com.google.common.base.Strings;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.util.function.BooleanSupplier;
+import javax.swing.BorderFactory;
+import javax.swing.ImageIcon;
+import javax.swing.JLabel;
+import javax.swing.JLayeredPane;
+import javax.swing.SwingConstants;
+import javax.swing.border.Border;
+import javax.swing.border.CompoundBorder;
+import javax.swing.border.EmptyBorder;
+import lombok.Getter;
+import lombok.Setter;
+import net.runelite.client.ui.ColorScheme;
+
+public class GimTab extends JLayeredPane
+{
+	private static final Border SELECTED_BORDER = new CompoundBorder(BorderFactory.createMatteBorder(0, 0, 1, 0, ColorScheme.BRAND_ORANGE), BorderFactory.createEmptyBorder(5, 10, 4, 10));
+
+	private static final Border UNSELECTED_BORDER = BorderFactory.createEmptyBorder(5, 10, 5, 10);
+
+	private static final Color ONLINE_COLOR = new Color(0, 146, 54, 230);
+
+	private static final Color OFFLINE_COLOR = Color.RED;
+
+	private static final int STATUS_DOT_SIZE = 5;
+
+	@Getter
+	private final String gimp;
+
+	private final JLabel label;
+
+	private final FilledCircle statusDot;
+
+	/* To be executed when the tab is selected */
+	@Setter
+	private BooleanSupplier onSelectEvent;
+
+	@Getter
+	private boolean selected;
+
+	public GimTab(String string, GimTabGroup group, String gimp)
+	{
+		super();
+
+		this.gimp = gimp;
+
+		setLayout(new BorderLayout());
+
+		this.label = new JLabel(string);
+		// Pad the left side of the icon to account for the status dot
+		this.label.setBorder(new EmptyBorder(0, STATUS_DOT_SIZE, 0, 0));
+		add(this.label, BorderLayout.CENTER);
+		setLayer(this.label, DEFAULT_LAYER);
+
+		this.statusDot = new FilledCircle(STATUS_DOT_SIZE, STATUS_DOT_SIZE, OFFLINE_COLOR);
+		add(this.statusDot, BorderLayout.EAST);
+		setLayer(this.statusDot, PALETTE_LAYER);
+
+		unselect();
+
+		addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mousePressed(MouseEvent mouseEvent)
+			{
+				group.select(GimTab.this);
+			}
+		});
+
+		if (!Strings.isNullOrEmpty(string))
+		{
+			addMouseListener(new MouseAdapter()
+			{
+				@Override
+				public void mouseEntered(MouseEvent e)
+				{
+					GimTab tab = (GimTab) e.getSource();
+					tab.setForeground(Color.WHITE);
+				}
+
+				@Override
+				public void mouseExited(MouseEvent e)
+				{
+					GimTab tab = (GimTab) e.getSource();
+					if (!tab.isSelected())
+					{
+						tab.setForeground(Color.GRAY);
+					}
+				}
+			});
+		}
+	}
+
+	public GimTab(ImageIcon icon, GimTabGroup group, String gimp)
+	{
+		this("", group, gimp);
+		setOpaque(true);
+		setBackground(ColorScheme.DARKER_GRAY_COLOR);
+		this.drawLabel(icon);
+
+		addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseEntered(MouseEvent e)
+			{
+				GimTab tab = (GimTab) e.getSource();
+				tab.setBackground(ColorScheme.DARKER_GRAY_HOVER_COLOR);
+			}
+
+			@Override
+			public void mouseExited(MouseEvent e)
+			{
+				GimTab tab = (GimTab) e.getSource();
+				tab.setBackground(ColorScheme.DARKER_GRAY_COLOR);
+			}
+		});
+
+	}
+
+	private void drawLabel(ImageIcon icon)
+	{
+		this.label.setIcon(icon);
+		this.label.setOpaque(false);
+		this.label.setVerticalAlignment(SwingConstants.CENTER);
+		this.label.setHorizontalAlignment(SwingConstants.CENTER);
+	}
+
+	public void setStatus(boolean isOnline)
+	{
+		Color color = isOnline ? ONLINE_COLOR : OFFLINE_COLOR;
+		this.statusDot.setColor(color);
+		this.statusDot.repaint();
+	}
+
+	public boolean select()
+	{
+		if (onSelectEvent != null)
+		{
+			if (!onSelectEvent.getAsBoolean())
+			{
+				return false;
+			}
+		}
+
+		setBorder(SELECTED_BORDER);
+		setForeground(Color.WHITE);
+		return selected = true;
+	}
+
+	public void unselect()
+	{
+		setBorder(UNSELECTED_BORDER);
+		setForeground(Color.GRAY);
+		selected = false;
+	}
+
+	@Override
+	public void setForeground(Color fg)
+	{
+		super.setForeground(fg);
+	}
+
+	@Override
+	public void setBackground(Color bg)
+	{
+		super.setBackground(bg);
+	}
+}
+
+/*
+ * Copyright (c) 2022, David Vorona <davidavorona@gmail.com>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.gimp.ui;
+
+import java.awt.BorderLayout;
+import java.awt.FlowLayout;
+import java.util.ArrayList;
+import java.util.List;
+import javax.swing.JPanel;
+
+public class GimTabGroup extends JPanel
+{
+	/* The panel on which the content tab's content will be displayed on. */
+	private final JPanel display;
+	/* A list of all the tabs contained in this group. */
+	private final List<GimTab> tabs = new ArrayList<>();
+
+	public GimTabGroup(JPanel display)
+	{
+		this.display = display;
+		if (display != null)
+		{
+			this.display.setLayout(new BorderLayout());
+		}
+		setLayout(new FlowLayout(FlowLayout.CENTER, 8, 0));
+		setOpaque(false);
+	}
+
+	public GimTabGroup()
+	{
+		this(null);
+	}
+
+	/* Returns the tab on a certain index. */
+	public GimTab getTab(int index)
+	{
+
+		if (tabs == null || tabs.isEmpty())
+		{
+			return null;
+		}
+
+		return tabs.get(index);
+	}
+
+	public GimTab getTab(String gimp)
+	{
+		if (tabs == null || tabs.isEmpty())
+		{
+			return null;
+		}
+		// Get a tab by the associated gimp
+		for (GimTab tab : tabs)
+		{
+			if (tab.getGimp().equals(gimp))
+			{
+				return tab;
+			}
+		}
+		return null;
+	}
+
+	public void addTab(GimTab tab)
+	{
+		tabs.add(tab);
+		add(tab, BorderLayout.NORTH);
+	}
+
+	/***
+	 * Selects a tab from the group, and sets the display's content to the
+	 * tab's associated content.
+	 * @param selectedTab - The tab to select
+	 */
+	public void select(GimTab selectedTab)
+	{
+		if (!tabs.contains(selectedTab))
+		{
+			return;
+		}
+
+		// If the OnTabSelected returned false, exit the method to prevent tab switching
+		if (!selectedTab.select())
+		{
+			return;
+		}
+
+		// If the display is available, switch from the old to the new display
+		if (display != null)
+		{
+			display.removeAll();
+			display.revalidate();
+			display.repaint();
+		}
+
+		// Unselected all other tabs
+		for (GimTab tab : tabs)
+		{
+			if (!tab.equals(selectedTab))
+			{
+				tab.unselect();
+			}
+		}
+
 	}
 }
 

@@ -1,3 +1,1389 @@
+package com.geel.customitemhovers;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.ConfigSection;
+
+import java.awt.*;
+
+@ConfigGroup("customitemhovers")
+public interface CustomItemHoversConfig extends Config {
+    @ConfigSection(
+            name = "Informational Messages",
+            description = "Configures messages that the plugin posts to game chat",
+            position = 2
+    )
+    static String messageSection = "messages";
+
+    @ConfigItem(
+            keyName = "hoverEnableHotReload",
+            name = "Hot Reload",
+            description = "Whether or not Hot Reload is enabled.",
+            position = 1
+    )
+    default boolean hoverEnableHotReload() {
+        return false;
+    }
+
+    @ConfigItem(
+            keyName = "enableObsoleteMessage",
+            name = "Deprecated Expression",
+            description = "Display a message whenever your hover files are displayed if they contain obsolete expressions",
+            section = messageSection,
+            position = 1
+    )
+    default boolean enableObsoleteMessage() {
+        return false;
+    }
+
+    @ConfigItem(
+            keyName = "hoverDefaultColor",
+            name = "Default Text Color",
+            description = "The default text color for a hover when no color is specified",
+            position = 2
+    )
+    default Color defaultHoverColor() {
+        return new Color(238, 238, 238);
+    }
+
+    @ConfigItem(
+            keyName = "openDirChatCommand",
+            name = "Hover Directory Chat Command",
+            description = "Chat command to open hoverfile directory in your file explorer",
+            position = 3
+    )
+    default String openDirChatCommand() {
+        return "openhoverdir";
+    }
+}
+
+package com.geel.customitemhovers;
+
+import com.geel.customitemhovers.expressions.ExecutionContext;
+import com.geel.customitemhovers.expressions.functions.Function;
+import com.geel.customitemhovers.expressions.functions.LambdaFixedArgsFunction;
+import com.geel.customitemhovers.expressions.functions.LambdaVariadicFunction;
+import com.geel.customitemhovers.expressions.models.ArgumentType;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.expressions.models.TokenType;
+import com.geel.customitemhovers.expressions.providers.IFunctionProvider;
+import lombok.Getter;
+import net.runelite.api.*;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.util.ColorUtil;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import java.awt.*;
+import java.util.*;
+
+/**
+ * Provides functions to the expression engine.
+ */
+@Singleton
+public class CustomItemHoversFunctionProvider implements IFunctionProvider {
+    // A map(functionName -> map(numArguments -> listOfFunctions))
+    @Getter
+    private HashMap<String, HashMap<Integer, ArrayList<Function>>> functions;
+
+    public Client client;
+
+    public ItemManager itemManager;
+
+    @Inject
+    public CustomItemHoversFunctionProvider(Client client, ItemManager itemManager) {
+        this.client = client;
+        this.itemManager = itemManager;
+
+        functions = new HashMap<>();
+        prepareFunctions();
+    }
+
+    public Function findFunction(String name, Token[] arguments) {
+        int numArgs = arguments.length;
+
+        // Find the function by name. The result will be a map(numArgs -> list_of_functions)
+        HashMap<Integer, ArrayList<Function>> numArgsMap = functions.getOrDefault(name, null);
+
+        // If no functions found, obviously return null
+        if (numArgsMap == null) {
+            return null;
+        }
+
+        // Look for it in the fixed functions, then try variadic functions
+        ArrayList<Function> fixedFunctions = numArgsMap.getOrDefault(numArgs, null);
+        ArrayList<Function> variadicFunctions = numArgsMap.getOrDefault(-1, null);
+
+        Function fixedFunction = searchFuncs(fixedFunctions, arguments);
+        if (fixedFunction != null)
+            return fixedFunction;
+
+        return searchFuncs(variadicFunctions, arguments);
+    }
+
+    private Function searchFuncs(ArrayList<Function> functions, Token[] arguments) {
+        if (functions == null)
+            return null;
+
+        for (Function func : functions) {
+            if (func.argumentsMatch(arguments)) {
+                return func;
+            }
+        }
+
+        return null;
+    }
+
+    public void addFunction(Function f) {
+        String name = f.getName();
+
+        // Ensure that the overarching map has an entry for the function name
+        if (!functions.containsKey(name)) {
+            functions.put(name, new HashMap<>());
+        }
+
+        // Get the entry for the function name, and ensure the sub-map has an entry for the number of arguments
+        HashMap<Integer, ArrayList<Function>> argumentsMap = functions.get(name);
+        int argsHashCode = f.getArgumentsHashCode();
+        if (!argumentsMap.containsKey(argsHashCode)) {
+            argumentsMap.put(argsHashCode, new ArrayList<>(1));
+        }
+
+        // Get the entry for the number of arguments from the sub-map, and insert the function into the list
+        ArrayList<Function> funcList = argumentsMap.get(argsHashCode);
+        if (funcList.contains(f)) {
+            throw new IllegalArgumentException("Function already exists");
+        }
+
+        funcList.add(f);
+    }
+
+    private void prepareFunctions() {
+        // {inv}_contains() and {inv}_qty()
+        prepareInventoryFunctions();
+
+        // floor(), ceil(), pow(), max(), min(), abs()
+        prepareMathFunctions();
+
+        // len(), contains(), red(), green(), blue(), yellow(), rgb()
+        prepareStringFunctions();
+
+        // varbit(), varplayer(), varcint(), varcstr()
+        prepareVarBitFunctions();
+
+        // qtymult(), qtydivide(), qtydivideceil()
+        prepareBackwardsCompatFunctions();
+    }
+
+    /**
+     * Prepares inventory-related functions.
+     *
+     * EG, inv_contains(), bank_contains(), inv_qty(), etc
+     */
+    private void prepareInventoryFunctions() {
+        inventoryFunction("inv", InventoryID.INVENTORY);
+        inventoryFunction("bank", InventoryID.BANK);
+        inventoryFunction("equipment", InventoryID.EQUIPMENT);
+    }
+
+    /**
+     * Creates varbit-related functions
+     */
+    private void prepareVarBitFunctions() {
+        // The varbit(varbitId) function returns the integer value of a varbit
+        addFunction(new LambdaFixedArgsFunction("varbit", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
+            if(client == null) return Token.fromFalse();
+            return Token.fromInt(client.getVarbitValue(args[0].getNumericValue().intValue()));
+        }));
+
+        // The varplayer(varPlayerId) function returns the integer value of a varplayer
+        addFunction(new LambdaFixedArgsFunction("varplayer", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
+            if(client == null) return Token.fromFalse();
+            return Token.fromInt(client.getVarpValue(args[0].getNumericValue().intValue()));
+        }));
+
+        // The varcint(varCIntId) function returns the integer value of a varcint
+        addFunction(new LambdaFixedArgsFunction("varcint", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
+            if(client == null) return Token.fromFalse();
+            return Token.fromInt(client.getVarcIntValue(args[0].getNumericValue().intValue()));
+        }));
+
+        // The varcstr(varCStrId) function returns the string value of a varcstr
+        addFunction(new LambdaFixedArgsFunction("varcstr", TokenType.STRING, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
+            if(client == null) return Token.fromFalse();
+            return Token.fromString(client.getVarcStrValue(args[0].getNumericValue().intValue()));
+        }));
+    }
+
+    /**
+     * Creates string- and color-related functions
+     */
+    private void prepareStringFunctions() {
+        addFunction(new LambdaFixedArgsFunction("len", TokenType.INTEGER, new ArgumentType[]{ArgumentType.STRING}, true, (args, context) -> {
+            return Token.fromInt(args[0].getValue().length());
+        }));
+
+        addFunction(new LambdaFixedArgsFunction("contains", TokenType.INTEGER, new ArgumentType[]{ArgumentType.STRING, ArgumentType.STRING}, true, (args, context) -> {
+            return Token.fromInt(args[0].getValue().contains(args[1].getValue()) ? 1 : 0);
+        }));
+
+        // Colors
+        // Wrapping functions -- red(), green(), blue(), yellow()
+        simpleColorStringFunc("red", Color.RED);
+        simpleColorStringFunc("green", Color.GREEN);
+        simpleColorStringFunc("blue", Color.BLUE);
+        simpleColorStringFunc("yellow", Color.YELLOW);
+
+        // Tag *start* functions -- redStart(), greenStart(), blueStart(), yellowStart()
+        simpleColorStringStartFunc("red", Color.RED);
+        simpleColorStringStartFunc("green", Color.GREEN);
+        simpleColorStringStartFunc("blue", Color.BLUE);
+        simpleColorStringStartFunc("yellow", Color.YELLOW);
+
+        // colorEnd()
+        addFunction(new LambdaFixedArgsFunction("colorEnd", TokenType.STRING,
+                new ArgumentType[]{},
+                true,
+                (args, context) -> {
+                    return Token.fromString("</col>");
+                }));
+
+        // rgb()
+        addFunction(new LambdaFixedArgsFunction("rgb", TokenType.STRING,
+                new ArgumentType[]{ArgumentType.INTEGER, ArgumentType.INTEGER, ArgumentType.INTEGER, ArgumentType.STRING},
+                true,
+                (args, context) -> {
+                    int r = args[0].getNumericValue().intValue() % 256;
+                    int g = args[1].getNumericValue().intValue() % 256;
+                    int b = args[2].getNumericValue().intValue() % 256;
+
+                    Color color = new Color(r, g, b);
+                    return Token.fromString(ColorUtil.wrapWithColorTag(args[3].getValue(), color));
+                }));
+
+        // rgbStart()
+        addFunction(new LambdaFixedArgsFunction("rgbStart", TokenType.STRING,
+                new ArgumentType[]{ArgumentType.INTEGER, ArgumentType.INTEGER, ArgumentType.INTEGER},
+                true,
+                (args, context) -> {
+                    int r = args[0].getNumericValue().intValue() % 256;
+                    int g = args[1].getNumericValue().intValue() % 256;
+                    int b = args[2].getNumericValue().intValue() % 256;
+
+                    Color color = new Color(r, g, b);
+                    return Token.fromString(ColorUtil.colorTag(color));
+                }));
+    }
+
+    /**
+     * Creates the floor(), ceil(), pow(), max(), min() functions
+     */
+    private void prepareMathFunctions() {
+        // abs(x) takes a number and returns the absolute value
+        addFunction(new LambdaFixedArgsFunction("abs", TokenType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE}, true, (args, context) -> {
+            return Token.fromDouble(Math.abs(args[0].getNumericValue().doubleValue()));
+        }));
+        addFunction(new LambdaFixedArgsFunction("abs", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, true, (args, context) -> {
+            return Token.fromInt(Math.abs(args[0].getNumericValue().intValue()));
+        }));
+
+        // floor(x) takes a double and returns an integer
+        addFunction(new LambdaFixedArgsFunction("floor", TokenType.INTEGER, new ArgumentType[]{ArgumentType.DOUBLE},true, (args, context) -> {
+            return Token.fromInt((int) Math.floor(args[0].getNumericValue().doubleValue()));
+        }));
+
+        // ceil(x) takes a double and returns an integer
+        addFunction(new LambdaFixedArgsFunction("ceil", TokenType.INTEGER, new ArgumentType[]{ArgumentType.DOUBLE},true, (args, context) -> {
+            return Token.fromInt((int) Math.ceil(args[0].getNumericValue().doubleValue()));
+        }));
+
+        // pow(x) takes two numbers and returns the first to the power of the second as a double
+        addFunction(new LambdaFixedArgsFunction("pow", TokenType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE, ArgumentType.DOUBLE}, true, (args, context) -> {
+            return Token.fromDouble(Math.pow(args[0].getNumericValue().doubleValue(), args[1].getNumericValue().doubleValue()));
+        }));
+
+        // max(...) takes in any amount of numbers and returns the largest one
+        addFunction(new LambdaVariadicFunction("max", TokenType.DOUBLE, ArgumentType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE}, true, (args, context) -> {
+            double max = Double.MIN_VALUE;
+
+            for(Token t : args) {
+                double value = t.getNumericValue().doubleValue();
+                if(value > max) {
+                    max = value;
+                }
+            }
+
+            return Token.fromDouble(max);
+        }));
+
+        // min(...) takes in any amount of numbers and returns the smallest one
+        addFunction(new LambdaVariadicFunction("min", TokenType.DOUBLE, ArgumentType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE}, true, (args, context) -> {
+            double min = Double.MAX_VALUE;
+
+            for(Token t : args) {
+                double value = t.getNumericValue().doubleValue();
+                if(value < min) {
+                    min = value;
+                }
+            }
+
+            return Token.fromDouble(min);
+        }));
+    }
+
+    /**
+     * Creates functions which exist for backwards compatibility with the previous (terrible) "expression" engine
+     */
+    private void prepareBackwardsCompatFunctions() {
+        // THE FOLLOWING FUNCTIONS ARE ONLY PRESENT FOR BACKWARDS COMPATIBILITY WITH THE OLD SHITTY SYSTEM
+        // qtymult(x) takes an integer and returns an integer
+        addFunction(new LambdaFixedArgsFunction("qtymult", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
+            String numInStackStr = context.resolveVariable("qty");
+            if(numInStackStr == null) return Token.fromInt(0);
+
+            return Token.fromInt(Integer.parseInt(numInStackStr) * args[0].getNumericValue().intValue());
+        }));
+        // qtydivide(x) takes an integer and returns an integer
+        addFunction(new LambdaFixedArgsFunction("qtydivide", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
+            String numInStackStr = context.resolveVariable("qty");
+            if(numInStackStr == null) return Token.fromInt(0);
+
+            return Token.fromInt(Integer.parseInt(numInStackStr) / args[0].getNumericValue().intValue());
+        }));
+        // qtydivideceil(x) takes an integer and returns an integer
+        addFunction(new LambdaFixedArgsFunction("qtydivideceil", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
+            String numInStackStr = context.resolveVariable("qty");
+            if(numInStackStr == null) return Token.fromInt(0);
+
+            return Token.fromInt((int) Math.ceil((double) Integer.parseInt(numInStackStr) / (double) args[0].getNumericValue().intValue()));
+        }));
+    }
+
+    /**
+     * Implements the logic for the `{inv}_qty()` functions
+     */
+    private Token containerQty(Token[] args, ExecutionContext context, InventoryID inventoryID, boolean shortCircuitOnFind) {
+        if (client == null || client.getLocalPlayer() == null)
+            return Token.fromInt(0);
+
+        ItemContainer container = client.getItemContainer(inventoryID);
+        if (container == null) {
+            return Token.fromInt(0);
+        }
+
+        // Loop through the arguments, constructing a list of item IDs
+        Set<Integer> itemIDs = new HashSet<>(args.length);
+        for(Token arg : args) {
+            if (arg.getType() == TokenType.STRING) {
+                for(int itemId : ItemNameMap.GetItemIDs(arg.getValue())) {
+                    itemIDs.add(itemId);
+                }
+            } else {
+                int itemID = arg.getNumericValue().intValue();
+                if (itemManager != null) itemID = itemManager.canonicalize(itemID);
+
+                itemIDs.add(itemID);
+            }
+        }
+
+        // No item IDs are relevant -- so zero
+        if (itemIDs.size() == 0)
+            return Token.fromInt(0);
+
+        // Find the sum of quantities of items in the given inventory which are represented in `itemIDs`
+        int count = 0;
+        for (Item item : container.getItems()) {
+            int canonicalId = itemManager == null ? item.getId() : itemManager.canonicalize(item.getId());
+            if (itemIDs.contains(canonicalId)) {
+                count += item.getQuantity();
+
+                // If we should short-circuit when we find the first match, then... do that.
+                if(shortCircuitOnFind) {
+                    break;
+                }
+            }
+        }
+
+        return Token.fromInt(count);
+    }
+
+    /**
+     * Implements the logic for the `{inv}_contains()` functions
+     */
+    private Token containerContainsAnyItem(Token[] args, ExecutionContext context, InventoryID inventoryID) {
+        Token qty = containerQty(args, context, inventoryID, true);
+        return Token.fromBool(qty.getNumericValue().intValue() > 0);
+    }
+
+    /**
+     * Creates the `{inventory}_qty()` and `{inventory}_contains()` functions for a given inventory
+     */
+    private void inventoryFunction(String prefix, InventoryID inventoryID) {
+        String containsFuncName = prefix + "_contains";
+        String qtyFuncName = prefix + "_qty";
+
+        // {prefix}_contains(idOrName, ...) takes variable item IDs/names and returns 1 if any of said items are in the specified inventory
+        addFunction(new LambdaVariadicFunction(containsFuncName, TokenType.INTEGER, ArgumentType.ANY, null, (args, context) -> {
+            return containerContainsAnyItem(args, context, inventoryID);
+        }));
+
+        // {prefix}_qty(idOrName, ...) takes variable item IDs/names and returns the number of items with any of said IDs in the given inventory
+        addFunction(new LambdaVariadicFunction(qtyFuncName, TokenType.INTEGER, ArgumentType.ANY, null, (args, context) -> {
+            return containerQty(args, context, inventoryID, false);
+        }));
+    }
+
+    private void simpleColorStringFunc(String colorName, Color color) {
+        addFunction(new LambdaFixedArgsFunction(colorName, TokenType.STRING, new ArgumentType[]{ArgumentType.ANY}, true, (args, context) -> {
+            return Token.fromString(ColorUtil.wrapWithColorTag(args[0].getValue(), color));
+        }));
+    }
+
+    private void simpleColorStringStartFunc(String colorName, Color color) {
+        addFunction(new LambdaFixedArgsFunction(colorName + "Start", TokenType.STRING, new ArgumentType[]{}, true, (args, context) -> {
+            return Token.fromString(ColorUtil.colorTag(color));
+        }));
+    }
+}
+
+package com.geel.customitemhovers;
+
+import net.runelite.api.*;
+import net.runelite.api.widgets.InterfaceID;
+import net.runelite.api.widgets.Widget;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.tooltip.Tooltip;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
+import net.runelite.client.util.ColorUtil;
+
+import javax.inject.Inject;
+import java.awt.*;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+
+import static net.runelite.api.MenuAction.CC_OP;
+import static net.runelite.api.MenuAction.WIDGET_TARGET;
+import static net.runelite.api.MenuAction.ITEM_USE;
+import static net.runelite.api.MenuAction.ITEM_FIRST_OPTION;
+import static net.runelite.api.MenuAction.ITEM_SECOND_OPTION;
+import static net.runelite.api.MenuAction.ITEM_THIRD_OPTION;
+import static net.runelite.api.MenuAction.ITEM_FOURTH_OPTION;
+import static net.runelite.api.MenuAction.ITEM_FIFTH_OPTION;
+
+class CustomItemHoversOverlay extends Overlay
+{
+	//Interface IDs for the standard inventory container
+	private static final Set<Integer> INVENTORY_COMPONENT_IDS = new HashSet<>(
+			Arrays.asList(
+					InterfaceID.INVENTORY,
+					InterfaceID.BANK_INVENTORY,
+					InterfaceID.SEED_VAULT_INVENTORY,
+					InterfaceID.EXPLORERS_RING
+			)
+	);
+
+	//Interface IDs which an item hover MenuAction will be related to
+	private static final Set<Integer> VALID_INTERFACE_IDS = new HashSet<>(
+			Arrays.asList(InterfaceID.INVENTORY, InterfaceID.BANK, InterfaceID.BANK_INVENTORY,
+					InterfaceID.SEED_VAULT, InterfaceID.SEED_VAULT_INVENTORY, InterfaceID.EXPLORERS_RING)
+	);
+
+	//MenuActions which indicate an item is being hovered on
+	private static final Set<MenuAction> VALID_MENU_ACTIONS = new HashSet<>(
+			Arrays.asList(CC_OP, ITEM_USE, WIDGET_TARGET, ITEM_FIRST_OPTION, ITEM_SECOND_OPTION,
+					ITEM_THIRD_OPTION, ITEM_FOURTH_OPTION, ITEM_FIFTH_OPTION)
+	);
+
+	private final Client client;
+	private final CustomItemHoversConfig config;
+	private final CustomItemHoversPlugin plugin;
+	private final TooltipManager tooltipManager;
+
+	@Inject
+	CustomItemHoversOverlay(Client client, CustomItemHoversPlugin plugin, CustomItemHoversConfig config, TooltipManager tooltipManager)
+	{
+		setPosition(OverlayPosition.DYNAMIC);
+		this.client = client;
+		this.plugin = plugin;
+		this.config = config;
+		this.tooltipManager = tooltipManager;
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		// If the player is not hovering over any items, reset the cache
+		if(!innerRender(graphics)) {
+			plugin.resetHoveredItemCache();
+		}
+
+		return null;
+	}
+
+	/**
+	 * Handles the hover.
+	 *
+	 * Returns true if the user is presently hovering over any item, inlcuding those without a hover.
+	 */
+	private boolean innerRender(Graphics2D graphics) {
+		//Don't display anything if a right-click menu is open.
+		if (client.isMenuOpen())
+			return false;
+
+		//Get the current menu entries; if there aren't any, return.
+		final MenuEntry[] menuEntries = client.getMenuEntries();
+		if (menuEntries.length <= 0)
+			return false;
+
+		final MenuEntry lastEntry = menuEntries[menuEntries.length - 1];
+		final MenuAction action = lastEntry.getType();
+		final Widget widget = lastEntry.getWidget();
+
+		if(widget == null) {
+			return false;
+		}
+
+		final int widgetId = widget.getId();
+		final int interfaceId = widgetId >>> 16;
+
+		if (!VALID_MENU_ACTIONS.contains(action))
+			return false;
+
+		if (!VALID_INTERFACE_IDS.contains(interfaceId))
+			return false;
+
+		//We should now display a hover.
+		ItemContainer container = getContainer(interfaceId);
+
+		if (container == null)
+			return false;
+
+		//Get the Item from the Container
+		final int containerItemIndex = lastEntry.getParam0();
+		final Item item = container.getItem(containerItemIndex);
+		if (item == null)
+			return false;
+
+		//Get the hovers for this item ID
+		String[] hoverTexts = plugin.getItemHovers(item);
+		if (hoverTexts.length == 0)
+			return true;
+
+		for (String s : hoverTexts) {
+			tooltipManager.add(new Tooltip(ColorUtil.prependColorTag(s, config.defaultHoverColor())));
+		}
+
+		return true;
+	}
+
+	private ItemContainer getContainer(int interfaceId)
+	{
+		if (INVENTORY_COMPONENT_IDS.contains(interfaceId))
+			return client.getItemContainer(InventoryID.INVENTORY);
+		else if (interfaceId == InterfaceID.BANK)
+			return client.getItemContainer(InventoryID.BANK);
+		else if (interfaceId == InterfaceID.SEED_VAULT) {
+			return client.getItemContainer(InventoryID.SEED_VAULT);
+		}
+
+		return null;
+	}
+}
+
+package com.geel.customitemhovers;
+
+import javax.inject.Inject;
+
+import com.geel.customitemhovers.expressions.ExecutionContext;
+import com.geel.customitemhovers.expressions.EvaluationUtil;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.models.hovers.HoverFile;
+import com.geel.customitemhovers.models.hovers.HoverDef;
+import com.geel.customitemhovers.models.hovers.ParsedHover;
+import com.geel.customitemhovers.models.itemtables.ItemTable;
+import com.geel.customitemhovers.models.itemtables.ItemTableCollection;
+import com.google.gson.Gson;
+import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.CommandExecuted;
+import net.runelite.client.RuneLite;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.overlay.OverlayManager;
+
+import java.awt.*;
+import java.io.IOException;
+import java.nio.file.*;
+import java.util.*;
+
+import static java.nio.file.StandardWatchEventKinds.*;
+
+@Slf4j
+@PluginDescriptor(
+        name = "Custom Item Hovers",
+        description = "Enables custom item hovers. Read github page.",
+        tags = {"custom", "item", "hovers", "tooltips"},
+        enabledByDefault = true
+)
+public class CustomItemHoversPlugin extends Plugin {
+    private static final String PLUGIN_FOLDER_NAME = "customitemhovers";
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private ConfigManager configManager;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private ClientToolbar clientToolbar;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private CustomItemHoversOverlay overlay;
+
+    @Inject
+    private CustomItemHoversConfig config;
+
+    @Inject
+    private Gson gson;
+
+    @Inject
+    private HoverFileParser parser;
+
+    @Inject
+    private ItemTableManager itemTableManager;
+
+    @Inject
+    private CustomItemHoversFunctionProvider functionProvider;
+
+    @Provides
+    CustomItemHoversConfig getConfig(ConfigManager configManager) {
+        return configManager.getConfig(CustomItemHoversConfig.class);
+    }
+
+    //Map between an Item ID and all of its associated HoverDefs.
+    public Map<Integer, ArrayList<HoverDef>> hovers = new HashMap<>();
+
+    // Watchers of the hover directory
+    WatchService hoverWatcher;
+    WatchKey hoverWatchKey;
+    WatchKey tableWatchKey;
+
+    @Override
+    protected void startUp() throws Exception {
+        prepareHoverFolder();
+
+        //Invoke this on the client thread because `itemManager.canonicalize()` must be run in the client thread
+        clientThread.invokeLater(() -> {
+            prepareItemNameMap();
+            prepareItemTables();
+            prepareHoverMap();
+            prepareHoverWatcher();
+        });
+
+        overlayManager.add(overlay);
+    }
+
+    @Override
+    protected void shutDown() throws Exception {
+        if (hoverWatcher != null)
+            hoverWatcher.close();
+
+        overlayManager.remove(overlay);
+    }
+
+    @Subscribe
+    public void onConfigChanged(ConfigChanged ev) {
+        if (ev.getGroup().equals("customitemhovers") && ev.getKey().equals("hoverEnableHotReload")) {
+            if (config.hoverEnableHotReload()) {
+                clientThread.invoke(this::prepareHoverWatcher);
+            } else {
+                clientThread.invoke(this::stopHoverWatcher);
+            }
+        }
+    }
+
+    @Subscribe
+    public void onCommandExecuted(CommandExecuted commandExecuted) {
+        if (!commandExecuted.getCommand().equals(config.openDirChatCommand())) {
+            return;
+        }
+
+        Path hoverPath = getHoverPath();
+
+        if (hoverPath == null) {
+            return;
+        }
+
+        try {
+            Desktop.getDesktop().open(hoverPath.toFile());
+        } catch (Exception e) {
+            log.error("Got exception opening hover folder", e);
+        }
+    }
+
+    /**
+     * Returns an array of hover texts that should be rendered for a given item
+     */
+    private Item lastItem = null;
+    private String[] lastHovers = null;
+
+    /**
+     * Resets the cache of the item hover.
+     *
+     * This system seems badly coupled. I should refactor this. Blech.
+     */
+    public void resetHoveredItemCache() {
+        lastHovers = null;
+        lastItem = null;
+    }
+
+    /**
+     *
+     * For the given Item in a supported container, returns a String array, each representing
+     * HTML that should be rendered in a hover box.
+     *
+     * Fully processes all expressions contained within hover texts.
+     */
+    public String[] getItemHovers(Item item) {
+        // Cache hovers
+        // TODO: FIXME: This prevents users from creating hovers which update dynamically without having to re-hover
+        if (item.equals(lastItem)) {
+            return lastHovers;
+        }
+
+        //Do a hot-reload if we should
+        if (config.hoverEnableHotReload()) {
+            if (hoverWatcherTriggered()) {
+                prepareHoverMap();
+            }
+
+            if (tableWatcherTriggered()) {
+                prepareItemTables();
+            }
+        }
+
+        // Canonicalize the item and get its composition
+        int itemID = itemManager.canonicalize(item.getId());
+        ItemComposition comp = itemManager.getItemComposition(itemID);
+
+        //If item's ID is not in `hovers`, it has no hovers.
+        if (!hovers.containsKey(itemID))
+            return new String[0];
+
+        // Prepare expression execution context
+        ItemTableCollection tableCollection = itemTableManager.getCollectionForItem(comp.getName());
+        ItemTable baseTable = itemTableManager.getBaseTableForItemAndPlayer(item, client);
+        CustomItemHoversVariableProvider variableProvider = new CustomItemHoversVariableProvider(tableCollection, baseTable);
+        ExecutionContext context = new ExecutionContext(functionProvider, variableProvider);
+
+        //For each hover associated with this item, add its transformed text to the resultant array
+        boolean obsoleteExpressionDetected = false;
+        ArrayList<String> ret = new ArrayList<>();
+        for (HoverDef hoverDef : hovers.get(itemID)) {
+            // If the hoverdef has a condition, evaluate it first
+            if(hoverDef.Condition != null) {
+                Token conditionResult = EvaluationUtil.EvaluateAtRuntime(hoverDef.Condition, context);
+                if(conditionResult.getNumericValue().intValue() == 0) {
+                    continue;
+                }
+            }
+
+            for (ParsedHover parsedHover : hoverDef.ParsedHoverTexts) {
+                String transformed = HoverEvaluator.Evaluate(parsedHover, context);
+                if(transformed == null) {
+                    continue;
+                }
+
+                ret.add(transformed);
+
+                // Warn about obsolete expressions
+                if (config.enableObsoleteMessage()) {
+                    obsoleteExpressionDetected = obsoleteExpressionDetected ||
+                            Arrays
+                                    .stream(parsedHover.getExpressions())
+                                    .anyMatch(e -> e.isLegacy());
+                }
+            }
+        }
+
+        // Warn about obsolete expressions if we find any
+        if(obsoleteExpressionDetected) {
+            warnObsoleteExpression();
+        }
+
+        //Turn `ret` into an array from an ArrayList
+        String[] retArr = new String[ret.size()];
+        retArr = ret.toArray(retArr);
+
+        lastItem = item;
+        lastHovers = retArr;
+
+        return retArr;
+    }
+
+    private void warnObsoleteExpression() {
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE,
+                "",
+                "<col=e74c3c>[Custom Item Hovers]</col> " +
+                        "Obsolete expression detected. " +
+                        "See the plugin support page (or GitHub) to learn about the new, better expression system. " +
+                        "Turn this message off in settings.",
+                "");
+    }
+
+    /**
+     * Parses the config's hover dirs path and returns it if it's a readable directory.
+     *
+     * @return Path|null The path if it's a valid, readable directory Path, null otherwise.
+     */
+    public Path getHoverPath() {
+        return Paths.get(RuneLite.RUNELITE_DIR.getAbsolutePath() + "/" + PLUGIN_FOLDER_NAME);
+    }
+
+    /**
+     * Parses the config's table path and returns it if it's a readable directory.
+     *
+     * @return Path|null The path if it's a valid, readable directory Path, null otherwise.
+     */
+    public Path getTablePath() {
+        return Paths.get(RuneLite.RUNELITE_DIR.getAbsolutePath() + "/" + PLUGIN_FOLDER_NAME + "/tables");
+    }
+
+    /**
+     * Prepare ItemNameMap
+     */
+    protected void prepareItemNameMap() {
+        ItemNameMap.PrepareMap(client, itemManager);
+    }
+
+    /**
+     * Creates, if necessary, the `customitemhovers` folder in the user's `.runelite` directory
+     *
+     * @throws IOException
+     */
+    protected void prepareHoverFolder() throws IOException {
+        Path rlPath = RuneLite.RUNELITE_DIR.toPath();
+
+        if (!Files.isDirectory(rlPath) || !Files.isReadable(rlPath) || !Files.isWritable(rlPath)) {
+            log.error("[CUSTOMITEMHOVERS] Bad .runelite path");
+            return;
+        }
+
+        // Ensure that `/customitemhovers` and `/customitemhovers/tables` exist in RL directory
+        prepareSpecificHoverFolder(getHoverPath());
+        prepareSpecificHoverFolder(getTablePath());
+    }
+
+    /**
+     * Creates a directory if it doesn't exist, logging an error if creation failed
+     */
+    private void prepareSpecificHoverFolder(Path path) throws IOException {
+        // Create directory if it doesn't exist
+        if (Files.notExists(path)) {
+            Files.createDirectory(path);
+        }
+
+        // Make sure we actually created the directory and it's readable
+        if (!Files.isDirectory(path) || !Files.isReadable(path)) {
+            log.error("[CUSTOMITEMHOVERS] Couldn't ensure path " + path);
+        }
+    }
+
+    /**
+     * Reads all files from the `customitemhovers` directory, parses them, and
+     * prepares a map of (itemID, hovers) for each item that has a hover.
+     */
+    protected void prepareHoverMap() {
+        hovers.clear();
+
+        //Read all hover files
+        ArrayList<HoverFile> hoverFiles = parser.readHoverFiles(getHoverPath());
+
+        for (HoverFile f : hoverFiles) {
+            for (HoverDef d : f.Hovers) {
+                //Compute which item IDs this HoverDef is attached to. This fills in `d.ItemIDs`.
+                parseHoverDefNames(d);
+
+                //Add this HoverDef to the map for every Item ID it represents
+                for (int itemID : d.ItemIDs) {
+                    if (!hovers.containsKey(itemID))
+                        hovers.put(itemID, new ArrayList<>());
+
+                    ArrayList<HoverDef> curArr = hovers.get(itemID);
+                    curArr.add(d);
+                }
+            }
+        }
+    }
+
+    /**
+     * TODO document
+     */
+    protected void prepareItemTables() {
+        itemTableManager.reparseItemDatabase(getTablePath());
+    }
+
+    /**
+     * @return True if the `customitemhovers` directory has changed since the last time this function was called
+     */
+    private boolean hoverWatcherTriggered() {
+        if (hoverWatchKey == null || !hoverWatchKey.isValid())
+            return false;
+
+        //If we've received any filesystem events, then assume it changed
+        boolean triggered = hoverWatchKey.pollEvents().size() > 0;
+
+        //Enable more events to be queued
+        hoverWatchKey.reset();
+
+        return triggered;
+    }
+
+    /**
+     * @return True if the `customitemhovers` directory has changed since the last time this function was called
+     */
+    private boolean tableWatcherTriggered() {
+        if (tableWatchKey == null || !tableWatchKey.isValid())
+            return false;
+
+        //If we've received any filesystem events, then assume it changed
+        boolean triggered = tableWatchKey.pollEvents().size() > 0;
+
+        //Enable more events to be queued
+        tableWatchKey.reset();
+
+        return triggered;
+    }
+
+    /**
+     * Set up a filesystem watcher on the `customitemhovers` directory.
+     * <p>
+     * This enables hot-reloading.
+     */
+    private void prepareHoverWatcher() {
+        if (!config.hoverEnableHotReload())
+            return;
+
+        Path hoverPath = getHoverPath();
+        Path tablePath = getTablePath();
+
+        //Nothing to watch
+        if (hoverPath == null)
+            return;
+
+        try {
+            hoverWatcher = FileSystems.getDefault().newWatchService();
+
+            hoverWatchKey = hoverPath.register(hoverWatcher,
+                    ENTRY_CREATE,
+                    ENTRY_DELETE,
+                    ENTRY_MODIFY);
+
+            if (tablePath != null) {
+                tableWatchKey = tablePath.register(hoverWatcher,
+                        ENTRY_CREATE,
+                        ENTRY_DELETE,
+                        ENTRY_MODIFY);
+            }
+        } catch (Exception e) {
+
+        }
+    }
+
+    /**
+     * Closes `hoverWatcher` and `hoverWatchKey`, if possible.
+     */
+    private void stopHoverWatcher() {
+        if (hoverWatcher != null) {
+            try {
+                hoverWatcher.close();
+            } catch (IOException e) {
+                log.error("[CUSTOMITEMHOVERS]: exception closing hover watcher", e);
+            }
+
+            hoverWatcher = null;
+        }
+
+        if (hoverWatchKey != null) {
+            hoverWatchKey.cancel();
+            hoverWatchKey = null;
+        }
+
+        if (tableWatchKey != null) {
+            tableWatchKey.cancel();
+            tableWatchKey = null;
+        }
+    }
+
+    /**
+     * Computes all item IDs that a HoverDef is targeting, and stores the results in
+     * its `ItemIDs` member variable.
+     *
+     * @param d HoverDef to parse names for
+     */
+    private void parseHoverDefNames(HoverDef d) {
+        Set<Integer> itemIDs = new HashSet<>();
+
+        //If ItemNamesRegex is non-empty, insert all item IDs whose name matches any of the given regexes
+        if (d.ItemNamesRegex != null) {
+            for (String name : d.ItemNamesRegex) {
+                itemIDs.addAll(ItemNameMap.GetItemIDsRegex(name));
+            }
+        }
+
+        //If ItemNames is non-empty, insert all item IDs with the exact name(s) specified
+        if (d.ItemNames != null) {
+            for (String name : d.ItemNames) {
+                for (int id : ItemNameMap.GetItemIDs(name)) {
+                    itemIDs.add(id);
+                }
+            }
+        }
+
+        //If ItemIDs has any IDs specified, copy them in
+        if (d.ItemIDs != null && d.ItemIDs.length > 0) {
+            for (int id : d.ItemIDs) {
+                itemIDs.add(id);
+            }
+        }
+
+        //Convert `itemIDs` into an array and store it in `d.ItemIDs`
+        d.ItemIDs = new int[itemIDs.size()];
+        int i = 0;
+        for (Iterator<Integer> it = itemIDs.iterator(); it.hasNext(); ) {
+            int id = it.next();
+            d.ItemIDs[i++] = id;
+        }
+    }
+}
+
+package com.geel.customitemhovers;
+
+import com.geel.customitemhovers.expressions.providers.IVariableProvider;
+import com.geel.customitemhovers.models.itemtables.ItemTable;
+import com.geel.customitemhovers.models.itemtables.ItemTableCollection;
+import lombok.Getter;
+
+import java.util.Locale;
+
+/**
+ * Provides variables for an item hover.
+ *
+ * Basically just packages together an ItemTableCollection (containing variables that the user of the plugin has
+ * set up) and a base ItemTable (generated for each item that is hovered over).
+ */
+public class CustomItemHoversVariableProvider implements IVariableProvider {
+    @Getter
+    private ItemTableCollection tableCollection;
+
+    @Getter
+    private ItemTable baseTable;
+
+    public CustomItemHoversVariableProvider(
+                                      ItemTableCollection tableCollection,
+                                      ItemTable baseTable) {
+        this.tableCollection = tableCollection;
+        this.baseTable = baseTable;
+    }
+
+    public String resolveVariable(String variableName) {
+        if(tableCollection != null) {
+            variableName = variableName.toLowerCase(Locale.ROOT);
+
+            // Try to resolve via explicit tables, then base table
+            String tableCollectionRet = tableCollection.resolveVariable(variableName);
+            if (tableCollectionRet != null) {
+                return tableCollectionRet;
+            }
+        }
+
+        if(baseTable == null) {
+            return null;
+        }
+
+        return baseTable.getOrDefault(variableName, null);
+    }
+}
+
+package com.geel.customitemhovers.expressions;
+import com.geel.customitemhovers.expressions.models.*;
+
+import java.util.ArrayList;
+import java.util.Stack;
+
+/**
+ * Performs the Shunting Yard Algorithm to convert an infix mathematical expression to Reverse Polish Notation (postfix).
+ *
+ * This is here so that we can enable rich mathematical expressions, including variables and functions, in
+ * item hover text.
+ */
+public class Compiler {
+    /**
+     * Parses an infix notation (eg "(a + b) - sqrt(12)") expression, returning an Expression object.
+     */
+    public static CompiledExpression Compile(TokenizedExpression expression) {
+        Token[] tokenized = expression.getTokens();
+        if (tokenized.length == 0) {
+            return new CompiledExpression(expression);
+        }
+
+        ArrayList<Token> outputQueue = new ArrayList<>();
+        Stack<Token> operatorStack = new Stack<>();
+
+        // Stack for tracking how many arguments are passed to each function as we parse it
+        Stack<Integer> functionArgs = new Stack<>();
+
+        for (int i = 0; i < tokenized.length; i++) {
+            Token token = tokenized[i];
+
+            // Handle numbers and variables
+            if (token.getType().isValue()) {
+                outputQueue.add(token);
+                continue;
+            }
+
+            // Handle function calls
+            if (token.getType() == TokenType.FUNCTION) {
+                operatorStack.add(token);
+
+                int numArgsToInitiateWith = 1;
+
+                // HACK: look ahead two tokens, which we know will exist because the parser ensures it.
+                //       If it's a right paren, we know it's a function with no arguments,
+                //       so we can just add it to the output queue and move on.
+                //       We do this because we track the number of function arguments by incrementing whenever we encounter
+                //       an argument separator (comma), so to handle single-argument (no-comma) scenarios we start with 1,
+                //       but this breaks in a no-argument scenario.
+                if(i + 2 < tokenized.length
+                        && tokenized[i + 2].getType() == TokenType.PAREN_RIGHT) {
+                    numArgsToInitiateWith = 0;
+                }
+
+                functionArgs.add(numArgsToInitiateWith);
+                continue;
+            }
+
+            // Handle comma
+            if(token.getType() == TokenType.COMMA) {
+                // While the top of the stack isn't a left paren, pop from operator stack to output queue
+                while (true) {
+                    // If the stack is empty before we hit a left paren, there's a mismatch
+                    if (operatorStack.isEmpty()) {
+                        throw new IllegalArgumentException("Operator stack empty");
+                    }
+
+                    // If we find a left paren, exit the loop. Leave the left paren on the stack.
+                    if (operatorStack.peek().getType() == TokenType.PAREN_LEFT) {
+                        break;
+                    }
+
+                    // If not a left paren, just move to the output queue
+                    outputQueue.add(operatorStack.pop());
+                }
+
+                // Increment top of functionArgs stack
+                functionArgs.push(functionArgs.pop() + 1);
+                continue;
+            }
+
+            // Handle operators
+            if (token.getType().isOperator()) {
+                // While there exists a token at the top of the stack that should be moved to the output queue
+                // before this operator is added to the stack, do so
+                while (ShuntOperator(token, operatorStack)) {
+                    outputQueue.add(operatorStack.pop());
+                }
+
+                operatorStack.add(token);
+                continue;
+            }
+
+            // Handle left paren
+            if (token.getType() == TokenType.PAREN_LEFT) {
+                operatorStack.add(token);
+            }
+
+            // Handle right paren
+            if (token.getType() == TokenType.PAREN_RIGHT) {
+                // While the top of the stack isn't a left paren, pop from operator stack to output queue
+                while (true) {
+                    // If the stack is empty before we hit a left paren, there's a mismatch
+                    if (operatorStack.isEmpty()) {
+                        throw new IllegalArgumentException("Operator stack empty");
+                    }
+
+                    Token popped = operatorStack.pop();
+                    if (popped.getType() == TokenType.PAREN_LEFT) {
+                        // If we hit a left paren, drop it from the stack and don't move it to the output queue
+                        break;
+                    }
+
+                    // If not a left paren, just move to the output queue
+                    outputQueue.add(popped);
+                }
+
+                // If the top of the operator stack is a function, then the function should also be moved now
+                if (!operatorStack.isEmpty() && operatorStack.peek().getType() == TokenType.FUNCTION) {
+                    if(functionArgs.size() == 0) {
+                        throw new IllegalArgumentException("Function argument stack corrupted");
+                    }
+
+                    Token funcArg = operatorStack.pop();
+                    funcArg.setNumFunctionArgs(functionArgs.pop());
+                    outputQueue.add(funcArg);
+                }
+            }
+        }
+
+        // Cleanup Stack
+        while (!operatorStack.isEmpty()) {
+            Token popped = operatorStack.pop();
+
+            if (popped.getType().isParenthesis()) {
+                throw new IllegalArgumentException("Mismatched parentheses");
+            }
+
+            outputQueue.add(popped);
+        }
+
+        CompiledExpression compiled = new CompiledExpression(outputQueue.toArray(new Token[0]), expression.getExpressionText(), expression.isLegacy());
+        return compiled;
+    }
+
+    /**
+     * Called when processing an operator token.
+     *
+     * Determines if the top of the stack should be popped to the output queue before the new operator
+     * is added to the stack.
+     */
+    private static boolean ShuntOperator(Token newToken, Stack<Token> stack) {
+        // No top of stack? Nothing to shunt
+        // (I don't know if "shunt" is the right word to actually use, but I like it)
+        if (stack.isEmpty()) {
+            return false;
+        }
+
+        Token topOfStack = stack.peek();
+
+        // If it's a left paren, don't shunt
+        if (topOfStack.getType() == TokenType.PAREN_LEFT) {
+            return false;
+        }
+
+        // If the top has higher precedence than the new operator,
+        // OR the same precedence but the new operator is left-associative,
+        // it should be shunted.
+        int topPrecedence = topOfStack.getType().getPrecedence();
+        int newPrecedence = newToken.getType().getPrecedence();
+
+        if (topPrecedence < newPrecedence) {
+            return true;
+        }
+
+        if (topPrecedence == newPrecedence && !newToken.getType().isRightAssociative()) {
+            return true;
+        }
+
+        // No shuntage
+        return false;
+    }
+}
+
+
+
+package com.geel.customitemhovers.expressions;
+
+import com.geel.customitemhovers.expressions.models.CompiledExpression;
+import com.geel.customitemhovers.expressions.models.Token;
+
+/**
+ * Helpers for simplifying the evaluation of expressions
+ */
+public class EvaluationUtil {
+    /**
+     * Evaluates a Reverse Polish Notation queue (output from `ExpressionCompiler`), returning the result
+     */
+    public static Token EvaluateAtRuntime(CompiledExpression expression, ExecutionContext context) {
+        Token[] evaluationResult = Evaluator.EvaluateExpression(expression, context, false);
+
+        // Stack should have one entry: the result
+        if (evaluationResult.length != 1) {
+            throw new IllegalArgumentException("Stack should only have a single entry at the end");
+        }
+
+        // Single entry should be a constant integer, double, or string value
+        Token result = evaluationResult[0];
+        if (!result.getType().isConstant()) {
+            throw new IllegalArgumentException("Invalid token type after RPN evaluation");
+        }
+
+        // Return result
+        return result;
+    }
+
+    /**
+     * Statically evaluates a CompiledExpression, returning its simplified form.
+     *
+     * If the expression is fully statically evaluatable, the resultant `CompiledExpression` will contain only
+     * a single Token, which is the result of evaluation.
+     *
+     *
+     *
+     * This will attempt to execute as much of the expression as possible, replacing constant operations (eg "3 + 4") with
+     * their results.
+     *
+     * The end result will, ideally, be the simplest form of an expression possible, with all operations on constant values pre-resolved.
+     *
+     * For example, take the following expression: (3 + (4 - sqrt(sqrt(81))) - pow(2, 0) + (2 * a)
+     *
+     * This expression references a variable -- `a` -- which we will only be able to resolve at runtime, when we're hovering over an item.
+     * However, it also contains many static math operations, including some functions -- `pow` and `sqrt`.
+     *
+     * Both functions called (`pow` and `sqrt`) are `constexpr` (meaning they can be evaluated without any game state),
+     * and the arguments being fed into them are const themselves.
+     *
+     * sqrt(sqrt(81)) should simplify to sqrt(9) -> 3
+     * pow(2,0) should simplify to 1
+     *
+     * Therefore, the entire above expression can be statically evaluated to:
+     * (3 + (4 - 3)) - 1 + (2 * a) -> (4) - 1 + (2 * a) -> 3 + (2 * a)
+     *
+     * Which, in RPN form, would be: 2 a * 3 +
+     *
+     * That's a mere 5 tokens that we have to execute at runtime, instead of however many were in the original expression.
+     */
+    public static CompiledExpression EvaluateStatically(CompiledExpression expression, ExecutionContext context) {
+        Token[] evaluationResult = Evaluator.EvaluateExpression(expression, context, true);
+
+        // Stack should not be empty
+        if (evaluationResult.length == 0) {
+            throw new IllegalArgumentException("Stack empty??");
+        }
+
+        // Return result
+        return new CompiledExpression(evaluationResult, expression.getExpressionText(), expression.isLegacy());
+    }
+}
+
 package com.geel.customitemhovers.expressions;
 
 import com.geel.customitemhovers.expressions.models.CompiledExpression;
@@ -399,6 +1785,484 @@ class Evaluator {
     }
 }
 
+package com.geel.customitemhovers.expressions;
+
+import com.geel.customitemhovers.expressions.functions.Function;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.expressions.providers.IFunctionProvider;
+import com.geel.customitemhovers.expressions.providers.IVariableProvider;
+
+/**
+ * Context for expression execution -- packages together providers of functions and variables
+ */
+public class ExecutionContext {
+    private final IFunctionProvider functionProvider;
+    private final IVariableProvider variableProvider;
+
+    public ExecutionContext(IFunctionProvider functionProvider,
+                            IVariableProvider variableProvider) {
+        this.functionProvider = functionProvider;
+        this.variableProvider = variableProvider;
+    }
+
+    public String resolveVariable(String variableName) {
+        if(variableProvider == null) {
+            return null;
+        }
+        return variableProvider.resolveVariable(variableName);
+    }
+
+    public Function resolveFunction(String functionName, Token[] arguments) {
+        if(functionProvider == null) {
+            return null;
+        }
+
+        return functionProvider.findFunction(functionName, arguments);
+    }
+}
+
+package com.geel.customitemhovers.expressions.functions;
+
+import com.geel.customitemhovers.expressions.ExecutionContext;
+import com.geel.customitemhovers.expressions.models.ArgumentType;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.expressions.models.TokenType;
+import lombok.Getter;
+
+public abstract class FixedArgsFunction extends Function {
+    @Getter
+    private int numArguments;
+
+    @Getter
+    private ArgumentType[] argumentTypes;
+
+    public FixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments) {
+        super(name, returnType);
+
+        this.argumentTypes = arguments;
+        this.numArguments = arguments.length;
+    }
+
+    public FixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments, boolean isConstExpr) {
+        super(name, returnType, isConstExpr);
+
+        this.argumentTypes = arguments;
+        this.numArguments = arguments.length;
+    }
+
+    @Override
+    public int getArgumentsHashCode() {
+        return numArguments;
+    }
+
+    public boolean argumentsMatch(Token[] matchArguments) {
+        if(matchArguments.length != numArguments) return false;
+
+        for(int i = 0; i < numArguments; i++) {
+            if(!argumentTypes[i].fitsTokenType(matchArguments[i].getType()))
+                return false;
+        }
+
+        return true;
+    }
+
+    public Token execute(Token[] arguments, ExecutionContext context) {
+        if(arguments.length != numArguments) {
+            throw new IllegalArgumentException("Invalid number of arguments to " + name);
+        }
+
+        Token[] coercedArguments = new Token[arguments.length];
+        for(int i = 0; i < arguments.length; i++) {
+            coercedArguments[i] = argumentTypes[i].coerceTokenToType(arguments[i]);
+        }
+
+        return innerExecute(coercedArguments, context);
+    }
+}
+
+package com.geel.customitemhovers.expressions.functions;
+
+import com.geel.customitemhovers.expressions.ExecutionContext;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.expressions.models.TokenType;
+import lombok.Getter;
+
+public abstract class Function {
+    @Getter
+    protected String name;
+
+    @Getter
+    protected TokenType returnType;
+
+    @Getter
+    protected boolean isConstExpr;
+
+    public Function(String name, TokenType returnType) {
+        this.name = name;
+        this.returnType = returnType;
+    }
+
+    public Function(String name, TokenType returnType, boolean isConstExpr) {
+        this(name, returnType);
+        this.isConstExpr = isConstExpr;
+    }
+
+    public abstract int getArgumentsHashCode();
+
+    public abstract boolean argumentsMatch(Token[] matchArguments);
+
+    public abstract Token execute(Token[] arguments, ExecutionContext context);
+
+    protected abstract Token innerExecute(Token[] arguments, ExecutionContext context);
+}
+
+package com.geel.customitemhovers.expressions.functions;
+
+import com.geel.customitemhovers.expressions.ExecutionContext;
+import com.geel.customitemhovers.expressions.models.ArgumentType;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.expressions.models.TokenType;
+
+public class LambdaFixedArgsFunction extends FixedArgsFunction {
+    private java.util.function.BiFunction<Token[], ExecutionContext, Token> executionFunc;
+
+    public LambdaFixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments,
+                                   java.util.function.BiFunction<Token[], ExecutionContext, Token> executionFunc) {
+        super(name, returnType, arguments);
+        this.executionFunc = executionFunc;
+    }
+
+    public LambdaFixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments, boolean isConstExpr,
+                                   java.util.function.BiFunction<Token[], ExecutionContext, Token> executionFunc) {
+        super(name, returnType, arguments, isConstExpr);
+        this.executionFunc = executionFunc;
+    }
+
+    protected Token innerExecute(Token[] arguments, ExecutionContext context) {
+        return executionFunc.apply(arguments, context);
+    }
+}
+
+package com.geel.customitemhovers.expressions.functions;
+
+import com.geel.customitemhovers.expressions.ExecutionContext;
+import com.geel.customitemhovers.expressions.models.ArgumentType;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.expressions.models.TokenType;
+
+import java.util.function.BiFunction;
+
+public class LambdaVariadicFunction extends VariadicFunction {
+    private BiFunction<Token[], ExecutionContext, Token> executionFunc;
+
+    public LambdaVariadicFunction(String name,
+                                  TokenType returnType,
+                                  ArgumentType variadicArgumentType,
+                                  ArgumentType[] fixedArguments,
+                                  BiFunction<Token[], ExecutionContext, Token> callback
+    ) {
+        super(name, returnType, variadicArgumentType, fixedArguments);
+
+        this.executionFunc = callback;
+    }
+
+    public LambdaVariadicFunction(String name,
+                                  TokenType returnType,
+                                  ArgumentType variadicArgumentType,
+                                  ArgumentType[] fixedArguments,
+                                  boolean isConstExpr,
+                                  BiFunction<Token[], ExecutionContext, Token> callback
+    ) {
+        super(name, returnType, variadicArgumentType, fixedArguments, isConstExpr);
+
+        this.executionFunc = callback;
+    }
+
+    protected Token innerExecute(Token[] arguments, ExecutionContext context) {
+        return executionFunc.apply(arguments, context);
+    }
+}
+
+package com.geel.customitemhovers.expressions.functions;
+
+import com.geel.customitemhovers.expressions.ExecutionContext;
+import com.geel.customitemhovers.expressions.models.ArgumentType;
+import com.geel.customitemhovers.expressions.models.Token;
+import com.geel.customitemhovers.expressions.models.TokenType;
+import lombok.Getter;
+
+public abstract class VariadicFunction extends Function {
+    @Getter
+    private int minVariadicArguments;
+
+    @Getter
+    private int maxVariadicArguments;
+
+    @Getter
+    private ArgumentType variadicArgumentType;
+
+    @Getter
+    private int numFixedArguments;
+
+    @Getter
+    private final ArgumentType[] fixedArgumentTypes;
+
+    public VariadicFunction(String name,
+                            TokenType returnType,
+                            ArgumentType variadicArgumentType
+    ) {
+        this(name, returnType, 0, 100, variadicArgumentType, null, false);
+    }
+
+    public VariadicFunction(String name,
+                            TokenType returnType,
+                            ArgumentType variadicArgumentType,
+                            boolean isConstExpr
+    ) {
+        this(name, returnType, 0, 100, variadicArgumentType, null, isConstExpr);
+    }
+
+    public VariadicFunction(String name,
+                            TokenType returnType,
+                            ArgumentType variadicArgumentType,
+                            ArgumentType[] fixedArguments
+    ) {
+        this(name, returnType, 0, 100, variadicArgumentType, fixedArguments, false);
+    }
+
+    public VariadicFunction(String name,
+                            TokenType returnType,
+                            ArgumentType variadicArgumentType,
+                            ArgumentType[] fixedArguments,
+                            boolean isConstExpr
+    ) {
+        this(name, returnType, 0, 100, variadicArgumentType, fixedArguments, isConstExpr);
+    }
+
+    public VariadicFunction(String name,
+                            TokenType returnType,
+                            int minVariadicArguments,
+                            int maxVariadicArguments,
+                            ArgumentType variadicArgumentType,
+                            ArgumentType[] fixedArguments,
+                            boolean isConstExpr)
+    {
+        super(name, returnType, isConstExpr);
+
+        this.minVariadicArguments = minVariadicArguments;
+        this.maxVariadicArguments = maxVariadicArguments;
+        this.variadicArgumentType = variadicArgumentType;
+
+        if(fixedArguments == null) {
+            fixedArguments = new ArgumentType[0];
+        }
+
+        this.fixedArgumentTypes = fixedArguments;
+        this.numFixedArguments = fixedArguments.length;
+    }
+
+    @Override
+    public int getArgumentsHashCode() {
+        return -1;
+    }
+
+    public boolean argumentsMatch(Token[] matchArguments) {
+        if(matchArguments.length < minVariadicArguments + numFixedArguments) {
+            return false;
+        }
+        if(matchArguments.length > maxVariadicArguments + numFixedArguments) {
+            return false;
+        }
+
+        // Check all fixed arguments
+        for(int i = 0; i < numFixedArguments; i++) {
+            if(!fixedArgumentTypes[i].fitsTokenType(matchArguments[i].getType()))
+                return false;
+        }
+
+        // Check all variadic arguments
+        for(int i = numFixedArguments; i < matchArguments.length; i++)
+        {
+            if(!variadicArgumentType.fitsTokenType(matchArguments[i].getType())) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    public Token execute(Token[] arguments, ExecutionContext context) {
+        if(!argumentsMatch(arguments)) {
+            throw new IllegalArgumentException("Invalid number of arguments to " + name);
+        }
+
+        Token[] coercedArguments = new Token[arguments.length];
+
+        // Coerce all fixed arguments
+        for(int i = 0; i < numFixedArguments; i++) {
+            coercedArguments[i] = fixedArgumentTypes[i].coerceTokenToType(arguments[i]);
+        }
+
+        // Coerce all variadic arguments
+        for(int i = numFixedArguments; i < arguments.length; i++) {
+            coercedArguments[i] = variadicArgumentType.coerceTokenToType(arguments[i]);
+        }
+
+        return innerExecute(coercedArguments, context);
+    }
+}
+
+package com.geel.customitemhovers.expressions.models;
+
+public enum ArgumentType {
+    ANY,
+    INTEGER,
+    DOUBLE,
+    STRING;
+
+    public boolean fitsTokenType(TokenType type) {
+        if (!type.isConstant()) return false;
+        if (this == ANY) return true;
+        if (this == INTEGER || this == DOUBLE) return type == TokenType.INTEGER || type == TokenType.DOUBLE;
+        if (this == STRING) return type == TokenType.STRING;
+
+        return false; //Should never get here
+    }
+
+    public Token coerceTokenToType(Token token) {
+        if(!fitsTokenType(token.getType())) {
+            throw new IllegalArgumentException("Cannot coerce token of invalid type");
+        }
+
+        if(this == ANY) return token;
+        if(this == INTEGER) return token.getType() == TokenType.INTEGER ? token : Token.fromInt(token.getNumericValue().intValue());
+        if(this == DOUBLE) return token.getType() == TokenType.DOUBLE ? token : Token.fromDouble(token.getNumericValue().doubleValue());
+        if(this == STRING){
+            if(token.getType() == TokenType.STRING) return token;
+            return Token.fromString(token.getValue());
+        }
+
+        return token; // Should not get here
+    }
+}
+
+package com.geel.customitemhovers.expressions.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+@AllArgsConstructor
+public class BaseExpression {
+    /**
+     * The Tokens that make up this expression, in Reverse Polish Notation
+     */
+    @Getter
+    private Token[] tokens;
+
+    /**
+     * The original raw text of the expression
+     */
+    @Getter
+    private String expressionText;
+
+    /**
+     * Whether the expression is "legacy" (begins with <% and ends with %>)
+     */
+    @Getter
+    private boolean isLegacy = false;
+}
+
+package com.geel.customitemhovers.expressions.models;
+
+/**
+ * A "compiled" expression, after tokenization and parsing.
+ *
+ * TODO: Figure out a way to collapse constexpr expressions, eg:
+ *      "(3 + 4) * 2" should collapse to a single constant token "24"
+ *      "sqrt(3 + 4 + 2) * a" should collapse to "3.0 * a"
+ */
+public class CompiledExpression extends BaseExpression {
+    public CompiledExpression(Token[] tokens, String expressionText, boolean isLegacy) {
+        super(tokens, expressionText, isLegacy);
+    }
+
+    public CompiledExpression(BaseExpression expression) {
+        super(expression.getTokens(), expression.getExpressionText(), expression.isLegacy());
+    }
+}
+
+package com.geel.customitemhovers.expressions.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+import lombok.Setter;
+
+public class Token {
+    @Getter
+    private TokenType type;
+
+    @Getter
+    private String value; // TODO: Make more efficient than Strings. Are slices a thing in Java?
+
+    @Getter
+    @Setter
+    private int numFunctionArgs = 0;
+
+    public Token(TokenType type, String value) {
+        this.type = type;
+        this.value = value;
+    }
+
+    public Number getNumericValue() {
+        if(type == TokenType.INTEGER) {
+            return Integer.parseInt(value);
+        } else if(type == TokenType.DOUBLE) {
+            return Double.parseDouble(value);
+        } else {
+            throw new IllegalArgumentException("Not a number type");
+        }
+    }
+
+    public static Token fromDouble(double value) {
+        return new Token(TokenType.DOUBLE, String.valueOf(value));
+    }
+
+    public static Token fromInt(int value) {
+        return new Token(TokenType.INTEGER, String.valueOf(value));
+    }
+
+    public static Token fromString(String value) {
+        return new Token(TokenType.STRING, value);
+    }
+
+    public static Token fromBool(boolean value) {
+        return new Token(TokenType.INTEGER, value ? "1" : "0");
+    }
+
+    public static Token fromTrue() {
+        return fromBool(true);
+    }
+
+    public static Token fromFalse() {
+        return fromBool(false);
+    }
+}
+
+package com.geel.customitemhovers.expressions.models;
+
+/**
+ * An expression, after being tokenized, but before parsing.
+ */
+public class TokenizedExpression extends BaseExpression {
+    public TokenizedExpression(Token[] tokens, String expressionText, boolean isLegacy) {
+        super(tokens, expressionText, isLegacy);
+    }
+
+    public TokenizedExpression(BaseExpression expression) {
+        super(expression.getTokens(), expression.getExpressionText(), expression.isLegacy());
+    }
+}
+
 package com.geel.customitemhovers.expressions.models;
 
 import lombok.Getter;
@@ -574,633 +2438,20 @@ public enum TokenType {
         return isValue() || isFunction();
     }
 }
-package com.geel.customitemhovers.expressions.models;
+package com.geel.customitemhovers.expressions.providers;
 
-/**
- * An expression, after being tokenized, but before parsing.
- */
-public class TokenizedExpression extends BaseExpression {
-    public TokenizedExpression(Token[] tokens, String expressionText, boolean isLegacy) {
-        super(tokens, expressionText, isLegacy);
-    }
-
-    public TokenizedExpression(BaseExpression expression) {
-        super(expression.getTokens(), expression.getExpressionText(), expression.isLegacy());
-    }
-}
-
-package com.geel.customitemhovers.expressions.models;
-
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-import lombok.Setter;
-
-public class Token {
-    @Getter
-    private TokenType type;
-
-    @Getter
-    private String value; // TODO: Make more efficient than Strings. Are slices a thing in Java?
-
-    @Getter
-    @Setter
-    private int numFunctionArgs = 0;
-
-    public Token(TokenType type, String value) {
-        this.type = type;
-        this.value = value;
-    }
-
-    public Number getNumericValue() {
-        if(type == TokenType.INTEGER) {
-            return Integer.parseInt(value);
-        } else if(type == TokenType.DOUBLE) {
-            return Double.parseDouble(value);
-        } else {
-            throw new IllegalArgumentException("Not a number type");
-        }
-    }
-
-    public static Token fromDouble(double value) {
-        return new Token(TokenType.DOUBLE, String.valueOf(value));
-    }
-
-    public static Token fromInt(int value) {
-        return new Token(TokenType.INTEGER, String.valueOf(value));
-    }
-
-    public static Token fromString(String value) {
-        return new Token(TokenType.STRING, value);
-    }
-
-    public static Token fromBool(boolean value) {
-        return new Token(TokenType.INTEGER, value ? "1" : "0");
-    }
-
-    public static Token fromTrue() {
-        return fromBool(true);
-    }
-
-    public static Token fromFalse() {
-        return fromBool(false);
-    }
-}
-
-package com.geel.customitemhovers.expressions.models;
-
-/**
- * A "compiled" expression, after tokenization and parsing.
- *
- * TODO: Figure out a way to collapse constexpr expressions, eg:
- *      "(3 + 4) * 2" should collapse to a single constant token "24"
- *      "sqrt(3 + 4 + 2) * a" should collapse to "3.0 * a"
- */
-public class CompiledExpression extends BaseExpression {
-    public CompiledExpression(Token[] tokens, String expressionText, boolean isLegacy) {
-        super(tokens, expressionText, isLegacy);
-    }
-
-    public CompiledExpression(BaseExpression expression) {
-        super(expression.getTokens(), expression.getExpressionText(), expression.isLegacy());
-    }
-}
-
-package com.geel.customitemhovers.expressions.models;
-
-public enum ArgumentType {
-    ANY,
-    INTEGER,
-    DOUBLE,
-    STRING;
-
-    public boolean fitsTokenType(TokenType type) {
-        if (!type.isConstant()) return false;
-        if (this == ANY) return true;
-        if (this == INTEGER || this == DOUBLE) return type == TokenType.INTEGER || type == TokenType.DOUBLE;
-        if (this == STRING) return type == TokenType.STRING;
-
-        return false; //Should never get here
-    }
-
-    public Token coerceTokenToType(Token token) {
-        if(!fitsTokenType(token.getType())) {
-            throw new IllegalArgumentException("Cannot coerce token of invalid type");
-        }
-
-        if(this == ANY) return token;
-        if(this == INTEGER) return token.getType() == TokenType.INTEGER ? token : Token.fromInt(token.getNumericValue().intValue());
-        if(this == DOUBLE) return token.getType() == TokenType.DOUBLE ? token : Token.fromDouble(token.getNumericValue().doubleValue());
-        if(this == STRING){
-            if(token.getType() == TokenType.STRING) return token;
-            return Token.fromString(token.getValue());
-        }
-
-        return token; // Should not get here
-    }
-}
-
-package com.geel.customitemhovers.expressions.models;
-
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-
-@AllArgsConstructor
-public class BaseExpression {
-    /**
-     * The Tokens that make up this expression, in Reverse Polish Notation
-     */
-    @Getter
-    private Token[] tokens;
-
-    /**
-     * The original raw text of the expression
-     */
-    @Getter
-    private String expressionText;
-
-    /**
-     * Whether the expression is "legacy" (begins with <% and ends with %>)
-     */
-    @Getter
-    private boolean isLegacy = false;
-}
-
-package com.geel.customitemhovers.expressions.functions;
-
-import com.geel.customitemhovers.expressions.ExecutionContext;
-import com.geel.customitemhovers.expressions.models.ArgumentType;
+import com.geel.customitemhovers.expressions.functions.Function;
 import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.expressions.models.TokenType;
-import lombok.Getter;
 
-public abstract class VariadicFunction extends Function {
-    @Getter
-    private int minVariadicArguments;
-
-    @Getter
-    private int maxVariadicArguments;
-
-    @Getter
-    private ArgumentType variadicArgumentType;
-
-    @Getter
-    private int numFixedArguments;
-
-    @Getter
-    private final ArgumentType[] fixedArgumentTypes;
-
-    public VariadicFunction(String name,
-                            TokenType returnType,
-                            ArgumentType variadicArgumentType
-    ) {
-        this(name, returnType, 0, 100, variadicArgumentType, null, false);
-    }
-
-    public VariadicFunction(String name,
-                            TokenType returnType,
-                            ArgumentType variadicArgumentType,
-                            boolean isConstExpr
-    ) {
-        this(name, returnType, 0, 100, variadicArgumentType, null, isConstExpr);
-    }
-
-    public VariadicFunction(String name,
-                            TokenType returnType,
-                            ArgumentType variadicArgumentType,
-                            ArgumentType[] fixedArguments
-    ) {
-        this(name, returnType, 0, 100, variadicArgumentType, fixedArguments, false);
-    }
-
-    public VariadicFunction(String name,
-                            TokenType returnType,
-                            ArgumentType variadicArgumentType,
-                            ArgumentType[] fixedArguments,
-                            boolean isConstExpr
-    ) {
-        this(name, returnType, 0, 100, variadicArgumentType, fixedArguments, isConstExpr);
-    }
-
-    public VariadicFunction(String name,
-                            TokenType returnType,
-                            int minVariadicArguments,
-                            int maxVariadicArguments,
-                            ArgumentType variadicArgumentType,
-                            ArgumentType[] fixedArguments,
-                            boolean isConstExpr)
-    {
-        super(name, returnType, isConstExpr);
-
-        this.minVariadicArguments = minVariadicArguments;
-        this.maxVariadicArguments = maxVariadicArguments;
-        this.variadicArgumentType = variadicArgumentType;
-
-        if(fixedArguments == null) {
-            fixedArguments = new ArgumentType[0];
-        }
-
-        this.fixedArgumentTypes = fixedArguments;
-        this.numFixedArguments = fixedArguments.length;
-    }
-
-    @Override
-    public int getArgumentsHashCode() {
-        return -1;
-    }
-
-    public boolean argumentsMatch(Token[] matchArguments) {
-        if(matchArguments.length < minVariadicArguments + numFixedArguments) {
-            return false;
-        }
-        if(matchArguments.length > maxVariadicArguments + numFixedArguments) {
-            return false;
-        }
-
-        // Check all fixed arguments
-        for(int i = 0; i < numFixedArguments; i++) {
-            if(!fixedArgumentTypes[i].fitsTokenType(matchArguments[i].getType()))
-                return false;
-        }
-
-        // Check all variadic arguments
-        for(int i = numFixedArguments; i < matchArguments.length; i++)
-        {
-            if(!variadicArgumentType.fitsTokenType(matchArguments[i].getType())) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    public Token execute(Token[] arguments, ExecutionContext context) {
-        if(!argumentsMatch(arguments)) {
-            throw new IllegalArgumentException("Invalid number of arguments to " + name);
-        }
-
-        Token[] coercedArguments = new Token[arguments.length];
-
-        // Coerce all fixed arguments
-        for(int i = 0; i < numFixedArguments; i++) {
-            coercedArguments[i] = fixedArgumentTypes[i].coerceTokenToType(arguments[i]);
-        }
-
-        // Coerce all variadic arguments
-        for(int i = numFixedArguments; i < arguments.length; i++) {
-            coercedArguments[i] = variadicArgumentType.coerceTokenToType(arguments[i]);
-        }
-
-        return innerExecute(coercedArguments, context);
-    }
+public interface IFunctionProvider {
+    Function findFunction(String name, Token[] arguments);
 }
 
-package com.geel.customitemhovers.expressions.functions;
+package com.geel.customitemhovers.expressions.providers;
 
-import com.geel.customitemhovers.expressions.ExecutionContext;
-import com.geel.customitemhovers.expressions.models.ArgumentType;
-import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.expressions.models.TokenType;
-
-import java.util.function.BiFunction;
-
-public class LambdaVariadicFunction extends VariadicFunction {
-    private BiFunction<Token[], ExecutionContext, Token> executionFunc;
-
-    public LambdaVariadicFunction(String name,
-                                  TokenType returnType,
-                                  ArgumentType variadicArgumentType,
-                                  ArgumentType[] fixedArguments,
-                                  BiFunction<Token[], ExecutionContext, Token> callback
-    ) {
-        super(name, returnType, variadicArgumentType, fixedArguments);
-
-        this.executionFunc = callback;
-    }
-
-    public LambdaVariadicFunction(String name,
-                                  TokenType returnType,
-                                  ArgumentType variadicArgumentType,
-                                  ArgumentType[] fixedArguments,
-                                  boolean isConstExpr,
-                                  BiFunction<Token[], ExecutionContext, Token> callback
-    ) {
-        super(name, returnType, variadicArgumentType, fixedArguments, isConstExpr);
-
-        this.executionFunc = callback;
-    }
-
-    protected Token innerExecute(Token[] arguments, ExecutionContext context) {
-        return executionFunc.apply(arguments, context);
-    }
+public interface IVariableProvider {
+    String resolveVariable(String name);
 }
-
-package com.geel.customitemhovers.expressions.functions;
-
-import com.geel.customitemhovers.expressions.ExecutionContext;
-import com.geel.customitemhovers.expressions.models.ArgumentType;
-import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.expressions.models.TokenType;
-
-public class LambdaFixedArgsFunction extends FixedArgsFunction {
-    private java.util.function.BiFunction<Token[], ExecutionContext, Token> executionFunc;
-
-    public LambdaFixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments,
-                                   java.util.function.BiFunction<Token[], ExecutionContext, Token> executionFunc) {
-        super(name, returnType, arguments);
-        this.executionFunc = executionFunc;
-    }
-
-    public LambdaFixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments, boolean isConstExpr,
-                                   java.util.function.BiFunction<Token[], ExecutionContext, Token> executionFunc) {
-        super(name, returnType, arguments, isConstExpr);
-        this.executionFunc = executionFunc;
-    }
-
-    protected Token innerExecute(Token[] arguments, ExecutionContext context) {
-        return executionFunc.apply(arguments, context);
-    }
-}
-
-package com.geel.customitemhovers.expressions.functions;
-
-import com.geel.customitemhovers.expressions.ExecutionContext;
-import com.geel.customitemhovers.expressions.models.ArgumentType;
-import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.expressions.models.TokenType;
-import lombok.Getter;
-
-public abstract class FixedArgsFunction extends Function {
-    @Getter
-    private int numArguments;
-
-    @Getter
-    private ArgumentType[] argumentTypes;
-
-    public FixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments) {
-        super(name, returnType);
-
-        this.argumentTypes = arguments;
-        this.numArguments = arguments.length;
-    }
-
-    public FixedArgsFunction(String name, TokenType returnType, ArgumentType[] arguments, boolean isConstExpr) {
-        super(name, returnType, isConstExpr);
-
-        this.argumentTypes = arguments;
-        this.numArguments = arguments.length;
-    }
-
-    @Override
-    public int getArgumentsHashCode() {
-        return numArguments;
-    }
-
-    public boolean argumentsMatch(Token[] matchArguments) {
-        if(matchArguments.length != numArguments) return false;
-
-        for(int i = 0; i < numArguments; i++) {
-            if(!argumentTypes[i].fitsTokenType(matchArguments[i].getType()))
-                return false;
-        }
-
-        return true;
-    }
-
-    public Token execute(Token[] arguments, ExecutionContext context) {
-        if(arguments.length != numArguments) {
-            throw new IllegalArgumentException("Invalid number of arguments to " + name);
-        }
-
-        Token[] coercedArguments = new Token[arguments.length];
-        for(int i = 0; i < arguments.length; i++) {
-            coercedArguments[i] = argumentTypes[i].coerceTokenToType(arguments[i]);
-        }
-
-        return innerExecute(coercedArguments, context);
-    }
-}
-
-package com.geel.customitemhovers.expressions.functions;
-
-import com.geel.customitemhovers.expressions.ExecutionContext;
-import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.expressions.models.TokenType;
-import lombok.Getter;
-
-public abstract class Function {
-    @Getter
-    protected String name;
-
-    @Getter
-    protected TokenType returnType;
-
-    @Getter
-    protected boolean isConstExpr;
-
-    public Function(String name, TokenType returnType) {
-        this.name = name;
-        this.returnType = returnType;
-    }
-
-    public Function(String name, TokenType returnType, boolean isConstExpr) {
-        this(name, returnType);
-        this.isConstExpr = isConstExpr;
-    }
-
-    public abstract int getArgumentsHashCode();
-
-    public abstract boolean argumentsMatch(Token[] matchArguments);
-
-    public abstract Token execute(Token[] arguments, ExecutionContext context);
-
-    protected abstract Token innerExecute(Token[] arguments, ExecutionContext context);
-}
-
-package com.geel.customitemhovers.expressions;
-import com.geel.customitemhovers.expressions.models.*;
-
-import java.util.ArrayList;
-import java.util.Stack;
-
-/**
- * Performs the Shunting Yard Algorithm to convert an infix mathematical expression to Reverse Polish Notation (postfix).
- *
- * This is here so that we can enable rich mathematical expressions, including variables and functions, in
- * item hover text.
- */
-public class Compiler {
-    /**
-     * Parses an infix notation (eg "(a + b) - sqrt(12)") expression, returning an Expression object.
-     */
-    public static CompiledExpression Compile(TokenizedExpression expression) {
-        Token[] tokenized = expression.getTokens();
-        if (tokenized.length == 0) {
-            return new CompiledExpression(expression);
-        }
-
-        ArrayList<Token> outputQueue = new ArrayList<>();
-        Stack<Token> operatorStack = new Stack<>();
-
-        // Stack for tracking how many arguments are passed to each function as we parse it
-        Stack<Integer> functionArgs = new Stack<>();
-
-        for (int i = 0; i < tokenized.length; i++) {
-            Token token = tokenized[i];
-
-            // Handle numbers and variables
-            if (token.getType().isValue()) {
-                outputQueue.add(token);
-                continue;
-            }
-
-            // Handle function calls
-            if (token.getType() == TokenType.FUNCTION) {
-                operatorStack.add(token);
-
-                int numArgsToInitiateWith = 1;
-
-                // HACK: look ahead two tokens, which we know will exist because the parser ensures it.
-                //       If it's a right paren, we know it's a function with no arguments,
-                //       so we can just add it to the output queue and move on.
-                //       We do this because we track the number of function arguments by incrementing whenever we encounter
-                //       an argument separator (comma), so to handle single-argument (no-comma) scenarios we start with 1,
-                //       but this breaks in a no-argument scenario.
-                if(i + 2 < tokenized.length
-                        && tokenized[i + 2].getType() == TokenType.PAREN_RIGHT) {
-                    numArgsToInitiateWith = 0;
-                }
-
-                functionArgs.add(numArgsToInitiateWith);
-                continue;
-            }
-
-            // Handle comma
-            if(token.getType() == TokenType.COMMA) {
-                // While the top of the stack isn't a left paren, pop from operator stack to output queue
-                while (true) {
-                    // If the stack is empty before we hit a left paren, there's a mismatch
-                    if (operatorStack.isEmpty()) {
-                        throw new IllegalArgumentException("Operator stack empty");
-                    }
-
-                    // If we find a left paren, exit the loop. Leave the left paren on the stack.
-                    if (operatorStack.peek().getType() == TokenType.PAREN_LEFT) {
-                        break;
-                    }
-
-                    // If not a left paren, just move to the output queue
-                    outputQueue.add(operatorStack.pop());
-                }
-
-                // Increment top of functionArgs stack
-                functionArgs.push(functionArgs.pop() + 1);
-                continue;
-            }
-
-            // Handle operators
-            if (token.getType().isOperator()) {
-                // While there exists a token at the top of the stack that should be moved to the output queue
-                // before this operator is added to the stack, do so
-                while (ShuntOperator(token, operatorStack)) {
-                    outputQueue.add(operatorStack.pop());
-                }
-
-                operatorStack.add(token);
-                continue;
-            }
-
-            // Handle left paren
-            if (token.getType() == TokenType.PAREN_LEFT) {
-                operatorStack.add(token);
-            }
-
-            // Handle right paren
-            if (token.getType() == TokenType.PAREN_RIGHT) {
-                // While the top of the stack isn't a left paren, pop from operator stack to output queue
-                while (true) {
-                    // If the stack is empty before we hit a left paren, there's a mismatch
-                    if (operatorStack.isEmpty()) {
-                        throw new IllegalArgumentException("Operator stack empty");
-                    }
-
-                    Token popped = operatorStack.pop();
-                    if (popped.getType() == TokenType.PAREN_LEFT) {
-                        // If we hit a left paren, drop it from the stack and don't move it to the output queue
-                        break;
-                    }
-
-                    // If not a left paren, just move to the output queue
-                    outputQueue.add(popped);
-                }
-
-                // If the top of the operator stack is a function, then the function should also be moved now
-                if (!operatorStack.isEmpty() && operatorStack.peek().getType() == TokenType.FUNCTION) {
-                    if(functionArgs.size() == 0) {
-                        throw new IllegalArgumentException("Function argument stack corrupted");
-                    }
-
-                    Token funcArg = operatorStack.pop();
-                    funcArg.setNumFunctionArgs(functionArgs.pop());
-                    outputQueue.add(funcArg);
-                }
-            }
-        }
-
-        // Cleanup Stack
-        while (!operatorStack.isEmpty()) {
-            Token popped = operatorStack.pop();
-
-            if (popped.getType().isParenthesis()) {
-                throw new IllegalArgumentException("Mismatched parentheses");
-            }
-
-            outputQueue.add(popped);
-        }
-
-        CompiledExpression compiled = new CompiledExpression(outputQueue.toArray(new Token[0]), expression.getExpressionText(), expression.isLegacy());
-        return compiled;
-    }
-
-    /**
-     * Called when processing an operator token.
-     *
-     * Determines if the top of the stack should be popped to the output queue before the new operator
-     * is added to the stack.
-     */
-    private static boolean ShuntOperator(Token newToken, Stack<Token> stack) {
-        // No top of stack? Nothing to shunt
-        // (I don't know if "shunt" is the right word to actually use, but I like it)
-        if (stack.isEmpty()) {
-            return false;
-        }
-
-        Token topOfStack = stack.peek();
-
-        // If it's a left paren, don't shunt
-        if (topOfStack.getType() == TokenType.PAREN_LEFT) {
-            return false;
-        }
-
-        // If the top has higher precedence than the new operator,
-        // OR the same precedence but the new operator is left-associative,
-        // it should be shunted.
-        int topPrecedence = topOfStack.getType().getPrecedence();
-        int newPrecedence = newToken.getType().getPrecedence();
-
-        if (topPrecedence < newPrecedence) {
-            return true;
-        }
-
-        if (topPrecedence == newPrecedence && !newToken.getType().isRightAssociative()) {
-            return true;
-        }
-
-        // No shuntage
-        return false;
-    }
-}
-
-
 
 package com.geel.customitemhovers.expressions;
 
@@ -1706,131 +2957,6 @@ public class Tokenizer {
     }
 }
 
-package com.geel.customitemhovers.expressions;
-
-import com.geel.customitemhovers.expressions.functions.Function;
-import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.expressions.providers.IFunctionProvider;
-import com.geel.customitemhovers.expressions.providers.IVariableProvider;
-
-/**
- * Context for expression execution -- packages together providers of functions and variables
- */
-public class ExecutionContext {
-    private final IFunctionProvider functionProvider;
-    private final IVariableProvider variableProvider;
-
-    public ExecutionContext(IFunctionProvider functionProvider,
-                            IVariableProvider variableProvider) {
-        this.functionProvider = functionProvider;
-        this.variableProvider = variableProvider;
-    }
-
-    public String resolveVariable(String variableName) {
-        if(variableProvider == null) {
-            return null;
-        }
-        return variableProvider.resolveVariable(variableName);
-    }
-
-    public Function resolveFunction(String functionName, Token[] arguments) {
-        if(functionProvider == null) {
-            return null;
-        }
-
-        return functionProvider.findFunction(functionName, arguments);
-    }
-}
-
-package com.geel.customitemhovers.expressions;
-
-import com.geel.customitemhovers.expressions.models.CompiledExpression;
-import com.geel.customitemhovers.expressions.models.Token;
-
-/**
- * Helpers for simplifying the evaluation of expressions
- */
-public class EvaluationUtil {
-    /**
-     * Evaluates a Reverse Polish Notation queue (output from `ExpressionCompiler`), returning the result
-     */
-    public static Token EvaluateAtRuntime(CompiledExpression expression, ExecutionContext context) {
-        Token[] evaluationResult = Evaluator.EvaluateExpression(expression, context, false);
-
-        // Stack should have one entry: the result
-        if (evaluationResult.length != 1) {
-            throw new IllegalArgumentException("Stack should only have a single entry at the end");
-        }
-
-        // Single entry should be a constant integer, double, or string value
-        Token result = evaluationResult[0];
-        if (!result.getType().isConstant()) {
-            throw new IllegalArgumentException("Invalid token type after RPN evaluation");
-        }
-
-        // Return result
-        return result;
-    }
-
-    /**
-     * Statically evaluates a CompiledExpression, returning its simplified form.
-     *
-     * If the expression is fully statically evaluatable, the resultant `CompiledExpression` will contain only
-     * a single Token, which is the result of evaluation.
-     *
-     *
-     *
-     * This will attempt to execute as much of the expression as possible, replacing constant operations (eg "3 + 4") with
-     * their results.
-     *
-     * The end result will, ideally, be the simplest form of an expression possible, with all operations on constant values pre-resolved.
-     *
-     * For example, take the following expression: (3 + (4 - sqrt(sqrt(81))) - pow(2, 0) + (2 * a)
-     *
-     * This expression references a variable -- `a` -- which we will only be able to resolve at runtime, when we're hovering over an item.
-     * However, it also contains many static math operations, including some functions -- `pow` and `sqrt`.
-     *
-     * Both functions called (`pow` and `sqrt`) are `constexpr` (meaning they can be evaluated without any game state),
-     * and the arguments being fed into them are const themselves.
-     *
-     * sqrt(sqrt(81)) should simplify to sqrt(9) -> 3
-     * pow(2,0) should simplify to 1
-     *
-     * Therefore, the entire above expression can be statically evaluated to:
-     * (3 + (4 - 3)) - 1 + (2 * a) -> (4) - 1 + (2 * a) -> 3 + (2 * a)
-     *
-     * Which, in RPN form, would be: 2 a * 3 +
-     *
-     * That's a mere 5 tokens that we have to execute at runtime, instead of however many were in the original expression.
-     */
-    public static CompiledExpression EvaluateStatically(CompiledExpression expression, ExecutionContext context) {
-        Token[] evaluationResult = Evaluator.EvaluateExpression(expression, context, true);
-
-        // Stack should not be empty
-        if (evaluationResult.length == 0) {
-            throw new IllegalArgumentException("Stack empty??");
-        }
-
-        // Return result
-        return new CompiledExpression(evaluationResult, expression.getExpressionText(), expression.isLegacy());
-    }
-}
-
-package com.geel.customitemhovers.expressions.providers;
-
-import com.geel.customitemhovers.expressions.functions.Function;
-import com.geel.customitemhovers.expressions.models.Token;
-
-public interface IFunctionProvider {
-    Function findFunction(String name, Token[] arguments);
-}
-
-package com.geel.customitemhovers.expressions.providers;
-
-public interface IVariableProvider {
-    String resolveVariable(String name);
-}
-
 package com.geel.customitemhovers;
 
 import com.geel.customitemhovers.expressions.*;
@@ -1910,792 +3036,6 @@ public class HoverEvaluator {
         } catch (IllegalArgumentException e) {
             return "${" + expression.getExpressionText() + "}";
         }
-    }
-}
-
-package com.geel.customitemhovers.models.hovers;
-
-import com.geel.customitemhovers.expressions.models.CompiledExpression;
-import com.google.gson.annotations.SerializedName;
-
-/**
- * A parsed entry in a hoverfile.
- */
-public class HoverDef {
-    @SerializedName("ids")
-    public int[] ItemIDs;
-
-    @SerializedName("items")
-    public String[] ItemNames;
-
-    @SerializedName("items_regex")
-    public String[] ItemNamesRegex;
-
-    @SerializedName("condition")
-    public String ConditionString;
-
-    @SerializedName("hovers")
-    public String[][] HoverTexts;
-
-    /**
-     * A condition expression, which controls whether or not this hover will display.
-     */
-    public CompiledExpression Condition;
-
-    /**
-     * An array of Hovers; each element in this array corresponds to an individual hover box that should be rendered.
-     *
-     * This is produced from `HoverTexts`, which is a 2D array of strings.
-     * Each sub-array of strings in `HoverTexts` is treated as an array of lines which are concatenated together.
-     */
-    public ParsedHover[] ParsedHoverTexts;
-}
-
-package com.geel.customitemhovers.models.hovers;
-
-import com.geel.customitemhovers.expressions.models.BaseExpression;
-import com.geel.customitemhovers.expressions.models.CompiledExpression;
-import lombok.AllArgsConstructor;
-import lombok.Getter;
-
-/**
- * A parsed Hover from a HoverFile.
- *
- * One ParsedHover is created for every 1D hover array in the 2D array of a HoverDef. That is, for every individual
- * hover box.
- *
- * This class exists as a caching mechanism for expressions; we want to parse (tokenize + shunting-yard) hover texts
- * as infrequently as possible (on load only).
- *
- * Therefore, `hoverText` contains a hoverbox text with all expressions removed.
- * `expressionLocations` is an ascending array of positions that expression results should be inserted,
- * and `expressions` is an array of expressions.
- *
- * To fully resolve `hoverText`, simply copy it, and then iterate through `expressionLocations` and `expressions`
- * simultaneously (their indexes align) -- evaluate each expression in turn, and insert the string result into
- * `hoverText` at the location indicated by `expressionLocations[i]`.
- */
-@AllArgsConstructor
-public class ParsedHover {
-    /**
-     * The text for this hover box, without any expressions.
-     *
-     * If any expressions were present in the original text, use `expressionLocations` and `expressions` to
-     * build the final text.
-     */
-    @Getter
-    private final String hoverText;
-
-    @Getter
-    private final Integer[] expressionLocations;
-
-    @Getter
-    private final CompiledExpression[] expressions;
-
-    @Getter
-    private final CompiledExpression condition;
-}
-
-package com.geel.customitemhovers.models.hovers;
-
-import com.google.gson.annotations.SerializedName;
-
-public class HoverFile {
-    @SerializedName("is_hover_map")
-    public String IsHoverMap;
-
-    @SerializedName("hovers")
-    public HoverDef[] Hovers;
-}
-package com.geel.customitemhovers.models.itemtables;
-
-import lombok.Getter;
-
-import java.util.HashMap;
-
-/**
- * A collection of multiple ItemTables for a single item.
- *
- * An item can have multiple ItemTables if multiple ItemTableFiles contain ItemTables for the item.
- */
-public class ItemTableCollection {
-    @Getter
-    private HashMap<String, ItemTable> itemTables;
-
-    public ItemTableCollection() {
-        this.itemTables = new HashMap<>();
-    }
-
-    public String resolveVariable(String variableName) {
-        for (ItemTable i : itemTables.values()) {
-            String val = i.getOrDefault(variableName, null);
-
-            if (val == null) {
-                continue;
-            }
-
-            return val;
-        }
-
-        return null;
-    }
-}
-
-package com.geel.customitemhovers.models.itemtables;
-
-import com.google.gson.annotations.SerializedName;
-
-import java.util.Map;
-
-public class ItemTableFile {
-    @SerializedName("is_table_file")
-    public String IsTableFile;
-
-    @SerializedName("name")
-    public String Name;
-
-    @SerializedName("items")
-    public Map<String, ItemTable> Items;
-}
-package com.geel.customitemhovers.models.itemtables;
-
-import lombok.Getter;
-import lombok.Setter;
-
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.HashMap;
-
-/**
- * A parsed entry in an ItemTableFile.
- *
- * Contains variables that are "attached" to items
- */
-public class ItemTable extends HashMap<String, String> {
-    @Getter
-    @Setter
-    private String itemName;
-
-    @Getter
-    @Setter
-    private ItemTableFile parentFile;
-
-    public String[] getAllNames() {
-        ArrayList<String> ret = new ArrayList<>();
-        ret.add(this.itemName);
-
-        // Handle $also
-        String also = this.getOrDefault("$also", null);
-        if (also != null) {
-            ret.addAll(Arrays.asList(also.split("\\|")));
-        }
-
-        return ret.toArray(new String[0]);
-    }
-}
-
-package com.geel.customitemhovers;
-
-import com.geel.customitemhovers.expressions.providers.IVariableProvider;
-import com.geel.customitemhovers.models.itemtables.ItemTable;
-import com.geel.customitemhovers.models.itemtables.ItemTableCollection;
-import lombok.Getter;
-
-import java.util.Locale;
-
-/**
- * Provides variables for an item hover.
- *
- * Basically just packages together an ItemTableCollection (containing variables that the user of the plugin has
- * set up) and a base ItemTable (generated for each item that is hovered over).
- */
-public class CustomItemHoversVariableProvider implements IVariableProvider {
-    @Getter
-    private ItemTableCollection tableCollection;
-
-    @Getter
-    private ItemTable baseTable;
-
-    public CustomItemHoversVariableProvider(
-                                      ItemTableCollection tableCollection,
-                                      ItemTable baseTable) {
-        this.tableCollection = tableCollection;
-        this.baseTable = baseTable;
-    }
-
-    public String resolveVariable(String variableName) {
-        if(tableCollection != null) {
-            variableName = variableName.toLowerCase(Locale.ROOT);
-
-            // Try to resolve via explicit tables, then base table
-            String tableCollectionRet = tableCollection.resolveVariable(variableName);
-            if (tableCollectionRet != null) {
-                return tableCollectionRet;
-            }
-        }
-
-        if(baseTable == null) {
-            return null;
-        }
-
-        return baseTable.getOrDefault(variableName, null);
-    }
-}
-
-package com.geel.customitemhovers;
-
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-import net.runelite.client.config.ConfigSection;
-
-import java.awt.*;
-
-@ConfigGroup("customitemhovers")
-public interface CustomItemHoversConfig extends Config {
-    @ConfigSection(
-            name = "Informational Messages",
-            description = "Configures messages that the plugin posts to game chat",
-            position = 2
-    )
-    static String messageSection = "messages";
-
-    @ConfigItem(
-            keyName = "hoverEnableHotReload",
-            name = "Hot Reload",
-            description = "Whether or not Hot Reload is enabled.",
-            position = 1
-    )
-    default boolean hoverEnableHotReload() {
-        return false;
-    }
-
-    @ConfigItem(
-            keyName = "enableObsoleteMessage",
-            name = "Deprecated Expression",
-            description = "Display a message whenever your hover files are displayed if they contain obsolete expressions",
-            section = messageSection,
-            position = 1
-    )
-    default boolean enableObsoleteMessage() {
-        return false;
-    }
-
-    @ConfigItem(
-            keyName = "hoverDefaultColor",
-            name = "Default Text Color",
-            description = "The default text color for a hover when no color is specified",
-            position = 2
-    )
-    default Color defaultHoverColor() {
-        return new Color(238, 238, 238);
-    }
-
-    @ConfigItem(
-            keyName = "openDirChatCommand",
-            name = "Hover Directory Chat Command",
-            description = "Chat command to open hoverfile directory in your file explorer",
-            position = 3
-    )
-    default String openDirChatCommand() {
-        return "openhoverdir";
-    }
-}
-
-package com.geel.customitemhovers;
-
-import com.geel.customitemhovers.expressions.ExecutionContext;
-import com.geel.customitemhovers.expressions.functions.Function;
-import com.geel.customitemhovers.expressions.functions.LambdaFixedArgsFunction;
-import com.geel.customitemhovers.expressions.functions.LambdaVariadicFunction;
-import com.geel.customitemhovers.expressions.models.ArgumentType;
-import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.expressions.models.TokenType;
-import com.geel.customitemhovers.expressions.providers.IFunctionProvider;
-import lombok.Getter;
-import net.runelite.api.*;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.util.ColorUtil;
-
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import java.awt.*;
-import java.util.*;
-
-/**
- * Provides functions to the expression engine.
- */
-@Singleton
-public class CustomItemHoversFunctionProvider implements IFunctionProvider {
-    // A map(functionName -> map(numArguments -> listOfFunctions))
-    @Getter
-    private HashMap<String, HashMap<Integer, ArrayList<Function>>> functions;
-
-    public Client client;
-
-    public ItemManager itemManager;
-
-    @Inject
-    public CustomItemHoversFunctionProvider(Client client, ItemManager itemManager) {
-        this.client = client;
-        this.itemManager = itemManager;
-
-        functions = new HashMap<>();
-        prepareFunctions();
-    }
-
-    public Function findFunction(String name, Token[] arguments) {
-        int numArgs = arguments.length;
-
-        // Find the function by name. The result will be a map(numArgs -> list_of_functions)
-        HashMap<Integer, ArrayList<Function>> numArgsMap = functions.getOrDefault(name, null);
-
-        // If no functions found, obviously return null
-        if (numArgsMap == null) {
-            return null;
-        }
-
-        // Look for it in the fixed functions, then try variadic functions
-        ArrayList<Function> fixedFunctions = numArgsMap.getOrDefault(numArgs, null);
-        ArrayList<Function> variadicFunctions = numArgsMap.getOrDefault(-1, null);
-
-        Function fixedFunction = searchFuncs(fixedFunctions, arguments);
-        if (fixedFunction != null)
-            return fixedFunction;
-
-        return searchFuncs(variadicFunctions, arguments);
-    }
-
-    private Function searchFuncs(ArrayList<Function> functions, Token[] arguments) {
-        if (functions == null)
-            return null;
-
-        for (Function func : functions) {
-            if (func.argumentsMatch(arguments)) {
-                return func;
-            }
-        }
-
-        return null;
-    }
-
-    public void addFunction(Function f) {
-        String name = f.getName();
-
-        // Ensure that the overarching map has an entry for the function name
-        if (!functions.containsKey(name)) {
-            functions.put(name, new HashMap<>());
-        }
-
-        // Get the entry for the function name, and ensure the sub-map has an entry for the number of arguments
-        HashMap<Integer, ArrayList<Function>> argumentsMap = functions.get(name);
-        int argsHashCode = f.getArgumentsHashCode();
-        if (!argumentsMap.containsKey(argsHashCode)) {
-            argumentsMap.put(argsHashCode, new ArrayList<>(1));
-        }
-
-        // Get the entry for the number of arguments from the sub-map, and insert the function into the list
-        ArrayList<Function> funcList = argumentsMap.get(argsHashCode);
-        if (funcList.contains(f)) {
-            throw new IllegalArgumentException("Function already exists");
-        }
-
-        funcList.add(f);
-    }
-
-    private void prepareFunctions() {
-        // {inv}_contains() and {inv}_qty()
-        prepareInventoryFunctions();
-
-        // floor(), ceil(), pow(), max(), min(), abs()
-        prepareMathFunctions();
-
-        // len(), contains(), red(), green(), blue(), yellow(), rgb()
-        prepareStringFunctions();
-
-        // varbit(), varplayer(), varcint(), varcstr()
-        prepareVarBitFunctions();
-
-        // qtymult(), qtydivide(), qtydivideceil()
-        prepareBackwardsCompatFunctions();
-    }
-
-    /**
-     * Prepares inventory-related functions.
-     *
-     * EG, inv_contains(), bank_contains(), inv_qty(), etc
-     */
-    private void prepareInventoryFunctions() {
-        inventoryFunction("inv", InventoryID.INVENTORY);
-        inventoryFunction("bank", InventoryID.BANK);
-        inventoryFunction("equipment", InventoryID.EQUIPMENT);
-    }
-
-    /**
-     * Creates varbit-related functions
-     */
-    private void prepareVarBitFunctions() {
-        // The varbit(varbitId) function returns the integer value of a varbit
-        addFunction(new LambdaFixedArgsFunction("varbit", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
-            if(client == null) return Token.fromFalse();
-            return Token.fromInt(client.getVarbitValue(args[0].getNumericValue().intValue()));
-        }));
-
-        // The varplayer(varPlayerId) function returns the integer value of a varplayer
-        addFunction(new LambdaFixedArgsFunction("varplayer", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
-            if(client == null) return Token.fromFalse();
-            return Token.fromInt(client.getVarpValue(args[0].getNumericValue().intValue()));
-        }));
-
-        // The varcint(varCIntId) function returns the integer value of a varcint
-        addFunction(new LambdaFixedArgsFunction("varcint", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
-            if(client == null) return Token.fromFalse();
-            return Token.fromInt(client.getVarcIntValue(args[0].getNumericValue().intValue()));
-        }));
-
-        // The varcstr(varCStrId) function returns the string value of a varcstr
-        addFunction(new LambdaFixedArgsFunction("varcstr", TokenType.STRING, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
-            if(client == null) return Token.fromFalse();
-            return Token.fromString(client.getVarcStrValue(args[0].getNumericValue().intValue()));
-        }));
-    }
-
-    /**
-     * Creates string- and color-related functions
-     */
-    private void prepareStringFunctions() {
-        addFunction(new LambdaFixedArgsFunction("len", TokenType.INTEGER, new ArgumentType[]{ArgumentType.STRING}, true, (args, context) -> {
-            return Token.fromInt(args[0].getValue().length());
-        }));
-
-        addFunction(new LambdaFixedArgsFunction("contains", TokenType.INTEGER, new ArgumentType[]{ArgumentType.STRING, ArgumentType.STRING}, true, (args, context) -> {
-            return Token.fromInt(args[0].getValue().contains(args[1].getValue()) ? 1 : 0);
-        }));
-
-        // Colors
-        // Wrapping functions -- red(), green(), blue(), yellow()
-        simpleColorStringFunc("red", Color.RED);
-        simpleColorStringFunc("green", Color.GREEN);
-        simpleColorStringFunc("blue", Color.BLUE);
-        simpleColorStringFunc("yellow", Color.YELLOW);
-
-        // Tag *start* functions -- redStart(), greenStart(), blueStart(), yellowStart()
-        simpleColorStringStartFunc("red", Color.RED);
-        simpleColorStringStartFunc("green", Color.GREEN);
-        simpleColorStringStartFunc("blue", Color.BLUE);
-        simpleColorStringStartFunc("yellow", Color.YELLOW);
-
-        // colorEnd()
-        addFunction(new LambdaFixedArgsFunction("colorEnd", TokenType.STRING,
-                new ArgumentType[]{},
-                true,
-                (args, context) -> {
-                    return Token.fromString("</col>");
-                }));
-
-        // rgb()
-        addFunction(new LambdaFixedArgsFunction("rgb", TokenType.STRING,
-                new ArgumentType[]{ArgumentType.INTEGER, ArgumentType.INTEGER, ArgumentType.INTEGER, ArgumentType.STRING},
-                true,
-                (args, context) -> {
-                    int r = args[0].getNumericValue().intValue() % 256;
-                    int g = args[1].getNumericValue().intValue() % 256;
-                    int b = args[2].getNumericValue().intValue() % 256;
-
-                    Color color = new Color(r, g, b);
-                    return Token.fromString(ColorUtil.wrapWithColorTag(args[3].getValue(), color));
-                }));
-
-        // rgbStart()
-        addFunction(new LambdaFixedArgsFunction("rgbStart", TokenType.STRING,
-                new ArgumentType[]{ArgumentType.INTEGER, ArgumentType.INTEGER, ArgumentType.INTEGER},
-                true,
-                (args, context) -> {
-                    int r = args[0].getNumericValue().intValue() % 256;
-                    int g = args[1].getNumericValue().intValue() % 256;
-                    int b = args[2].getNumericValue().intValue() % 256;
-
-                    Color color = new Color(r, g, b);
-                    return Token.fromString(ColorUtil.colorTag(color));
-                }));
-    }
-
-    /**
-     * Creates the floor(), ceil(), pow(), max(), min() functions
-     */
-    private void prepareMathFunctions() {
-        // abs(x) takes a number and returns the absolute value
-        addFunction(new LambdaFixedArgsFunction("abs", TokenType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE}, true, (args, context) -> {
-            return Token.fromDouble(Math.abs(args[0].getNumericValue().doubleValue()));
-        }));
-        addFunction(new LambdaFixedArgsFunction("abs", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, true, (args, context) -> {
-            return Token.fromInt(Math.abs(args[0].getNumericValue().intValue()));
-        }));
-
-        // floor(x) takes a double and returns an integer
-        addFunction(new LambdaFixedArgsFunction("floor", TokenType.INTEGER, new ArgumentType[]{ArgumentType.DOUBLE},true, (args, context) -> {
-            return Token.fromInt((int) Math.floor(args[0].getNumericValue().doubleValue()));
-        }));
-
-        // ceil(x) takes a double and returns an integer
-        addFunction(new LambdaFixedArgsFunction("ceil", TokenType.INTEGER, new ArgumentType[]{ArgumentType.DOUBLE},true, (args, context) -> {
-            return Token.fromInt((int) Math.ceil(args[0].getNumericValue().doubleValue()));
-        }));
-
-        // pow(x) takes two numbers and returns the first to the power of the second as a double
-        addFunction(new LambdaFixedArgsFunction("pow", TokenType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE, ArgumentType.DOUBLE}, true, (args, context) -> {
-            return Token.fromDouble(Math.pow(args[0].getNumericValue().doubleValue(), args[1].getNumericValue().doubleValue()));
-        }));
-
-        // max(...) takes in any amount of numbers and returns the largest one
-        addFunction(new LambdaVariadicFunction("max", TokenType.DOUBLE, ArgumentType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE}, true, (args, context) -> {
-            double max = Double.MIN_VALUE;
-
-            for(Token t : args) {
-                double value = t.getNumericValue().doubleValue();
-                if(value > max) {
-                    max = value;
-                }
-            }
-
-            return Token.fromDouble(max);
-        }));
-
-        // min(...) takes in any amount of numbers and returns the smallest one
-        addFunction(new LambdaVariadicFunction("min", TokenType.DOUBLE, ArgumentType.DOUBLE, new ArgumentType[]{ArgumentType.DOUBLE}, true, (args, context) -> {
-            double min = Double.MAX_VALUE;
-
-            for(Token t : args) {
-                double value = t.getNumericValue().doubleValue();
-                if(value < min) {
-                    min = value;
-                }
-            }
-
-            return Token.fromDouble(min);
-        }));
-    }
-
-    /**
-     * Creates functions which exist for backwards compatibility with the previous (terrible) "expression" engine
-     */
-    private void prepareBackwardsCompatFunctions() {
-        // THE FOLLOWING FUNCTIONS ARE ONLY PRESENT FOR BACKWARDS COMPATIBILITY WITH THE OLD SHITTY SYSTEM
-        // qtymult(x) takes an integer and returns an integer
-        addFunction(new LambdaFixedArgsFunction("qtymult", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
-            String numInStackStr = context.resolveVariable("qty");
-            if(numInStackStr == null) return Token.fromInt(0);
-
-            return Token.fromInt(Integer.parseInt(numInStackStr) * args[0].getNumericValue().intValue());
-        }));
-        // qtydivide(x) takes an integer and returns an integer
-        addFunction(new LambdaFixedArgsFunction("qtydivide", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
-            String numInStackStr = context.resolveVariable("qty");
-            if(numInStackStr == null) return Token.fromInt(0);
-
-            return Token.fromInt(Integer.parseInt(numInStackStr) / args[0].getNumericValue().intValue());
-        }));
-        // qtydivideceil(x) takes an integer and returns an integer
-        addFunction(new LambdaFixedArgsFunction("qtydivideceil", TokenType.INTEGER, new ArgumentType[]{ArgumentType.INTEGER}, (args, context) -> {
-            String numInStackStr = context.resolveVariable("qty");
-            if(numInStackStr == null) return Token.fromInt(0);
-
-            return Token.fromInt((int) Math.ceil((double) Integer.parseInt(numInStackStr) / (double) args[0].getNumericValue().intValue()));
-        }));
-    }
-
-    /**
-     * Implements the logic for the `{inv}_qty()` functions
-     */
-    private Token containerQty(Token[] args, ExecutionContext context, InventoryID inventoryID, boolean shortCircuitOnFind) {
-        if (client == null || client.getLocalPlayer() == null)
-            return Token.fromInt(0);
-
-        ItemContainer container = client.getItemContainer(inventoryID);
-        if (container == null) {
-            return Token.fromInt(0);
-        }
-
-        // Loop through the arguments, constructing a list of item IDs
-        Set<Integer> itemIDs = new HashSet<>(args.length);
-        for(Token arg : args) {
-            if (arg.getType() == TokenType.STRING) {
-                for(int itemId : ItemNameMap.GetItemIDs(arg.getValue())) {
-                    itemIDs.add(itemId);
-                }
-            } else {
-                int itemID = arg.getNumericValue().intValue();
-                if (itemManager != null) itemID = itemManager.canonicalize(itemID);
-
-                itemIDs.add(itemID);
-            }
-        }
-
-        // No item IDs are relevant -- so zero
-        if (itemIDs.size() == 0)
-            return Token.fromInt(0);
-
-        // Find the sum of quantities of items in the given inventory which are represented in `itemIDs`
-        int count = 0;
-        for (Item item : container.getItems()) {
-            int canonicalId = itemManager == null ? item.getId() : itemManager.canonicalize(item.getId());
-            if (itemIDs.contains(canonicalId)) {
-                count += item.getQuantity();
-
-                // If we should short-circuit when we find the first match, then... do that.
-                if(shortCircuitOnFind) {
-                    break;
-                }
-            }
-        }
-
-        return Token.fromInt(count);
-    }
-
-    /**
-     * Implements the logic for the `{inv}_contains()` functions
-     */
-    private Token containerContainsAnyItem(Token[] args, ExecutionContext context, InventoryID inventoryID) {
-        Token qty = containerQty(args, context, inventoryID, true);
-        return Token.fromBool(qty.getNumericValue().intValue() > 0);
-    }
-
-    /**
-     * Creates the `{inventory}_qty()` and `{inventory}_contains()` functions for a given inventory
-     */
-    private void inventoryFunction(String prefix, InventoryID inventoryID) {
-        String containsFuncName = prefix + "_contains";
-        String qtyFuncName = prefix + "_qty";
-
-        // {prefix}_contains(idOrName, ...) takes variable item IDs/names and returns 1 if any of said items are in the specified inventory
-        addFunction(new LambdaVariadicFunction(containsFuncName, TokenType.INTEGER, ArgumentType.ANY, null, (args, context) -> {
-            return containerContainsAnyItem(args, context, inventoryID);
-        }));
-
-        // {prefix}_qty(idOrName, ...) takes variable item IDs/names and returns the number of items with any of said IDs in the given inventory
-        addFunction(new LambdaVariadicFunction(qtyFuncName, TokenType.INTEGER, ArgumentType.ANY, null, (args, context) -> {
-            return containerQty(args, context, inventoryID, false);
-        }));
-    }
-
-    private void simpleColorStringFunc(String colorName, Color color) {
-        addFunction(new LambdaFixedArgsFunction(colorName, TokenType.STRING, new ArgumentType[]{ArgumentType.ANY}, true, (args, context) -> {
-            return Token.fromString(ColorUtil.wrapWithColorTag(args[0].getValue(), color));
-        }));
-    }
-
-    private void simpleColorStringStartFunc(String colorName, Color color) {
-        addFunction(new LambdaFixedArgsFunction(colorName + "Start", TokenType.STRING, new ArgumentType[]{}, true, (args, context) -> {
-            return Token.fromString(ColorUtil.colorTag(color));
-        }));
-    }
-}
-
-package com.geel.customitemhovers;
-
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.api.ItemComposition;
-import net.runelite.api.ItemID;
-import net.runelite.client.game.ItemManager;
-
-import java.lang.reflect.Field;
-import java.util.*;
-import java.util.regex.Pattern;
-
-/**
- * Stores an (item name -> [item ids]) and (item id -> item name) mapping for all items in game
- */
-@Slf4j
-public class ItemNameMap {
-    //Map of (item name -> [item id, ...])
-    private final static Map<String, ArrayList<Integer>> itemNameToIDs = new HashMap<>();
-
-    /**
-     * Prepare map of item names to IDs
-     *
-     * @param client      Reference to RL Client; used to fetch total number of items
-     * @param itemManager Reference to ItemManager; used to fetch item compositions
-     */
-    public static void PrepareMap(Client client, ItemManager itemManager) {
-        //Don't do anything if already prepared
-        if (itemNameToIDs.size() > 0)
-            return;
-
-        //Clear just to be safe
-        itemNameToIDs.clear();
-
-        Set<Integer> processedIDs = new HashSet<>();
-
-        for (int i = 0; i < client.getItemCount(); i++) {
-            int canonicalID = itemManager.canonicalize(i);
-
-            if(processedIDs.contains(canonicalID))
-                continue;
-
-            processedIDs.add(canonicalID);
-
-            ItemComposition comp = itemManager.getItemComposition(canonicalID);
-            String itemName = comp.getName();
-
-            if(itemName.toLowerCase().equals("null")) {
-                continue;
-            }
-
-            //Create list for item name if it doesn't exist
-            if (!itemNameToIDs.containsKey(itemName)) {
-                itemNameToIDs.put(itemName, new ArrayList<>(1));
-            }
-
-            itemNameToIDs.get(itemName).add(canonicalID);
-        }
-    }
-
-    /**
-     * Returns all item IDs which correspond to the given string name
-     *
-     * @param itemName The name of an entry in the `ItemID` class, eg, "PINEAPPLE_SAPLING"
-     */
-    public static int[] GetItemIDs(String itemName) {
-        ArrayList<Integer> itemIDs = itemNameToIDs.getOrDefault(itemName, new ArrayList<>(0));
-
-        //The lack of a sane toArray() function is going to kill me
-        int[] ret = new int[itemIDs.size()];
-
-        for (int i = 0; i < itemIDs.size(); i++) {
-            ret[i] = itemIDs.get(i);
-        }
-
-        return ret;
-    }
-
-
-    /**
-     * Returns all IDs of items whose names match the given regex
-     *
-     * @param itemNameRegex A regex string to match item names against
-     * @return A list of all item IDs whose names match the given regex
-     */
-    public static ArrayList<Integer> GetItemIDsRegex(String itemNameRegex) {
-        ArrayList<Integer> ret = new ArrayList<>(1);
-        Pattern finder = Pattern.compile(itemNameRegex);
-
-        if (finder == null) {
-            return ret;
-        }
-
-        for (String entry : itemNameToIDs.keySet()) {
-            if (!finder.matcher(entry).matches())
-                continue;
-
-            for (int itemID : itemNameToIDs.get(entry)) {
-                //O(n^2), sue me (don't)
-                if (!ret.contains(itemID))
-                    ret.add(itemID);
-            }
-        }
-
-        return ret;
     }
 }
 
@@ -2908,631 +3248,110 @@ public class HoverFileParser {
 
 package com.geel.customitemhovers;
 
-import javax.inject.Inject;
-
-import com.geel.customitemhovers.expressions.ExecutionContext;
-import com.geel.customitemhovers.expressions.EvaluationUtil;
-import com.geel.customitemhovers.expressions.models.Token;
-import com.geel.customitemhovers.models.hovers.HoverFile;
-import com.geel.customitemhovers.models.hovers.HoverDef;
-import com.geel.customitemhovers.models.hovers.ParsedHover;
-import com.geel.customitemhovers.models.itemtables.ItemTable;
-import com.geel.customitemhovers.models.itemtables.ItemTableCollection;
-import com.google.gson.Gson;
-import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.*;
-import net.runelite.api.events.CommandExecuted;
-import net.runelite.client.RuneLite;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.ConfigChanged;
+import net.runelite.api.Client;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.ItemID;
 import net.runelite.client.game.ItemManager;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.ui.ClientToolbar;
-import net.runelite.client.ui.overlay.OverlayManager;
 
-import java.awt.*;
-import java.io.IOException;
-import java.nio.file.*;
+import java.lang.reflect.Field;
 import java.util.*;
+import java.util.regex.Pattern;
 
-import static java.nio.file.StandardWatchEventKinds.*;
-
+/**
+ * Stores an (item name -> [item ids]) and (item id -> item name) mapping for all items in game
+ */
 @Slf4j
-@PluginDescriptor(
-        name = "Custom Item Hovers",
-        description = "Enables custom item hovers. Read github page.",
-        tags = {"custom", "item", "hovers", "tooltips"},
-        enabledByDefault = true
-)
-public class CustomItemHoversPlugin extends Plugin {
-    private static final String PLUGIN_FOLDER_NAME = "customitemhovers";
-
-    @Inject
-    private Client client;
-
-    @Inject
-    private ClientThread clientThread;
-
-    @Inject
-    private ConfigManager configManager;
-
-    @Inject
-    private OverlayManager overlayManager;
-
-    @Inject
-    private ClientToolbar clientToolbar;
-
-    @Inject
-    private ItemManager itemManager;
-
-    @Inject
-    private CustomItemHoversOverlay overlay;
-
-    @Inject
-    private CustomItemHoversConfig config;
-
-    @Inject
-    private Gson gson;
-
-    @Inject
-    private HoverFileParser parser;
-
-    @Inject
-    private ItemTableManager itemTableManager;
-
-    @Inject
-    private CustomItemHoversFunctionProvider functionProvider;
-
-    @Provides
-    CustomItemHoversConfig getConfig(ConfigManager configManager) {
-        return configManager.getConfig(CustomItemHoversConfig.class);
-    }
-
-    //Map between an Item ID and all of its associated HoverDefs.
-    public Map<Integer, ArrayList<HoverDef>> hovers = new HashMap<>();
-
-    // Watchers of the hover directory
-    WatchService hoverWatcher;
-    WatchKey hoverWatchKey;
-    WatchKey tableWatchKey;
-
-    @Override
-    protected void startUp() throws Exception {
-        prepareHoverFolder();
-
-        //Invoke this on the client thread because `itemManager.canonicalize()` must be run in the client thread
-        clientThread.invokeLater(() -> {
-            prepareItemNameMap();
-            prepareItemTables();
-            prepareHoverMap();
-            prepareHoverWatcher();
-        });
-
-        overlayManager.add(overlay);
-    }
-
-    @Override
-    protected void shutDown() throws Exception {
-        if (hoverWatcher != null)
-            hoverWatcher.close();
-
-        overlayManager.remove(overlay);
-    }
-
-    @Subscribe
-    public void onConfigChanged(ConfigChanged ev) {
-        if (ev.getGroup().equals("customitemhovers") && ev.getKey().equals("hoverEnableHotReload")) {
-            if (config.hoverEnableHotReload()) {
-                clientThread.invoke(this::prepareHoverWatcher);
-            } else {
-                clientThread.invoke(this::stopHoverWatcher);
-            }
-        }
-    }
-
-    @Subscribe
-    public void onCommandExecuted(CommandExecuted commandExecuted) {
-        if (!commandExecuted.getCommand().equals(config.openDirChatCommand())) {
-            return;
-        }
-
-        Path hoverPath = getHoverPath();
-
-        if (hoverPath == null) {
-            return;
-        }
-
-        try {
-            Desktop.getDesktop().open(hoverPath.toFile());
-        } catch (Exception e) {
-            log.error("Got exception opening hover folder", e);
-        }
-    }
+public class ItemNameMap {
+    //Map of (item name -> [item id, ...])
+    private final static Map<String, ArrayList<Integer>> itemNameToIDs = new HashMap<>();
 
     /**
-     * Returns an array of hover texts that should be rendered for a given item
-     */
-    private Item lastItem = null;
-    private String[] lastHovers = null;
-
-    /**
-     * Resets the cache of the item hover.
+     * Prepare map of item names to IDs
      *
-     * This system seems badly coupled. I should refactor this. Blech.
+     * @param client      Reference to RL Client; used to fetch total number of items
+     * @param itemManager Reference to ItemManager; used to fetch item compositions
      */
-    public void resetHoveredItemCache() {
-        lastHovers = null;
-        lastItem = null;
-    }
-
-    /**
-     *
-     * For the given Item in a supported container, returns a String array, each representing
-     * HTML that should be rendered in a hover box.
-     *
-     * Fully processes all expressions contained within hover texts.
-     */
-    public String[] getItemHovers(Item item) {
-        // Cache hovers
-        // TODO: FIXME: This prevents users from creating hovers which update dynamically without having to re-hover
-        if (item.equals(lastItem)) {
-            return lastHovers;
-        }
-
-        //Do a hot-reload if we should
-        if (config.hoverEnableHotReload()) {
-            if (hoverWatcherTriggered()) {
-                prepareHoverMap();
-            }
-
-            if (tableWatcherTriggered()) {
-                prepareItemTables();
-            }
-        }
-
-        // Canonicalize the item and get its composition
-        int itemID = itemManager.canonicalize(item.getId());
-        ItemComposition comp = itemManager.getItemComposition(itemID);
-
-        //If item's ID is not in `hovers`, it has no hovers.
-        if (!hovers.containsKey(itemID))
-            return new String[0];
-
-        // Prepare expression execution context
-        ItemTableCollection tableCollection = itemTableManager.getCollectionForItem(comp.getName());
-        ItemTable baseTable = itemTableManager.getBaseTableForItemAndPlayer(item, client);
-        CustomItemHoversVariableProvider variableProvider = new CustomItemHoversVariableProvider(tableCollection, baseTable);
-        ExecutionContext context = new ExecutionContext(functionProvider, variableProvider);
-
-        //For each hover associated with this item, add its transformed text to the resultant array
-        boolean obsoleteExpressionDetected = false;
-        ArrayList<String> ret = new ArrayList<>();
-        for (HoverDef hoverDef : hovers.get(itemID)) {
-            // If the hoverdef has a condition, evaluate it first
-            if(hoverDef.Condition != null) {
-                Token conditionResult = EvaluationUtil.EvaluateAtRuntime(hoverDef.Condition, context);
-                if(conditionResult.getNumericValue().intValue() == 0) {
-                    continue;
-                }
-            }
-
-            for (ParsedHover parsedHover : hoverDef.ParsedHoverTexts) {
-                String transformed = HoverEvaluator.Evaluate(parsedHover, context);
-                if(transformed == null) {
-                    continue;
-                }
-
-                ret.add(transformed);
-
-                // Warn about obsolete expressions
-                if (config.enableObsoleteMessage()) {
-                    obsoleteExpressionDetected = obsoleteExpressionDetected ||
-                            Arrays
-                                    .stream(parsedHover.getExpressions())
-                                    .anyMatch(e -> e.isLegacy());
-                }
-            }
-        }
-
-        // Warn about obsolete expressions if we find any
-        if(obsoleteExpressionDetected) {
-            warnObsoleteExpression();
-        }
-
-        //Turn `ret` into an array from an ArrayList
-        String[] retArr = new String[ret.size()];
-        retArr = ret.toArray(retArr);
-
-        lastItem = item;
-        lastHovers = retArr;
-
-        return retArr;
-    }
-
-    private void warnObsoleteExpression() {
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE,
-                "",
-                "<col=e74c3c>[Custom Item Hovers]</col> " +
-                        "Obsolete expression detected. " +
-                        "See the plugin support page (or GitHub) to learn about the new, better expression system. " +
-                        "Turn this message off in settings.",
-                "");
-    }
-
-    /**
-     * Parses the config's hover dirs path and returns it if it's a readable directory.
-     *
-     * @return Path|null The path if it's a valid, readable directory Path, null otherwise.
-     */
-    public Path getHoverPath() {
-        return Paths.get(RuneLite.RUNELITE_DIR.getAbsolutePath() + "/" + PLUGIN_FOLDER_NAME);
-    }
-
-    /**
-     * Parses the config's table path and returns it if it's a readable directory.
-     *
-     * @return Path|null The path if it's a valid, readable directory Path, null otherwise.
-     */
-    public Path getTablePath() {
-        return Paths.get(RuneLite.RUNELITE_DIR.getAbsolutePath() + "/" + PLUGIN_FOLDER_NAME + "/tables");
-    }
-
-    /**
-     * Prepare ItemNameMap
-     */
-    protected void prepareItemNameMap() {
-        ItemNameMap.PrepareMap(client, itemManager);
-    }
-
-    /**
-     * Creates, if necessary, the `customitemhovers` folder in the user's `.runelite` directory
-     *
-     * @throws IOException
-     */
-    protected void prepareHoverFolder() throws IOException {
-        Path rlPath = RuneLite.RUNELITE_DIR.toPath();
-
-        if (!Files.isDirectory(rlPath) || !Files.isReadable(rlPath) || !Files.isWritable(rlPath)) {
-            log.error("[CUSTOMITEMHOVERS] Bad .runelite path");
-            return;
-        }
-
-        // Ensure that `/customitemhovers` and `/customitemhovers/tables` exist in RL directory
-        prepareSpecificHoverFolder(getHoverPath());
-        prepareSpecificHoverFolder(getTablePath());
-    }
-
-    /**
-     * Creates a directory if it doesn't exist, logging an error if creation failed
-     */
-    private void prepareSpecificHoverFolder(Path path) throws IOException {
-        // Create directory if it doesn't exist
-        if (Files.notExists(path)) {
-            Files.createDirectory(path);
-        }
-
-        // Make sure we actually created the directory and it's readable
-        if (!Files.isDirectory(path) || !Files.isReadable(path)) {
-            log.error("[CUSTOMITEMHOVERS] Couldn't ensure path " + path);
-        }
-    }
-
-    /**
-     * Reads all files from the `customitemhovers` directory, parses them, and
-     * prepares a map of (itemID, hovers) for each item that has a hover.
-     */
-    protected void prepareHoverMap() {
-        hovers.clear();
-
-        //Read all hover files
-        ArrayList<HoverFile> hoverFiles = parser.readHoverFiles(getHoverPath());
-
-        for (HoverFile f : hoverFiles) {
-            for (HoverDef d : f.Hovers) {
-                //Compute which item IDs this HoverDef is attached to. This fills in `d.ItemIDs`.
-                parseHoverDefNames(d);
-
-                //Add this HoverDef to the map for every Item ID it represents
-                for (int itemID : d.ItemIDs) {
-                    if (!hovers.containsKey(itemID))
-                        hovers.put(itemID, new ArrayList<>());
-
-                    ArrayList<HoverDef> curArr = hovers.get(itemID);
-                    curArr.add(d);
-                }
-            }
-        }
-    }
-
-    /**
-     * TODO document
-     */
-    protected void prepareItemTables() {
-        itemTableManager.reparseItemDatabase(getTablePath());
-    }
-
-    /**
-     * @return True if the `customitemhovers` directory has changed since the last time this function was called
-     */
-    private boolean hoverWatcherTriggered() {
-        if (hoverWatchKey == null || !hoverWatchKey.isValid())
-            return false;
-
-        //If we've received any filesystem events, then assume it changed
-        boolean triggered = hoverWatchKey.pollEvents().size() > 0;
-
-        //Enable more events to be queued
-        hoverWatchKey.reset();
-
-        return triggered;
-    }
-
-    /**
-     * @return True if the `customitemhovers` directory has changed since the last time this function was called
-     */
-    private boolean tableWatcherTriggered() {
-        if (tableWatchKey == null || !tableWatchKey.isValid())
-            return false;
-
-        //If we've received any filesystem events, then assume it changed
-        boolean triggered = tableWatchKey.pollEvents().size() > 0;
-
-        //Enable more events to be queued
-        tableWatchKey.reset();
-
-        return triggered;
-    }
-
-    /**
-     * Set up a filesystem watcher on the `customitemhovers` directory.
-     * <p>
-     * This enables hot-reloading.
-     */
-    private void prepareHoverWatcher() {
-        if (!config.hoverEnableHotReload())
+    public static void PrepareMap(Client client, ItemManager itemManager) {
+        //Don't do anything if already prepared
+        if (itemNameToIDs.size() > 0)
             return;
 
-        Path hoverPath = getHoverPath();
-        Path tablePath = getTablePath();
+        //Clear just to be safe
+        itemNameToIDs.clear();
 
-        //Nothing to watch
-        if (hoverPath == null)
-            return;
+        Set<Integer> processedIDs = new HashSet<>();
 
-        try {
-            hoverWatcher = FileSystems.getDefault().newWatchService();
+        for (int i = 0; i < client.getItemCount(); i++) {
+            int canonicalID = itemManager.canonicalize(i);
 
-            hoverWatchKey = hoverPath.register(hoverWatcher,
-                    ENTRY_CREATE,
-                    ENTRY_DELETE,
-                    ENTRY_MODIFY);
+            if(processedIDs.contains(canonicalID))
+                continue;
 
-            if (tablePath != null) {
-                tableWatchKey = tablePath.register(hoverWatcher,
-                        ENTRY_CREATE,
-                        ENTRY_DELETE,
-                        ENTRY_MODIFY);
+            processedIDs.add(canonicalID);
+
+            ItemComposition comp = itemManager.getItemComposition(canonicalID);
+            String itemName = comp.getName();
+
+            if(itemName.toLowerCase().equals("null")) {
+                continue;
             }
-        } catch (Exception e) {
 
+            //Create list for item name if it doesn't exist
+            if (!itemNameToIDs.containsKey(itemName)) {
+                itemNameToIDs.put(itemName, new ArrayList<>(1));
+            }
+
+            itemNameToIDs.get(itemName).add(canonicalID);
         }
     }
 
     /**
-     * Closes `hoverWatcher` and `hoverWatchKey`, if possible.
-     */
-    private void stopHoverWatcher() {
-        if (hoverWatcher != null) {
-            try {
-                hoverWatcher.close();
-            } catch (IOException e) {
-                log.error("[CUSTOMITEMHOVERS]: exception closing hover watcher", e);
-            }
-
-            hoverWatcher = null;
-        }
-
-        if (hoverWatchKey != null) {
-            hoverWatchKey.cancel();
-            hoverWatchKey = null;
-        }
-
-        if (tableWatchKey != null) {
-            tableWatchKey.cancel();
-            tableWatchKey = null;
-        }
-    }
-
-    /**
-     * Computes all item IDs that a HoverDef is targeting, and stores the results in
-     * its `ItemIDs` member variable.
+     * Returns all item IDs which correspond to the given string name
      *
-     * @param d HoverDef to parse names for
+     * @param itemName The name of an entry in the `ItemID` class, eg, "PINEAPPLE_SAPLING"
      */
-    private void parseHoverDefNames(HoverDef d) {
-        Set<Integer> itemIDs = new HashSet<>();
+    public static int[] GetItemIDs(String itemName) {
+        ArrayList<Integer> itemIDs = itemNameToIDs.getOrDefault(itemName, new ArrayList<>(0));
 
-        //If ItemNamesRegex is non-empty, insert all item IDs whose name matches any of the given regexes
-        if (d.ItemNamesRegex != null) {
-            for (String name : d.ItemNamesRegex) {
-                itemIDs.addAll(ItemNameMap.GetItemIDsRegex(name));
-            }
+        //The lack of a sane toArray() function is going to kill me
+        int[] ret = new int[itemIDs.size()];
+
+        for (int i = 0; i < itemIDs.size(); i++) {
+            ret[i] = itemIDs.get(i);
         }
 
-        //If ItemNames is non-empty, insert all item IDs with the exact name(s) specified
-        if (d.ItemNames != null) {
-            for (String name : d.ItemNames) {
-                for (int id : ItemNameMap.GetItemIDs(name)) {
-                    itemIDs.add(id);
-                }
-            }
-        }
-
-        //If ItemIDs has any IDs specified, copy them in
-        if (d.ItemIDs != null && d.ItemIDs.length > 0) {
-            for (int id : d.ItemIDs) {
-                itemIDs.add(id);
-            }
-        }
-
-        //Convert `itemIDs` into an array and store it in `d.ItemIDs`
-        d.ItemIDs = new int[itemIDs.size()];
-        int i = 0;
-        for (Iterator<Integer> it = itemIDs.iterator(); it.hasNext(); ) {
-            int id = it.next();
-            d.ItemIDs[i++] = id;
-        }
+        return ret;
     }
-}
 
-package com.geel.customitemhovers;
 
-import net.runelite.api.*;
-import net.runelite.api.widgets.InterfaceID;
-import net.runelite.api.widgets.Widget;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.tooltip.Tooltip;
-import net.runelite.client.ui.overlay.tooltip.TooltipManager;
-import net.runelite.client.util.ColorUtil;
+    /**
+     * Returns all IDs of items whose names match the given regex
+     *
+     * @param itemNameRegex A regex string to match item names against
+     * @return A list of all item IDs whose names match the given regex
+     */
+    public static ArrayList<Integer> GetItemIDsRegex(String itemNameRegex) {
+        ArrayList<Integer> ret = new ArrayList<>(1);
+        Pattern finder = Pattern.compile(itemNameRegex);
 
-import javax.inject.Inject;
-import java.awt.*;
-import java.util.Arrays;
-import java.util.HashSet;
-import java.util.Set;
+        if (finder == null) {
+            return ret;
+        }
 
-import static net.runelite.api.MenuAction.CC_OP;
-import static net.runelite.api.MenuAction.WIDGET_TARGET;
-import static net.runelite.api.MenuAction.ITEM_USE;
-import static net.runelite.api.MenuAction.ITEM_FIRST_OPTION;
-import static net.runelite.api.MenuAction.ITEM_SECOND_OPTION;
-import static net.runelite.api.MenuAction.ITEM_THIRD_OPTION;
-import static net.runelite.api.MenuAction.ITEM_FOURTH_OPTION;
-import static net.runelite.api.MenuAction.ITEM_FIFTH_OPTION;
+        for (String entry : itemNameToIDs.keySet()) {
+            if (!finder.matcher(entry).matches())
+                continue;
 
-class CustomItemHoversOverlay extends Overlay
-{
-	//Interface IDs for the standard inventory container
-	private static final Set<Integer> INVENTORY_COMPONENT_IDS = new HashSet<>(
-			Arrays.asList(
-					InterfaceID.INVENTORY,
-					InterfaceID.BANK_INVENTORY,
-					InterfaceID.SEED_VAULT_INVENTORY,
-					InterfaceID.EXPLORERS_RING
-			)
-	);
+            for (int itemID : itemNameToIDs.get(entry)) {
+                //O(n^2), sue me (don't)
+                if (!ret.contains(itemID))
+                    ret.add(itemID);
+            }
+        }
 
-	//Interface IDs which an item hover MenuAction will be related to
-	private static final Set<Integer> VALID_INTERFACE_IDS = new HashSet<>(
-			Arrays.asList(InterfaceID.INVENTORY, InterfaceID.BANK, InterfaceID.BANK_INVENTORY,
-					InterfaceID.SEED_VAULT, InterfaceID.SEED_VAULT_INVENTORY, InterfaceID.EXPLORERS_RING)
-	);
-
-	//MenuActions which indicate an item is being hovered on
-	private static final Set<MenuAction> VALID_MENU_ACTIONS = new HashSet<>(
-			Arrays.asList(CC_OP, ITEM_USE, WIDGET_TARGET, ITEM_FIRST_OPTION, ITEM_SECOND_OPTION,
-					ITEM_THIRD_OPTION, ITEM_FOURTH_OPTION, ITEM_FIFTH_OPTION)
-	);
-
-	private final Client client;
-	private final CustomItemHoversConfig config;
-	private final CustomItemHoversPlugin plugin;
-	private final TooltipManager tooltipManager;
-
-	@Inject
-	CustomItemHoversOverlay(Client client, CustomItemHoversPlugin plugin, CustomItemHoversConfig config, TooltipManager tooltipManager)
-	{
-		setPosition(OverlayPosition.DYNAMIC);
-		this.client = client;
-		this.plugin = plugin;
-		this.config = config;
-		this.tooltipManager = tooltipManager;
-	}
-
-	@Override
-	public Dimension render(Graphics2D graphics)
-	{
-		// If the player is not hovering over any items, reset the cache
-		if(!innerRender(graphics)) {
-			plugin.resetHoveredItemCache();
-		}
-
-		return null;
-	}
-
-	/**
-	 * Handles the hover.
-	 *
-	 * Returns true if the user is presently hovering over any item, inlcuding those without a hover.
-	 */
-	private boolean innerRender(Graphics2D graphics) {
-		//Don't display anything if a right-click menu is open.
-		if (client.isMenuOpen())
-			return false;
-
-		//Get the current menu entries; if there aren't any, return.
-		final MenuEntry[] menuEntries = client.getMenuEntries();
-		if (menuEntries.length <= 0)
-			return false;
-
-		final MenuEntry lastEntry = menuEntries[menuEntries.length - 1];
-		final MenuAction action = lastEntry.getType();
-		final Widget widget = lastEntry.getWidget();
-
-		if(widget == null) {
-			return false;
-		}
-
-		final int widgetId = widget.getId();
-		final int interfaceId = widgetId >>> 16;
-
-		if (!VALID_MENU_ACTIONS.contains(action))
-			return false;
-
-		if (!VALID_INTERFACE_IDS.contains(interfaceId))
-			return false;
-
-		//We should now display a hover.
-		ItemContainer container = getContainer(interfaceId);
-
-		if (container == null)
-			return false;
-
-		//Get the Item from the Container
-		final int containerItemIndex = lastEntry.getParam0();
-		final Item item = container.getItem(containerItemIndex);
-		if (item == null)
-			return false;
-
-		//Get the hovers for this item ID
-		String[] hoverTexts = plugin.getItemHovers(item);
-		if (hoverTexts.length == 0)
-			return true;
-
-		for (String s : hoverTexts) {
-			tooltipManager.add(new Tooltip(ColorUtil.prependColorTag(s, config.defaultHoverColor())));
-		}
-
-		return true;
-	}
-
-	private ItemContainer getContainer(int interfaceId)
-	{
-		if (INVENTORY_COMPONENT_IDS.contains(interfaceId))
-			return client.getItemContainer(InventoryID.INVENTORY);
-		else if (interfaceId == InterfaceID.BANK)
-			return client.getItemContainer(InventoryID.BANK);
-		else if (interfaceId == InterfaceID.SEED_VAULT) {
-			return client.getItemContainer(InventoryID.SEED_VAULT);
-		}
-
-		return null;
-	}
+        return ret;
+    }
 }
 
 package com.geel.customitemhovers;
@@ -3709,6 +3528,200 @@ public class ItemTableManager {
     }
 }
 
+package com.geel.customitemhovers.models.hovers;
+
+import com.geel.customitemhovers.expressions.models.CompiledExpression;
+import com.google.gson.annotations.SerializedName;
+
+/**
+ * A parsed entry in a hoverfile.
+ */
+public class HoverDef {
+    @SerializedName("ids")
+    public int[] ItemIDs;
+
+    @SerializedName("items")
+    public String[] ItemNames;
+
+    @SerializedName("items_regex")
+    public String[] ItemNamesRegex;
+
+    @SerializedName("condition")
+    public String ConditionString;
+
+    @SerializedName("hovers")
+    public String[][] HoverTexts;
+
+    /**
+     * A condition expression, which controls whether or not this hover will display.
+     */
+    public CompiledExpression Condition;
+
+    /**
+     * An array of Hovers; each element in this array corresponds to an individual hover box that should be rendered.
+     *
+     * This is produced from `HoverTexts`, which is a 2D array of strings.
+     * Each sub-array of strings in `HoverTexts` is treated as an array of lines which are concatenated together.
+     */
+    public ParsedHover[] ParsedHoverTexts;
+}
+
+package com.geel.customitemhovers.models.hovers;
+
+import com.google.gson.annotations.SerializedName;
+
+public class HoverFile {
+    @SerializedName("is_hover_map")
+    public String IsHoverMap;
+
+    @SerializedName("hovers")
+    public HoverDef[] Hovers;
+}
+package com.geel.customitemhovers.models.hovers;
+
+import com.geel.customitemhovers.expressions.models.BaseExpression;
+import com.geel.customitemhovers.expressions.models.CompiledExpression;
+import lombok.AllArgsConstructor;
+import lombok.Getter;
+
+/**
+ * A parsed Hover from a HoverFile.
+ *
+ * One ParsedHover is created for every 1D hover array in the 2D array of a HoverDef. That is, for every individual
+ * hover box.
+ *
+ * This class exists as a caching mechanism for expressions; we want to parse (tokenize + shunting-yard) hover texts
+ * as infrequently as possible (on load only).
+ *
+ * Therefore, `hoverText` contains a hoverbox text with all expressions removed.
+ * `expressionLocations` is an ascending array of positions that expression results should be inserted,
+ * and `expressions` is an array of expressions.
+ *
+ * To fully resolve `hoverText`, simply copy it, and then iterate through `expressionLocations` and `expressions`
+ * simultaneously (their indexes align) -- evaluate each expression in turn, and insert the string result into
+ * `hoverText` at the location indicated by `expressionLocations[i]`.
+ */
+@AllArgsConstructor
+public class ParsedHover {
+    /**
+     * The text for this hover box, without any expressions.
+     *
+     * If any expressions were present in the original text, use `expressionLocations` and `expressions` to
+     * build the final text.
+     */
+    @Getter
+    private final String hoverText;
+
+    @Getter
+    private final Integer[] expressionLocations;
+
+    @Getter
+    private final CompiledExpression[] expressions;
+
+    @Getter
+    private final CompiledExpression condition;
+}
+
+package com.geel.customitemhovers.models.itemtables;
+
+import lombok.Getter;
+import lombok.Setter;
+
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+
+/**
+ * A parsed entry in an ItemTableFile.
+ *
+ * Contains variables that are "attached" to items
+ */
+public class ItemTable extends HashMap<String, String> {
+    @Getter
+    @Setter
+    private String itemName;
+
+    @Getter
+    @Setter
+    private ItemTableFile parentFile;
+
+    public String[] getAllNames() {
+        ArrayList<String> ret = new ArrayList<>();
+        ret.add(this.itemName);
+
+        // Handle $also
+        String also = this.getOrDefault("$also", null);
+        if (also != null) {
+            ret.addAll(Arrays.asList(also.split("\\|")));
+        }
+
+        return ret.toArray(new String[0]);
+    }
+}
+
+package com.geel.customitemhovers.models.itemtables;
+
+import lombok.Getter;
+
+import java.util.HashMap;
+
+/**
+ * A collection of multiple ItemTables for a single item.
+ *
+ * An item can have multiple ItemTables if multiple ItemTableFiles contain ItemTables for the item.
+ */
+public class ItemTableCollection {
+    @Getter
+    private HashMap<String, ItemTable> itemTables;
+
+    public ItemTableCollection() {
+        this.itemTables = new HashMap<>();
+    }
+
+    public String resolveVariable(String variableName) {
+        for (ItemTable i : itemTables.values()) {
+            String val = i.getOrDefault(variableName, null);
+
+            if (val == null) {
+                continue;
+            }
+
+            return val;
+        }
+
+        return null;
+    }
+}
+
+package com.geel.customitemhovers.models.itemtables;
+
+import com.google.gson.annotations.SerializedName;
+
+import java.util.Map;
+
+public class ItemTableFile {
+    @SerializedName("is_table_file")
+    public String IsTableFile;
+
+    @SerializedName("name")
+    public String Name;
+
+    @SerializedName("items")
+    public Map<String, ItemTable> Items;
+}
+package com.geel.customitemhovers;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class CustomItemHoversTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(CustomItemHoversPlugin.class);
+		RuneLite.main(args);
+	}
+}
 package com.geel.customitemhovers;
 
 import com.geel.customitemhovers.expressions.*;
@@ -3965,16 +3978,3 @@ public class TestVariableProvider extends HashMap<String, String> implements IVa
     }
 }
 
-package com.geel.customitemhovers;
-
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
-
-public class CustomItemHoversTest
-{
-	public static void main(String[] args) throws Exception
-	{
-		ExternalPluginManager.loadBuiltin(CustomItemHoversPlugin.class);
-		RuneLite.main(args);
-	}
-}

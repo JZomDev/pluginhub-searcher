@@ -79,94 +79,511 @@ public interface GnomeRestaurantConfig extends Config {
     }
 }
 
-package io.github.mmagicala.gnomeRestaurant.order;
+/*
+ * Copyright (c) 2020, MMagicala <https://github.com/MMagicala>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ *  Redistributions of source code must retain the above copyright notice, this
+ *   list of conditions and the following disclaimer.
+ *
+ *  Redistributions in binary form must reproduce the above copyright notice,
+ *   this list of conditions and the following disclaimer in the documentation
+ *   and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+ * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+ * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+ * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+ * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+ * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+ * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+ * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+ * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
 
+package io.github.mmagicala.gnomeRestaurant;
+
+import com.google.inject.Provides;
+import io.github.mmagicala.gnomeRestaurant.order.Customer;
+import io.github.mmagicala.gnomeRestaurant.order.OrderDifficulty;
+import io.github.mmagicala.gnomeRestaurant.overlay.GnomeRestaurantOverlay;
+import io.github.mmagicala.gnomeRestaurant.overlay.OverlayHeader;
+import io.github.mmagicala.gnomeRestaurant.overlay.OverlayTableEntry;
+import io.github.mmagicala.gnomeRestaurant.recipe.Ingredient;
+import io.github.mmagicala.gnomeRestaurant.recipe.Order;
 import net.runelite.api.Client;
-import net.runelite.api.coords.WorldPoint;
-
-public interface CustomerLocation {
-
-    int npcTypeId(Client client);
-
-    WorldPoint resolve(Client client);
-
-    static CustomerLocation fixed(int npcTypeId, int x, int y) {
-        return fixed(npcTypeId, x, y, 0);
-    }
-
-    static CustomerLocation fixed(int npcTypeId, int x, int y, int plane) {
-        return new StaticCustomerLocation(npcTypeId, new WorldPoint(x, y, plane));
-    }
-
-    class StaticCustomerLocation implements CustomerLocation {
-
-        private final int npcTypeId;
-        private final WorldPoint worldPoint;
-
-        private StaticCustomerLocation(int npcTypeId, WorldPoint worldPoint) {
-            this.npcTypeId = npcTypeId;
-            this.worldPoint = worldPoint;
-        }
-
-        @Override
-        public int npcTypeId(Client client) {
-            return npcTypeId;
-        }
-
-        @Override
-        public WorldPoint resolve(Client client) {
-            return worldPoint;
-        }
-    }
-}
-
-package io.github.mmagicala.gnomeRestaurant.order;
-
-import net.runelite.api.Client;
-import net.runelite.api.coords.WorldPoint;
-import net.runelite.api.gameval.NpcID;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.NPC;
+import net.runelite.api.events.ItemContainerChanged;
+import net.runelite.api.events.NpcDespawned;
+import net.runelite.api.events.NpcSpawned;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.api.gameval.InventoryID;
+import net.runelite.api.gameval.ItemID;
 import net.runelite.api.gameval.VarbitID;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayManager;
+import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
+import net.runelite.client.ui.overlay.infobox.Timer;
+import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
+import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
-public class GarkorLocation implements CustomerLocation {
+import javax.inject.Inject;
+import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
+import java.util.List;
 
-    @Override
-    public int npcTypeId(Client client) {
-        var mm2progress = client.getVarbitValue(VarbitID.MM2_PROGRESS);
+@PluginDescriptor(name = "Gnome Restaurant")
+public class GnomeRestaurantPlugin extends Plugin {
 
-        if (mm2progress >= 195 && mm2progress <= 200) {
-            // Post mm2
-            return NpcID.MM_GARKOR_GS;
-        } else if (mm2progress >= 140 && mm2progress <= 175) {
-            // Gnome Stronghold Fence
-            return NpcID.MM2_GARKOR_BREACH;
-        } else {
-            // Ape Atoll
-            return NpcID.MM_GARKOR_AA;
-        }
+    private static final Logger LOGGER = LoggerFactory.getLogger(GnomeRestaurantPlugin.class);
+
+    @Inject
+    private Client client;
+
+    @Inject
+    private GnomeRestaurantConfig config;
+
+    @Inject
+    private InfoBoxManager infoBoxManager;
+
+    @Inject
+    private OverlayManager overlayManager;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    private ClientThread clientThread;
+
+    @Inject
+    private WorldMapPointManager worldMapPointManager;
+
+    // UI
+
+    private Timer timer;
+    private Overlay overlay;
+    private WorldMapPoint worldMapPoint;
+
+    private String tooltipText;
+
+    private boolean refusedHardOrder = false;
+    private boolean queuedUpdate = false;
+
+    // Current order information
+
+    private Order order;
+    private Customer customer;
+    private int stepIdx;
+
+    // Overlay
+
+    private OverlayHeader overlayHeader = new OverlayHeader("null", -1, -1);
+    private final List<OverlayTableEntry> stepIngredientsOverlayTable = new ArrayList<>();
+    private final List<OverlayTableEntry> nextRawIngredientsOverlayTable = new ArrayList<>();
+
+    public OverlayHeader overlayHeader() {
+        return overlayHeader;
     }
 
     @Override
-    public WorldPoint resolve(Client client) {
-        var mm2progress = client.getVarbitValue(VarbitID.MM2_PROGRESS);
+    protected void shutDown() {
+        resetPlugin();
+    }
 
-        if (mm2progress >= 195 && mm2progress <= 200) {
-            // Post mm2
-            return new WorldPoint(2479, 3463, 0);
-        } else if (mm2progress >= 140 && mm2progress <= 175) {
-            // Gnome Stronghold Fence
-            return new WorldPoint(2434, 3519, 0);
+    private void resetPlugin() {
+        removeTimer();
+        removeOverlay();
+        removeWorldMapPoint();
+        client.clearHintArrow();
+
+        stepIdx = 0;
+
+        refusedHardOrder = false;
+
+        order = null;
+        customer = null;
+    }
+
+    private void onRefusedHardOrder() {
+        resetPlugin();
+
+        setupRefusedOrderTimer();
+        refusedHardOrder = true;
+    }
+
+    private void updateOrder() {
+        updateOrderStep();
+        setupUI();
+    }
+
+    private void queueUpdateOrder() {
+        if (queuedUpdate) {
+            return;
+        }
+        clientThread.invokeAtTickEnd(() -> {
+            LOGGER.debug("Updating ui for order={}, customer={}", order, customer);
+            updateOrder();
+            queuedUpdate = false;
+        });
+        queuedUpdate = true;
+    }
+
+    private void setupRefusedOrderTimer() {
+        timer = new Timer(5, ChronoUnit.MINUTES, itemManager.getImage(ItemID.ALUFT_DELIVERY_BOX), this);
+        timer.setTooltip("Refused hard order cooldown");
+        infoBoxManager.addInfoBox(timer);
+    }
+
+    /**
+     * Update the step we are working on in the recipe
+     * Returns whether a step has been updated or not
+     **/
+    private boolean updateOrderStep() {
+        // Go from the beginning of the recipe to the final item produced
+
+        int newStepIdx = 0;
+
+        for (int i = 0; i < order.getSteps().size() - 1; i++) {
+            int producedId = order.getSteps().get(i).getProducedItemId();
+            if (getItemCount(producedId) > 0) {
+                // We produced the item for this step
+                newStepIdx = i + 1;
+            }
+        }
+        boolean stepUpdated = newStepIdx != stepIdx;
+
+        stepIdx = newStepIdx;
+        return stepUpdated;
+    }
+
+    private int getItemCount(int itemId) {
+        // Assume the inventory is empty (and player just logged in) if it is null
+        ItemContainer inventory = client.getItemContainer(InventoryID.INV);
+
+        if (inventory == null) {
+            return 0;
         } else {
-            // Ape Atoll
-            return new WorldPoint(2805, 2762, 0);
+            return inventory.count(itemId);
         }
     }
-}
 
-package io.github.mmagicala.gnomeRestaurant.order;
+    private void setupUI() {
+        tooltipText = "Deliver " + order.getName() + " to " + customer.getName();
 
-public enum OrderDifficulty {
-    EASY,
-    HARD
+        if (config.showOverlay()) {
+            setupOverlay();
+        }
+
+        if (config.showOrderTimer()) {
+            setupOrderTimer();
+        }
+
+        if (config.showHintArrow()) {
+            showHintArrow();
+        }
+
+        if (config.showWorldMapPoint()) {
+            showWorldMapPoint();
+        }
+    }
+
+    private void setupOverlay() {
+        if (overlay != null) {
+            removeOverlay();
+        }
+        updateOverlayHeader();
+        rebuildOverlayTables();
+
+        // Display overlay
+        overlay = new GnomeRestaurantOverlay(this, stepIngredientsOverlayTable, nextRawIngredientsOverlayTable);
+        overlayManager.add(overlay);
+    }
+
+    private void setupOrderTimer() {
+        LOGGER.debug("Setting up order timer");
+        int numSecondsLeft;
+
+        if (customer.getDifficulty() == OrderDifficulty.HARD) {
+            numSecondsLeft = 660;
+        } else {
+            numSecondsLeft = 360;
+        }
+
+        if (timer != null) {
+            LOGGER.debug("Removing previous order timer");
+            removeTimer();
+        }
+        timer = new Timer(numSecondsLeft, ChronoUnit.SECONDS, itemManager.getImage(order.getItemId()), this);
+        timer.setTooltip(tooltipText);
+
+        infoBoxManager.addInfoBox(timer);
+    }
+
+    private void showHintArrow() {
+        if (!setHintArrowToCustomer()) {
+            // NPC not in sight
+            // Show hint arrow in minimap instead
+            client.setHintArrow(customer.getLocation(client));
+        }
+    }
+
+    private void showWorldMapPoint() {
+        if (worldMapPoint != null) {
+            removeWorldMapPoint();
+        }
+
+        worldMapPoint = WorldMapPoint.builder().name(customer.getName())
+                                     .worldPoint(customer.getLocation(client))
+                                     .image(itemManager.getImage(ItemID.ALUFT_DELIVERY_BOX))
+                                     .build();
+        worldMapPoint.setSnapToEdge(true);
+        worldMapPoint.setJumpOnClick(true);
+        worldMapPoint.setTooltip(tooltipText);
+        worldMapPointManager.add(worldMapPoint);
+    }
+
+    private boolean setHintArrowToCustomer() {
+        var npcs = client.getTopLevelWorldView().npcs();
+
+        for (NPC npc : npcs) {
+            if (npc.getId() == customer.getNpcTypeId(client)) {
+                client.setHintArrow(npc);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    @Subscribe
+    public void onNpcSpawned(final NpcSpawned event) {
+        var npc = event.getNpc();
+
+        if (order == null || !config.showHintArrow()) {
+            return;
+        }
+        if (npc.getId() == customer.getNpcTypeId(client)) {
+            client.setHintArrow(npc);
+        }
+    }
+
+    @Subscribe
+    public void onNpcDespawned(final NpcDespawned event) {
+        var npc = event.getNpc();
+
+        if (order == null || !config.showHintArrow()) {
+            return;
+        }
+        if (npc.getId() == customer.getNpcTypeId(client)) {
+            client.setHintArrow(customer.getLocation(client));
+        }
+    }
+
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged event) {
+        switch (event.getVarbitId()) {
+            case VarbitID.ALUFT_MINIGAME_STARTED:
+                onAluftMinigameStarted(event.getValue());
+                break;
+            case VarbitID.ALUFT_CURRENT_CUSTOMER:
+                onAluftCustomerChanged(event.getValue());
+                break;
+            case VarbitID.ALUFT_CURRENT_ORDER:
+                onAluftOrderChanged(event.getValue());
+                break;
+            case VarbitID.ALUFT_REFUSED_HARD_ORDER:
+                onAluftRefusedOrderChanged(event.getValue());
+                break;
+        }
+    }
+
+    private void onAluftMinigameStarted(int value) {
+        LOGGER.debug("Aluft Minigame started is {}", value);
+
+        if (value == 0) {
+            resetPlugin();
+        }
+    }
+
+    private void onAluftCustomerChanged(int customerId) {
+        if (customerId == 0) {
+            customer = null;
+            return;
+        }
+        customer = Customer.forId(customerId);
+        LOGGER.debug("Customer is now {}", customer);
+        queueUpdateOrder();
+    }
+
+    private void onAluftOrderChanged(int orderId) {
+        if (orderId == 0) {
+            order = null;
+            return;
+        }
+        order = Order.forId(orderId);
+        LOGGER.debug("Order is now {}", order);
+        queueUpdateOrder();
+    }
+
+    private void onAluftRefusedOrderChanged(int value) {
+        if (value == 1) {
+            LOGGER.debug("Refused hard order, setting up timer");
+            onRefusedHardOrder();
+        }
+    }
+
+    @Subscribe
+    public void onItemContainerChanged(ItemContainerChanged event) {
+        if (event.getContainerId() != InventoryID.INV) {
+            return;
+        }
+        if (order == null) {
+            return;
+        }
+        // Has player finished a step?
+
+        if (updateOrderStep()) {
+            updateOverlayHeader();
+            rebuildOverlayTables();
+        } else {
+            updateOverlayTables();
+        }
+    }
+
+    private void updateOverlayHeader() {
+        var instruction = order.getSteps().get(stepIdx).getInstruction().getOverlayDirections();
+        overlayHeader = new OverlayHeader(instruction, stepIdx + 1, order.getSteps().size());
+    }
+
+    private void rebuildOverlayTables() {
+        clearOverlayTables();
+
+        List<Ingredient> stepIngredients = order.getSteps().get(stepIdx).getIngredients();
+        rebuildOverlayTable(stepIngredients, stepIngredientsOverlayTable);
+
+        List<Ingredient> nextRawIngredients = order.getNextRawIngredients(stepIdx);
+        rebuildOverlayTable(nextRawIngredients, nextRawIngredientsOverlayTable);
+    }
+
+    private void rebuildOverlayTable(List<Ingredient> ingredients, List<OverlayTableEntry> overlayTable) {
+        for (Ingredient ingredient : ingredients) {
+            int itemId = ingredient.getItemId();
+            String itemName = itemManager.getItemComposition(itemId).getName();
+            int inventoryCount = getItemCount(itemId);
+            int expectedCount = ingredient.getCount();
+
+            overlayTable.add(new OverlayTableEntry(itemId, itemName, inventoryCount, expectedCount));
+        }
+    }
+
+    private void updateOverlayTables() {
+        updateOverlayTable(stepIngredientsOverlayTable);
+        updateOverlayTable(nextRawIngredientsOverlayTable);
+    }
+
+    private void updateOverlayTable(List<OverlayTableEntry> overlayTable) {
+        for (OverlayTableEntry entry : overlayTable) {
+            int inventoryCount = getItemCount(entry.getItemId());
+            if (entry.getInventoryCount() != inventoryCount) {
+                entry.setInventoryCount(inventoryCount);
+            }
+        }
+    }
+
+    // Config
+
+    @Provides
+    GnomeRestaurantConfig provideConfig(ConfigManager configManager) {
+        return configManager.getConfig(GnomeRestaurantConfig.class);
+    }
+
+    // Config group keys
+
+    public static final String SHOW_DELAY_TIMER = "showDelayTimer";
+    public static final String SHOW_ORDER_TIMER = "showOrderTimer";
+    public static final String SHOW_OVERLAY = "showOverlay";
+    public static final String SHOW_HINT_ARROW = "showHintArrow";
+    public static final String SHOW_WORLD_MAP_POINT = "showWorldMapPoint";
+
+    /**
+     * Monitor changes to plugin config and update the plugin accordingly
+     *
+     * @param event indicates the setting that was changed and its new value
+     */
+    @Subscribe
+    public void onConfigChanged(ConfigChanged event) {
+        if (order != null) {
+            if (event.getKey().equals(SHOW_ORDER_TIMER)) {
+                if (event.getNewValue().equals("false")) {
+                    removeTimer();
+                }
+            } else if (event.getKey().equals(SHOW_OVERLAY)) {
+                if (event.getNewValue().equals("false")) {
+                    removeOverlay();
+                } else {
+                    // Must be called from client thread
+                    clientThread.invoke(this::setupOverlay);
+                }
+            } else if (event.getKey().equals(SHOW_HINT_ARROW)) {
+                if (event.getNewValue().equals("false")) {
+                    client.clearHintArrow();
+                } else {
+                    showHintArrow();
+                }
+            } else if (event.getKey().equals(SHOW_WORLD_MAP_POINT)) {
+                if (event.getNewValue().equals("false")) {
+                    removeWorldMapPoint();
+                } else {
+                    showWorldMapPoint();
+                }
+            }
+        } else {
+            if (!event.getGroup().equals("gnomerestaurant")) {
+                // This plugin's config has not changed
+                return;
+            } else if (event.getKey().equals(SHOW_DELAY_TIMER) && refusedHardOrder) {
+                if (event.getNewValue().equals("false")) {
+                    removeTimer();
+                }
+            }
+        }
+    }
+
+    // UI cleaning
+
+    private void removeTimer() {
+        infoBoxManager.removeInfoBox(timer);
+        timer = null;
+    }
+
+    private void removeOverlay() {
+        clearOverlayTables();
+        overlayManager.remove(overlay);
+        overlay = null;
+    }
+
+    private void removeWorldMapPoint() {
+        worldMapPointManager.remove(worldMapPoint);
+        worldMapPoint = null;
+    }
+
+    private void clearOverlayTables() {
+        stepIngredientsOverlayTable.clear();
+        nextRawIngredientsOverlayTable.clear();
+    }
 }
 
 package io.github.mmagicala.gnomeRestaurant.order;
@@ -258,43 +675,94 @@ public enum Customer {
     }
 }
 
-package io.github.mmagicala.gnomeRestaurant.overlay;
+package io.github.mmagicala.gnomeRestaurant.order;
 
-public class OverlayTableEntry {
-    // Used by plugin to update entry
+import net.runelite.api.Client;
+import net.runelite.api.coords.WorldPoint;
 
-    private final int itemId;
-    // Used by overlay table for output
-    private final String itemName;
-    private final int requiredCount;
-    private int inventoryCount;
+public interface CustomerLocation {
 
-    public OverlayTableEntry(int itemId, String itemName, int inventoryCount, int requiredCount) {
-        this.itemId = itemId;
-        this.itemName = itemName;
-        this.inventoryCount = inventoryCount;
-        this.requiredCount = requiredCount;
+    int npcTypeId(Client client);
+
+    WorldPoint resolve(Client client);
+
+    static CustomerLocation fixed(int npcTypeId, int x, int y) {
+        return fixed(npcTypeId, x, y, 0);
     }
 
-    public int getItemId() {
-        return this.itemId;
+    static CustomerLocation fixed(int npcTypeId, int x, int y, int plane) {
+        return new StaticCustomerLocation(npcTypeId, new WorldPoint(x, y, plane));
     }
 
-    public String getItemName() {
-        return this.itemName;
+    class StaticCustomerLocation implements CustomerLocation {
+
+        private final int npcTypeId;
+        private final WorldPoint worldPoint;
+
+        private StaticCustomerLocation(int npcTypeId, WorldPoint worldPoint) {
+            this.npcTypeId = npcTypeId;
+            this.worldPoint = worldPoint;
+        }
+
+        @Override
+        public int npcTypeId(Client client) {
+            return npcTypeId;
+        }
+
+        @Override
+        public WorldPoint resolve(Client client) {
+            return worldPoint;
+        }
+    }
+}
+
+package io.github.mmagicala.gnomeRestaurant.order;
+
+import net.runelite.api.Client;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.gameval.NpcID;
+import net.runelite.api.gameval.VarbitID;
+
+public class GarkorLocation implements CustomerLocation {
+
+    @Override
+    public int npcTypeId(Client client) {
+        var mm2progress = client.getVarbitValue(VarbitID.MM2_PROGRESS);
+
+        if (mm2progress >= 195 && mm2progress <= 200) {
+            // Post mm2
+            return NpcID.MM_GARKOR_GS;
+        } else if (mm2progress >= 140 && mm2progress <= 175) {
+            // Gnome Stronghold Fence
+            return NpcID.MM2_GARKOR_BREACH;
+        } else {
+            // Ape Atoll
+            return NpcID.MM_GARKOR_AA;
+        }
     }
 
-    public int getInventoryCount() {
-        return this.inventoryCount;
-    }
+    @Override
+    public WorldPoint resolve(Client client) {
+        var mm2progress = client.getVarbitValue(VarbitID.MM2_PROGRESS);
 
-    public int getRequiredCount() {
-        return this.requiredCount;
+        if (mm2progress >= 195 && mm2progress <= 200) {
+            // Post mm2
+            return new WorldPoint(2479, 3463, 0);
+        } else if (mm2progress >= 140 && mm2progress <= 175) {
+            // Gnome Stronghold Fence
+            return new WorldPoint(2434, 3519, 0);
+        } else {
+            // Ape Atoll
+            return new WorldPoint(2805, 2762, 0);
+        }
     }
+}
 
-    public void setInventoryCount(int inventoryCount) {
-        this.inventoryCount = inventoryCount;
-    }
+package io.github.mmagicala.gnomeRestaurant.order;
+
+public enum OrderDifficulty {
+    EASY,
+    HARD
 }
 
 /*
@@ -431,6 +899,45 @@ public class OverlayHeader {
     }
 }
 
+package io.github.mmagicala.gnomeRestaurant.overlay;
+
+public class OverlayTableEntry {
+    // Used by plugin to update entry
+
+    private final int itemId;
+    // Used by overlay table for output
+    private final String itemName;
+    private final int requiredCount;
+    private int inventoryCount;
+
+    public OverlayTableEntry(int itemId, String itemName, int inventoryCount, int requiredCount) {
+        this.itemId = itemId;
+        this.itemName = itemName;
+        this.inventoryCount = inventoryCount;
+        this.requiredCount = requiredCount;
+    }
+
+    public int getItemId() {
+        return this.itemId;
+    }
+
+    public String getItemName() {
+        return this.itemName;
+    }
+
+    public int getInventoryCount() {
+        return this.inventoryCount;
+    }
+
+    public int getRequiredCount() {
+        return this.requiredCount;
+    }
+
+    public void setInventoryCount(int inventoryCount) {
+        this.inventoryCount = inventoryCount;
+    }
+}
+
 /*
  * Copyright (c) 2020, MMagicala <https://github.com/MMagicala>
  * All rights reserved.
@@ -459,27 +966,32 @@ public class OverlayHeader {
 
 package io.github.mmagicala.gnomeRestaurant.recipe;
 
-public enum RecipeInstruction {
-    CREATE_RAW("Create the raw batter"),
-    CREATE_HALF_BAKED("Bake the raw batter"),
-    COMBINE_INGREDIENTS("Combine ingredients"),
-    BAKE_HALF_MADE("Bake item again"),
-    ADD_TOPPINGS("Add topping ingredients"),
+public class Ingredient {
 
-    MIX_COCKTAIL("Mix ingredients in the cocktail shaker"),
-    POUR("Pour mix into the cocktail glass"),
-    HEAT_COCKTAIL("Heat the cocktail"),
+    private final int itemId;
+    private final int count;
+    private final boolean isIntermediate;
 
-    DELIVER("Deliver the item to recipient");
-
-    private final String overlayDirections;
-
-    RecipeInstruction(String overlayDirections) {
-        this.overlayDirections = overlayDirections;
+    public Ingredient(int itemId, int count) {
+        this(itemId, count, false);
     }
 
-    public String getOverlayDirections() {
-        return this.overlayDirections;
+    public Ingredient(int itemId, int count, boolean isIntermediate) {
+        this.itemId = itemId;
+        this.count = count;
+        this.isIntermediate = isIntermediate;
+    }
+
+    public int getItemId() {
+        return this.itemId;
+    }
+
+    public int getCount() {
+        return this.count;
+    }
+
+    public boolean isIntermediate() {
+        return this.isIntermediate;
     }
 }
 
@@ -1139,32 +1651,27 @@ public enum Order {
 
 package io.github.mmagicala.gnomeRestaurant.recipe;
 
-public class Ingredient {
+public enum RecipeInstruction {
+    CREATE_RAW("Create the raw batter"),
+    CREATE_HALF_BAKED("Bake the raw batter"),
+    COMBINE_INGREDIENTS("Combine ingredients"),
+    BAKE_HALF_MADE("Bake item again"),
+    ADD_TOPPINGS("Add topping ingredients"),
 
-    private final int itemId;
-    private final int count;
-    private final boolean isIntermediate;
+    MIX_COCKTAIL("Mix ingredients in the cocktail shaker"),
+    POUR("Pour mix into the cocktail glass"),
+    HEAT_COCKTAIL("Heat the cocktail"),
 
-    public Ingredient(int itemId, int count) {
-        this(itemId, count, false);
+    DELIVER("Deliver the item to recipient");
+
+    private final String overlayDirections;
+
+    RecipeInstruction(String overlayDirections) {
+        this.overlayDirections = overlayDirections;
     }
 
-    public Ingredient(int itemId, int count, boolean isIntermediate) {
-        this.itemId = itemId;
-        this.count = count;
-        this.isIntermediate = isIntermediate;
-    }
-
-    public int getItemId() {
-        return this.itemId;
-    }
-
-    public int getCount() {
-        return this.count;
-    }
-
-    public boolean isIntermediate() {
-        return this.isIntermediate;
+    public String getOverlayDirections() {
+        return this.overlayDirections;
     }
 }
 
@@ -1233,513 +1740,6 @@ public class RecipeStep {
 
     public int getProducedItemId() {
         return this.producedItemId;
-    }
-}
-
-/*
- * Copyright (c) 2020, MMagicala <https://github.com/MMagicala>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *  Redistributions of source code must retain the above copyright notice, this
- *   list of conditions and the following disclaimer.
- *
- *  Redistributions in binary form must reproduce the above copyright notice,
- *   this list of conditions and the following disclaimer in the documentation
- *   and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-package io.github.mmagicala.gnomeRestaurant;
-
-import com.google.inject.Provides;
-import io.github.mmagicala.gnomeRestaurant.order.Customer;
-import io.github.mmagicala.gnomeRestaurant.order.OrderDifficulty;
-import io.github.mmagicala.gnomeRestaurant.overlay.GnomeRestaurantOverlay;
-import io.github.mmagicala.gnomeRestaurant.overlay.OverlayHeader;
-import io.github.mmagicala.gnomeRestaurant.overlay.OverlayTableEntry;
-import io.github.mmagicala.gnomeRestaurant.recipe.Ingredient;
-import io.github.mmagicala.gnomeRestaurant.recipe.Order;
-import net.runelite.api.Client;
-import net.runelite.api.ItemContainer;
-import net.runelite.api.NPC;
-import net.runelite.api.events.ItemContainerChanged;
-import net.runelite.api.events.NpcDespawned;
-import net.runelite.api.events.NpcSpawned;
-import net.runelite.api.events.VarbitChanged;
-import net.runelite.api.gameval.InventoryID;
-import net.runelite.api.gameval.ItemID;
-import net.runelite.api.gameval.VarbitID;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.ConfigChanged;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayManager;
-import net.runelite.client.ui.overlay.infobox.InfoBoxManager;
-import net.runelite.client.ui.overlay.infobox.Timer;
-import net.runelite.client.ui.overlay.worldmap.WorldMapPoint;
-import net.runelite.client.ui.overlay.worldmap.WorldMapPointManager;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import javax.inject.Inject;
-import java.time.temporal.ChronoUnit;
-import java.util.ArrayList;
-import java.util.List;
-
-@PluginDescriptor(name = "Gnome Restaurant")
-public class GnomeRestaurantPlugin extends Plugin {
-
-    private static final Logger LOGGER = LoggerFactory.getLogger(GnomeRestaurantPlugin.class);
-
-    @Inject
-    private Client client;
-
-    @Inject
-    private GnomeRestaurantConfig config;
-
-    @Inject
-    private InfoBoxManager infoBoxManager;
-
-    @Inject
-    private OverlayManager overlayManager;
-
-    @Inject
-    private ItemManager itemManager;
-
-    @Inject
-    private ClientThread clientThread;
-
-    @Inject
-    private WorldMapPointManager worldMapPointManager;
-
-    // UI
-
-    private Timer timer;
-    private Overlay overlay;
-    private WorldMapPoint worldMapPoint;
-
-    private String tooltipText;
-
-    private boolean refusedHardOrder = false;
-    private boolean queuedUpdate = false;
-
-    // Current order information
-
-    private Order order;
-    private Customer customer;
-    private int stepIdx;
-
-    // Overlay
-
-    private OverlayHeader overlayHeader = new OverlayHeader("null", -1, -1);
-    private final List<OverlayTableEntry> stepIngredientsOverlayTable = new ArrayList<>();
-    private final List<OverlayTableEntry> nextRawIngredientsOverlayTable = new ArrayList<>();
-
-    public OverlayHeader overlayHeader() {
-        return overlayHeader;
-    }
-
-    @Override
-    protected void shutDown() {
-        resetPlugin();
-    }
-
-    private void resetPlugin() {
-        removeTimer();
-        removeOverlay();
-        removeWorldMapPoint();
-        client.clearHintArrow();
-
-        stepIdx = 0;
-
-        refusedHardOrder = false;
-
-        order = null;
-        customer = null;
-    }
-
-    private void onRefusedHardOrder() {
-        resetPlugin();
-
-        setupRefusedOrderTimer();
-        refusedHardOrder = true;
-    }
-
-    private void updateOrder() {
-        updateOrderStep();
-        setupUI();
-    }
-
-    private void queueUpdateOrder() {
-        if (queuedUpdate) {
-            return;
-        }
-        clientThread.invokeAtTickEnd(() -> {
-            LOGGER.debug("Updating ui for order={}, customer={}", order, customer);
-            updateOrder();
-            queuedUpdate = false;
-        });
-        queuedUpdate = true;
-    }
-
-    private void setupRefusedOrderTimer() {
-        timer = new Timer(5, ChronoUnit.MINUTES, itemManager.getImage(ItemID.ALUFT_DELIVERY_BOX), this);
-        timer.setTooltip("Refused hard order cooldown");
-        infoBoxManager.addInfoBox(timer);
-    }
-
-    /**
-     * Update the step we are working on in the recipe
-     * Returns whether a step has been updated or not
-     **/
-    private boolean updateOrderStep() {
-        // Go from the beginning of the recipe to the final item produced
-
-        int newStepIdx = 0;
-
-        for (int i = 0; i < order.getSteps().size() - 1; i++) {
-            int producedId = order.getSteps().get(i).getProducedItemId();
-            if (getItemCount(producedId) > 0) {
-                // We produced the item for this step
-                newStepIdx = i + 1;
-            }
-        }
-        boolean stepUpdated = newStepIdx != stepIdx;
-
-        stepIdx = newStepIdx;
-        return stepUpdated;
-    }
-
-    private int getItemCount(int itemId) {
-        // Assume the inventory is empty (and player just logged in) if it is null
-        ItemContainer inventory = client.getItemContainer(InventoryID.INV);
-
-        if (inventory == null) {
-            return 0;
-        } else {
-            return inventory.count(itemId);
-        }
-    }
-
-    private void setupUI() {
-        tooltipText = "Deliver " + order.getName() + " to " + customer.getName();
-
-        if (config.showOverlay()) {
-            setupOverlay();
-        }
-
-        if (config.showOrderTimer()) {
-            setupOrderTimer();
-        }
-
-        if (config.showHintArrow()) {
-            showHintArrow();
-        }
-
-        if (config.showWorldMapPoint()) {
-            showWorldMapPoint();
-        }
-    }
-
-    private void setupOverlay() {
-        if (overlay != null) {
-            removeOverlay();
-        }
-        updateOverlayHeader();
-        rebuildOverlayTables();
-
-        // Display overlay
-        overlay = new GnomeRestaurantOverlay(this, stepIngredientsOverlayTable, nextRawIngredientsOverlayTable);
-        overlayManager.add(overlay);
-    }
-
-    private void setupOrderTimer() {
-        LOGGER.debug("Setting up order timer");
-        int numSecondsLeft;
-
-        if (customer.getDifficulty() == OrderDifficulty.HARD) {
-            numSecondsLeft = 660;
-        } else {
-            numSecondsLeft = 360;
-        }
-
-        if (timer != null) {
-            LOGGER.debug("Removing previous order timer");
-            removeTimer();
-        }
-        timer = new Timer(numSecondsLeft, ChronoUnit.SECONDS, itemManager.getImage(order.getItemId()), this);
-        timer.setTooltip(tooltipText);
-
-        infoBoxManager.addInfoBox(timer);
-    }
-
-    private void showHintArrow() {
-        if (!setHintArrowToCustomer()) {
-            // NPC not in sight
-            // Show hint arrow in minimap instead
-            client.setHintArrow(customer.getLocation(client));
-        }
-    }
-
-    private void showWorldMapPoint() {
-        if (worldMapPoint != null) {
-            removeWorldMapPoint();
-        }
-
-        worldMapPoint = WorldMapPoint.builder().name(customer.getName())
-                                     .worldPoint(customer.getLocation(client))
-                                     .image(itemManager.getImage(ItemID.ALUFT_DELIVERY_BOX))
-                                     .build();
-        worldMapPoint.setSnapToEdge(true);
-        worldMapPoint.setJumpOnClick(true);
-        worldMapPoint.setTooltip(tooltipText);
-        worldMapPointManager.add(worldMapPoint);
-    }
-
-    private boolean setHintArrowToCustomer() {
-        var npcs = client.getTopLevelWorldView().npcs();
-
-        for (NPC npc : npcs) {
-            if (npc.getId() == customer.getNpcTypeId(client)) {
-                client.setHintArrow(npc);
-                return true;
-            }
-        }
-        return false;
-    }
-
-    @Subscribe
-    public void onNpcSpawned(final NpcSpawned event) {
-        var npc = event.getNpc();
-
-        if (order == null || !config.showHintArrow()) {
-            return;
-        }
-        if (npc.getId() == customer.getNpcTypeId(client)) {
-            client.setHintArrow(npc);
-        }
-    }
-
-    @Subscribe
-    public void onNpcDespawned(final NpcDespawned event) {
-        var npc = event.getNpc();
-
-        if (order == null || !config.showHintArrow()) {
-            return;
-        }
-        if (npc.getId() == customer.getNpcTypeId(client)) {
-            client.setHintArrow(customer.getLocation(client));
-        }
-    }
-
-    @Subscribe
-    public void onVarbitChanged(VarbitChanged event) {
-        switch (event.getVarbitId()) {
-            case VarbitID.ALUFT_MINIGAME_STARTED:
-                onAluftMinigameStarted(event.getValue());
-                break;
-            case VarbitID.ALUFT_CURRENT_CUSTOMER:
-                onAluftCustomerChanged(event.getValue());
-                break;
-            case VarbitID.ALUFT_CURRENT_ORDER:
-                onAluftOrderChanged(event.getValue());
-                break;
-            case VarbitID.ALUFT_REFUSED_HARD_ORDER:
-                onAluftRefusedOrderChanged(event.getValue());
-                break;
-        }
-    }
-
-    private void onAluftMinigameStarted(int value) {
-        LOGGER.debug("Aluft Minigame started is {}", value);
-
-        if (value == 0) {
-            resetPlugin();
-        }
-    }
-
-    private void onAluftCustomerChanged(int customerId) {
-        if (customerId == 0) {
-            customer = null;
-            return;
-        }
-        customer = Customer.forId(customerId);
-        LOGGER.debug("Customer is now {}", customer);
-        queueUpdateOrder();
-    }
-
-    private void onAluftOrderChanged(int orderId) {
-        if (orderId == 0) {
-            order = null;
-            return;
-        }
-        order = Order.forId(orderId);
-        LOGGER.debug("Order is now {}", order);
-        queueUpdateOrder();
-    }
-
-    private void onAluftRefusedOrderChanged(int value) {
-        if (value == 1) {
-            LOGGER.debug("Refused hard order, setting up timer");
-            onRefusedHardOrder();
-        }
-    }
-
-    @Subscribe
-    public void onItemContainerChanged(ItemContainerChanged event) {
-        if (event.getContainerId() != InventoryID.INV) {
-            return;
-        }
-        if (order == null) {
-            return;
-        }
-        // Has player finished a step?
-
-        if (updateOrderStep()) {
-            updateOverlayHeader();
-            rebuildOverlayTables();
-        } else {
-            updateOverlayTables();
-        }
-    }
-
-    private void updateOverlayHeader() {
-        var instruction = order.getSteps().get(stepIdx).getInstruction().getOverlayDirections();
-        overlayHeader = new OverlayHeader(instruction, stepIdx + 1, order.getSteps().size());
-    }
-
-    private void rebuildOverlayTables() {
-        clearOverlayTables();
-
-        List<Ingredient> stepIngredients = order.getSteps().get(stepIdx).getIngredients();
-        rebuildOverlayTable(stepIngredients, stepIngredientsOverlayTable);
-
-        List<Ingredient> nextRawIngredients = order.getNextRawIngredients(stepIdx);
-        rebuildOverlayTable(nextRawIngredients, nextRawIngredientsOverlayTable);
-    }
-
-    private void rebuildOverlayTable(List<Ingredient> ingredients, List<OverlayTableEntry> overlayTable) {
-        for (Ingredient ingredient : ingredients) {
-            int itemId = ingredient.getItemId();
-            String itemName = itemManager.getItemComposition(itemId).getName();
-            int inventoryCount = getItemCount(itemId);
-            int expectedCount = ingredient.getCount();
-
-            overlayTable.add(new OverlayTableEntry(itemId, itemName, inventoryCount, expectedCount));
-        }
-    }
-
-    private void updateOverlayTables() {
-        updateOverlayTable(stepIngredientsOverlayTable);
-        updateOverlayTable(nextRawIngredientsOverlayTable);
-    }
-
-    private void updateOverlayTable(List<OverlayTableEntry> overlayTable) {
-        for (OverlayTableEntry entry : overlayTable) {
-            int inventoryCount = getItemCount(entry.getItemId());
-            if (entry.getInventoryCount() != inventoryCount) {
-                entry.setInventoryCount(inventoryCount);
-            }
-        }
-    }
-
-    // Config
-
-    @Provides
-    GnomeRestaurantConfig provideConfig(ConfigManager configManager) {
-        return configManager.getConfig(GnomeRestaurantConfig.class);
-    }
-
-    // Config group keys
-
-    public static final String SHOW_DELAY_TIMER = "showDelayTimer";
-    public static final String SHOW_ORDER_TIMER = "showOrderTimer";
-    public static final String SHOW_OVERLAY = "showOverlay";
-    public static final String SHOW_HINT_ARROW = "showHintArrow";
-    public static final String SHOW_WORLD_MAP_POINT = "showWorldMapPoint";
-
-    /**
-     * Monitor changes to plugin config and update the plugin accordingly
-     *
-     * @param event indicates the setting that was changed and its new value
-     */
-    @Subscribe
-    public void onConfigChanged(ConfigChanged event) {
-        if (order != null) {
-            if (event.getKey().equals(SHOW_ORDER_TIMER)) {
-                if (event.getNewValue().equals("false")) {
-                    removeTimer();
-                }
-            } else if (event.getKey().equals(SHOW_OVERLAY)) {
-                if (event.getNewValue().equals("false")) {
-                    removeOverlay();
-                } else {
-                    // Must be called from client thread
-                    clientThread.invoke(this::setupOverlay);
-                }
-            } else if (event.getKey().equals(SHOW_HINT_ARROW)) {
-                if (event.getNewValue().equals("false")) {
-                    client.clearHintArrow();
-                } else {
-                    showHintArrow();
-                }
-            } else if (event.getKey().equals(SHOW_WORLD_MAP_POINT)) {
-                if (event.getNewValue().equals("false")) {
-                    removeWorldMapPoint();
-                } else {
-                    showWorldMapPoint();
-                }
-            }
-        } else {
-            if (!event.getGroup().equals("gnomerestaurant")) {
-                // This plugin's config has not changed
-                return;
-            } else if (event.getKey().equals(SHOW_DELAY_TIMER) && refusedHardOrder) {
-                if (event.getNewValue().equals("false")) {
-                    removeTimer();
-                }
-            }
-        }
-    }
-
-    // UI cleaning
-
-    private void removeTimer() {
-        infoBoxManager.removeInfoBox(timer);
-        timer = null;
-    }
-
-    private void removeOverlay() {
-        clearOverlayTables();
-        overlayManager.remove(overlay);
-        overlay = null;
-    }
-
-    private void removeWorldMapPoint() {
-        worldMapPointManager.remove(worldMapPoint);
-        worldMapPoint = null;
-    }
-
-    private void clearOverlayTables() {
-        stepIngredientsOverlayTable.clear();
-        nextRawIngredientsOverlayTable.clear();
     }
 }
 

@@ -1,535 +1,91 @@
-package com.BaPB;
-
-import com.google.gson.Gson;
-import com.google.gson.annotations.SerializedName;
-import lombok.extern.slf4j.Slf4j;
-import okhttp3.*;
-
-import javax.crypto.Mac;
-import javax.crypto.spec.SecretKeySpec;
-import javax.inject.Inject;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.time.Instant;
-import java.time.LocalDateTime;
-import java.time.ZoneOffset;
-import java.time.format.DateTimeFormatter;
-import java.util.*;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ExecutorService;
-
-@Slf4j
-public class BaPBService
-{
-    private static final String TOKEN_ISSUER_URL   = "https://osrs-ba-api-7f97e40f532b.herokuapp.com/api/v1/tokens/public/";
-    private static final String SUBMIT_RUN_URL   = "https://osrs-ba-api-7f97e40f532b.herokuapp.com/api/v1/rounds/";
-
-    private static final String SIGNING_SECRET = "ba-4-all";
-    private String cachedToken = null;
-    private Instant cachedTokenExpiry = null;
-
-    private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
-
-    private final ExecutorService executor = Executors.newSingleThreadExecutor();
-    private final OkHttpClient http;
-    private final Gson gson;
-    private final BaPBConfig config;
-
-    @Inject
-    public BaPBService(OkHttpClient http, Gson gson, BaPBConfig config)
-    {
-        this.http = http;
-        this.gson = gson;
-        this.config = config;
-    }
-
-    public void shutdown()
-    {
-        executor.shutdown();
-    }
-
-    private boolean isTokenValid()
-    {
-        if (cachedToken == null || cachedToken.isEmpty()) return false;
-        if (cachedTokenExpiry == null ) return false;
-
-        // Expire 30 seconds early to avoid edge cases
-        Instant bufferExpiry = cachedTokenExpiry.minusSeconds(30);
-        return Instant.now().isBefore(bufferExpiry);
-    }
-
-    private void fetchToken(String currentPlayer) throws Exception
-    {
-        String timestamp = String.valueOf(Instant.now().toEpochMilli());
-        String nonce = UUID.randomUUID().toString();
-        String signature = generateHmacSha256(SIGNING_SECRET, timestamp + nonce);
-
-        // Create JSON body
-        Map<String, String> bodyMap = new HashMap<>();
-        bodyMap.put("description", currentPlayer);
-        String jsonBody = gson.toJson(bodyMap);
-
-        RequestBody body = RequestBody.create(JSON, jsonBody);
-
-        Request req = new Request.Builder()
-                .url(TOKEN_ISSUER_URL)
-                .header("X-Timestamp", timestamp)
-                .header("X-Nonce", nonce)
-                .header("X-Signature", signature)
-                .post(body)
-                .build();
-
-        try (Response resp = http.newCall(req).execute())
-        {
-            if (!resp.isSuccessful() || resp.body() == null)
-                throw new RuntimeException("Failed to fetch API token: " + resp.code() + " " + resp.message());
-
-
-            String rawResponse = resp.body().string();  // read raw response
-
-            log.debug("Raw API response: {}", rawResponse);
-
-            TokenWrapper wrapper = gson.fromJson(rawResponse, TokenWrapper.class);
-            if (wrapper == null || wrapper.data == null || wrapper.data.token == null || wrapper.data.token.isEmpty())
-                throw new RuntimeException("Token issuer returned no 'token' key");
-
-            cachedToken = wrapper.data.token;
-
-            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSS");
-            LocalDateTime ldt = LocalDateTime.parse(wrapper.data.expiresAt, formatter);
-            cachedTokenExpiry = ldt.toInstant(ZoneOffset.UTC);
-        }
-    }
-
-    private void submitRunToAPI(
-            Map<String, String> currentTeam,
-            String roundFormat,
-            Timers timers,
-            boolean scroller,
-            String submittedBy,
-            String userUuid
-    ) throws IOException
-    {
-        // Prepare players
-        List<PlayerEntry> players = new ArrayList<>();
-        for (Map.Entry<String, String> e : currentTeam.entrySet())
-        {
-            String uuid = (userUuid != null && e.getKey().equals(submittedBy)) ? userUuid : null;
-            players.add(new PlayerEntry(e.getKey(), e.getValue(), uuid));
-        }
-
-        // Prepare wave data
-        List<WaveEntry> waveData = new ArrayList<>();
-        for (Map.Entry<Integer, Timers.WaveData> entry : timers.getWaveData().entrySet()) {
-            int waveNumber = entry.getKey();
-            Timers.WaveData data = entry.getValue();
-
-            double waveTime = 0;
-            int qsTime = 0;
-            boolean goodPremove = false;
-            boolean reset = false;
-            Lobby.RelativePoint rp = null;
-
-            if (data != null) {
-                waveTime = data.getWaveTimer().getElapsedSeconds(scroller, false); // true = isLeader/scroller
-                qsTime = data.getQsTimer().roundTicks;
-                goodPremove = data.isGoodPremove();
-                reset = data.getLobbyCount() > 1;
-                rp = data.getRelativePoint();
-            }
-
-            waveData.add(new WaveEntry(waveNumber, waveTime, qsTime, goodPremove, reset, rp));
-        }
-
-        // Prepare round time
-        double roundTime = timers.getRoundTimer().getElapsedSeconds(scroller);
-
-        SubmitPayload payload = new SubmitPayload(
-                roundFormat,
-                roundTime,
-                submittedBy,
-                scroller,
-                players,
-                waveData
-        );
-
-        RequestBody body = RequestBody.create(JSON, gson.toJson(payload));
-        Request req = new Request.Builder()
-                .url(SUBMIT_RUN_URL)
-                .addHeader("Authorization", "Bearer " + cachedToken)
-                .post(body)
-                .build();
-
-        try (Response resp = http.newCall(req).execute())
-        {
-            if (resp.isSuccessful())
-            {
-                log.info("Successfully submitted run to API");
-            }
-            else
-            {
-                log.warn("API submission failed: {} {}", resp.code(), resp.message());
-            }
-        }
-    }
-
-    public void handleRoundEnd(
-            Map<String, String> currentTeam,
-            String roundFormat,
-            Timers timers,
-            boolean scroller,
-            String submittedBy
-    )
-    {
-        if (!config.SubmitRuns() || roundFormat == null)
-        {
-            log.debug("SubmitRuns is disabled or roundFormat is null. Skipping round submission.");
-            return;
-        }
-
-        String userUuid = config.uuid_key();
-
-        executor.execute(() -> {
-            try {
-                // Validate token
-                if (!isTokenValid()) {
-                    log.info("API token invalid or expired. Fetching a new one...");
-                    fetchToken(submittedBy);
-                }
-
-                submitRunToAPI(currentTeam, roundFormat, timers, scroller, submittedBy, userUuid);
-
-            } catch (Exception e) {
-                log.warn("Failed during token check or run submission", e);
-            }
-        });
-    }
-
-    private String generateHmacSha256(String key, String data) throws Exception
-    {
-        Mac mac = Mac.getInstance("HmacSHA256");
-        mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
-        byte[] rawHmac = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
-        return Base64.getEncoder().encodeToString(rawHmac);
-    }
-
-    private static class TokenWrapper {
-        String status;
-        TokenResponse data;
-        Object error;
-    }
-
-    private static class TokenResponse
-    {
-        @SerializedName("token")
-        String token;
-
-        @SerializedName("expires_at")
-        String expiresAt;
-    }
-
-    private static class WaveEntry {
-        @SerializedName("wave_number")
-        final int waveNumber;
-
-        @SerializedName("wave_time")
-        final double waveTime;
-
-        @SerializedName("qs_time")
-        final int qsTime;
-
-        @SerializedName("good_premove")
-        final boolean goodPremove;
-
-        @SerializedName("reset")
-        final Boolean reset;
-
-        @SerializedName("x_qs_spawn")
-        final Integer xSpawn;
-
-        @SerializedName("y_qs_spawn")
-        final Integer ySpawn;
-
-        WaveEntry(int waveNumber, double waveTime, int qsTime, boolean goodPremove, boolean reset, Lobby.RelativePoint relativePoint) {
-            this.waveNumber = waveNumber;
-            this.waveTime = waveTime;
-            this.qsTime = qsTime;
-            this.goodPremove = goodPremove;
-            this.reset = reset;
-
-            if (relativePoint != null) {
-                this.xSpawn = relativePoint.getX();
-                this.ySpawn = relativePoint.getY();
-            } else {
-                this.xSpawn = null;
-                this.ySpawn = null;
-            }
-        }
-    }
-
-    private static class PlayerEntry
-    {
-        @SerializedName("character_name")
-        final String characterName;
-
-        @SerializedName("role")
-        final String role;
-
-        @SerializedName("uuid_key")
-        final String uuidKey; // optional
-
-        PlayerEntry(String characterName, String role, String uuidKey)
-        {
-            this.characterName = characterName;
-            this.role = role;
-            this.uuidKey = uuidKey;
-        }
-    }
-
-    private static class SubmitPayload
-    {
-        @SerializedName("format")
-        final String format;
-        @SerializedName("round_time")
-        final double roundTime;
-        @SerializedName("scroller")
-        final boolean scroller;
-        @SerializedName("submitted_by")
-        final String submittedBy;
-        @SerializedName("players")
-        final List<PlayerEntry> players;
-        @SerializedName("wave_data")
-        final List<WaveEntry> waveData;
-
-        SubmitPayload(String format, double roundTime, String submittedBy, boolean scroller, List<PlayerEntry> players, List<WaveEntry> waveData)
-        {
-            this.format = format;
-            this.roundTime = roundTime;
-            this.submittedBy = submittedBy;
-            this.scroller = scroller;
-            this.players = players;
-            this.waveData = waveData;
-        }
-    }
-}
-
-package com.BaPB;
-
-import lombok.Getter;
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-
-import java.util.HashMap;
-import java.util.Map;
-
-/**
- * Holds GameTimers for:
- * 1. Individual wave timers
- * 2. Queue/Lobby (QS) timers
- * 3. Global round timer
- * Provides methods to start/stop/reset and tick all timers.
+/*
+ * Copyright (c) 2018, Cameron <https://github.com/noremac201>
+ * Copyright (c) 2018, Jacob M <https://github.com/jacoblairm>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-@Slf4j
-public class Timers
+package com.BaPB;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("BaPb")
+public interface
+
+BaPBConfig extends Config
 {
-    @Setter
-    @Getter
-    public static class WaveData {
-        private final GameTimer waveTimer;
-        private final GameTimer qsTimer;
-        private boolean goodPremove;
-        private int lobbyCount;
-        private Lobby.RelativePoint relativePoint;
+	@ConfigItem(
+			position = 1,
+		keyName = "baPB",
+		name = "Save role PB different then Overall PB",
+		description = "Turning this on will save your round time into a specific role round time as well as into the overall pb"
+	)
+	default boolean Seperate()
+	{
+		return true;
+	}
 
-        public WaveData() {
-            this.waveTimer = new GameTimer();
-            this.qsTimer = new GameTimer();
-            this.goodPremove = false;
-            this.lobbyCount = 0;
-        }
+	@ConfigItem(
+			position = 2,
+		keyName = "msg",
+		name = "Turn round msg on/off",
+		description = "Turning this on will display a nice lil message at the start of the round"
+	)
+		default boolean Message() {return true;}
+	@ConfigItem(
+			position = 3,
+		keyName = "log",
+		name = "logger",
+		description = "Allows to log your times to a file in your .runelite file turn off/on to update file"
+	)
+	default boolean Logging() {return false;}
 
-        public void onGameTick() {
-            waveTimer.onGameTick();
-            qsTimer.onGameTick();
-        }
+	@ConfigItem(
+			position = 4,
+			keyName = "sub_runs",
+			name = "Submit Runs",
+			warning = "This portion of the plugin submits data to a 3rd party website not controlled or verified by the RuneLite Developers.",
+			description = "This will submit runs to osrs-ba.com"
+	)
+	default boolean SubmitRuns() { return false; }
 
-        public void stopTimers() {
-            waveTimer.stop();
-            qsTimer.stop();
-        }
+    @ConfigItem(
+            position = 5,
+            keyName = "sub_qs",
+            name = "Submit QS Stats",
+            description = "This will submit QS statistics to osrs-ba.com. Only used when \"Submit Runs\" is enabled."
+    )
+    default boolean SubmitQS() { return false; }
 
-        public void incrementLobbyCount() {
-            this.lobbyCount++;
-        }
-    }
 
-    // Per-wave meta data, wave # -> meta data
-    @Getter
-    private final Map<Integer, WaveData> waveData = new HashMap<>();
+    @ConfigItem(
+			position = 6,
+			keyName = "uuid_key",
+			name = "UUID Key",
+			description = "Key used for linking ALT accounts, you can get one by logging into osrs-ba.com/accounts. Only used when \"Submit Runs\" is enabled."
+	)
+	default String uuid_key() { return null; }
 
-    // Global round timer
-    @Getter
-    private final GameTimer roundTimer = new GameTimer();
-
-    public int lastWave = 0; // 0 = not in a wave
-    public int lastLobby = 0;  // 0 = not in a lobby
-
-    /* -------------------- Wave Timer Methods -------------------- **/
-
-    public GameTimer getWaveTimer(int waveNumber)
-    {
-        return waveData
-                .computeIfAbsent(waveNumber, k -> new WaveData())
-                .getWaveTimer();
-    }
-
-    public void startWave(int waveNumber)
-    {
-        if (waveNumber > 0) getWaveTimer(waveNumber).start();
-    }
-
-    public void stopWave(int waveNumber)
-    {
-        WaveData data = waveData.get(waveNumber);
-        if (data != null) data.getWaveTimer().stop();
-    }
-
-    /* -------------------- QS Timer Methods -------------------- **/
-
-    public GameTimer getQSTimer(int waveNumber) {
-        return waveData
-                .computeIfAbsent(waveNumber, k -> new WaveData())
-                .getQsTimer();
-    }
-
-    public void startQS(int waveNumber) {
-        if (waveNumber > 0) getQSTimer(waveNumber).start();
-    }
-
-    public void stopQS(int waveNumber)
-    {
-        WaveData data = waveData.get(waveNumber);
-        if (data != null) data.getQsTimer().stop();
-    }
-
-    /* -------------------- Round Timer Methods -------------------- **/
-
-    public void startRound()
-    {
-        roundTimer.start();
-    }
-
-    public double getRoundSeconds(boolean isLeader)
-    {
-        return roundTimer.getElapsedSeconds(isLeader);
-    }
-
-    /* -------------------- Tick Update -------------------- **/
-
-    /**
-     * Call once per game tick to update all timers
-     */
-    public void onGameTick() {
-        roundTimer.onGameTick();
-        waveData.values().forEach(WaveData::onGameTick);
-    }
-
-    /* -------------------- Reset Methods -------------------- **/
-
-    /**
-     * Resets all timers: round, waves, and QS
-     */
-    public void resetAll() {
-        roundTimer.clear();
-        waveData.clear();
-        lastWave = 0;
-        lastLobby = 0;
-    }
-
-    /**
-     * Stops the round timer, all wave timers, and all QS timers.
-     */
-    public void stopAll()
-    {
-        // Stop round
-        roundTimer.stop();
-
-        // Stop all per-wave timers
-        waveData.values().forEach(WaveData::stopTimers);
-    }
-
-    /* -------------------- Core flow methods -------------------- */
-
-    /**
-     * Update timers based on the detected wave/lobby state.
-     */
-    public void updateState(int currentWave, int currentLobby, boolean goodPremove, Lobby.RelativePoint relPoint)
-    {
-        // --- Transition: Lobby → Wave ---
-        if (lastWave == 0 && currentWave > 0)
-        {
-            startWave(currentWave);
-            stopQS(lastLobby);
-
-            // Set premove for this wave (which produce the next lobby premove)
-            if (currentWave + 1 <= 10) {
-                WaveData data = waveData.computeIfAbsent(currentWave + 1, k -> new WaveData());
-                data.setGoodPremove(goodPremove);
-            }
-        }
-
-        // --- Transition: Wave → Lobby ---
-        else if (lastWave > 0 && currentWave == 0)
-        {
-            stopWave(lastWave);
-            startQS(currentLobby);
-
-            if (relPoint != null)
-            {
-                WaveData data = waveData.computeIfAbsent(currentLobby, k -> new WaveData());
-                data.setRelativePoint(relPoint);
-            }
-
-            // Detect resets
-            WaveData data = waveData.get(currentLobby);
-            if (data != null) data.incrementLobbyCount();
-
-        }
-
-        // Save latest state
-        lastWave = currentWave;
-        lastLobby = currentLobby;
-    }
-
-    public void logWaveData()
-    {
-        if (waveData.isEmpty())
-        {
-            log.debug("No wave data available.");
-            return;
-        }
-
-        log.debug("----- WaveData Dump -----");
-        for (Map.Entry<Integer, WaveData> entry : waveData.entrySet())
-        {
-            int waveNumber = entry.getKey();
-            WaveData data = entry.getValue();
-
-            String relPointStr = (data.getRelativePoint() != null)
-                    ? "(" + data.getRelativePoint().getX() + "," + data.getRelativePoint().getY() + ")"
-                    : "null";
-
-            log.debug("Wave {}: waveTimer={}s, qsTimer={}s, goodPremove={}, lobbyCount={}, relativePoint={}",
-                    waveNumber,
-                    data.getWaveTimer().getElapsedSeconds(true),
-                    data.getQsTimer().getElapsedSeconds(true),
-                    data.isGoodPremove(),
-                    data.getLobbyCount(),
-                    relPointStr
-            );
-        }
-        log.debug("-------------------------");
-    }
 }
 
 /*
@@ -1325,6 +881,321 @@ public class BaPBPlugin extends Plugin
 		}
 	}
 }
+package com.BaPB;
+
+import com.google.gson.Gson;
+import com.google.gson.annotations.SerializedName;
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.*;
+
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
+import javax.inject.Inject;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ExecutorService;
+
+@Slf4j
+public class BaPBService
+{
+    private static final String TOKEN_ISSUER_URL   = "https://osrs-ba-api-7f97e40f532b.herokuapp.com/api/v1/tokens/public/";
+    private static final String SUBMIT_RUN_URL   = "https://osrs-ba-api-7f97e40f532b.herokuapp.com/api/v1/rounds/";
+
+    private static final String SIGNING_SECRET = "ba-4-all";
+    private String cachedToken = null;
+    private Instant cachedTokenExpiry = null;
+
+    private static final MediaType JSON = MediaType.parse("application/json; charset=utf-8");
+
+    private final ExecutorService executor = Executors.newSingleThreadExecutor();
+    private final OkHttpClient http;
+    private final Gson gson;
+    private final BaPBConfig config;
+
+    @Inject
+    public BaPBService(OkHttpClient http, Gson gson, BaPBConfig config)
+    {
+        this.http = http;
+        this.gson = gson;
+        this.config = config;
+    }
+
+    public void shutdown()
+    {
+        executor.shutdown();
+    }
+
+    private boolean isTokenValid()
+    {
+        if (cachedToken == null || cachedToken.isEmpty()) return false;
+        if (cachedTokenExpiry == null ) return false;
+
+        // Expire 30 seconds early to avoid edge cases
+        Instant bufferExpiry = cachedTokenExpiry.minusSeconds(30);
+        return Instant.now().isBefore(bufferExpiry);
+    }
+
+    private void fetchToken(String currentPlayer) throws Exception
+    {
+        String timestamp = String.valueOf(Instant.now().toEpochMilli());
+        String nonce = UUID.randomUUID().toString();
+        String signature = generateHmacSha256(SIGNING_SECRET, timestamp + nonce);
+
+        // Create JSON body
+        Map<String, String> bodyMap = new HashMap<>();
+        bodyMap.put("description", currentPlayer);
+        String jsonBody = gson.toJson(bodyMap);
+
+        RequestBody body = RequestBody.create(JSON, jsonBody);
+
+        Request req = new Request.Builder()
+                .url(TOKEN_ISSUER_URL)
+                .header("X-Timestamp", timestamp)
+                .header("X-Nonce", nonce)
+                .header("X-Signature", signature)
+                .post(body)
+                .build();
+
+        try (Response resp = http.newCall(req).execute())
+        {
+            if (!resp.isSuccessful() || resp.body() == null)
+                throw new RuntimeException("Failed to fetch API token: " + resp.code() + " " + resp.message());
+
+
+            String rawResponse = resp.body().string();  // read raw response
+
+            log.debug("Raw API response: {}", rawResponse);
+
+            TokenWrapper wrapper = gson.fromJson(rawResponse, TokenWrapper.class);
+            if (wrapper == null || wrapper.data == null || wrapper.data.token == null || wrapper.data.token.isEmpty())
+                throw new RuntimeException("Token issuer returned no 'token' key");
+
+            cachedToken = wrapper.data.token;
+
+            DateTimeFormatter formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSSSSS");
+            LocalDateTime ldt = LocalDateTime.parse(wrapper.data.expiresAt, formatter);
+            cachedTokenExpiry = ldt.toInstant(ZoneOffset.UTC);
+        }
+    }
+
+    private void submitRunToAPI(
+            Map<String, String> currentTeam,
+            String roundFormat,
+            Timers timers,
+            boolean scroller,
+            String submittedBy,
+            String userUuid
+    ) throws IOException
+    {
+        // Prepare players
+        List<PlayerEntry> players = new ArrayList<>();
+        for (Map.Entry<String, String> e : currentTeam.entrySet())
+        {
+            String uuid = (userUuid != null && e.getKey().equals(submittedBy)) ? userUuid : null;
+            players.add(new PlayerEntry(e.getKey(), e.getValue(), uuid));
+        }
+
+        // Prepare wave data
+        List<WaveEntry> waveData = new ArrayList<>();
+        for (Map.Entry<Integer, Timers.WaveData> entry : timers.getWaveData().entrySet()) {
+            int waveNumber = entry.getKey();
+            Timers.WaveData data = entry.getValue();
+
+            double waveTime = 0;
+            int qsTime = 0;
+            boolean goodPremove = false;
+            boolean reset = false;
+            Lobby.RelativePoint rp = null;
+
+            if (data != null) {
+                waveTime = data.getWaveTimer().getElapsedSeconds(scroller, false); // true = isLeader/scroller
+                qsTime = data.getQsTimer().roundTicks;
+                goodPremove = data.isGoodPremove();
+                reset = data.getLobbyCount() > 1;
+                rp = data.getRelativePoint();
+            }
+
+            waveData.add(new WaveEntry(waveNumber, waveTime, qsTime, goodPremove, reset, rp));
+        }
+
+        // Prepare round time
+        double roundTime = timers.getRoundTimer().getElapsedSeconds(scroller);
+
+        SubmitPayload payload = new SubmitPayload(
+                roundFormat,
+                roundTime,
+                submittedBy,
+                scroller,
+                players,
+                waveData
+        );
+
+        RequestBody body = RequestBody.create(JSON, gson.toJson(payload));
+        Request req = new Request.Builder()
+                .url(SUBMIT_RUN_URL)
+                .addHeader("Authorization", "Bearer " + cachedToken)
+                .post(body)
+                .build();
+
+        try (Response resp = http.newCall(req).execute())
+        {
+            if (resp.isSuccessful())
+            {
+                log.info("Successfully submitted run to API");
+            }
+            else
+            {
+                log.warn("API submission failed: {} {}", resp.code(), resp.message());
+            }
+        }
+    }
+
+    public void handleRoundEnd(
+            Map<String, String> currentTeam,
+            String roundFormat,
+            Timers timers,
+            boolean scroller,
+            String submittedBy
+    )
+    {
+        if (!config.SubmitRuns() || roundFormat == null)
+        {
+            log.debug("SubmitRuns is disabled or roundFormat is null. Skipping round submission.");
+            return;
+        }
+
+        String userUuid = config.uuid_key();
+
+        executor.execute(() -> {
+            try {
+                // Validate token
+                if (!isTokenValid()) {
+                    log.info("API token invalid or expired. Fetching a new one...");
+                    fetchToken(submittedBy);
+                }
+
+                submitRunToAPI(currentTeam, roundFormat, timers, scroller, submittedBy, userUuid);
+
+            } catch (Exception e) {
+                log.warn("Failed during token check or run submission", e);
+            }
+        });
+    }
+
+    private String generateHmacSha256(String key, String data) throws Exception
+    {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(new SecretKeySpec(key.getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+        byte[] rawHmac = mac.doFinal(data.getBytes(StandardCharsets.UTF_8));
+        return Base64.getEncoder().encodeToString(rawHmac);
+    }
+
+    private static class TokenWrapper {
+        String status;
+        TokenResponse data;
+        Object error;
+    }
+
+    private static class TokenResponse
+    {
+        @SerializedName("token")
+        String token;
+
+        @SerializedName("expires_at")
+        String expiresAt;
+    }
+
+    private static class WaveEntry {
+        @SerializedName("wave_number")
+        final int waveNumber;
+
+        @SerializedName("wave_time")
+        final double waveTime;
+
+        @SerializedName("qs_time")
+        final int qsTime;
+
+        @SerializedName("good_premove")
+        final boolean goodPremove;
+
+        @SerializedName("reset")
+        final Boolean reset;
+
+        @SerializedName("x_qs_spawn")
+        final Integer xSpawn;
+
+        @SerializedName("y_qs_spawn")
+        final Integer ySpawn;
+
+        WaveEntry(int waveNumber, double waveTime, int qsTime, boolean goodPremove, boolean reset, Lobby.RelativePoint relativePoint) {
+            this.waveNumber = waveNumber;
+            this.waveTime = waveTime;
+            this.qsTime = qsTime;
+            this.goodPremove = goodPremove;
+            this.reset = reset;
+
+            if (relativePoint != null) {
+                this.xSpawn = relativePoint.getX();
+                this.ySpawn = relativePoint.getY();
+            } else {
+                this.xSpawn = null;
+                this.ySpawn = null;
+            }
+        }
+    }
+
+    private static class PlayerEntry
+    {
+        @SerializedName("character_name")
+        final String characterName;
+
+        @SerializedName("role")
+        final String role;
+
+        @SerializedName("uuid_key")
+        final String uuidKey; // optional
+
+        PlayerEntry(String characterName, String role, String uuidKey)
+        {
+            this.characterName = characterName;
+            this.role = role;
+            this.uuidKey = uuidKey;
+        }
+    }
+
+    private static class SubmitPayload
+    {
+        @SerializedName("format")
+        final String format;
+        @SerializedName("round_time")
+        final double roundTime;
+        @SerializedName("scroller")
+        final boolean scroller;
+        @SerializedName("submitted_by")
+        final String submittedBy;
+        @SerializedName("players")
+        final List<PlayerEntry> players;
+        @SerializedName("wave_data")
+        final List<WaveEntry> waveData;
+
+        SubmitPayload(String format, double roundTime, String submittedBy, boolean scroller, List<PlayerEntry> players, List<WaveEntry> waveData)
+        {
+            this.format = format;
+            this.roundTime = roundTime;
+            this.submittedBy = submittedBy;
+            this.scroller = scroller;
+            this.players = players;
+            this.waveData = waveData;
+        }
+    }
+}
+
 /*
  * Copyright (c) 2018, Jacob M <https://github.com/jacoblairm>
  * All rights reserved.
@@ -1519,94 +1390,223 @@ public class Lobby
     }
 }
 
-/*
- * Copyright (c) 2018, Cameron <https://github.com/noremac201>
- * Copyright (c) 2018, Jacob M <https://github.com/jacoblairm>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
 package com.BaPB;
 
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
+import lombok.Getter;
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
 
-@ConfigGroup("BaPb")
-public interface
+import java.util.HashMap;
+import java.util.Map;
 
-BaPBConfig extends Config
+/**
+ * Holds GameTimers for:
+ * 1. Individual wave timers
+ * 2. Queue/Lobby (QS) timers
+ * 3. Global round timer
+ * Provides methods to start/stop/reset and tick all timers.
+ */
+@Slf4j
+public class Timers
 {
-	@ConfigItem(
-			position = 1,
-		keyName = "baPB",
-		name = "Save role PB different then Overall PB",
-		description = "Turning this on will save your round time into a specific role round time as well as into the overall pb"
-	)
-	default boolean Seperate()
-	{
-		return true;
-	}
+    @Setter
+    @Getter
+    public static class WaveData {
+        private final GameTimer waveTimer;
+        private final GameTimer qsTimer;
+        private boolean goodPremove;
+        private int lobbyCount;
+        private Lobby.RelativePoint relativePoint;
 
-	@ConfigItem(
-			position = 2,
-		keyName = "msg",
-		name = "Turn round msg on/off",
-		description = "Turning this on will display a nice lil message at the start of the round"
-	)
-		default boolean Message() {return true;}
-	@ConfigItem(
-			position = 3,
-		keyName = "log",
-		name = "logger",
-		description = "Allows to log your times to a file in your .runelite file turn off/on to update file"
-	)
-	default boolean Logging() {return false;}
+        public WaveData() {
+            this.waveTimer = new GameTimer();
+            this.qsTimer = new GameTimer();
+            this.goodPremove = false;
+            this.lobbyCount = 0;
+        }
 
-	@ConfigItem(
-			position = 4,
-			keyName = "sub_runs",
-			name = "Submit Runs",
-			warning = "This portion of the plugin submits data to a 3rd party website not controlled or verified by the RuneLite Developers.",
-			description = "This will submit runs to osrs-ba.com"
-	)
-	default boolean SubmitRuns() { return false; }
+        public void onGameTick() {
+            waveTimer.onGameTick();
+            qsTimer.onGameTick();
+        }
 
-    @ConfigItem(
-            position = 5,
-            keyName = "sub_qs",
-            name = "Submit QS Stats",
-            description = "This will submit QS statistics to osrs-ba.com. Only used when \"Submit Runs\" is enabled."
-    )
-    default boolean SubmitQS() { return false; }
+        public void stopTimers() {
+            waveTimer.stop();
+            qsTimer.stop();
+        }
 
+        public void incrementLobbyCount() {
+            this.lobbyCount++;
+        }
+    }
 
-    @ConfigItem(
-			position = 6,
-			keyName = "uuid_key",
-			name = "UUID Key",
-			description = "Key used for linking ALT accounts, you can get one by logging into osrs-ba.com/accounts. Only used when \"Submit Runs\" is enabled."
-	)
-	default String uuid_key() { return null; }
+    // Per-wave meta data, wave # -> meta data
+    @Getter
+    private final Map<Integer, WaveData> waveData = new HashMap<>();
 
+    // Global round timer
+    @Getter
+    private final GameTimer roundTimer = new GameTimer();
+
+    public int lastWave = 0; // 0 = not in a wave
+    public int lastLobby = 0;  // 0 = not in a lobby
+
+    /* -------------------- Wave Timer Methods -------------------- **/
+
+    public GameTimer getWaveTimer(int waveNumber)
+    {
+        return waveData
+                .computeIfAbsent(waveNumber, k -> new WaveData())
+                .getWaveTimer();
+    }
+
+    public void startWave(int waveNumber)
+    {
+        if (waveNumber > 0) getWaveTimer(waveNumber).start();
+    }
+
+    public void stopWave(int waveNumber)
+    {
+        WaveData data = waveData.get(waveNumber);
+        if (data != null) data.getWaveTimer().stop();
+    }
+
+    /* -------------------- QS Timer Methods -------------------- **/
+
+    public GameTimer getQSTimer(int waveNumber) {
+        return waveData
+                .computeIfAbsent(waveNumber, k -> new WaveData())
+                .getQsTimer();
+    }
+
+    public void startQS(int waveNumber) {
+        if (waveNumber > 0) getQSTimer(waveNumber).start();
+    }
+
+    public void stopQS(int waveNumber)
+    {
+        WaveData data = waveData.get(waveNumber);
+        if (data != null) data.getQsTimer().stop();
+    }
+
+    /* -------------------- Round Timer Methods -------------------- **/
+
+    public void startRound()
+    {
+        roundTimer.start();
+    }
+
+    public double getRoundSeconds(boolean isLeader)
+    {
+        return roundTimer.getElapsedSeconds(isLeader);
+    }
+
+    /* -------------------- Tick Update -------------------- **/
+
+    /**
+     * Call once per game tick to update all timers
+     */
+    public void onGameTick() {
+        roundTimer.onGameTick();
+        waveData.values().forEach(WaveData::onGameTick);
+    }
+
+    /* -------------------- Reset Methods -------------------- **/
+
+    /**
+     * Resets all timers: round, waves, and QS
+     */
+    public void resetAll() {
+        roundTimer.clear();
+        waveData.clear();
+        lastWave = 0;
+        lastLobby = 0;
+    }
+
+    /**
+     * Stops the round timer, all wave timers, and all QS timers.
+     */
+    public void stopAll()
+    {
+        // Stop round
+        roundTimer.stop();
+
+        // Stop all per-wave timers
+        waveData.values().forEach(WaveData::stopTimers);
+    }
+
+    /* -------------------- Core flow methods -------------------- */
+
+    /**
+     * Update timers based on the detected wave/lobby state.
+     */
+    public void updateState(int currentWave, int currentLobby, boolean goodPremove, Lobby.RelativePoint relPoint)
+    {
+        // --- Transition: Lobby → Wave ---
+        if (lastWave == 0 && currentWave > 0)
+        {
+            startWave(currentWave);
+            stopQS(lastLobby);
+
+            // Set premove for this wave (which produce the next lobby premove)
+            if (currentWave + 1 <= 10) {
+                WaveData data = waveData.computeIfAbsent(currentWave + 1, k -> new WaveData());
+                data.setGoodPremove(goodPremove);
+            }
+        }
+
+        // --- Transition: Wave → Lobby ---
+        else if (lastWave > 0 && currentWave == 0)
+        {
+            stopWave(lastWave);
+            startQS(currentLobby);
+
+            if (relPoint != null)
+            {
+                WaveData data = waveData.computeIfAbsent(currentLobby, k -> new WaveData());
+                data.setRelativePoint(relPoint);
+            }
+
+            // Detect resets
+            WaveData data = waveData.get(currentLobby);
+            if (data != null) data.incrementLobbyCount();
+
+        }
+
+        // Save latest state
+        lastWave = currentWave;
+        lastLobby = currentLobby;
+    }
+
+    public void logWaveData()
+    {
+        if (waveData.isEmpty())
+        {
+            log.debug("No wave data available.");
+            return;
+        }
+
+        log.debug("----- WaveData Dump -----");
+        for (Map.Entry<Integer, WaveData> entry : waveData.entrySet())
+        {
+            int waveNumber = entry.getKey();
+            WaveData data = entry.getValue();
+
+            String relPointStr = (data.getRelativePoint() != null)
+                    ? "(" + data.getRelativePoint().getX() + "," + data.getRelativePoint().getY() + ")"
+                    : "null";
+
+            log.debug("Wave {}: waveTimer={}s, qsTimer={}s, goodPremove={}, lobbyCount={}, relativePoint={}",
+                    waveNumber,
+                    data.getWaveTimer().getElapsedSeconds(true),
+                    data.getQsTimer().getElapsedSeconds(true),
+                    data.isGoodPremove(),
+                    data.getLobbyCount(),
+                    relPointStr
+            );
+        }
+        log.debug("-------------------------");
+    }
 }
 
 package com.BaPB;

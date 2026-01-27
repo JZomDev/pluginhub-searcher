@@ -1,1798 +1,3 @@
-package nl.alowaniak.runelite.musicreplacer;
-
-import net.runelite.client.RuneLite;
-import net.runelite.client.externalplugins.ExternalPluginManager;
-
-public class MusicReplacerPluginTest
-{
-	public static void main(String[] args) throws Exception
-	{
-		ExternalPluginManager.loadBuiltin(MusicReplacerPlugin.class);
-		RuneLite.main(args);
-	}
-}
-package nl.alowaniak.runelite.musicreplacer;
-
-import com.google.common.primitives.Ints;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.*;
-import net.runelite.api.events.GameTick;
-import net.runelite.api.events.MenuOpened;
-import net.runelite.api.events.VarClientIntChanged;
-import net.runelite.api.widgets.JavaScriptCallback;
-import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetID;
-import net.runelite.api.widgets.WidgetInfo;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.events.ConfigChanged;
-import net.runelite.client.game.chatbox.ChatboxPanelManager;
-import net.runelite.client.game.chatbox.ChatboxTextMenuInput;
-import net.runelite.client.ui.overlay.tooltip.Tooltip;
-import net.runelite.client.ui.overlay.tooltip.TooltipManager;
-import net.runelite.client.util.Text;
-
-import javax.inject.Inject;
-import javax.inject.Singleton;
-import javax.swing.*;
-import javax.swing.filechooser.FileFilter;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.time.Duration;
-import java.util.Comparator;
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Stream;
-
-import static net.runelite.http.api.RuneLiteAPI.GSON;
-import static nl.alowaniak.runelite.musicreplacer.MusicReplacerConfig.CONFIG_GROUP;
-import static nl.alowaniak.runelite.musicreplacer.MusicReplacerPlugin.CURRENTLY_PLAYING_WIDGET_ID;
-import static nl.alowaniak.runelite.musicreplacer.Tracks.OVERRIDE_CONFIG_KEY_PREFIX;
-
-@Slf4j
-@Singleton
-class TracksOverridesUi
-{
-	public static final int PAGE_SIZE = 4;
-
-	public static final int OVERRIDE_FONT = FontID.BOLD_12;
-	public static final int NORMAL_FONT = FontID.PLAIN_12;
-
-	public static final int RESIZABLE_VIEWPORT_BOTTOM_LINE_MUSIC_TAB_ID = 10747946;
-
-	@Inject
-	private Client client;
-	@Inject
-	private ClientThread clientThread;
-	@Inject
-	private TooltipManager tooltipManager;
-	@Inject
-	private ChatboxPanelManager chatboxPanelManager;
-
-	@Inject
-	private Tracks tracks;
-	@Inject
-	private YouTubeSearcher ytSearcher;
-
-	private String lastPlayingTrack;
-	private boolean overrideWidgetsOutdated = true;
-
-	@Subscribe
-	public void onGameTick(GameTick tick)
-	{
-		Widget playingTrackWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
-		if (playingTrackWidget == null) return;
-
-		String playingTrack = playingTrackWidget.getText();
-		if (!playingTrack.equals(lastPlayingTrack))
-		{
-			lastPlayingTrack = playingTrack;
-			updateCurrentlyPlayingWidget();
-		}
-
-		if (overrideWidgetsOutdated)
-		{
-			updateOverridesInTrackList();
-		}
-	}
-
-	@Subscribe
-	public void onConfigChanged(ConfigChanged configChanged)
-	{
-		String key = configChanged.getKey();
-		if (CONFIG_GROUP.equals(configChanged.getGroup()) && key.startsWith(OVERRIDE_CONFIG_KEY_PREFIX))
-		{
-			overrideWidgetsOutdated = true;
-			if (key.contains(lastPlayingTrack))
-			{
-				updateCurrentlyPlayingWidget();
-			}
-		}
-	}
-
-	@Subscribe
-	public void onVarClientIntChanged(VarClientIntChanged varClientIntChanged)
-	{
-		if (varClientIntChanged.getIndex() == VarClientInt.INVENTORY_TAB && isOnMusicTab())
-		{
-			// The widgets could be outdated, just ensure it's updated whenever we go to the music tab
-			// TODO figure out better way of ensuring the tracklist is up to date
-			overrideWidgetsOutdated = true;
-		}
-	}
-
-	private boolean isOnMusicTab()
-	{
-		return client.getVarcIntValue(VarClientInt.INVENTORY_TAB) == 13;
-	}
-
-	@Subscribe
-	public void onMenuOpened(final MenuOpened event)
-	{
-		final MenuEntry entry = event.getFirstEntry();
-		if (entry == null) return;
-
-		int widgetId = entry.getParam1();
-		if (widgetId == WidgetInfo.MUSIC_TRACK_LIST.getId())
-		{
-			String trackName = Text.removeTags(entry.getTarget());
-			addMenuEntry("Override", entry).onClick(e ->
-				chatboxPanelManager.openTextMenuInput("How would you like to override " + trackName + "?")
-				.option("With a local file.", () -> overrideByLocal(trackName))
-				.option("From a youtube search.", () -> overrideBySearch(trackName))
-				.build()
-			);
-
-			if (tracks.getOverride(trackName) != null)
-			{
-				addMenuEntry("Remove override", entry).onClick(e -> tracks.removeOverride(trackName));
-			}
-		}
-		else if (widgetId == WidgetInfo.FIXED_VIEWPORT_MUSIC_TAB.getId()
-				|| widgetId == WidgetInfo.RESIZABLE_VIEWPORT_MUSIC_TAB.getId()
-				|| widgetId == RESIZABLE_VIEWPORT_BOTTOM_LINE_MUSIC_TAB_ID)
-		{
-			if (!tracks.overriddenTracks().isEmpty())
-			{
-				addMenuEntry("Remove overrides", entry).onClick(e -> tracks.removeAllOverrides());
-			}
-
-			addMenuEntry("Override tracks", entry).onClick(e ->
-				chatboxPanelManager.openTextMenuInput("How would you like to bulk override?")
-						.option("From preset", choosePresetForBulkOverride)
-						.option("From directory", () -> SwingUtilities.invokeLater(chooseDirectoryForBulkOverride))
-						.build()
-			);
-		}
-	}
-
-	private final Runnable choosePresetForBulkOverride =  () -> {
-		try (InputStreamReader reader = new InputStreamReader(getClass().getResourceAsStream("/presets.json"))) {
-			ChatboxTextMenuInput input = chatboxPanelManager.openTextMenuInput("Which preset? (This will download ALL overridden tracks!)");
-			List<Preset> presets = GSON.fromJson(reader, Preset.LIST_TYPE.getType());
-			presets.forEach(preset -> input.option(preset.getName(), () -> tracks.bulkCreateOverride(preset)));
-			input.build();
-		} catch (NullPointerException | IOException ex) {
-			log.warn("Something went wrong when reading presets.", ex);
-		}
-	};
-
-	private final Runnable chooseDirectoryForBulkOverride = () -> {
-		JFileChooser fileChooser = new JFileChooser();
-		fileChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
-		fileChooser.setMultiSelectionEnabled(false);
-		int status = fileChooser.showOpenDialog(client.getCanvas());
-		if (status == JFileChooser.APPROVE_OPTION) {
-			tracks.bulkCreateOverride(fileChooser.getSelectedFile().toPath());
-		}
-	};
-
-	private MenuEntry addMenuEntry(String option, MenuEntry entryForCopy)
-	{
-		return client.createMenuEntry(-1)
-			.setOption(option)
-			.setTarget(entryForCopy.getTarget())
-			.setType(MenuAction.RUNELITE)
-			.setParam0(entryForCopy.getParam0())
-			.setParam1(entryForCopy.getParam1())
-			.setIdentifier(entryForCopy.getIdentifier());
-	}
-
-	private void overrideByLocal(String trackName)
-	{
-		SwingUtilities.invokeLater(() -> {
-			JFileChooser fileChooser = new JFileChooser();
-			fileChooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
-			fileChooser.setMultiSelectionEnabled(false);
-			fileChooser.setFileFilter(new FileFilter() {
-				@Override
-				public boolean accept(File f) {
-					return f.isDirectory() || MusicPlayer.PLAYER_PER_EXT.keySet().stream().anyMatch(ext -> f.getName().endsWith(ext));
-				}
-
-				@Override
-				public String getDescription() {
-					return "Supported audio files";
-				}
-			});
-			int status = fileChooser.showOpenDialog(client.getCanvas());
-			if (status == JFileChooser.APPROVE_OPTION) {
-				tracks.createOverride(trackName, fileChooser.getSelectedFile().toPath());
-			}
-		});
-	}
-
-	private void overrideBySearch(String trackName)
-	{
-		chatboxPanelManager.openTextInput("Enter your search criteria for " + trackName)
-				.value(trackName)
-				.onDone((String s) -> ytSearcher.search(s, hits -> paginateSearch(trackName, hits)))
-				.build();
-	}
-
-	private void paginateSearch(String trackName, List<SearchResult> hits)
-	{
-		ChatboxTextMenuInput chooser = chatboxPanelManager.openTextMenuInput("Choose which you want to use as override for " + trackName);
-
-		int pageSize = PAGE_SIZE + (PAGE_SIZE + 1 == hits.size() ? 1 : 0);
-
-		hits.stream().limit(pageSize).forEach(hit ->
-			chooser.option(
-				hit.getName() + " " + Duration.ofSeconds(hit.getDuration()).toString().substring(2) + " " + hit.getUploader(),
-				() -> tracks.createOverride(trackName, hit)
-			)
-		);
-
-		List<SearchResult> remainingHits = hits.subList(Math.min(hits.size(), pageSize), hits.size());
-		if (!remainingHits.isEmpty()) chooser.option("Continue", () -> paginateSearch(trackName, remainingHits));
-
-		chooser.build();
-	}
-
-	private void updateOverridesInTrackList()
-	{
-		clientThread.invoke(() ->
-		{
-			Widget trackList = client.getWidget(WidgetInfo.MUSIC_TRACK_LIST);
-			if (trackList == null) return;
-			for (Widget e : trackList.getDynamicChildren())
-			{
-				e.setFontId(tracks.overrideExists(e.getText()) ? OVERRIDE_FONT : NORMAL_FONT);
-				e.revalidate();
-			}
-		});
-	}
-
-	private void updateCurrentlyPlayingWidget()
-	{
-		clientThread.invoke(() ->
-		{
-			Widget trackPlayingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
-			if (trackPlayingWidget == null) return;
-
-			trackPlayingWidget.setOnClickListener((JavaScriptCallback) e -> scrollToTrack(e.getSource().getText()));
-			trackPlayingWidget.setHasListener(true);
-
-			TrackOverride override = tracks.getOverride(trackPlayingWidget.getText());
-			if (override != null)
-			{
-				trackPlayingWidget.setFontId(OVERRIDE_FONT);
-
-				String origin = truncate(override.getOriginalPath(), 40);
-
-				StringBuilder tooltipTxt = new StringBuilder("From: " + origin + "</br>");
-				override.getAdditionalInfo().entrySet().stream()
-						.sorted(Map.Entry.comparingByKey(Comparator.comparing(String::length).thenComparing(String::compareTo)))
-						.forEach(e -> tooltipTxt.append(e.getKey()).append(": ").append(e.getValue()).append("</br>"));
-				Tooltip tooltip = new Tooltip(tooltipTxt.toString());
-
-				trackPlayingWidget.setOnMouseRepeatListener((JavaScriptCallback) e ->
-				{
-					if (!tooltipManager.getTooltips().contains(tooltip)) tooltipManager.add(tooltip);
-				});
-			}
-			else
-			{
-				trackPlayingWidget.setOnMouseRepeatListener((Object[]) null);
-				trackPlayingWidget.setFontId(NORMAL_FONT);
-			}
-		});
-	}
-
-	private void scrollToTrack(String name)
-	{
-		Widget track = findTrackWidget(name);
-		if (track == null) return;
-
-		Widget scrollContainer = client.getWidget(WidgetInfo.MUSIC_TRACK_SCROLL_CONTAINER);
-		if (scrollContainer == null) return;
-
-		int centralY = track.getRelativeY() + track.getHeight() / 2;
-
-		int newScroll = Ints.constrainToRange(
-			centralY - scrollContainer.getHeight() / 2,
-			0, scrollContainer.getScrollHeight()
-		);
-
-		client.runScript(
-			ScriptID.UPDATE_SCROLLBAR,
-			WidgetInfo.MUSIC_TRACK_SCROLLBAR.getId(),
-			WidgetInfo.MUSIC_TRACK_SCROLL_CONTAINER.getId(),
-			newScroll
-		);
-	}
-
-	private Widget findTrackWidget(String name) {
-		Widget trackList = client.getWidget(WidgetInfo.MUSIC_TRACK_LIST);
-		if (trackList == null) return null;
-
-		return Stream.of(trackList.getDynamicChildren())
-				.filter(w -> name.equals(w.getText()))
-				.findAny().orElse(null);
-	}
-
-	private void clearCurrentlyPlayingWidget()
-	{
-		clientThread.invoke(() ->
-		{
-			Widget trackPlayingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
-			if (trackPlayingWidget == null) return;
-
-			trackPlayingWidget.setFontId(NORMAL_FONT);
-
-			trackPlayingWidget.setOnClickListener((Object[]) null);
-			trackPlayingWidget.setOnMouseRepeatListener((Object[]) null);
-			trackPlayingWidget.setHasListener(false);
-		});
-	}
-
-	public void shutdown()
-	{
-		overrideWidgetsOutdated = true;
-		lastPlayingTrack = null;
-		clientThread.invoke(() ->
-		{
-			Widget trackList = client.getWidget(WidgetInfo.MUSIC_TRACK_LIST);
-			if (trackList == null) return;
-			for (Widget e : trackList.getDynamicChildren())
-			{
-				e.setFontId(NORMAL_FONT);
-				e.revalidate();
-			}
-		});
-		clearCurrentlyPlayingWidget();
-	}
-
-	private static String truncate(String s, int length)
-	{
-		return s.length() <= length ? s : s.substring(0, length / 2 - 2) + " .. " + s.substring(s.length() - (length / 2 - 2));
-	}
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import com.adonax.audiocue.AudioCue;
-import com.google.common.collect.ImmutableMap;
-import jaco.mp3.player.MP3Player;
-import lombok.SneakyThrows;
-import org.slf4j.LoggerFactory;
-
-import javax.swing.*;
-import java.io.File;
-import java.net.URI;
-import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
-import java.util.Map;
-import java.util.function.Function;
-
-public interface MusicPlayer {
-
-    static void preloadNecessaries() {
-        // Jaco's MP3Player does some init that needs to happen on the UI thread
-        SwingUtilities.invokeLater(JacoPlayer.player::toString);
-    }
-
-    ImmutableMap<String, Function<URI, MusicPlayer>> PLAYER_PER_EXT = ImmutableMap.of(
-            ".mp3", JacoPlayer::new,
-            ".wav", AudioCuePlayer::new
-    );
-
-    static MusicPlayer create(URI media)
-    {
-        for (Map.Entry<String, Function<URI, MusicPlayer>> extAndPlayer : PLAYER_PER_EXT.entrySet()) {
-            if (media.getPath().endsWith(extAndPlayer.getKey()))
-                try {
-                    return extAndPlayer.getValue().apply(media);
-                } catch (Exception e) {
-                    LoggerFactory.getLogger(MusicPlayer.class).warn("Couldn't load player for " + media, e);
-                }
-        }
-        return null;
-    }
-
-    void play();
-
-    boolean isPlaying();
-
-    void setVolume(double volume);
-
-    default void close() {}
-
-    class JacoPlayer implements MusicPlayer {
-
-        public static final MP3Player player = new MP3Player();
-        private final File tempPlayFile; // A hacky solution for overriding/deleting current playing song
-
-        @SneakyThrows
-        public JacoPlayer(URI mediaFile) {
-            player.getPlayList().clear();
-            tempPlayFile = File.createTempFile("tmpJacoPlayfile", ".mp3");
-            tempPlayFile.deleteOnExit();
-            Files.copy(new File(mediaFile).toPath(), tempPlayFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-            player.add(tempPlayFile);
-        }
-
-        @Override
-        public void play() {
-            player.play();
-        }
-
-        @Override
-        public boolean isPlaying() {
-            return player.isPlaying();
-        }
-
-        @Override
-        public void setVolume(double volume) {
-            int intVol = (int) (volume * 100);
-            if (volume > 0 && intVol == 0) intVol = 1;
-            player.setVolume(intVol);
-        }
-
-        @Override
-        public void close() {
-            player.stop();
-            tempPlayFile.delete();
-        }
-    }
-
-    class AudioCuePlayer implements MusicPlayer
-    {
-        // Same hacky solution as JaCo even though it shouldn't happen here cause audiocue fully loads in memory
-        private final File tempPlayFile;
-        private final AudioCue audioCue;
-
-        @SneakyThrows
-        private AudioCuePlayer(URI media)
-        {
-            tempPlayFile = File.createTempFile("tmpJacoPlayfile", ".mp3");
-            tempPlayFile.deleteOnExit();
-            Files.copy(new File(media).toPath(), tempPlayFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
-            audioCue = AudioCue.makeStereoCue(tempPlayFile.toURL(), 1);
-            audioCue.open();
-        }
-
-        @Override
-        public void play()
-        {
-            if (audioCue.getIsActive(0)) audioCue.releaseInstance(0);
-            audioCue.play();
-        }
-
-        @Override
-        public boolean isPlaying()
-        {
-            return audioCue.getIsActive(0);
-        }
-
-        @Override
-        public void setVolume(double volume)
-        {
-            audioCue.setVolume(0, volume);
-        }
-
-        @Override
-        public void close()
-        {
-            tempPlayFile.delete();
-            audioCue.close();
-        }
-    }
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import lombok.extern.slf4j.Slf4j;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Response;
-
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import java.io.IOException;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.util.Collections;
-import java.util.List;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
-
-import static net.runelite.http.api.RuneLiteAPI.GSON;
-import static nl.alowaniak.runelite.musicreplacer.MusicReplacerPlugin.MUSIC_REPLACER_API;
-
-@Slf4j
-@Singleton
-class YouTubeSearcher
-{
-
-    @Inject
-	private OkHttpClient http;
-	@Inject
-	@Named(MusicReplacerPlugin.MUSIC_REPLACER_EXECUTOR)
-	private ExecutorService executor;
-
-	/**
-	 * @param term the {@code term} to search for.
-	 * @param resultCollector will be called with the found results.
-	 */
-	public void search(String term, Consumer<List<SearchResult>> resultCollector)
-	{
-		executor.submit(() -> resultCollector.accept(getSearchResults(term)));
-	}
-
-    private List<SearchResult> getSearchResults(String term) {
-        try (Response res = getSearchResponse(term))
-        {
-            if (!res.isSuccessful()) throw new IOException(res.code() + ": " + res.message() + " " + res.body().string());
-
-            return GSON.fromJson(res.body().string(), SearchResult.LIST_TYPE.getType());
-        }
-        catch (IOException e)
-        {
-            log.warn("Something went wrong when searching for " + term, e);
-            return Collections.emptyList();
-        }
-    }
-
-    private Response getSearchResponse(String term) throws IOException {
-        return http.newBuilder().readTimeout(1, TimeUnit.MINUTES)
-            .build()
-            .newCall(new Request.Builder()
-                .url(MUSIC_REPLACER_API + "search/" + URLEncoder.encode(term, StandardCharsets.UTF_8.toString()))
-                .build()
-            ).execute();
-    }
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import com.google.common.collect.ImmutableMap;
-import lombok.Getter;
-import lombok.Value;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.api.EnumID;
-import net.runelite.client.RuneLite;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
-
-import javax.inject.Inject;
-import javax.inject.Named;
-import javax.inject.Singleton;
-import java.io.File;
-import java.io.IOException;
-import java.io.InputStream;
-import java.net.URL;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
-import java.nio.file.StandardCopyOption;
-import java.time.Duration;
-import java.util.Arrays;
-import java.util.List;
-import java.util.SortedSet;
-import java.util.TreeSet;
-import java.util.concurrent.ExecutorService;
-import java.util.stream.Collectors;
-import java.util.stream.Stream;
-
-import static net.runelite.http.api.RuneLiteAPI.GSON;
-import static nl.alowaniak.runelite.musicreplacer.MusicReplacerConfig.CONFIG_GROUP;
-import static nl.alowaniak.runelite.musicreplacer.MusicReplacerPlugin.MUSIC_REPLACER_API;
-
-/**
- * Provides access to all OSRS track names as well as all {@link TrackOverride overridden tracks}.
- */
-@Slf4j
-@Singleton
-class Tracks
-{
-	static final File MUSIC_OVERRIDES_DIR = new File(RuneLite.RUNELITE_DIR, "music-replacer");
-	{ // Not static initializer, if we fail we only want to fail loading our plugin
-		if (!MUSIC_OVERRIDES_DIR.exists() && !MUSIC_OVERRIDES_DIR.mkdirs())
-		{
-			throw new IllegalStateException("Failed to create " + MUSIC_OVERRIDES_DIR);
-		}
-	}
-
-	public static final String OVERRIDE_CONFIG_KEY_PREFIX = "track_";
-	public static final String FULL_OVERRIDE_CONFIG_KEY_PREFIX = CONFIG_GROUP + '.' + OVERRIDE_CONFIG_KEY_PREFIX;
-
-	@Inject
-	private ConfigManager configMgr;
-	@Inject
-	private MusicReplacerConfig config;
-	@Inject
-	private MusicReplacerPlugin musicReplacer;
-	@Inject
-	@Named(MusicReplacerPlugin.MUSIC_REPLACER_EXECUTOR)
-	private ExecutorService executor;
-
-	/**
-	 * @return whether or not given {@code name} exists as a {@link TrackOverride}
-	 */
-	public boolean overrideExists(String name)
-	{
-		return configMgr.getConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name) != null;
-	}
-
-	public List<String> overriddenTracks()
-	{
-		return configMgr.getConfigurationKeys(CONFIG_GROUP).stream()
-			.filter(e -> e.startsWith(FULL_OVERRIDE_CONFIG_KEY_PREFIX))
-			.map(e -> e.replace(FULL_OVERRIDE_CONFIG_KEY_PREFIX, ""))
-			.collect(Collectors.toList());
-	}
-
-	/**
-	 * Bulk creates overrides assuming {@code dir} contains audio files with exact same names as tracks
-	 */
-	public void bulkCreateOverride(Path dirPath)
-	{
-		@Value class PathAndFilename {
-			Path path;
-			@Getter(lazy = true) String filename = path.getFileName().toString().replaceAll("\\..+$", "");
-		}
-		executor.submit(() ->
-		{
-			musicReplacer.chatMsg("Overriding with tracks in " + dirPath + ".");
-			try (Stream<Path> ls = Files.list(dirPath))
-			{
-				ls.map(e -> new PathAndFilename(e))
-						// Ideally we filtered only files with an osrs track name, but music track enum is removed, let place responsibility on user
-						.forEach(e -> {
-							if (!config.skipAlreadyOverriddenWhenBulkOverride() || !overrideExists(e.getFilename())) {
-								createOverride(e.getFilename(), e.getPath());
-							} else {
-								musicReplacer.chatMsg("Skipping " + e.getFilename() + ", already overridden.");
-							}
-						});
-			}
-			catch (IOException e)
-			{
-				log.warn("Error opening `" + dirPath + "` for bulk override.", e);
-			}
-			musicReplacer.chatMsg("Done overriding.");
-		});
-	}
-
-    public void createOverride(String name, Path path)
-	{
-		createOverride(new TrackOverride(name, path.toString(), true, ImmutableMap.of()));
-	}
-
-	public void bulkCreateOverride(Preset preset) {
-		musicReplacer.chatMsg(
-				"Downloading " + preset.getTracks().size() + " tracks, won't dl all if RL closes prematurely.",
-				preset.getCredits()
-		);
-		preset.getTracks().forEach((name, override) -> {
-			if (!config.skipAlreadyOverriddenWhenBulkOverride() || !overrideExists(name)) {
-				createOverride(name, override);
-			} else {
-				musicReplacer.chatMsg("Skipping " + name + ", already overridden.");
-			}
-		});
-		executor.submit(() -> musicReplacer.chatMsg("Finished downloading preset " + preset.getName() + ".", preset.getCredits()));
-	}
-
-	public void createOverride(String trackName, SearchResult hit)
-	{
-		executor.submit(() -> createOverride(
-			new TrackOverride(trackName, hit.id, false,
-				ImmutableMap.of(
-				"Name", hit.getName(),
-				"Duration", Duration.ofSeconds(hit.getDuration()).toString(),
-				"Uploader", hit.getUploader()
-				)
-			)
-		));
-	}
-
-	private void createOverride(TrackOverride override)
-	{
-		Path overridePath = transfer(override);
-		if (overridePath != null)
-		{
-			// Ensure we only keep the current override transferred file
-			override.getPaths()
-					.filter(e -> !e.equals(overridePath))
-					.forEach(path -> {
-						try {
-							Files.deleteIfExists(path);
-						} catch (IOException e) {
-							log.warn("Couldn't delete " + path, e);
-						}
-					});
-
-			configMgr.setConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + override.getName(), GSON.toJson(override));
-			musicReplacer.chatMsg(override.isFromLocal()
-							? "Overridden " + override.getName()
-							: "Overridden " + override.getName() + ", uploaded by " + override.getAdditionalInfo().get("Uploader")
-			);
-		} else {
-			musicReplacer.chatMsg("Failed to override " + override.getName() + ", check the logs.");
-		}
-	}
-
-	public TrackOverride getOverride(String name)
-	{
-		TrackOverride override = GSON.fromJson(
-			configMgr.getConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name),
-			TrackOverride.class
-		);
-
-		if (override == null || override.getPaths().anyMatch(Files::exists))
-		{
-			return override;
-		}
-		else
-		{
-			log.warn("Deleting: " + override + " because there was no override file for it.");
-			configMgr.unsetConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name);
-			return null;
-		}
-	}
-
-	/**
-	 * Clears all overridden tracks.
-	 */
-	public void removeAllOverrides()
-	{
-		executor.submit(() -> overriddenTracks().forEach(this::removeOverride));
-	}
-
-	public void removeOverride(String name) {
-		TrackOverride override = getOverride(name);
-		if (override == null) return;
-
-		configMgr.unsetConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name);
-		override.getPaths().forEach(overridePath -> {
-			try {
-				Files.deleteIfExists(overridePath);
-			} catch (IOException e) {
-				log.warn("Couldn't delete " + name, e);
-			}
-		});
-	}
-
-	private Path transfer(TrackOverride override)
-	{
-		return override.isFromLocal()
-			? transferLocal(override)
-			: transferLink(override);
-	}
-
-	private Path transferLocal(TrackOverride override)
-	{
-		Path path = Paths.get(override.getOriginalPath());
-		Path targetPath = override.getPaths()
-				.filter(e -> extensionOf(path).equals(extensionOf(e)))
-				.findFirst().orElse(null);
-
-		if (targetPath == null)
-		{
-			log.warn("Can only load " + MusicPlayer.PLAYER_PER_EXT.keySet() + " files. " + override);
-			return null;
-		}
-
-		try
-		{
-			Files.copy(path, targetPath, StandardCopyOption.REPLACE_EXISTING);
-			return targetPath;
-		} catch (IOException e)
-		{
-			log.warn("Something went wrong when copying " + override, e);
-			return null;
-		}
-	}
-
-	private String extensionOf(Path p) {
-		String fileName = p.getFileName().toString();
-		return fileName.substring(fileName.lastIndexOf('.'));
-	}
-
-	private Path transferLink(TrackOverride override)
-	{
-		Path targetPath = override.getPaths().findFirst().orElseThrow(IllegalStateException::new);
-
-		String dlUrl = MUSIC_REPLACER_API + "download/" + override.getOriginalPath() + "?ext=" + extensionOf(targetPath);
-		try (InputStream is = new URL(dlUrl).openStream())
-		{
-			Files.copy(is, targetPath, StandardCopyOption.REPLACE_EXISTING);
-			return targetPath;
-		}
-		catch (IOException e)
-		{
-			log.warn("Something went wrong when downloading for " + override, e);
-			return null;
-		}
-	}
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import java.nio.file.Path;
-import java.util.Map;
-import java.util.stream.Stream;
-
-import lombok.Value;
-
-/*
- * Ideally this class is refactored a bunch.
- * But such a refactor will likely break already existing overrides + not sure what the best design would be.
- *
- * Things that aren't too clean:
- * 	originalPath when downloaded
- *  fromLocal which could be deduced (or maybe have a hierarchy LocalOverride/RemoteOverride)
- *  coupling of name to path and not knowing it's extension (which is requiring nasty workarounds)
- */
-@Value
-class TrackOverride
-{
-	String name;
-	/**
-	 * The originalPath for a local override or the {@link SearchResult#id} for downloads
-	 */
-	String originalPath;
-	boolean fromLocal;
-	Map<String, String> additionalInfo;
-
-	/**
-	 * Multiple possibilities because extension is unknown.
-	 *
-	 * @return the possible paths of the overridden tracks in most favouring first.
-	 */
-	public Stream<Path> getPaths()
-	{
-		return MusicPlayer.PLAYER_PER_EXT.keySet().stream().map(e -> Tracks.MUSIC_OVERRIDES_DIR.toPath().resolve(name + e));
-	}
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-
-import static nl.alowaniak.runelite.musicreplacer.MusicReplacerConfig.CONFIG_GROUP;
-
-@ConfigGroup(CONFIG_GROUP)
-public interface MusicReplacerConfig extends Config
-{
-	String CONFIG_GROUP = "musicreplacer";
-	@ConfigItem(
-			keyName = "skipAlreadyOverriddenWhenBulkOverride",
-			name = "Skip overridden if bulk",
-			description = "When on this will skip any already overridden tracks when doing a bulk override.<br>" +
-					"If off the bulk override will replace already overridden tracks (if said track is in the bulk)."
-	)
-	default boolean skipAlreadyOverriddenWhenBulkOverride()
-	{
-		return true;
-	}
-
-	@ConfigItem(
-			keyName = "playOverridesToEnd",
-			name = "Play overrides to end",
-			description = "When on a next track won't play until current override has ended."
-	)
-	default boolean playOverridesToEnd()
-	{
-		return false;
-	}
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import com.google.common.primitives.Doubles;
-import com.google.common.primitives.Ints;
-import com.google.inject.Binder;
-import com.google.inject.Provides;
-import com.google.inject.name.Names;
-import joptsimple.internal.Strings;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.ChatMessageType;
-import net.runelite.api.Client;
-import net.runelite.api.GameState;
-import net.runelite.api.events.ClientTick;
-import net.runelite.api.events.GameStateChanged;
-import net.runelite.api.widgets.JavaScriptCallback;
-import net.runelite.api.widgets.Widget;
-import net.runelite.api.widgets.WidgetID;
-import net.runelite.client.callback.ClientThread;
-import net.runelite.client.config.ConfigManager;
-import net.runelite.client.eventbus.EventBus;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.plugins.Plugin;
-import net.runelite.client.plugins.PluginDependency;
-import net.runelite.client.plugins.PluginDescriptor;
-import net.runelite.client.plugins.music.MusicConfig;
-import net.runelite.client.plugins.music.MusicPlugin;
-import net.runelite.client.ui.overlay.tooltip.Tooltip;
-import net.runelite.client.ui.overlay.tooltip.TooltipManager;
-
-import javax.inject.Inject;
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.util.Arrays;
-import java.util.Objects;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-
-import static nl.alowaniak.runelite.musicreplacer.TracksOverridesUi.NORMAL_FONT;
-import static nl.alowaniak.runelite.musicreplacer.TracksOverridesUi.OVERRIDE_FONT;
-
-@Slf4j
-@PluginDescriptor(
-		name = "Music Replacer",
-		description = "Replace music tracks with presets (e.g. OSRSBeatz) or your own music",
-		tags = {"music", "replace", "override", "track", "song", "youtube", "beats", "osrsbeatz", "rs3"}
-)
-@PluginDependency(MusicPlugin.class)
-public class MusicReplacerPlugin extends Plugin
-{
-	static {
-		MusicPlayer.preloadNecessaries();
-	}
-
-	public static final String MUSIC_REPLACER_API = "https://alowan.nl/runelite-music-replacer/";
-	public static final String MUSIC_REPLACER_EXECUTOR = "musicReplacerExecutor";
-	public static final int PLAYING_WIDGET_ID = 8;
-	public static final int CURRENTLY_PLAYING_WIDGET_ID = 9;
-
-	private static final int MUSIC_LOOP_STATE_VAR_ID = 4137;
-	private static final double MAX_VOL = 255;
-
-	@Override
-	public void configure(Binder binder)
-	{
-		// Use our own ExecutorService instead of ScheduledExecutorService because the downloads can take a while
-		binder.bind(ExecutorService.class).annotatedWith(Names.named(MUSIC_REPLACER_EXECUTOR)).toInstance(Executors.newSingleThreadExecutor());
-	}
-
-	@Inject
-	private Client client;
-	@Inject
-	private EventBus eventBus;
-	@Inject
-	private ClientThread clientThread;
-	@Inject
-	private TooltipManager tooltipManager;
-
-	@Inject
-	private Tracks tracks;
-	@Inject
-	private TracksOverridesUi tracksOverridesUi;
-
-	@Inject
-	private MusicConfig musicConfig;
-	@Inject
-	private MusicReplacerConfig config;
-
-	private MusicPlayer player;
-	private String actualCurTrack;
-	private boolean restoreActualCurTrack;
-	private TrackOverride trackToPlay;
-
-	private double fading;
-
-	@Override
-	protected void startUp()
-	{
-		eventBus.register(tracksOverridesUi);
-	}
-
-	@Provides
-	MusicReplacerConfig getConfig(ConfigManager configManager)
-	{
-		return configManager.getConfig(MusicReplacerConfig.class);
-	}
-
-	@Subscribe
-	public void onGameStateChanged(GameStateChanged gameStateChanged)
-	{
-		if (gameStateChanged.getGameState() == GameState.LOGIN_SCREEN)
-		{
-			stopPlaying();
-		}
-	}
-
-	private double oldVolume = -1;
-	@Subscribe
-	public void onClientTick(ClientTick tick)
-	{
-		Widget curTrackWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
-		Widget playingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, PLAYING_WIDGET_ID);
-		if (curTrackWidget == null || playingWidget == null) return;
-		String curTrack = curTrackWidget.getText();
-		if (Strings.isNullOrEmpty(curTrack)) return;
-
-		// I would rather do UI kinda stuff in TracksOverridesUi, but let's do it here for now
-		if (restoreActualCurTrack)
-		{
-			restoreActualCurTrack = false;
-			curTrackWidget.setText(curTrack = actualCurTrack);
-			playingWidget.setFontId(NORMAL_FONT);
-			playingWidget.setHasListener(false);
-		}
-		else if (config.playOverridesToEnd() && trackToPlay != null && !curTrack.equals(trackToPlay.getName()))
-		{
-			// curTrack is a new one, so keep track of actual playing track and change widget
-			actualCurTrack = curTrack;
-			playingWidget.setFontId(OVERRIDE_FONT);
-			Tooltip tooltip = new Tooltip("Up next: " + actualCurTrack);
-			playingWidget.setOnMouseRepeatListener((JavaScriptCallback) e ->
-			{
-				if (!tooltipManager.getTooltips().contains(tooltip)) tooltipManager.add(tooltip);
-			});
-			playingWidget.setOnClickListener((JavaScriptCallback) e -> restoreActualCurTrack = true);
-			playingWidget.setHasListener(true);
-			curTrackWidget.setText(curTrack = trackToPlay.getName());
-			// Sometimes a track tries to come through briefly, this might fix that hopefully?
-			applyVolume();
-		}
-
-		TrackOverride newTrack = tracks.getOverride(curTrack);
-		if (!Objects.equals(trackToPlay, newTrack))
-		{
-			trackToPlay = newTrack;
-			if (fading <= 0) fading = 1;
-		}
-
-
-		if (fading > 0)
-		{
-			applyVolume(fading -= .01);
-
-			if (fading <= 0)
-			{
-				stopCurrentAndStartNew();
-			}
-		}
-		else if (player != null)
-		{
-			double volume = (musicConfig.getMusicVolume() - 1) / MAX_VOL;
-			boolean actualTrackIsBeingOverruled = config.playOverridesToEnd() && actualCurTrack != null && trackToPlay != null && !actualCurTrack.equals(trackToPlay.getName());
-			if (actualTrackIsBeingOverruled && (volume <= 0 || !player.isPlaying()))
-			{
-				restoreActualCurTrack = true;
-			}
-			else if ((oldVolume <= 0 && volume > 0) || (!player.isPlaying() && client.getVarbitValue(MUSIC_LOOP_STATE_VAR_ID) == 1))
-			{
-				// Restart play if
-				// we switched from muted to on (mimic osrs behavior)
-				// or we ended and have loop enabled
-				player.play();
-			}
-
-			applyVolume();
-			oldVolume = volume;
-		}
-	}
-
-	private void stopCurrentAndStartNew() {
-		stopPlaying();
-
-		if (trackToPlay != null)
-		{
-			try
-			{
-				player = trackToPlay.getPaths()
-						.filter(Files::exists)
-						.map(Path::toUri)
-						.map(MusicPlayer::create)
-						.filter(Objects::nonNull)
-						.findFirst()
-						.orElse(null);
-				if (player != null) player.play();
-				else {
-					chatMsg("Deleting " + trackToPlay + " override because no player could be made (no file or wrong format?).");
-					tracks.removeOverride(trackToPlay.getName());
-				}
-			}
-			catch (OutOfMemoryError e)
-			{
-				log.warn("Out of memory when loading " + trackToPlay, e);
-				trackToPlay = null;
-			}
-		}
-
-		applyVolume();
-	}
-
-	private void applyVolume()
-	{
-		applyVolume(1);
-	}
-
-	private void applyVolume(double multiplier)
-	{
-		// Setting client music volume with invokeLater seems to prevent the original music from coming through
-		// I'm guessing because it depends on "where" in the client loop the vol is set
-		// And with invokeLater it happens to "overwrite" Music plugin's write at the correct "point" in the client loop
-
-		if (player == null)
-		{
-			int volume = (int) ((musicConfig.getMusicVolume() - 1) * multiplier);
-			clientThread.invokeLater(() -> client.setMusicVolume(Ints.constrainToRange(volume, 0, (int) MAX_VOL)));
-		}
-		else
-		{
-			if (player.isPlaying())
-			{
-				double volume = Doubles.constrainToRange((musicConfig.getMusicVolume() - 1) / MAX_VOL * multiplier, 0, 1);
-				player.setVolume(volume);
-			}
-			clientThread.invokeLater(() -> client.setMusicVolume(0));
-		}
-	}
-
-	public void stopPlaying()
-	{
-		fading = 0;
-		if (player != null)
-		{
-			player.close();
-			player = null;
-		}
-	}
-
-	@Override
-	protected void shutDown()
-	{
-		eventBus.unregister(tracksOverridesUi);
-		tracksOverridesUi.shutdown();
-		trackToPlay = null;
-		stopPlaying();
-		clientThread.invoke(() ->
-		{
-			applyVolume();
-			Widget curTrackWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
-			Widget playingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, PLAYING_WIDGET_ID);
-			if (curTrackWidget == null || playingWidget == null) return;
-			if (!Strings.isNullOrEmpty(actualCurTrack)) curTrackWidget.setText(actualCurTrack);
-			playingWidget.setFontId(NORMAL_FONT);
-			playingWidget.setHasListener(false);
-			playingWidget.setOnMouseRepeatListener((Object[]) null);
-			actualCurTrack = null;
-		});
-	}
-
-	public void chatMsg(String... msgs) {
-		clientThread.invoke(() -> Arrays.stream(msgs).forEach(msg -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", msg, null)));
-	}
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import com.google.gson.reflect.TypeToken;
-import lombok.Data;
-
-import java.util.List;
-
-@Data
-public class SearchResult {
-    public static final TypeToken<List<SearchResult>> LIST_TYPE = new TypeToken<List<SearchResult>>() {};
-
-    String id;
-    String name;
-    long duration;
-    String uploader;
-}
-
-package nl.alowaniak.runelite.musicreplacer;
-
-import com.google.gson.reflect.TypeToken;
-import lombok.Value;
-
-import java.util.List;
-import java.util.Map;
-
-@Value
-public class Preset {
-    public static final TypeToken<List<Preset>> LIST_TYPE = new TypeToken<List<Preset>>() {};
-
-    String name;
-    String credits;
-    Map<String, SearchResult> tracks;
-}
-
-/*
- * This file is part of AudioCue,
- * Copyright 2017 Philip Freihofner.
- *
- * Redistribution and use in source and binary forms, with or
- * without modification, are permitted provided that the
- * following conditions are met:
- *
- * 1. Redistributions of source code must retain the above
- * copyright notice, this list of conditions and the following
- * disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following
- * disclaimer in the documentation and/or other materials
- * provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of
- * its contributors may be used to endorse or promote products
- * derived from this software without specific prior written
- * permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
- * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
- * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.adonax.audiocue;
-
-/**
- * The {@code AudioCueInstanceEvent} class represents an event
- * in the life cycle of an {@code AudioCue} <em>instance</em>.
- * An {@code AudioCueInstanceEvent} is passed as
- * an argument to every class that implements the
- * {@code AudioCueListener} interface and is registered to
- * receive notifications about <em>instance</em> events.
- * <p>
- * An {@code AudioCue} supports concurrent plays of its media, where
- * the maximum number of concurrent plays is equal to the value
- * held in the final variable {@code AudioCue.polyphony}.
- * Each concurrent play is referred to as an <em>instance</em>.
- * Instance <em>events</em> mark the life cycle of
- * a single playing or playable instance as follows:
- * <ul>
- * <li>OBTAIN_INSTANCE: an instance is obtained from the pool
- * of available instances if the limit of allocated concurrent
- * instances is not exceeded</li>
- * <li>START_INSTANCE: an instance starts to play</li>
- * <li>LOOP: a instance that finishes playing restarts from the
- * beginning</li>
- * <li>STOP_INSTANCE: a playing instance is stopped (but can
- * still be restarted)</li>
- * <li>RELEASE_INSTANCE: an instance is released back into the
- * pool of available instances. </li>
- * </ul>
- * <p>
- * The information packaged in the {@code AudioCueInstanceEvent}
- * is contained in the following immutable fields:
- * <ul>
- * <li><strong>type</strong> - an {@code enum} designating the
- * nature of the event</li>
- * <li><strong>time</strong> - a {@code long} containing the time
- * of occurrence of the event, to the nearest millisecond</li>
- * <li><strong>source</strong> - the originating
- * {@code AudioCue}</li>
- * <li><strong>frame</strong> - a {@code double} containing the
- * sample frame (may be fractional) current at the time of the
- * event</li>
- * <li><strong>instanceID</strong> - an {@code int} used to
- * identify the {@code AudioCue} instance.</li></ul>
- *
- * @author Philip Freihofner
- * @version AudioCue 1.1
- * @see <a href="http://adonax.com/AudioCue">http://adonax.com/AudioCue</a>
- */
-public class AudioCueInstanceEvent {
-
-	/**
-	 * The {@code enum Type} represents events that occur during
-	 * the lifetime of an {@code AudioCue} <em>instance</em>.
-	 */
-	static public enum Type {
-		/**
-		 * Indicates that an instance has been obtained from
-		 * the pool of available instances.
-		 */
-		OBTAIN_INSTANCE,
-		/**
-		 * Indicates that an instance has been released and
-		 * returned to the pool of available instances.
-		 */
-		RELEASE_INSTANCE,
-		/**
-		 * Indicates that an instance has started playing.
-		 */
-		START_INSTANCE,
-		/**
-		 * Indicates that an instance has stopped playing.
-		 */
-		STOP_INSTANCE,
-		/**
-		 * Indicates that an instance has finished playing
-		 * and is starting to play again from the beginning
-		 * of the media.
-		 */
-		LOOP};
-
-	/**
-	 * the triggering event
-	 */
-	public final Type type;
-
-	/**
-	 * the time in milliseconds when the event occurred
-	 */
-	public final long time;
-
-	/**
-	 * the {@code AudioCue} from which the event originated
-	 */
-	public final AudioCue source;
-
-	/**
-	 * the hook used to identify the instance
-	 */
-	public final int instanceID;
-
-	/**
-	 * the sample frame number (may be fractional) current
-	 * at the time of the event
-	 */
-	public final double frame;
-
-	/**
-	 * Constructor for an {@code AudioCueInstanceEvent}, a
-	 * class that is passed as a parameter for
-	 * {@code AudioCuelistener}.
-	 *
-	 * @param type an {@code enum} that designates the
-	 * category of {@code AudioCue} instance event
-	 * @param source the {@code AudioCue} that is the origin
-	 * of the event
-	 * @param instanceID an {@code int} hook used to identify the
-	 * {@code AudioCue}	instance
-	 * @param frame a {@code double} that holds the sample
-	 * frame current at the time of the event
-	 */
-	public AudioCueInstanceEvent(Type type, AudioCue source,
-								 int instanceID, double frame)
-	{
-		this.type = type;
-		time = System.currentTimeMillis();
-		this.source = source;
-		this.instanceID = instanceID;
-		this.frame = frame;
-	}
-}
-
-/*
- * This file is part of AudioCue,
- * Copyright 2017 Philip Freihofner.
- *
- * Redistribution and use in source and binary forms, with or
- * without modification, are permitted provided that the
- * following conditions are met:
- *
- * 1. Redistributions of source code must retain the above
- * copyright notice, this list of conditions and the following
- * disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following
- * disclaimer in the documentation and/or other materials
- * provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of
- * its contributors may be used to endorse or promote products
- * derived from this software without specific prior written
- * permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
- * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
- * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.adonax.audiocue;
-
-/**
- * A listener interface for receiving notifications of events
- * pertaining to an {@code AudioCue} and its playable or playing
- * instances. For a class to receive and act on these
- * notifications, it implements this interface, and a copy of
- * the class is registered with the {@code AudioCue} via the
- * following method:
- * <pre>    myAudioCue.addAudioCueListener(myAudioCueListener);</pre>
- * <p>
- * The execution of the implementing methods will occur on the
- * same thread that processes the audio data, and thus should
- * be coded for brevity in order to minimize extraneous processing
- * that might contribute to dropouts during playback.
- *
- * @author Philip Freihofner
- * @version AudioCue 1.1
- * @see <a href="http://adonax.com/AudioCue">http://adonax.com/AudioCue</a>
- */
-public interface AudioCueListener
-{
-	/**
-	 * Method called when an {@code AudioCue} executes its
-	 * {@code open} method.
-	 *
-	 * @param now {@code long} holding millisecond value
-	 * @param threadPriority {@code int} specifying thread
-	 * priority
-	 * @param bufferSize {@code int} specifying buffer size
-	 * in sample frames
-	 * @param source {@code AudioCue} that originated the
-	 * notification
-	 */
-	void audioCueOpened(long now, int threadPriority, int bufferSize,
-						AudioCue source);
-	/**
-	 * Method called when an {@code AudioCue} executes its
-	 * {@code close} method.
-	 *
-	 * @param now {@code long} holding millisecond value
-	 * @param source {@code AudioCue} that originated the
-	 * notification
-	 */
-	void audioCueClosed(long now, AudioCue source);
-
-	/**
-	 * Method called when an {@code AudioCue} instance event
-	 * occurs.
-	 *
-	 * @param event {@code AudioCueInstanceEvent}
-	 */
-	void instanceEventOccurred(AudioCueInstanceEvent event);
-}
-/*
- * This file is part of AudioCue,
- * Copyright 2017 Philip Freihofner.
- *
- * Redistribution and use in source and binary forms, with or
- * without modification, are permitted provided that the
- * following conditions are met:
- *
- * 1. Redistributions of source code must retain the above
- * copyright notice, this list of conditions and the following
- * disclaimer.
- *
- * 2. Redistributions in binary form must reproduce the above
- * copyright notice, this list of conditions and the following
- * disclaimer in the documentation and/or other materials
- * provided with the distribution.
- *
- * 3. Neither the name of the copyright holder nor the names of
- * its contributors may be used to endorse or promote products
- * derived from this software without specific prior written
- * permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
- * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
- * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
- * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
- * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
- * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
- * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
- * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-package com.adonax.audiocue;
-
-import java.util.concurrent.CopyOnWriteArrayList;
-
-import javax.sound.sampled.LineUnavailableException;
-import javax.sound.sampled.Mixer;
-import javax.sound.sampled.SourceDataLine;
-
-/**
- * {@code AudioMixer} combines the output of members of an
- * {@code AudioCue} collection into a single
- * {@code SourceDataLine} output line. Classes implementing
- * {@code AudioCue} can be added and removed from the
- * mix asynchronously, with the operation occurring at the
- * next buffer iteration. Source tracks must provide for the
- * return of an array of sound data frames whose length is
- * specified by the {@code AudioMixer}. Unlike an analog
- * mixer used in sound studios, the AudioMixer does <i>not</i>
- * provide functions such as panning or volume
- * controls. The only standard function is an equivalent
- * of a <em>mute</em> control, accessible via the {@code running}
- * variable. The mixer imposes a simple floor/ceiling of -1, 1,
- * to guard against volume overflows.
- *
- * @author Philip Freihofner
- * @version AudioCue 1.1
- * @see <a href="http://adonax.com/AudioCue">http://adonax.com/AudioCue</a>
- */
-public class AudioMixer
-{
-	private AudioCue[] trackCache, mixerTracks;
-	private CopyOnWriteArrayList<AudioCue> trackManager;
-	private volatile boolean trackCacheUpdated;
-	private int trackCount;
-
-	/**
-	 * Returns the number of tracks being mixed.
-	 *
-	 * @return integer number of tracks being mixed.
-	 */
-	public int getTrackLength() {return trackCount;}
-
-	public final int bufferSize, sdlByteBufferSize,
-		readBufferSize;
-	private float[] audioData;
-	private Mixer mixer;
-	public final int threadPriority;
-
-	private volatile boolean running;
-
-	/**
-	 * Constructor for {@code AudioMixer}, using default
-	 * settings:
-	 * Mixer           = system default
-	 * Buffer size     = 8196 frames
-	 * Thread priority = 10.
-	 *
-	 * The buffer size pertains to the frames collected in
-	 * a single {@code while} loop iteration. A buffer that
-	 * corresponds to the same number of frames converted
-	 * to bytes is assigned to the {@code SourceDataLine}.
-	 */
-	public AudioMixer()
-	{
-		this(null, 1024 * 8, 10); // default build
-	}
-
-	/**
-	 * Constructor for {@code AudioMixer}. The buffer size
-	 * is the number of frames collected in a single {@code while}
-	 * loop iteration. A buffer with a corresponding frame
-	 * count, calculated in bytes, is assigned to the
-	 * {@code SourceDataLine}. A thread priority of 10 is
-	 * recommended, in order to help prevent sound drop outs.
-	 * Note that a well designed and properly running sound thread
-	 * should spend the vast majority of its time in a blocked
-	 * state, and thus have a minimal impact in terms of usurping
-	 * cpu cycles from other threads.
-	 *
-	 * @param mixer javax.sound.sampled.Mixer to be used
-	 * @param bufferSize int specifying the number of frames to
-	 * process with each iteration
-	 * @param threadPriority int ranging from 1 to 10 specifying
-	 * the priority of the sound thread
-	 */
-	public AudioMixer(Mixer mixer, int bufferSize, int threadPriority)
-	{
-		trackManager = new CopyOnWriteArrayList<AudioCue>();
-		this.bufferSize = bufferSize;
-		this.readBufferSize = bufferSize * 2;
-		this.sdlByteBufferSize = bufferSize * 4;
-		this.mixer = mixer;
-		this.threadPriority = threadPriority;
-	}
-
-	// reminder: this does NOT update the trackCache!!
-	/**
-	 * Designates an {@code AudioCue} to be staged
-	 * for loading to the array of tracks being mixed. If
-	 * the mixer is not running, the track will become
-	 * part of the mix when the (@code AudioMixer} is started.
-	 * If the {@code AudioMixer} is running, the method
-	 * {@code updateTracks} must be executed in order for
-	 * the new track to be added to the mix.
-	 *
-	 * @param track {@code AudioCue} to be added
-	 */
-	public void addTrack(AudioCue track)
-	{
-		trackManager.add(track);
-	}
-
-	// reminder: this does NOT update the trackCache!!
-	/**
-	 * Designates an {@code AudioCue} to be staged
-	 * for removal from the array of tracks being mixed. If
-	 * the mixer is not running, the track, if previously
-	 * added, will <em>not</em> be included in the mix
-	 * when the (@code AudioMixer} is started.
-	 * If the {@code AudioMixer} is running, the method
-	 * {@code updateTracks} must be executed in order for
-	 * the new track to be removed from the mix.
-	 *
-	 * @param track
-	 * @throws IllegalThreadStateException
-	 */
-	public void removeTrack(AudioCue track) throws IllegalThreadStateException
-	{
-		trackManager.remove(track);
-	}
-
-	/**
-	 * This method signals the {@code AudioMixer}'s playback
-	 * loop to update the collection of tracks being mixed
-	 * at the next opportunity (depends on the size of the
-	 * buffer). Tracks to be added or removed are staged
-	 * for update by the methods {@code addTrack} and
-	 * {@code removeTrack}.
-	 */
-	public void updateTracks()
-	{
-		int size = trackManager.size();
-		AudioCue[] workCopyTracks = new AudioCue[size];
-		for (int i = 0; i < size; i++)
-		{
-			workCopyTracks[i] = trackManager.get(i);
-		}
-
-		trackCache = workCopyTracks;
-		trackCacheUpdated = true;
-		System.out.println("CoreMixer.updateTracks, new size:" + size);
-	}
-
-	/**
-	 * Starts the operation of the {@code AudioMixer}. A running
-	 * {@code AudioMixer} iteratively sums a buffer's worth of
-	 * frames of sound data from a collection of
-	 * {@code AudioCue}s, and writes the resulting
-	 * array to a {@code SourceDataLine}.
-	 *
-	 * @throws IllegalStateException is thrown if the
-	 * {@code AudioMixer} is already running.
-	 * @throws LineUnavailableException is thrown if there
-	 * is a problem securing a {@code SourceDataLine}
-	 */
-	public void start() throws IllegalStateException,
-		LineUnavailableException
-	{
-		if (running) throw new IllegalStateException(
-			"AudioMixer is already running!");
-
-		updateTracks();
-
-		AudioMixerPlayer player = new AudioMixerPlayer(
-			mixer, bufferSize);
-		Thread t = new Thread(player);
-		t.setPriority(threadPriority);
-		t.start();
-
-		running = true;
-	}
-
-	/**
-	 * Stops the iteration of the {@code AudioMixer} after the
-	 * soonest data write operation.
-	 *
-	 * @throws IllegalStateException if the {@code AudioMixer}
-	 * is already in a stopped state.
-	 */
-	public void stop() throws IllegalStateException
-	{
-		if (!running) throw new IllegalStateException("PFCoreMixer already stopped!");
-
-		running = false;
-	}
-
-	private float[] fillBufferFromTracks(float[] normalizedOut)
-	{
-		// loop through all tracks, summing
-		for (int n = 0; n < trackCount; n++)
-		{
-			if (mixerTracks[n].isRunning())
-			{
-				try
-				{
-					audioData = mixerTracks[n].readTrack();
-					for (int i = 0; i < readBufferSize; i++)
-					{
-						normalizedOut[i] += audioData[i];
-					}
-				}
-				catch (Exception e)
-				{
-					e.printStackTrace();
-				}
-			}
-			for (int i = 0; i < readBufferSize; i++)
-			{
-				if (normalizedOut[i] > 1)
-				{
-					normalizedOut[i] = 1;
-				}
-				else if (normalizedOut[i] < -1)
-				{
-					normalizedOut[i] = -1;
-				}
-			}
-		}
-		return normalizedOut;
-	}
-
-	private class AudioMixerPlayer implements Runnable
-	{
-		private SourceDataLine sdl;
-		private float[] readBuffer;
-		private byte[] audioBytes;
-
-		AudioMixerPlayer(Mixer mixer, int bufferFrames) throws
-			LineUnavailableException
-		{
-			audioBytes = new byte[sdlByteBufferSize];
-
-			sdl = AudioCue.getSourceDataLine(mixer, AudioCue.info);
-			sdl.open(AudioCue.audioFormat, sdlByteBufferSize);
-			sdl.start();
-		}
-
-		// Sound Thread
-		public void run()
-		{
-			while(running)
-			{
-				if (trackCacheUpdated)
-				{
-					/*
-					 * Concurrency plan: Better to allow a late
-					 * or redundant update than to skip an update.
-					 * Example: flag = true, next line resets, but
-					 * updater sets true again prior to mixerTracks
-					 * assignment. We might load the same trackCache
-					 * twice. That is OK.
-					 */
-					trackCacheUpdated = false;
-					mixerTracks = trackCache;
-					trackCount = mixerTracks.length;
-				}
-				readBuffer = new float[readBufferSize];
-				readBuffer = fillBufferFromTracks(readBuffer);
-				audioBytes = AudioCue.fromBufferToAudioBytes(
-					audioBytes, readBuffer);
-				sdl.write(audioBytes, 0, sdlByteBufferSize);
-			}
-
-			sdl.drain();
-			sdl.close();
-			sdl = null;
-		}
-	}
-}
 /*
  * This file is part of AudioCue,
  * Copyright 2017 Philip Freihofner.
@@ -3309,5 +1514,1800 @@ public class AudioCue
 					this, acc.hook, acc.idx
 				));
 		}
+	}
+}
+/*
+ * This file is part of AudioCue,
+ * Copyright 2017 Philip Freihofner.
+ *
+ * Redistribution and use in source and binary forms, with or
+ * without modification, are permitted provided that the
+ * following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above
+ * copyright notice, this list of conditions and the following
+ * disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above
+ * copyright notice, this list of conditions and the following
+ * disclaimer in the documentation and/or other materials
+ * provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of
+ * its contributors may be used to endorse or promote products
+ * derived from this software without specific prior written
+ * permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+ * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+ * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.adonax.audiocue;
+
+/**
+ * The {@code AudioCueInstanceEvent} class represents an event
+ * in the life cycle of an {@code AudioCue} <em>instance</em>.
+ * An {@code AudioCueInstanceEvent} is passed as
+ * an argument to every class that implements the
+ * {@code AudioCueListener} interface and is registered to
+ * receive notifications about <em>instance</em> events.
+ * <p>
+ * An {@code AudioCue} supports concurrent plays of its media, where
+ * the maximum number of concurrent plays is equal to the value
+ * held in the final variable {@code AudioCue.polyphony}.
+ * Each concurrent play is referred to as an <em>instance</em>.
+ * Instance <em>events</em> mark the life cycle of
+ * a single playing or playable instance as follows:
+ * <ul>
+ * <li>OBTAIN_INSTANCE: an instance is obtained from the pool
+ * of available instances if the limit of allocated concurrent
+ * instances is not exceeded</li>
+ * <li>START_INSTANCE: an instance starts to play</li>
+ * <li>LOOP: a instance that finishes playing restarts from the
+ * beginning</li>
+ * <li>STOP_INSTANCE: a playing instance is stopped (but can
+ * still be restarted)</li>
+ * <li>RELEASE_INSTANCE: an instance is released back into the
+ * pool of available instances. </li>
+ * </ul>
+ * <p>
+ * The information packaged in the {@code AudioCueInstanceEvent}
+ * is contained in the following immutable fields:
+ * <ul>
+ * <li><strong>type</strong> - an {@code enum} designating the
+ * nature of the event</li>
+ * <li><strong>time</strong> - a {@code long} containing the time
+ * of occurrence of the event, to the nearest millisecond</li>
+ * <li><strong>source</strong> - the originating
+ * {@code AudioCue}</li>
+ * <li><strong>frame</strong> - a {@code double} containing the
+ * sample frame (may be fractional) current at the time of the
+ * event</li>
+ * <li><strong>instanceID</strong> - an {@code int} used to
+ * identify the {@code AudioCue} instance.</li></ul>
+ *
+ * @author Philip Freihofner
+ * @version AudioCue 1.1
+ * @see <a href="http://adonax.com/AudioCue">http://adonax.com/AudioCue</a>
+ */
+public class AudioCueInstanceEvent {
+
+	/**
+	 * The {@code enum Type} represents events that occur during
+	 * the lifetime of an {@code AudioCue} <em>instance</em>.
+	 */
+	static public enum Type {
+		/**
+		 * Indicates that an instance has been obtained from
+		 * the pool of available instances.
+		 */
+		OBTAIN_INSTANCE,
+		/**
+		 * Indicates that an instance has been released and
+		 * returned to the pool of available instances.
+		 */
+		RELEASE_INSTANCE,
+		/**
+		 * Indicates that an instance has started playing.
+		 */
+		START_INSTANCE,
+		/**
+		 * Indicates that an instance has stopped playing.
+		 */
+		STOP_INSTANCE,
+		/**
+		 * Indicates that an instance has finished playing
+		 * and is starting to play again from the beginning
+		 * of the media.
+		 */
+		LOOP};
+
+	/**
+	 * the triggering event
+	 */
+	public final Type type;
+
+	/**
+	 * the time in milliseconds when the event occurred
+	 */
+	public final long time;
+
+	/**
+	 * the {@code AudioCue} from which the event originated
+	 */
+	public final AudioCue source;
+
+	/**
+	 * the hook used to identify the instance
+	 */
+	public final int instanceID;
+
+	/**
+	 * the sample frame number (may be fractional) current
+	 * at the time of the event
+	 */
+	public final double frame;
+
+	/**
+	 * Constructor for an {@code AudioCueInstanceEvent}, a
+	 * class that is passed as a parameter for
+	 * {@code AudioCuelistener}.
+	 *
+	 * @param type an {@code enum} that designates the
+	 * category of {@code AudioCue} instance event
+	 * @param source the {@code AudioCue} that is the origin
+	 * of the event
+	 * @param instanceID an {@code int} hook used to identify the
+	 * {@code AudioCue}	instance
+	 * @param frame a {@code double} that holds the sample
+	 * frame current at the time of the event
+	 */
+	public AudioCueInstanceEvent(Type type, AudioCue source,
+								 int instanceID, double frame)
+	{
+		this.type = type;
+		time = System.currentTimeMillis();
+		this.source = source;
+		this.instanceID = instanceID;
+		this.frame = frame;
+	}
+}
+
+/*
+ * This file is part of AudioCue,
+ * Copyright 2017 Philip Freihofner.
+ *
+ * Redistribution and use in source and binary forms, with or
+ * without modification, are permitted provided that the
+ * following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above
+ * copyright notice, this list of conditions and the following
+ * disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above
+ * copyright notice, this list of conditions and the following
+ * disclaimer in the documentation and/or other materials
+ * provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of
+ * its contributors may be used to endorse or promote products
+ * derived from this software without specific prior written
+ * permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+ * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+ * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.adonax.audiocue;
+
+/**
+ * A listener interface for receiving notifications of events
+ * pertaining to an {@code AudioCue} and its playable or playing
+ * instances. For a class to receive and act on these
+ * notifications, it implements this interface, and a copy of
+ * the class is registered with the {@code AudioCue} via the
+ * following method:
+ * <pre>    myAudioCue.addAudioCueListener(myAudioCueListener);</pre>
+ * <p>
+ * The execution of the implementing methods will occur on the
+ * same thread that processes the audio data, and thus should
+ * be coded for brevity in order to minimize extraneous processing
+ * that might contribute to dropouts during playback.
+ *
+ * @author Philip Freihofner
+ * @version AudioCue 1.1
+ * @see <a href="http://adonax.com/AudioCue">http://adonax.com/AudioCue</a>
+ */
+public interface AudioCueListener
+{
+	/**
+	 * Method called when an {@code AudioCue} executes its
+	 * {@code open} method.
+	 *
+	 * @param now {@code long} holding millisecond value
+	 * @param threadPriority {@code int} specifying thread
+	 * priority
+	 * @param bufferSize {@code int} specifying buffer size
+	 * in sample frames
+	 * @param source {@code AudioCue} that originated the
+	 * notification
+	 */
+	void audioCueOpened(long now, int threadPriority, int bufferSize,
+						AudioCue source);
+	/**
+	 * Method called when an {@code AudioCue} executes its
+	 * {@code close} method.
+	 *
+	 * @param now {@code long} holding millisecond value
+	 * @param source {@code AudioCue} that originated the
+	 * notification
+	 */
+	void audioCueClosed(long now, AudioCue source);
+
+	/**
+	 * Method called when an {@code AudioCue} instance event
+	 * occurs.
+	 *
+	 * @param event {@code AudioCueInstanceEvent}
+	 */
+	void instanceEventOccurred(AudioCueInstanceEvent event);
+}
+/*
+ * This file is part of AudioCue,
+ * Copyright 2017 Philip Freihofner.
+ *
+ * Redistribution and use in source and binary forms, with or
+ * without modification, are permitted provided that the
+ * following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above
+ * copyright notice, this list of conditions and the following
+ * disclaimer.
+ *
+ * 2. Redistributions in binary form must reproduce the above
+ * copyright notice, this list of conditions and the following
+ * disclaimer in the documentation and/or other materials
+ * provided with the distribution.
+ *
+ * 3. Neither the name of the copyright holder nor the names of
+ * its contributors may be used to endorse or promote products
+ * derived from this software without specific prior written
+ * permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND
+ * CONTRIBUTORS "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF
+ * MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR
+ * CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+ * SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT
+ * NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+ * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
+ * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR
+ * OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE,
+ * EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package com.adonax.audiocue;
+
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import javax.sound.sampled.LineUnavailableException;
+import javax.sound.sampled.Mixer;
+import javax.sound.sampled.SourceDataLine;
+
+/**
+ * {@code AudioMixer} combines the output of members of an
+ * {@code AudioCue} collection into a single
+ * {@code SourceDataLine} output line. Classes implementing
+ * {@code AudioCue} can be added and removed from the
+ * mix asynchronously, with the operation occurring at the
+ * next buffer iteration. Source tracks must provide for the
+ * return of an array of sound data frames whose length is
+ * specified by the {@code AudioMixer}. Unlike an analog
+ * mixer used in sound studios, the AudioMixer does <i>not</i>
+ * provide functions such as panning or volume
+ * controls. The only standard function is an equivalent
+ * of a <em>mute</em> control, accessible via the {@code running}
+ * variable. The mixer imposes a simple floor/ceiling of -1, 1,
+ * to guard against volume overflows.
+ *
+ * @author Philip Freihofner
+ * @version AudioCue 1.1
+ * @see <a href="http://adonax.com/AudioCue">http://adonax.com/AudioCue</a>
+ */
+public class AudioMixer
+{
+	private AudioCue[] trackCache, mixerTracks;
+	private CopyOnWriteArrayList<AudioCue> trackManager;
+	private volatile boolean trackCacheUpdated;
+	private int trackCount;
+
+	/**
+	 * Returns the number of tracks being mixed.
+	 *
+	 * @return integer number of tracks being mixed.
+	 */
+	public int getTrackLength() {return trackCount;}
+
+	public final int bufferSize, sdlByteBufferSize,
+		readBufferSize;
+	private float[] audioData;
+	private Mixer mixer;
+	public final int threadPriority;
+
+	private volatile boolean running;
+
+	/**
+	 * Constructor for {@code AudioMixer}, using default
+	 * settings:
+	 * Mixer           = system default
+	 * Buffer size     = 8196 frames
+	 * Thread priority = 10.
+	 *
+	 * The buffer size pertains to the frames collected in
+	 * a single {@code while} loop iteration. A buffer that
+	 * corresponds to the same number of frames converted
+	 * to bytes is assigned to the {@code SourceDataLine}.
+	 */
+	public AudioMixer()
+	{
+		this(null, 1024 * 8, 10); // default build
+	}
+
+	/**
+	 * Constructor for {@code AudioMixer}. The buffer size
+	 * is the number of frames collected in a single {@code while}
+	 * loop iteration. A buffer with a corresponding frame
+	 * count, calculated in bytes, is assigned to the
+	 * {@code SourceDataLine}. A thread priority of 10 is
+	 * recommended, in order to help prevent sound drop outs.
+	 * Note that a well designed and properly running sound thread
+	 * should spend the vast majority of its time in a blocked
+	 * state, and thus have a minimal impact in terms of usurping
+	 * cpu cycles from other threads.
+	 *
+	 * @param mixer javax.sound.sampled.Mixer to be used
+	 * @param bufferSize int specifying the number of frames to
+	 * process with each iteration
+	 * @param threadPriority int ranging from 1 to 10 specifying
+	 * the priority of the sound thread
+	 */
+	public AudioMixer(Mixer mixer, int bufferSize, int threadPriority)
+	{
+		trackManager = new CopyOnWriteArrayList<AudioCue>();
+		this.bufferSize = bufferSize;
+		this.readBufferSize = bufferSize * 2;
+		this.sdlByteBufferSize = bufferSize * 4;
+		this.mixer = mixer;
+		this.threadPriority = threadPriority;
+	}
+
+	// reminder: this does NOT update the trackCache!!
+	/**
+	 * Designates an {@code AudioCue} to be staged
+	 * for loading to the array of tracks being mixed. If
+	 * the mixer is not running, the track will become
+	 * part of the mix when the (@code AudioMixer} is started.
+	 * If the {@code AudioMixer} is running, the method
+	 * {@code updateTracks} must be executed in order for
+	 * the new track to be added to the mix.
+	 *
+	 * @param track {@code AudioCue} to be added
+	 */
+	public void addTrack(AudioCue track)
+	{
+		trackManager.add(track);
+	}
+
+	// reminder: this does NOT update the trackCache!!
+	/**
+	 * Designates an {@code AudioCue} to be staged
+	 * for removal from the array of tracks being mixed. If
+	 * the mixer is not running, the track, if previously
+	 * added, will <em>not</em> be included in the mix
+	 * when the (@code AudioMixer} is started.
+	 * If the {@code AudioMixer} is running, the method
+	 * {@code updateTracks} must be executed in order for
+	 * the new track to be removed from the mix.
+	 *
+	 * @param track
+	 * @throws IllegalThreadStateException
+	 */
+	public void removeTrack(AudioCue track) throws IllegalThreadStateException
+	{
+		trackManager.remove(track);
+	}
+
+	/**
+	 * This method signals the {@code AudioMixer}'s playback
+	 * loop to update the collection of tracks being mixed
+	 * at the next opportunity (depends on the size of the
+	 * buffer). Tracks to be added or removed are staged
+	 * for update by the methods {@code addTrack} and
+	 * {@code removeTrack}.
+	 */
+	public void updateTracks()
+	{
+		int size = trackManager.size();
+		AudioCue[] workCopyTracks = new AudioCue[size];
+		for (int i = 0; i < size; i++)
+		{
+			workCopyTracks[i] = trackManager.get(i);
+		}
+
+		trackCache = workCopyTracks;
+		trackCacheUpdated = true;
+		System.out.println("CoreMixer.updateTracks, new size:" + size);
+	}
+
+	/**
+	 * Starts the operation of the {@code AudioMixer}. A running
+	 * {@code AudioMixer} iteratively sums a buffer's worth of
+	 * frames of sound data from a collection of
+	 * {@code AudioCue}s, and writes the resulting
+	 * array to a {@code SourceDataLine}.
+	 *
+	 * @throws IllegalStateException is thrown if the
+	 * {@code AudioMixer} is already running.
+	 * @throws LineUnavailableException is thrown if there
+	 * is a problem securing a {@code SourceDataLine}
+	 */
+	public void start() throws IllegalStateException,
+		LineUnavailableException
+	{
+		if (running) throw new IllegalStateException(
+			"AudioMixer is already running!");
+
+		updateTracks();
+
+		AudioMixerPlayer player = new AudioMixerPlayer(
+			mixer, bufferSize);
+		Thread t = new Thread(player);
+		t.setPriority(threadPriority);
+		t.start();
+
+		running = true;
+	}
+
+	/**
+	 * Stops the iteration of the {@code AudioMixer} after the
+	 * soonest data write operation.
+	 *
+	 * @throws IllegalStateException if the {@code AudioMixer}
+	 * is already in a stopped state.
+	 */
+	public void stop() throws IllegalStateException
+	{
+		if (!running) throw new IllegalStateException("PFCoreMixer already stopped!");
+
+		running = false;
+	}
+
+	private float[] fillBufferFromTracks(float[] normalizedOut)
+	{
+		// loop through all tracks, summing
+		for (int n = 0; n < trackCount; n++)
+		{
+			if (mixerTracks[n].isRunning())
+			{
+				try
+				{
+					audioData = mixerTracks[n].readTrack();
+					for (int i = 0; i < readBufferSize; i++)
+					{
+						normalizedOut[i] += audioData[i];
+					}
+				}
+				catch (Exception e)
+				{
+					e.printStackTrace();
+				}
+			}
+			for (int i = 0; i < readBufferSize; i++)
+			{
+				if (normalizedOut[i] > 1)
+				{
+					normalizedOut[i] = 1;
+				}
+				else if (normalizedOut[i] < -1)
+				{
+					normalizedOut[i] = -1;
+				}
+			}
+		}
+		return normalizedOut;
+	}
+
+	private class AudioMixerPlayer implements Runnable
+	{
+		private SourceDataLine sdl;
+		private float[] readBuffer;
+		private byte[] audioBytes;
+
+		AudioMixerPlayer(Mixer mixer, int bufferFrames) throws
+			LineUnavailableException
+		{
+			audioBytes = new byte[sdlByteBufferSize];
+
+			sdl = AudioCue.getSourceDataLine(mixer, AudioCue.info);
+			sdl.open(AudioCue.audioFormat, sdlByteBufferSize);
+			sdl.start();
+		}
+
+		// Sound Thread
+		public void run()
+		{
+			while(running)
+			{
+				if (trackCacheUpdated)
+				{
+					/*
+					 * Concurrency plan: Better to allow a late
+					 * or redundant update than to skip an update.
+					 * Example: flag = true, next line resets, but
+					 * updater sets true again prior to mixerTracks
+					 * assignment. We might load the same trackCache
+					 * twice. That is OK.
+					 */
+					trackCacheUpdated = false;
+					mixerTracks = trackCache;
+					trackCount = mixerTracks.length;
+				}
+				readBuffer = new float[readBufferSize];
+				readBuffer = fillBufferFromTracks(readBuffer);
+				audioBytes = AudioCue.fromBufferToAudioBytes(
+					audioBytes, readBuffer);
+				sdl.write(audioBytes, 0, sdlByteBufferSize);
+			}
+
+			sdl.drain();
+			sdl.close();
+			sdl = null;
+		}
+	}
+}
+package nl.alowaniak.runelite.musicreplacer;
+
+import com.adonax.audiocue.AudioCue;
+import com.google.common.collect.ImmutableMap;
+import jaco.mp3.player.MP3Player;
+import lombok.SneakyThrows;
+import org.slf4j.LoggerFactory;
+
+import javax.swing.*;
+import java.io.File;
+import java.net.URI;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.Map;
+import java.util.function.Function;
+
+public interface MusicPlayer {
+
+    static void preloadNecessaries() {
+        // Jaco's MP3Player does some init that needs to happen on the UI thread
+        SwingUtilities.invokeLater(JacoPlayer.player::toString);
+    }
+
+    ImmutableMap<String, Function<URI, MusicPlayer>> PLAYER_PER_EXT = ImmutableMap.of(
+            ".mp3", JacoPlayer::new,
+            ".wav", AudioCuePlayer::new
+    );
+
+    static MusicPlayer create(URI media)
+    {
+        for (Map.Entry<String, Function<URI, MusicPlayer>> extAndPlayer : PLAYER_PER_EXT.entrySet()) {
+            if (media.getPath().endsWith(extAndPlayer.getKey()))
+                try {
+                    return extAndPlayer.getValue().apply(media);
+                } catch (Exception e) {
+                    LoggerFactory.getLogger(MusicPlayer.class).warn("Couldn't load player for " + media, e);
+                }
+        }
+        return null;
+    }
+
+    void play();
+
+    boolean isPlaying();
+
+    void setVolume(double volume);
+
+    default void close() {}
+
+    class JacoPlayer implements MusicPlayer {
+
+        public static final MP3Player player = new MP3Player();
+        private final File tempPlayFile; // A hacky solution for overriding/deleting current playing song
+
+        @SneakyThrows
+        public JacoPlayer(URI mediaFile) {
+            player.getPlayList().clear();
+            tempPlayFile = File.createTempFile("tmpJacoPlayfile", ".mp3");
+            tempPlayFile.deleteOnExit();
+            Files.copy(new File(mediaFile).toPath(), tempPlayFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            player.add(tempPlayFile);
+        }
+
+        @Override
+        public void play() {
+            player.play();
+        }
+
+        @Override
+        public boolean isPlaying() {
+            return player.isPlaying();
+        }
+
+        @Override
+        public void setVolume(double volume) {
+            int intVol = (int) (volume * 100);
+            if (volume > 0 && intVol == 0) intVol = 1;
+            player.setVolume(intVol);
+        }
+
+        @Override
+        public void close() {
+            player.stop();
+            tempPlayFile.delete();
+        }
+    }
+
+    class AudioCuePlayer implements MusicPlayer
+    {
+        // Same hacky solution as JaCo even though it shouldn't happen here cause audiocue fully loads in memory
+        private final File tempPlayFile;
+        private final AudioCue audioCue;
+
+        @SneakyThrows
+        private AudioCuePlayer(URI media)
+        {
+            tempPlayFile = File.createTempFile("tmpJacoPlayfile", ".mp3");
+            tempPlayFile.deleteOnExit();
+            Files.copy(new File(media).toPath(), tempPlayFile.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            audioCue = AudioCue.makeStereoCue(tempPlayFile.toURL(), 1);
+            audioCue.open();
+        }
+
+        @Override
+        public void play()
+        {
+            if (audioCue.getIsActive(0)) audioCue.releaseInstance(0);
+            audioCue.play();
+        }
+
+        @Override
+        public boolean isPlaying()
+        {
+            return audioCue.getIsActive(0);
+        }
+
+        @Override
+        public void setVolume(double volume)
+        {
+            audioCue.setVolume(0, volume);
+        }
+
+        @Override
+        public void close()
+        {
+            tempPlayFile.delete();
+            audioCue.close();
+        }
+    }
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+import static nl.alowaniak.runelite.musicreplacer.MusicReplacerConfig.CONFIG_GROUP;
+
+@ConfigGroup(CONFIG_GROUP)
+public interface MusicReplacerConfig extends Config
+{
+	String CONFIG_GROUP = "musicreplacer";
+	@ConfigItem(
+			keyName = "skipAlreadyOverriddenWhenBulkOverride",
+			name = "Skip overridden if bulk",
+			description = "When on this will skip any already overridden tracks when doing a bulk override.<br>" +
+					"If off the bulk override will replace already overridden tracks (if said track is in the bulk)."
+	)
+	default boolean skipAlreadyOverriddenWhenBulkOverride()
+	{
+		return true;
+	}
+
+	@ConfigItem(
+			keyName = "playOverridesToEnd",
+			name = "Play overrides to end",
+			description = "When on a next track won't play until current override has ended."
+	)
+	default boolean playOverridesToEnd()
+	{
+		return false;
+	}
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import com.google.common.primitives.Doubles;
+import com.google.common.primitives.Ints;
+import com.google.inject.Binder;
+import com.google.inject.Provides;
+import com.google.inject.name.Names;
+import joptsimple.internal.Strings;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.events.ClientTick;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.api.widgets.JavaScriptCallback;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetID;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.EventBus;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDependency;
+import net.runelite.client.plugins.PluginDescriptor;
+import net.runelite.client.plugins.music.MusicConfig;
+import net.runelite.client.plugins.music.MusicPlugin;
+import net.runelite.client.ui.overlay.tooltip.Tooltip;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
+
+import javax.inject.Inject;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.Arrays;
+import java.util.Objects;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+
+import static nl.alowaniak.runelite.musicreplacer.TracksOverridesUi.NORMAL_FONT;
+import static nl.alowaniak.runelite.musicreplacer.TracksOverridesUi.OVERRIDE_FONT;
+
+@Slf4j
+@PluginDescriptor(
+		name = "Music Replacer",
+		description = "Replace music tracks with presets (e.g. OSRSBeatz) or your own music",
+		tags = {"music", "replace", "override", "track", "song", "youtube", "beats", "osrsbeatz", "rs3"}
+)
+@PluginDependency(MusicPlugin.class)
+public class MusicReplacerPlugin extends Plugin
+{
+	static {
+		MusicPlayer.preloadNecessaries();
+	}
+
+	public static final String MUSIC_REPLACER_API = "https://alowan.nl/runelite-music-replacer/";
+	public static final String MUSIC_REPLACER_EXECUTOR = "musicReplacerExecutor";
+	public static final int PLAYING_WIDGET_ID = 8;
+	public static final int CURRENTLY_PLAYING_WIDGET_ID = 9;
+
+	private static final int MUSIC_LOOP_STATE_VAR_ID = 4137;
+	private static final double MAX_VOL = 255;
+
+	@Override
+	public void configure(Binder binder)
+	{
+		// Use our own ExecutorService instead of ScheduledExecutorService because the downloads can take a while
+		binder.bind(ExecutorService.class).annotatedWith(Names.named(MUSIC_REPLACER_EXECUTOR)).toInstance(Executors.newSingleThreadExecutor());
+	}
+
+	@Inject
+	private Client client;
+	@Inject
+	private EventBus eventBus;
+	@Inject
+	private ClientThread clientThread;
+	@Inject
+	private TooltipManager tooltipManager;
+
+	@Inject
+	private Tracks tracks;
+	@Inject
+	private TracksOverridesUi tracksOverridesUi;
+
+	@Inject
+	private MusicConfig musicConfig;
+	@Inject
+	private MusicReplacerConfig config;
+
+	private MusicPlayer player;
+	private String actualCurTrack;
+	private boolean restoreActualCurTrack;
+	private TrackOverride trackToPlay;
+
+	private double fading;
+
+	@Override
+	protected void startUp()
+	{
+		eventBus.register(tracksOverridesUi);
+	}
+
+	@Provides
+	MusicReplacerConfig getConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(MusicReplacerConfig.class);
+	}
+
+	@Subscribe
+	public void onGameStateChanged(GameStateChanged gameStateChanged)
+	{
+		if (gameStateChanged.getGameState() == GameState.LOGIN_SCREEN)
+		{
+			stopPlaying();
+		}
+	}
+
+	private double oldVolume = -1;
+	@Subscribe
+	public void onClientTick(ClientTick tick)
+	{
+		Widget curTrackWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
+		Widget playingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, PLAYING_WIDGET_ID);
+		if (curTrackWidget == null || playingWidget == null) return;
+		String curTrack = curTrackWidget.getText();
+		if (Strings.isNullOrEmpty(curTrack)) return;
+
+		// I would rather do UI kinda stuff in TracksOverridesUi, but let's do it here for now
+		if (restoreActualCurTrack)
+		{
+			restoreActualCurTrack = false;
+			curTrackWidget.setText(curTrack = actualCurTrack);
+			playingWidget.setFontId(NORMAL_FONT);
+			playingWidget.setHasListener(false);
+		}
+		else if (config.playOverridesToEnd() && trackToPlay != null && !curTrack.equals(trackToPlay.getName()))
+		{
+			// curTrack is a new one, so keep track of actual playing track and change widget
+			actualCurTrack = curTrack;
+			playingWidget.setFontId(OVERRIDE_FONT);
+			Tooltip tooltip = new Tooltip("Up next: " + actualCurTrack);
+			playingWidget.setOnMouseRepeatListener((JavaScriptCallback) e ->
+			{
+				if (!tooltipManager.getTooltips().contains(tooltip)) tooltipManager.add(tooltip);
+			});
+			playingWidget.setOnClickListener((JavaScriptCallback) e -> restoreActualCurTrack = true);
+			playingWidget.setHasListener(true);
+			curTrackWidget.setText(curTrack = trackToPlay.getName());
+			// Sometimes a track tries to come through briefly, this might fix that hopefully?
+			applyVolume();
+		}
+
+		TrackOverride newTrack = tracks.getOverride(curTrack);
+		if (!Objects.equals(trackToPlay, newTrack))
+		{
+			trackToPlay = newTrack;
+			if (fading <= 0) fading = 1;
+		}
+
+
+		if (fading > 0)
+		{
+			applyVolume(fading -= .01);
+
+			if (fading <= 0)
+			{
+				stopCurrentAndStartNew();
+			}
+		}
+		else if (player != null)
+		{
+			double volume = (musicConfig.getMusicVolume() - 1) / MAX_VOL;
+			boolean actualTrackIsBeingOverruled = config.playOverridesToEnd() && actualCurTrack != null && trackToPlay != null && !actualCurTrack.equals(trackToPlay.getName());
+			if (actualTrackIsBeingOverruled && (volume <= 0 || !player.isPlaying()))
+			{
+				restoreActualCurTrack = true;
+			}
+			else if ((oldVolume <= 0 && volume > 0) || (!player.isPlaying() && client.getVarbitValue(MUSIC_LOOP_STATE_VAR_ID) == 1))
+			{
+				// Restart play if
+				// we switched from muted to on (mimic osrs behavior)
+				// or we ended and have loop enabled
+				player.play();
+			}
+
+			applyVolume();
+			oldVolume = volume;
+		}
+	}
+
+	private void stopCurrentAndStartNew() {
+		stopPlaying();
+
+		if (trackToPlay != null)
+		{
+			try
+			{
+				player = trackToPlay.getPaths()
+						.filter(Files::exists)
+						.map(Path::toUri)
+						.map(MusicPlayer::create)
+						.filter(Objects::nonNull)
+						.findFirst()
+						.orElse(null);
+				if (player != null) player.play();
+				else {
+					chatMsg("Deleting " + trackToPlay + " override because no player could be made (no file or wrong format?).");
+					tracks.removeOverride(trackToPlay.getName());
+				}
+			}
+			catch (OutOfMemoryError e)
+			{
+				log.warn("Out of memory when loading " + trackToPlay, e);
+				trackToPlay = null;
+			}
+		}
+
+		applyVolume();
+	}
+
+	private void applyVolume()
+	{
+		applyVolume(1);
+	}
+
+	private void applyVolume(double multiplier)
+	{
+		// Setting client music volume with invokeLater seems to prevent the original music from coming through
+		// I'm guessing because it depends on "where" in the client loop the vol is set
+		// And with invokeLater it happens to "overwrite" Music plugin's write at the correct "point" in the client loop
+
+		if (player == null)
+		{
+			int volume = (int) ((musicConfig.getMusicVolume() - 1) * multiplier);
+			clientThread.invokeLater(() -> client.setMusicVolume(Ints.constrainToRange(volume, 0, (int) MAX_VOL)));
+		}
+		else
+		{
+			if (player.isPlaying())
+			{
+				double volume = Doubles.constrainToRange((musicConfig.getMusicVolume() - 1) / MAX_VOL * multiplier, 0, 1);
+				player.setVolume(volume);
+			}
+			clientThread.invokeLater(() -> client.setMusicVolume(0));
+		}
+	}
+
+	public void stopPlaying()
+	{
+		fading = 0;
+		if (player != null)
+		{
+			player.close();
+			player = null;
+		}
+	}
+
+	@Override
+	protected void shutDown()
+	{
+		eventBus.unregister(tracksOverridesUi);
+		tracksOverridesUi.shutdown();
+		trackToPlay = null;
+		stopPlaying();
+		clientThread.invoke(() ->
+		{
+			applyVolume();
+			Widget curTrackWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
+			Widget playingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, PLAYING_WIDGET_ID);
+			if (curTrackWidget == null || playingWidget == null) return;
+			if (!Strings.isNullOrEmpty(actualCurTrack)) curTrackWidget.setText(actualCurTrack);
+			playingWidget.setFontId(NORMAL_FONT);
+			playingWidget.setHasListener(false);
+			playingWidget.setOnMouseRepeatListener((Object[]) null);
+			actualCurTrack = null;
+		});
+	}
+
+	public void chatMsg(String... msgs) {
+		clientThread.invoke(() -> Arrays.stream(msgs).forEach(msg -> client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", msg, null)));
+	}
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import com.google.gson.reflect.TypeToken;
+import lombok.Value;
+
+import java.util.List;
+import java.util.Map;
+
+@Value
+public class Preset {
+    public static final TypeToken<List<Preset>> LIST_TYPE = new TypeToken<List<Preset>>() {};
+
+    String name;
+    String credits;
+    Map<String, SearchResult> tracks;
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import com.google.gson.reflect.TypeToken;
+import lombok.Data;
+
+import java.util.List;
+
+@Data
+public class SearchResult {
+    public static final TypeToken<List<SearchResult>> LIST_TYPE = new TypeToken<List<SearchResult>>() {};
+
+    String id;
+    String name;
+    long duration;
+    String uploader;
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import java.nio.file.Path;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import lombok.Value;
+
+/*
+ * Ideally this class is refactored a bunch.
+ * But such a refactor will likely break already existing overrides + not sure what the best design would be.
+ *
+ * Things that aren't too clean:
+ * 	originalPath when downloaded
+ *  fromLocal which could be deduced (or maybe have a hierarchy LocalOverride/RemoteOverride)
+ *  coupling of name to path and not knowing it's extension (which is requiring nasty workarounds)
+ */
+@Value
+class TrackOverride
+{
+	String name;
+	/**
+	 * The originalPath for a local override or the {@link SearchResult#id} for downloads
+	 */
+	String originalPath;
+	boolean fromLocal;
+	Map<String, String> additionalInfo;
+
+	/**
+	 * Multiple possibilities because extension is unknown.
+	 *
+	 * @return the possible paths of the overridden tracks in most favouring first.
+	 */
+	public Stream<Path> getPaths()
+	{
+		return MusicPlayer.PLAYER_PER_EXT.keySet().stream().map(e -> Tracks.MUSIC_OVERRIDES_DIR.toPath().resolve(name + e));
+	}
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import com.google.common.collect.ImmutableMap;
+import lombok.Getter;
+import lombok.Value;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.EnumID;
+import net.runelite.client.RuneLite;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.time.Duration;
+import java.util.Arrays;
+import java.util.List;
+import java.util.SortedSet;
+import java.util.TreeSet;
+import java.util.concurrent.ExecutorService;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
+
+import static net.runelite.http.api.RuneLiteAPI.GSON;
+import static nl.alowaniak.runelite.musicreplacer.MusicReplacerConfig.CONFIG_GROUP;
+import static nl.alowaniak.runelite.musicreplacer.MusicReplacerPlugin.MUSIC_REPLACER_API;
+
+/**
+ * Provides access to all OSRS track names as well as all {@link TrackOverride overridden tracks}.
+ */
+@Slf4j
+@Singleton
+class Tracks
+{
+	static final File MUSIC_OVERRIDES_DIR = new File(RuneLite.RUNELITE_DIR, "music-replacer");
+	{ // Not static initializer, if we fail we only want to fail loading our plugin
+		if (!MUSIC_OVERRIDES_DIR.exists() && !MUSIC_OVERRIDES_DIR.mkdirs())
+		{
+			throw new IllegalStateException("Failed to create " + MUSIC_OVERRIDES_DIR);
+		}
+	}
+
+	public static final String OVERRIDE_CONFIG_KEY_PREFIX = "track_";
+	public static final String FULL_OVERRIDE_CONFIG_KEY_PREFIX = CONFIG_GROUP + '.' + OVERRIDE_CONFIG_KEY_PREFIX;
+
+	@Inject
+	private ConfigManager configMgr;
+	@Inject
+	private MusicReplacerConfig config;
+	@Inject
+	private MusicReplacerPlugin musicReplacer;
+	@Inject
+	@Named(MusicReplacerPlugin.MUSIC_REPLACER_EXECUTOR)
+	private ExecutorService executor;
+
+	/**
+	 * @return whether or not given {@code name} exists as a {@link TrackOverride}
+	 */
+	public boolean overrideExists(String name)
+	{
+		return configMgr.getConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name) != null;
+	}
+
+	public List<String> overriddenTracks()
+	{
+		return configMgr.getConfigurationKeys(CONFIG_GROUP).stream()
+			.filter(e -> e.startsWith(FULL_OVERRIDE_CONFIG_KEY_PREFIX))
+			.map(e -> e.replace(FULL_OVERRIDE_CONFIG_KEY_PREFIX, ""))
+			.collect(Collectors.toList());
+	}
+
+	/**
+	 * Bulk creates overrides assuming {@code dir} contains audio files with exact same names as tracks
+	 */
+	public void bulkCreateOverride(Path dirPath)
+	{
+		@Value class PathAndFilename {
+			Path path;
+			@Getter(lazy = true) String filename = path.getFileName().toString().replaceAll("\\..+$", "");
+		}
+		executor.submit(() ->
+		{
+			musicReplacer.chatMsg("Overriding with tracks in " + dirPath + ".");
+			try (Stream<Path> ls = Files.list(dirPath))
+			{
+				ls.map(e -> new PathAndFilename(e))
+						// Ideally we filtered only files with an osrs track name, but music track enum is removed, let place responsibility on user
+						.forEach(e -> {
+							if (!config.skipAlreadyOverriddenWhenBulkOverride() || !overrideExists(e.getFilename())) {
+								createOverride(e.getFilename(), e.getPath());
+							} else {
+								musicReplacer.chatMsg("Skipping " + e.getFilename() + ", already overridden.");
+							}
+						});
+			}
+			catch (IOException e)
+			{
+				log.warn("Error opening `" + dirPath + "` for bulk override.", e);
+			}
+			musicReplacer.chatMsg("Done overriding.");
+		});
+	}
+
+    public void createOverride(String name, Path path)
+	{
+		createOverride(new TrackOverride(name, path.toString(), true, ImmutableMap.of()));
+	}
+
+	public void bulkCreateOverride(Preset preset) {
+		musicReplacer.chatMsg(
+				"Downloading " + preset.getTracks().size() + " tracks, won't dl all if RL closes prematurely.",
+				preset.getCredits()
+		);
+		preset.getTracks().forEach((name, override) -> {
+			if (!config.skipAlreadyOverriddenWhenBulkOverride() || !overrideExists(name)) {
+				createOverride(name, override);
+			} else {
+				musicReplacer.chatMsg("Skipping " + name + ", already overridden.");
+			}
+		});
+		executor.submit(() -> musicReplacer.chatMsg("Finished downloading preset " + preset.getName() + ".", preset.getCredits()));
+	}
+
+	public void createOverride(String trackName, SearchResult hit)
+	{
+		executor.submit(() -> createOverride(
+			new TrackOverride(trackName, hit.id, false,
+				ImmutableMap.of(
+				"Name", hit.getName(),
+				"Duration", Duration.ofSeconds(hit.getDuration()).toString(),
+				"Uploader", hit.getUploader()
+				)
+			)
+		));
+	}
+
+	private void createOverride(TrackOverride override)
+	{
+		Path overridePath = transfer(override);
+		if (overridePath != null)
+		{
+			// Ensure we only keep the current override transferred file
+			override.getPaths()
+					.filter(e -> !e.equals(overridePath))
+					.forEach(path -> {
+						try {
+							Files.deleteIfExists(path);
+						} catch (IOException e) {
+							log.warn("Couldn't delete " + path, e);
+						}
+					});
+
+			configMgr.setConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + override.getName(), GSON.toJson(override));
+			musicReplacer.chatMsg(override.isFromLocal()
+							? "Overridden " + override.getName()
+							: "Overridden " + override.getName() + ", uploaded by " + override.getAdditionalInfo().get("Uploader")
+			);
+		} else {
+			musicReplacer.chatMsg("Failed to override " + override.getName() + ", check the logs.");
+		}
+	}
+
+	public TrackOverride getOverride(String name)
+	{
+		TrackOverride override = GSON.fromJson(
+			configMgr.getConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name),
+			TrackOverride.class
+		);
+
+		if (override == null || override.getPaths().anyMatch(Files::exists))
+		{
+			return override;
+		}
+		else
+		{
+			log.warn("Deleting: " + override + " because there was no override file for it.");
+			configMgr.unsetConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name);
+			return null;
+		}
+	}
+
+	/**
+	 * Clears all overridden tracks.
+	 */
+	public void removeAllOverrides()
+	{
+		executor.submit(() -> overriddenTracks().forEach(this::removeOverride));
+	}
+
+	public void removeOverride(String name) {
+		TrackOverride override = getOverride(name);
+		if (override == null) return;
+
+		configMgr.unsetConfiguration(CONFIG_GROUP, OVERRIDE_CONFIG_KEY_PREFIX + name);
+		override.getPaths().forEach(overridePath -> {
+			try {
+				Files.deleteIfExists(overridePath);
+			} catch (IOException e) {
+				log.warn("Couldn't delete " + name, e);
+			}
+		});
+	}
+
+	private Path transfer(TrackOverride override)
+	{
+		return override.isFromLocal()
+			? transferLocal(override)
+			: transferLink(override);
+	}
+
+	private Path transferLocal(TrackOverride override)
+	{
+		Path path = Paths.get(override.getOriginalPath());
+		Path targetPath = override.getPaths()
+				.filter(e -> extensionOf(path).equals(extensionOf(e)))
+				.findFirst().orElse(null);
+
+		if (targetPath == null)
+		{
+			log.warn("Can only load " + MusicPlayer.PLAYER_PER_EXT.keySet() + " files. " + override);
+			return null;
+		}
+
+		try
+		{
+			Files.copy(path, targetPath, StandardCopyOption.REPLACE_EXISTING);
+			return targetPath;
+		} catch (IOException e)
+		{
+			log.warn("Something went wrong when copying " + override, e);
+			return null;
+		}
+	}
+
+	private String extensionOf(Path p) {
+		String fileName = p.getFileName().toString();
+		return fileName.substring(fileName.lastIndexOf('.'));
+	}
+
+	private Path transferLink(TrackOverride override)
+	{
+		Path targetPath = override.getPaths().findFirst().orElseThrow(IllegalStateException::new);
+
+		String dlUrl = MUSIC_REPLACER_API + "download/" + override.getOriginalPath() + "?ext=" + extensionOf(targetPath);
+		try (InputStream is = new URL(dlUrl).openStream())
+		{
+			Files.copy(is, targetPath, StandardCopyOption.REPLACE_EXISTING);
+			return targetPath;
+		}
+		catch (IOException e)
+		{
+			log.warn("Something went wrong when downloading for " + override, e);
+			return null;
+		}
+	}
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import com.google.common.primitives.Ints;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.*;
+import net.runelite.api.events.GameTick;
+import net.runelite.api.events.MenuOpened;
+import net.runelite.api.events.VarClientIntChanged;
+import net.runelite.api.widgets.JavaScriptCallback;
+import net.runelite.api.widgets.Widget;
+import net.runelite.api.widgets.WidgetID;
+import net.runelite.api.widgets.WidgetInfo;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.events.ConfigChanged;
+import net.runelite.client.game.chatbox.ChatboxPanelManager;
+import net.runelite.client.game.chatbox.ChatboxTextMenuInput;
+import net.runelite.client.ui.overlay.tooltip.Tooltip;
+import net.runelite.client.ui.overlay.tooltip.TooltipManager;
+import net.runelite.client.util.Text;
+
+import javax.inject.Inject;
+import javax.inject.Singleton;
+import javax.swing.*;
+import javax.swing.filechooser.FileFilter;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStreamReader;
+import java.time.Duration;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Stream;
+
+import static net.runelite.http.api.RuneLiteAPI.GSON;
+import static nl.alowaniak.runelite.musicreplacer.MusicReplacerConfig.CONFIG_GROUP;
+import static nl.alowaniak.runelite.musicreplacer.MusicReplacerPlugin.CURRENTLY_PLAYING_WIDGET_ID;
+import static nl.alowaniak.runelite.musicreplacer.Tracks.OVERRIDE_CONFIG_KEY_PREFIX;
+
+@Slf4j
+@Singleton
+class TracksOverridesUi
+{
+	public static final int PAGE_SIZE = 4;
+
+	public static final int OVERRIDE_FONT = FontID.BOLD_12;
+	public static final int NORMAL_FONT = FontID.PLAIN_12;
+
+	public static final int RESIZABLE_VIEWPORT_BOTTOM_LINE_MUSIC_TAB_ID = 10747946;
+
+	@Inject
+	private Client client;
+	@Inject
+	private ClientThread clientThread;
+	@Inject
+	private TooltipManager tooltipManager;
+	@Inject
+	private ChatboxPanelManager chatboxPanelManager;
+
+	@Inject
+	private Tracks tracks;
+	@Inject
+	private YouTubeSearcher ytSearcher;
+
+	private String lastPlayingTrack;
+	private boolean overrideWidgetsOutdated = true;
+
+	@Subscribe
+	public void onGameTick(GameTick tick)
+	{
+		Widget playingTrackWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
+		if (playingTrackWidget == null) return;
+
+		String playingTrack = playingTrackWidget.getText();
+		if (!playingTrack.equals(lastPlayingTrack))
+		{
+			lastPlayingTrack = playingTrack;
+			updateCurrentlyPlayingWidget();
+		}
+
+		if (overrideWidgetsOutdated)
+		{
+			updateOverridesInTrackList();
+		}
+	}
+
+	@Subscribe
+	public void onConfigChanged(ConfigChanged configChanged)
+	{
+		String key = configChanged.getKey();
+		if (CONFIG_GROUP.equals(configChanged.getGroup()) && key.startsWith(OVERRIDE_CONFIG_KEY_PREFIX))
+		{
+			overrideWidgetsOutdated = true;
+			if (key.contains(lastPlayingTrack))
+			{
+				updateCurrentlyPlayingWidget();
+			}
+		}
+	}
+
+	@Subscribe
+	public void onVarClientIntChanged(VarClientIntChanged varClientIntChanged)
+	{
+		if (varClientIntChanged.getIndex() == VarClientInt.INVENTORY_TAB && isOnMusicTab())
+		{
+			// The widgets could be outdated, just ensure it's updated whenever we go to the music tab
+			// TODO figure out better way of ensuring the tracklist is up to date
+			overrideWidgetsOutdated = true;
+		}
+	}
+
+	private boolean isOnMusicTab()
+	{
+		return client.getVarcIntValue(VarClientInt.INVENTORY_TAB) == 13;
+	}
+
+	@Subscribe
+	public void onMenuOpened(final MenuOpened event)
+	{
+		final MenuEntry entry = event.getFirstEntry();
+		if (entry == null) return;
+
+		int widgetId = entry.getParam1();
+		if (widgetId == WidgetInfo.MUSIC_TRACK_LIST.getId())
+		{
+			String trackName = Text.removeTags(entry.getTarget());
+			addMenuEntry("Override", entry).onClick(e ->
+				chatboxPanelManager.openTextMenuInput("How would you like to override " + trackName + "?")
+				.option("With a local file.", () -> overrideByLocal(trackName))
+				.option("From a youtube search.", () -> overrideBySearch(trackName))
+				.build()
+			);
+
+			if (tracks.getOverride(trackName) != null)
+			{
+				addMenuEntry("Remove override", entry).onClick(e -> tracks.removeOverride(trackName));
+			}
+		}
+		else if (widgetId == WidgetInfo.FIXED_VIEWPORT_MUSIC_TAB.getId()
+				|| widgetId == WidgetInfo.RESIZABLE_VIEWPORT_MUSIC_TAB.getId()
+				|| widgetId == RESIZABLE_VIEWPORT_BOTTOM_LINE_MUSIC_TAB_ID)
+		{
+			if (!tracks.overriddenTracks().isEmpty())
+			{
+				addMenuEntry("Remove overrides", entry).onClick(e -> tracks.removeAllOverrides());
+			}
+
+			addMenuEntry("Override tracks", entry).onClick(e ->
+				chatboxPanelManager.openTextMenuInput("How would you like to bulk override?")
+						.option("From preset", choosePresetForBulkOverride)
+						.option("From directory", () -> SwingUtilities.invokeLater(chooseDirectoryForBulkOverride))
+						.build()
+			);
+		}
+	}
+
+	private final Runnable choosePresetForBulkOverride =  () -> {
+		try (InputStreamReader reader = new InputStreamReader(getClass().getResourceAsStream("/presets.json"))) {
+			ChatboxTextMenuInput input = chatboxPanelManager.openTextMenuInput("Which preset? (This will download ALL overridden tracks!)");
+			List<Preset> presets = GSON.fromJson(reader, Preset.LIST_TYPE.getType());
+			presets.forEach(preset -> input.option(preset.getName(), () -> tracks.bulkCreateOverride(preset)));
+			input.build();
+		} catch (NullPointerException | IOException ex) {
+			log.warn("Something went wrong when reading presets.", ex);
+		}
+	};
+
+	private final Runnable chooseDirectoryForBulkOverride = () -> {
+		JFileChooser fileChooser = new JFileChooser();
+		fileChooser.setFileSelectionMode(JFileChooser.DIRECTORIES_ONLY);
+		fileChooser.setMultiSelectionEnabled(false);
+		int status = fileChooser.showOpenDialog(client.getCanvas());
+		if (status == JFileChooser.APPROVE_OPTION) {
+			tracks.bulkCreateOverride(fileChooser.getSelectedFile().toPath());
+		}
+	};
+
+	private MenuEntry addMenuEntry(String option, MenuEntry entryForCopy)
+	{
+		return client.createMenuEntry(-1)
+			.setOption(option)
+			.setTarget(entryForCopy.getTarget())
+			.setType(MenuAction.RUNELITE)
+			.setParam0(entryForCopy.getParam0())
+			.setParam1(entryForCopy.getParam1())
+			.setIdentifier(entryForCopy.getIdentifier());
+	}
+
+	private void overrideByLocal(String trackName)
+	{
+		SwingUtilities.invokeLater(() -> {
+			JFileChooser fileChooser = new JFileChooser();
+			fileChooser.setFileSelectionMode(JFileChooser.FILES_ONLY);
+			fileChooser.setMultiSelectionEnabled(false);
+			fileChooser.setFileFilter(new FileFilter() {
+				@Override
+				public boolean accept(File f) {
+					return f.isDirectory() || MusicPlayer.PLAYER_PER_EXT.keySet().stream().anyMatch(ext -> f.getName().endsWith(ext));
+				}
+
+				@Override
+				public String getDescription() {
+					return "Supported audio files";
+				}
+			});
+			int status = fileChooser.showOpenDialog(client.getCanvas());
+			if (status == JFileChooser.APPROVE_OPTION) {
+				tracks.createOverride(trackName, fileChooser.getSelectedFile().toPath());
+			}
+		});
+	}
+
+	private void overrideBySearch(String trackName)
+	{
+		chatboxPanelManager.openTextInput("Enter your search criteria for " + trackName)
+				.value(trackName)
+				.onDone((String s) -> ytSearcher.search(s, hits -> paginateSearch(trackName, hits)))
+				.build();
+	}
+
+	private void paginateSearch(String trackName, List<SearchResult> hits)
+	{
+		ChatboxTextMenuInput chooser = chatboxPanelManager.openTextMenuInput("Choose which you want to use as override for " + trackName);
+
+		int pageSize = PAGE_SIZE + (PAGE_SIZE + 1 == hits.size() ? 1 : 0);
+
+		hits.stream().limit(pageSize).forEach(hit ->
+			chooser.option(
+				hit.getName() + " " + Duration.ofSeconds(hit.getDuration()).toString().substring(2) + " " + hit.getUploader(),
+				() -> tracks.createOverride(trackName, hit)
+			)
+		);
+
+		List<SearchResult> remainingHits = hits.subList(Math.min(hits.size(), pageSize), hits.size());
+		if (!remainingHits.isEmpty()) chooser.option("Continue", () -> paginateSearch(trackName, remainingHits));
+
+		chooser.build();
+	}
+
+	private void updateOverridesInTrackList()
+	{
+		clientThread.invoke(() ->
+		{
+			Widget trackList = client.getWidget(WidgetInfo.MUSIC_TRACK_LIST);
+			if (trackList == null) return;
+			for (Widget e : trackList.getDynamicChildren())
+			{
+				e.setFontId(tracks.overrideExists(e.getText()) ? OVERRIDE_FONT : NORMAL_FONT);
+				e.revalidate();
+			}
+		});
+	}
+
+	private void updateCurrentlyPlayingWidget()
+	{
+		clientThread.invoke(() ->
+		{
+			Widget trackPlayingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
+			if (trackPlayingWidget == null) return;
+
+			trackPlayingWidget.setOnClickListener((JavaScriptCallback) e -> scrollToTrack(e.getSource().getText()));
+			trackPlayingWidget.setHasListener(true);
+
+			TrackOverride override = tracks.getOverride(trackPlayingWidget.getText());
+			if (override != null)
+			{
+				trackPlayingWidget.setFontId(OVERRIDE_FONT);
+
+				String origin = truncate(override.getOriginalPath(), 40);
+
+				StringBuilder tooltipTxt = new StringBuilder("From: " + origin + "</br>");
+				override.getAdditionalInfo().entrySet().stream()
+						.sorted(Map.Entry.comparingByKey(Comparator.comparing(String::length).thenComparing(String::compareTo)))
+						.forEach(e -> tooltipTxt.append(e.getKey()).append(": ").append(e.getValue()).append("</br>"));
+				Tooltip tooltip = new Tooltip(tooltipTxt.toString());
+
+				trackPlayingWidget.setOnMouseRepeatListener((JavaScriptCallback) e ->
+				{
+					if (!tooltipManager.getTooltips().contains(tooltip)) tooltipManager.add(tooltip);
+				});
+			}
+			else
+			{
+				trackPlayingWidget.setOnMouseRepeatListener((Object[]) null);
+				trackPlayingWidget.setFontId(NORMAL_FONT);
+			}
+		});
+	}
+
+	private void scrollToTrack(String name)
+	{
+		Widget track = findTrackWidget(name);
+		if (track == null) return;
+
+		Widget scrollContainer = client.getWidget(WidgetInfo.MUSIC_TRACK_SCROLL_CONTAINER);
+		if (scrollContainer == null) return;
+
+		int centralY = track.getRelativeY() + track.getHeight() / 2;
+
+		int newScroll = Ints.constrainToRange(
+			centralY - scrollContainer.getHeight() / 2,
+			0, scrollContainer.getScrollHeight()
+		);
+
+		client.runScript(
+			ScriptID.UPDATE_SCROLLBAR,
+			WidgetInfo.MUSIC_TRACK_SCROLLBAR.getId(),
+			WidgetInfo.MUSIC_TRACK_SCROLL_CONTAINER.getId(),
+			newScroll
+		);
+	}
+
+	private Widget findTrackWidget(String name) {
+		Widget trackList = client.getWidget(WidgetInfo.MUSIC_TRACK_LIST);
+		if (trackList == null) return null;
+
+		return Stream.of(trackList.getDynamicChildren())
+				.filter(w -> name.equals(w.getText()))
+				.findAny().orElse(null);
+	}
+
+	private void clearCurrentlyPlayingWidget()
+	{
+		clientThread.invoke(() ->
+		{
+			Widget trackPlayingWidget = client.getWidget(WidgetID.MUSIC_GROUP_ID, CURRENTLY_PLAYING_WIDGET_ID);
+			if (trackPlayingWidget == null) return;
+
+			trackPlayingWidget.setFontId(NORMAL_FONT);
+
+			trackPlayingWidget.setOnClickListener((Object[]) null);
+			trackPlayingWidget.setOnMouseRepeatListener((Object[]) null);
+			trackPlayingWidget.setHasListener(false);
+		});
+	}
+
+	public void shutdown()
+	{
+		overrideWidgetsOutdated = true;
+		lastPlayingTrack = null;
+		clientThread.invoke(() ->
+		{
+			Widget trackList = client.getWidget(WidgetInfo.MUSIC_TRACK_LIST);
+			if (trackList == null) return;
+			for (Widget e : trackList.getDynamicChildren())
+			{
+				e.setFontId(NORMAL_FONT);
+				e.revalidate();
+			}
+		});
+		clearCurrentlyPlayingWidget();
+	}
+
+	private static String truncate(String s, int length)
+	{
+		return s.length() <= length ? s : s.substring(0, length / 2 - 2) + " .. " + s.substring(s.length() - (length / 2 - 2));
+	}
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import lombok.extern.slf4j.Slf4j;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
+
+import javax.inject.Inject;
+import javax.inject.Named;
+import javax.inject.Singleton;
+import java.io.IOException;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import static net.runelite.http.api.RuneLiteAPI.GSON;
+import static nl.alowaniak.runelite.musicreplacer.MusicReplacerPlugin.MUSIC_REPLACER_API;
+
+@Slf4j
+@Singleton
+class YouTubeSearcher
+{
+
+    @Inject
+	private OkHttpClient http;
+	@Inject
+	@Named(MusicReplacerPlugin.MUSIC_REPLACER_EXECUTOR)
+	private ExecutorService executor;
+
+	/**
+	 * @param term the {@code term} to search for.
+	 * @param resultCollector will be called with the found results.
+	 */
+	public void search(String term, Consumer<List<SearchResult>> resultCollector)
+	{
+		executor.submit(() -> resultCollector.accept(getSearchResults(term)));
+	}
+
+    private List<SearchResult> getSearchResults(String term) {
+        try (Response res = getSearchResponse(term))
+        {
+            if (!res.isSuccessful()) throw new IOException(res.code() + ": " + res.message() + " " + res.body().string());
+
+            return GSON.fromJson(res.body().string(), SearchResult.LIST_TYPE.getType());
+        }
+        catch (IOException e)
+        {
+            log.warn("Something went wrong when searching for " + term, e);
+            return Collections.emptyList();
+        }
+    }
+
+    private Response getSearchResponse(String term) throws IOException {
+        return http.newBuilder().readTimeout(1, TimeUnit.MINUTES)
+            .build()
+            .newCall(new Request.Builder()
+                .url(MUSIC_REPLACER_API + "search/" + URLEncoder.encode(term, StandardCharsets.UTF_8.toString()))
+                .build()
+            ).execute();
+    }
+}
+
+package nl.alowaniak.runelite.musicreplacer;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class MusicReplacerPluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(MusicReplacerPlugin.class);
+		RuneLite.main(args);
 	}
 }

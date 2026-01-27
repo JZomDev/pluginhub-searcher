@@ -1,6 +1,388 @@
 package com.salvagesack;
 
 import com.google.gson.Gson;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import lombok.extern.slf4j.Slf4j;
+
+import java.io.*;
+import java.nio.charset.StandardCharsets;
+import java.util.HashMap;
+import java.util.Map;
+
+/**
+ * Manages loading and accessing expected drop rates from configuration
+ */
+@Slf4j
+public class DropRateManager
+{
+	private final Map<ShipwreckType, Map<String, Double>> dropRates = new HashMap<>();
+	private final Gson gson;
+	private final File userConfigFile;
+
+	public DropRateManager(File dataDirectory, Gson gson)
+	{
+		this.gson = gson;
+		this.userConfigFile = new File(dataDirectory, "drop_rates.json");
+		loadDropRates();
+	}
+
+	/**
+	 * Load drop rates from bundled resource and user config
+	 */
+	private void loadDropRates()
+	{
+		// First load bundled defaults
+		loadBundledRates();
+
+		// Then override with user config if it exists
+		if (userConfigFile.exists())
+		{
+			loadUserRates();
+		}
+		else
+		{
+			// Copy bundled config to user directory for editing
+			copyBundledToUser();
+		}
+	}
+
+	/**
+	 * Load rates from bundled resource
+	 */
+	private void loadBundledRates()
+	{
+		try (InputStream is = getClass().getResourceAsStream("/drop_rates.json"))
+		{
+			if (is != null)
+			{
+				parseDropRates(new InputStreamReader(is, StandardCharsets.UTF_8));
+				log.info("Loaded bundled drop rates");
+			}
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to load bundled drop rates: {}", e.getMessage());
+		}
+	}
+
+	/**
+	 * Load rates from user config file
+	 */
+	private void loadUserRates()
+	{
+		try (FileReader reader = new FileReader(userConfigFile))
+		{
+			parseDropRates(reader);
+			log.info("Loaded user drop rates from {}", userConfigFile.getAbsolutePath());
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to load user drop rates: {}", e.getMessage());
+		}
+	}
+
+	/**
+	 * Copy bundled config to user directory
+	 */
+	private void copyBundledToUser()
+	{
+		try (InputStream is = getClass().getResourceAsStream("/drop_rates.json"))
+		{
+			if (is != null)
+			{
+				File parentDir = userConfigFile.getParentFile();
+				if (parentDir != null && !parentDir.exists() && !parentDir.mkdirs())
+				{
+					log.warn("Failed to create directory: {}", parentDir.getAbsolutePath());
+					return;
+				}
+				try (FileOutputStream fos = new FileOutputStream(userConfigFile))
+				{
+					byte[] buffer = new byte[1024];
+					int bytesRead;
+					while ((bytesRead = is.read(buffer)) != -1)
+					{
+						fos.write(buffer, 0, bytesRead);
+					}
+				}
+				log.info("Copied drop rates config to {}", userConfigFile.getAbsolutePath());
+			}
+		}
+		catch (Exception e)
+		{
+			log.warn("Failed to copy drop rates config: {}", e.getMessage());
+		}
+	}
+
+	/**
+	 * Parse drop rates from a reader
+	 */
+	private void parseDropRates(Reader reader)
+	{
+		JsonObject root = gson.fromJson(reader, JsonObject.class);
+		JsonObject shipwrecks = root.getAsJsonObject("shipwrecks");
+
+		if (shipwrecks == null)
+		{
+			return;
+		}
+
+		for (String shipwreckKey : shipwrecks.keySet())
+		{
+			try
+			{
+				ShipwreckType type = ShipwreckType.valueOf(shipwreckKey);
+				JsonObject shipwreckData = shipwrecks.getAsJsonObject(shipwreckKey);
+				JsonObject items = shipwreckData.getAsJsonObject("items");
+
+				if (items != null)
+				{
+					Map<String, Double> itemRates = dropRates.computeIfAbsent(type, k -> new HashMap<>());
+
+					for (String itemName : items.keySet())
+					{
+						JsonElement rateElement = items.get(itemName);
+						if (rateElement != null && rateElement.isJsonPrimitive())
+						{
+							double rate = rateElement.getAsDouble();
+							itemRates.put(itemName.toLowerCase(), rate);
+						}
+					}
+				}
+			}
+			catch (IllegalArgumentException e)
+			{
+				log.debug("Unknown shipwreck type in config: {}", shipwreckKey);
+			}
+		}
+	}
+
+	/**
+	 * Get the expected drop rate for an item from a specific shipwreck type
+	 * @param shipwreckType The type of shipwreck
+	 * @param itemName The name of the item
+	 * @return The expected drop rate (0.0 to 1.0), or 0.0 if unknown
+	 */
+	public double getExpectedDropRate(ShipwreckType shipwreckType, String itemName)
+	{
+		Map<String, Double> itemRates = dropRates.get(shipwreckType);
+		if (itemRates == null)
+		{
+			log.debug("No rates found for shipwreck type: {}", shipwreckType);
+			return 0.0;
+		}
+
+		double rate = itemRates.getOrDefault(itemName.toLowerCase(), 0.0);
+		log.info("Drop rate lookup: type={}, item='{}', rate={}", shipwreckType, itemName, rate);
+		return rate;
+	}
+}
+
+
+package com.salvagesack;
+
+import lombok.Setter;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.util.AsyncBufferedImage;
+
+import java.awt.image.BufferedImage;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Manages fetching and caching of item icons using RuneLite's ItemManager
+ */
+@Slf4j
+public class ItemIconManager
+{
+	private static final int ICON_SIZE = 32;
+	
+	private final Map<Integer, BufferedImage> iconCache;
+	private final BufferedImage placeholderIcon;
+
+	@Setter
+	private Runnable onIconLoaded;
+
+	@Setter
+	private ItemManager itemManager;
+
+	public ItemIconManager()
+	{
+		this.iconCache = new ConcurrentHashMap<>();
+		this.placeholderIcon = createPlaceholderIcon();
+	}
+
+	/**
+	 * Get icon for an item by ID
+	 * @param itemId ID of the item
+	 * @return BufferedImage of the item icon, or placeholder if not found
+	 */
+	public BufferedImage getItemIcon(int itemId)
+	{
+		if (itemId <= 0)
+		{
+			return placeholderIcon;
+		}
+
+		// Check cache first
+		BufferedImage cached = iconCache.get(itemId);
+		if (cached != null)
+		{
+			return cached;
+		}
+
+		// Try to get from ItemManager
+		if (itemManager != null)
+		{
+			try
+			{
+				AsyncBufferedImage asyncImage = itemManager.getImage(itemId);
+				if (asyncImage != null)
+				{
+					// Cache when the image loads and trigger callback
+					asyncImage.onLoaded(() -> {
+						iconCache.put(itemId, asyncImage);
+						log.debug("Cached icon for item {}", itemId);
+						if (onIconLoaded != null)
+						{
+							onIconLoaded.run();
+						}
+					});
+					// Return the async image (it extends BufferedImage)
+					return asyncImage;
+				}
+			}
+			catch (Exception e)
+			{
+				log.debug("Failed to get icon for item {}: {}", itemId, e.getMessage());
+			}
+		}
+
+		// Return placeholder if fetch failed
+		return placeholderIcon;
+	}
+
+	/**
+	 * Create a simple placeholder icon
+	 */
+	private BufferedImage createPlaceholderIcon()
+	{
+		BufferedImage image = new BufferedImage(ICON_SIZE, ICON_SIZE, BufferedImage.TYPE_INT_ARGB);
+		// Create a simple gray square
+		for (int x = 0; x < ICON_SIZE; x++)
+		{
+			for (int y = 0; y < ICON_SIZE; y++)
+			{
+				if (x < 2 || x >= ICON_SIZE - 2 || y < 2 || y >= ICON_SIZE - 2)
+				{
+					image.setRGB(x, y, 0xFF666666); // Border
+				}
+				else
+				{
+					image.setRGB(x, y, 0xFF333333); // Fill
+				}
+			}
+		}
+		return image;
+	}
+}
+
+package com.salvagesack;
+
+import lombok.Data;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Stores all salvage tracking data for a specific shipwreck type.
+ * <p>
+ * Each shipwreck type maintains its own loot statistics including total sorts,
+ * individual item drop counts, and a timestamp for UI ordering.
+ * </p>
+ * <p>
+ * The panel displays shipwreck sections sorted by {@link #lastUpdated} so that
+ * the most recently active shipwreck always appears at the top, regardless of
+ * whether it is expanded or collapsed.
+ * </p>
+ */
+@Data
+public class SalvageData
+{
+	private final ShipwreckType shipwreckType;
+	private int totalLoots;
+	private final Map<Integer, SalvageItem> items; // itemId -> SalvageItem
+
+	/**
+	 * Timestamp (milliseconds since epoch) of the last loot recorded for this shipwreck.
+	 * Used to sort shipwreck panels in the UI with most recently updated at the top.
+	 */
+	private long lastUpdated;
+
+	public SalvageData(ShipwreckType shipwreckType)
+	{
+		this.shipwreckType = shipwreckType;
+		this.totalLoots = 0;
+		this.items = new ConcurrentHashMap<>();
+		this.lastUpdated = 0;
+	}
+
+	/**
+	 * Constructor for deserialization
+	 */
+	public SalvageData(ShipwreckType shipwreckType, int totalLoots, Map<Integer, SalvageItem> items)
+	{
+		this.shipwreckType = shipwreckType;
+		this.totalLoots = totalLoots;
+		this.items = items;
+		this.lastUpdated = 0;
+	}
+
+	/**
+	 * Record a loot drop
+	 * @param itemId The item ID that was looted
+	 * @param itemName The item name
+	 * @param expectedDropRate Expected drop rate for this item
+	 */
+	public void recordLoot(int itemId, String itemName, double expectedDropRate)
+	{
+		recordLoot(itemId, itemName, expectedDropRate, 1);
+	}
+
+	/**
+	 * Record a loot drop with quantity
+	 * Counts as 1 drop for rate calculation, but tracks full quantity
+	 * @param itemId The item ID that was looted
+	 * @param itemName The item name
+	 * @param expectedDropRate Expected drop rate for this item
+	 * @param quantity Number of items looted (for display, not rate calc)
+	 */
+	public void recordLoot(int itemId, String itemName, double expectedDropRate, int quantity)
+	{
+		SalvageItem item = items.computeIfAbsent(itemId,
+			id -> new SalvageItem(id, itemName, expectedDropRate));
+		item.recordDrop(quantity);  // 1 drop for rate, full quantity for display
+	}
+
+	/**
+	 * Increment total loot count and update the last modified timestamp.
+	 * <p>
+	 * This method should be called once per salvage sort action. The timestamp
+	 * update ensures this shipwreck type will be displayed at the top of the
+	 * panel, as shipwrecks are sorted by most recently updated.
+	 * </p>
+	 */
+	public void incrementTotalLoots()
+	{
+		this.totalLoots++;
+		this.lastUpdated = System.currentTimeMillis();
+	}
+}
+
+package com.salvagesack;
+
+import com.google.gson.Gson;
 import lombok.extern.slf4j.Slf4j;
 
 import java.io.File;
@@ -175,6 +557,121 @@ public class SalvageDataManager
 			int qty = totalQuantity > 0 ? totalQuantity : dropCount;
 			return new SalvageItem(itemId, itemName, dropCount, qty, expectedDropRate);
 		}
+	}
+}
+
+package com.salvagesack;
+
+import lombok.Data;
+
+/**
+ * Represents a salvage item drop with tracking information
+ */
+@Data
+public class SalvageItem
+{
+	private final int itemId;
+	private final String itemName;
+	private int dropCount;      // Number of times this item was dropped (for rate calculation)
+	private int totalQuantity;  // Total quantity received (for display)
+	private final double expectedDropRate; // Expected rate from wiki (e.g., 0.1 for 10%)
+
+	public SalvageItem(int itemId, String itemName, double expectedDropRate)
+	{
+		this.itemId = itemId;
+		this.itemName = itemName;
+		this.dropCount = 0;
+		this.totalQuantity = 0;
+		this.expectedDropRate = expectedDropRate;
+	}
+
+
+	/**
+	 * Full constructor for deserialization with quantity
+	 */
+	public SalvageItem(int itemId, String itemName, int dropCount, int totalQuantity, double expectedDropRate)
+	{
+		this.itemId = itemId;
+		this.itemName = itemName;
+		this.dropCount = dropCount;
+		this.totalQuantity = totalQuantity;
+		this.expectedDropRate = expectedDropRate;
+	}
+
+	/**
+	 * Increment the drop count for this item (single drop)
+	 */
+	public void incrementDropCount()
+	{
+		this.dropCount++;
+		this.totalQuantity++;
+	}
+
+	/**
+	 * Record a drop with a specific quantity
+	 * Counts as 1 drop for rate calculation, but adds full quantity to total
+	 * @param quantity The quantity received in this drop
+	 */
+	public void recordDrop(int quantity)
+	{
+		this.dropCount++;           // Only 1 drop for rate calculation
+		this.totalQuantity += quantity;  // Full quantity for display
+	}
+
+	/**
+	 * Add to the drop count for this item (legacy method)
+	 * @param amount Amount to add
+	 * @deprecated Use recordDrop(quantity) instead
+	 */
+	@Deprecated
+	public void addDropCount(int amount)
+	{
+		this.dropCount += amount;
+		this.totalQuantity += amount;
+	}
+
+	/**
+	 * Calculate current drop rate based on total loots
+	 * @param totalLoots Total number of loots from this shipwreck type
+	 * @return Current drop rate as a decimal (e.g., 0.15 for 15%)
+	 */
+	public double getCurrentDropRate(int totalLoots)
+	{
+		if (totalLoots == 0)
+		{
+			return 0.0;
+		}
+		return (double) dropCount / totalLoots;
+	}
+}
+
+package com.salvagesack;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("salvagesack")
+public interface SalvageSackConfig extends Config
+{
+	@ConfigItem(
+		keyName = "sortOption",
+		name = "Sort Items By",
+		description = "Choose how to sort items within each shipwreck type"
+	)
+	default SortOption sortOption()
+	{
+		return SortOption.ALPHABETICAL;
+	}
+
+	@ConfigItem(
+		keyName = "sortDescending",
+		name = "Sort Descending",
+		description = "Sort items in descending order (highest to lowest)"
+	)
+	default boolean sortDescending()
+	{
+		return false;
 	}
 }
 
@@ -861,594 +1358,6 @@ public class SalvageSackPanel extends PluginPanel
 
 package com.salvagesack;
 
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-
-@ConfigGroup("salvagesack")
-public interface SalvageSackConfig extends Config
-{
-	@ConfigItem(
-		keyName = "sortOption",
-		name = "Sort Items By",
-		description = "Choose how to sort items within each shipwreck type"
-	)
-	default SortOption sortOption()
-	{
-		return SortOption.ALPHABETICAL;
-	}
-
-	@ConfigItem(
-		keyName = "sortDescending",
-		name = "Sort Descending",
-		description = "Sort items in descending order (highest to lowest)"
-	)
-	default boolean sortDescending()
-	{
-		return false;
-	}
-}
-
-package com.salvagesack;
-
-import lombok.Setter;
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.util.AsyncBufferedImage;
-
-import java.awt.image.BufferedImage;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
-/**
- * Manages fetching and caching of item icons using RuneLite's ItemManager
- */
-@Slf4j
-public class ItemIconManager
-{
-	private static final int ICON_SIZE = 32;
-	
-	private final Map<Integer, BufferedImage> iconCache;
-	private final BufferedImage placeholderIcon;
-
-	@Setter
-	private Runnable onIconLoaded;
-
-	@Setter
-	private ItemManager itemManager;
-
-	public ItemIconManager()
-	{
-		this.iconCache = new ConcurrentHashMap<>();
-		this.placeholderIcon = createPlaceholderIcon();
-	}
-
-	/**
-	 * Get icon for an item by ID
-	 * @param itemId ID of the item
-	 * @return BufferedImage of the item icon, or placeholder if not found
-	 */
-	public BufferedImage getItemIcon(int itemId)
-	{
-		if (itemId <= 0)
-		{
-			return placeholderIcon;
-		}
-
-		// Check cache first
-		BufferedImage cached = iconCache.get(itemId);
-		if (cached != null)
-		{
-			return cached;
-		}
-
-		// Try to get from ItemManager
-		if (itemManager != null)
-		{
-			try
-			{
-				AsyncBufferedImage asyncImage = itemManager.getImage(itemId);
-				if (asyncImage != null)
-				{
-					// Cache when the image loads and trigger callback
-					asyncImage.onLoaded(() -> {
-						iconCache.put(itemId, asyncImage);
-						log.debug("Cached icon for item {}", itemId);
-						if (onIconLoaded != null)
-						{
-							onIconLoaded.run();
-						}
-					});
-					// Return the async image (it extends BufferedImage)
-					return asyncImage;
-				}
-			}
-			catch (Exception e)
-			{
-				log.debug("Failed to get icon for item {}: {}", itemId, e.getMessage());
-			}
-		}
-
-		// Return placeholder if fetch failed
-		return placeholderIcon;
-	}
-
-	/**
-	 * Create a simple placeholder icon
-	 */
-	private BufferedImage createPlaceholderIcon()
-	{
-		BufferedImage image = new BufferedImage(ICON_SIZE, ICON_SIZE, BufferedImage.TYPE_INT_ARGB);
-		// Create a simple gray square
-		for (int x = 0; x < ICON_SIZE; x++)
-		{
-			for (int y = 0; y < ICON_SIZE; y++)
-			{
-				if (x < 2 || x >= ICON_SIZE - 2 || y < 2 || y >= ICON_SIZE - 2)
-				{
-					image.setRGB(x, y, 0xFF666666); // Border
-				}
-				else
-				{
-					image.setRGB(x, y, 0xFF333333); // Fill
-				}
-			}
-		}
-		return image;
-	}
-}
-
-package com.salvagesack;
-
-import lombok.Getter;
-import lombok.RequiredArgsConstructor;
-
-/**
- * Represents different types of shipwrecks in OSRS Sailing
- */
-@Getter
-@RequiredArgsConstructor
-public enum ShipwreckType
-{
-	SMALL("Small shipwreck", "Small"),
-	FISHERMANS("Fisherman's shipwreck", "Fishy"),
-	BARRACUDA("Barracuda shipwreck", "Barracuda"),
-	LARGE("Large shipwreck", "Large"),
-	PIRATE("Pirate shipwreck", "Plundered"),
-	MERCENARY("Mercenary shipwreck", "Martial"),
-	FREMENNIK("Fremennik shipwreck", "Fremennik"),
-	MERCHANT("Merchant shipwreck", "Opulent"),
-	UNKNOWN("Unknown", "unknown");
-
-	private final String displayName;
-	private final String salvageType;
-
-	public static ShipwreckType fromString(String text)
-	{
-		if (text == null)
-		{
-			return UNKNOWN;
-		}
-
-		String lowerText = text.toLowerCase().trim();
-		for (ShipwreckType type : ShipwreckType.values())
-		{
-			if (type.salvageType.toLowerCase().equals(lowerText) ||
-			    type.displayName.equalsIgnoreCase(text) ||
-			    lowerText.contains(type.salvageType.toLowerCase()))
-			{
-				return type;
-			}
-		}
-		return UNKNOWN;
-	}
-}
-
-package com.salvagesack;
-
-import lombok.Data;
-import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-
-/**
- * Stores all salvage tracking data for a specific shipwreck type.
- * <p>
- * Each shipwreck type maintains its own loot statistics including total sorts,
- * individual item drop counts, and a timestamp for UI ordering.
- * </p>
- * <p>
- * The panel displays shipwreck sections sorted by {@link #lastUpdated} so that
- * the most recently active shipwreck always appears at the top, regardless of
- * whether it is expanded or collapsed.
- * </p>
- */
-@Data
-public class SalvageData
-{
-	private final ShipwreckType shipwreckType;
-	private int totalLoots;
-	private final Map<Integer, SalvageItem> items; // itemId -> SalvageItem
-
-	/**
-	 * Timestamp (milliseconds since epoch) of the last loot recorded for this shipwreck.
-	 * Used to sort shipwreck panels in the UI with most recently updated at the top.
-	 */
-	private long lastUpdated;
-
-	public SalvageData(ShipwreckType shipwreckType)
-	{
-		this.shipwreckType = shipwreckType;
-		this.totalLoots = 0;
-		this.items = new ConcurrentHashMap<>();
-		this.lastUpdated = 0;
-	}
-
-	/**
-	 * Constructor for deserialization
-	 */
-	public SalvageData(ShipwreckType shipwreckType, int totalLoots, Map<Integer, SalvageItem> items)
-	{
-		this.shipwreckType = shipwreckType;
-		this.totalLoots = totalLoots;
-		this.items = items;
-		this.lastUpdated = 0;
-	}
-
-	/**
-	 * Record a loot drop
-	 * @param itemId The item ID that was looted
-	 * @param itemName The item name
-	 * @param expectedDropRate Expected drop rate for this item
-	 */
-	public void recordLoot(int itemId, String itemName, double expectedDropRate)
-	{
-		recordLoot(itemId, itemName, expectedDropRate, 1);
-	}
-
-	/**
-	 * Record a loot drop with quantity
-	 * Counts as 1 drop for rate calculation, but tracks full quantity
-	 * @param itemId The item ID that was looted
-	 * @param itemName The item name
-	 * @param expectedDropRate Expected drop rate for this item
-	 * @param quantity Number of items looted (for display, not rate calc)
-	 */
-	public void recordLoot(int itemId, String itemName, double expectedDropRate, int quantity)
-	{
-		SalvageItem item = items.computeIfAbsent(itemId,
-			id -> new SalvageItem(id, itemName, expectedDropRate));
-		item.recordDrop(quantity);  // 1 drop for rate, full quantity for display
-	}
-
-	/**
-	 * Increment total loot count and update the last modified timestamp.
-	 * <p>
-	 * This method should be called once per salvage sort action. The timestamp
-	 * update ensures this shipwreck type will be displayed at the top of the
-	 * panel, as shipwrecks are sorted by most recently updated.
-	 * </p>
-	 */
-	public void incrementTotalLoots()
-	{
-		this.totalLoots++;
-		this.lastUpdated = System.currentTimeMillis();
-	}
-}
-
-package com.salvagesack;
-
-import lombok.Getter;
-import lombok.RequiredArgsConstructor;
-
-/**
- * Sorting options for item display in the salvage panel.
- * <p>
- * Each option determines how items are ordered within each shipwreck section:
- * <ul>
- *   <li>ALPHABETICAL - Sort items by name (A-Z or Z-A)</li>
- *   <li>CURRENT_RATE - Sort by actual drop rate calculated from player's data</li>
- *   <li>EXPECTED_RATE - Sort by wiki-sourced expected drop rates</li>
- *   <li>QUANTITY - Sort by total quantity received</li>
- *   <li>LUCK - Sort by luck ratio (current/expected rate), grouping by color:
- *       <ul>
- *         <li>Green: ratio ≥ 1.1 (lucky - getting items more often)</li>
- *         <li>Yellow: 0.9 ≤ ratio < 1.1 (neutral - at expected rate)</li>
- *         <li>Red: ratio < 0.9 (unlucky - getting items less often)</li>
- *         <li>Unknown: no expected rate data available</li>
- *       </ul>
- *   </li>
- * </ul>
- * The sort direction (ascending/descending) can be toggled independently.
- * </p>
- */
-@Getter
-@RequiredArgsConstructor
-public enum SortOption
-{
-	ALPHABETICAL("Alphabetical"),
-	CURRENT_RATE("Current Rate"),
-	EXPECTED_RATE("Expected Rate"),
-	QUANTITY("Quantity"),
-	LUCK("Luck");
-
-	private final String displayName;
-
-	@Override
-	public String toString()
-	{
-		return displayName;
-	}
-}
-
-package com.salvagesack;
-
-import com.google.gson.Gson;
-import com.google.gson.JsonElement;
-import com.google.gson.JsonObject;
-import lombok.extern.slf4j.Slf4j;
-
-import java.io.*;
-import java.nio.charset.StandardCharsets;
-import java.util.HashMap;
-import java.util.Map;
-
-/**
- * Manages loading and accessing expected drop rates from configuration
- */
-@Slf4j
-public class DropRateManager
-{
-	private final Map<ShipwreckType, Map<String, Double>> dropRates = new HashMap<>();
-	private final Gson gson;
-	private final File userConfigFile;
-
-	public DropRateManager(File dataDirectory, Gson gson)
-	{
-		this.gson = gson;
-		this.userConfigFile = new File(dataDirectory, "drop_rates.json");
-		loadDropRates();
-	}
-
-	/**
-	 * Load drop rates from bundled resource and user config
-	 */
-	private void loadDropRates()
-	{
-		// First load bundled defaults
-		loadBundledRates();
-
-		// Then override with user config if it exists
-		if (userConfigFile.exists())
-		{
-			loadUserRates();
-		}
-		else
-		{
-			// Copy bundled config to user directory for editing
-			copyBundledToUser();
-		}
-	}
-
-	/**
-	 * Load rates from bundled resource
-	 */
-	private void loadBundledRates()
-	{
-		try (InputStream is = getClass().getResourceAsStream("/drop_rates.json"))
-		{
-			if (is != null)
-			{
-				parseDropRates(new InputStreamReader(is, StandardCharsets.UTF_8));
-				log.info("Loaded bundled drop rates");
-			}
-		}
-		catch (Exception e)
-		{
-			log.warn("Failed to load bundled drop rates: {}", e.getMessage());
-		}
-	}
-
-	/**
-	 * Load rates from user config file
-	 */
-	private void loadUserRates()
-	{
-		try (FileReader reader = new FileReader(userConfigFile))
-		{
-			parseDropRates(reader);
-			log.info("Loaded user drop rates from {}", userConfigFile.getAbsolutePath());
-		}
-		catch (Exception e)
-		{
-			log.warn("Failed to load user drop rates: {}", e.getMessage());
-		}
-	}
-
-	/**
-	 * Copy bundled config to user directory
-	 */
-	private void copyBundledToUser()
-	{
-		try (InputStream is = getClass().getResourceAsStream("/drop_rates.json"))
-		{
-			if (is != null)
-			{
-				File parentDir = userConfigFile.getParentFile();
-				if (parentDir != null && !parentDir.exists() && !parentDir.mkdirs())
-				{
-					log.warn("Failed to create directory: {}", parentDir.getAbsolutePath());
-					return;
-				}
-				try (FileOutputStream fos = new FileOutputStream(userConfigFile))
-				{
-					byte[] buffer = new byte[1024];
-					int bytesRead;
-					while ((bytesRead = is.read(buffer)) != -1)
-					{
-						fos.write(buffer, 0, bytesRead);
-					}
-				}
-				log.info("Copied drop rates config to {}", userConfigFile.getAbsolutePath());
-			}
-		}
-		catch (Exception e)
-		{
-			log.warn("Failed to copy drop rates config: {}", e.getMessage());
-		}
-	}
-
-	/**
-	 * Parse drop rates from a reader
-	 */
-	private void parseDropRates(Reader reader)
-	{
-		JsonObject root = gson.fromJson(reader, JsonObject.class);
-		JsonObject shipwrecks = root.getAsJsonObject("shipwrecks");
-
-		if (shipwrecks == null)
-		{
-			return;
-		}
-
-		for (String shipwreckKey : shipwrecks.keySet())
-		{
-			try
-			{
-				ShipwreckType type = ShipwreckType.valueOf(shipwreckKey);
-				JsonObject shipwreckData = shipwrecks.getAsJsonObject(shipwreckKey);
-				JsonObject items = shipwreckData.getAsJsonObject("items");
-
-				if (items != null)
-				{
-					Map<String, Double> itemRates = dropRates.computeIfAbsent(type, k -> new HashMap<>());
-
-					for (String itemName : items.keySet())
-					{
-						JsonElement rateElement = items.get(itemName);
-						if (rateElement != null && rateElement.isJsonPrimitive())
-						{
-							double rate = rateElement.getAsDouble();
-							itemRates.put(itemName.toLowerCase(), rate);
-						}
-					}
-				}
-			}
-			catch (IllegalArgumentException e)
-			{
-				log.debug("Unknown shipwreck type in config: {}", shipwreckKey);
-			}
-		}
-	}
-
-	/**
-	 * Get the expected drop rate for an item from a specific shipwreck type
-	 * @param shipwreckType The type of shipwreck
-	 * @param itemName The name of the item
-	 * @return The expected drop rate (0.0 to 1.0), or 0.0 if unknown
-	 */
-	public double getExpectedDropRate(ShipwreckType shipwreckType, String itemName)
-	{
-		Map<String, Double> itemRates = dropRates.get(shipwreckType);
-		if (itemRates == null)
-		{
-			log.debug("No rates found for shipwreck type: {}", shipwreckType);
-			return 0.0;
-		}
-
-		double rate = itemRates.getOrDefault(itemName.toLowerCase(), 0.0);
-		log.info("Drop rate lookup: type={}, item='{}', rate={}", shipwreckType, itemName, rate);
-		return rate;
-	}
-}
-
-
-package com.salvagesack;
-
-import lombok.Data;
-
-/**
- * Represents a salvage item drop with tracking information
- */
-@Data
-public class SalvageItem
-{
-	private final int itemId;
-	private final String itemName;
-	private int dropCount;      // Number of times this item was dropped (for rate calculation)
-	private int totalQuantity;  // Total quantity received (for display)
-	private final double expectedDropRate; // Expected rate from wiki (e.g., 0.1 for 10%)
-
-	public SalvageItem(int itemId, String itemName, double expectedDropRate)
-	{
-		this.itemId = itemId;
-		this.itemName = itemName;
-		this.dropCount = 0;
-		this.totalQuantity = 0;
-		this.expectedDropRate = expectedDropRate;
-	}
-
-
-	/**
-	 * Full constructor for deserialization with quantity
-	 */
-	public SalvageItem(int itemId, String itemName, int dropCount, int totalQuantity, double expectedDropRate)
-	{
-		this.itemId = itemId;
-		this.itemName = itemName;
-		this.dropCount = dropCount;
-		this.totalQuantity = totalQuantity;
-		this.expectedDropRate = expectedDropRate;
-	}
-
-	/**
-	 * Increment the drop count for this item (single drop)
-	 */
-	public void incrementDropCount()
-	{
-		this.dropCount++;
-		this.totalQuantity++;
-	}
-
-	/**
-	 * Record a drop with a specific quantity
-	 * Counts as 1 drop for rate calculation, but adds full quantity to total
-	 * @param quantity The quantity received in this drop
-	 */
-	public void recordDrop(int quantity)
-	{
-		this.dropCount++;           // Only 1 drop for rate calculation
-		this.totalQuantity += quantity;  // Full quantity for display
-	}
-
-	/**
-	 * Add to the drop count for this item (legacy method)
-	 * @param amount Amount to add
-	 * @deprecated Use recordDrop(quantity) instead
-	 */
-	@Deprecated
-	public void addDropCount(int amount)
-	{
-		this.dropCount += amount;
-		this.totalQuantity += amount;
-	}
-
-	/**
-	 * Calculate current drop rate based on total loots
-	 * @param totalLoots Total number of loots from this shipwreck type
-	 * @return Current drop rate as a decimal (e.g., 0.15 for 15%)
-	 */
-	public double getCurrentDropRate(int totalLoots)
-	{
-		if (totalLoots == 0)
-		{
-			return 0.0;
-		}
-		return (double) dropCount / totalLoots;
-	}
-}
-
-package com.salvagesack;
-
 import com.google.gson.Gson;
 import com.google.inject.Provides;
 import lombok.extern.slf4j.Slf4j;
@@ -1746,6 +1655,97 @@ public class SalvageSackPlugin extends Plugin
 	SalvageSackConfig provideConfig(ConfigManager configManager)
 	{
 		return configManager.getConfig(SalvageSackConfig.class);
+	}
+}
+
+package com.salvagesack;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+/**
+ * Represents different types of shipwrecks in OSRS Sailing
+ */
+@Getter
+@RequiredArgsConstructor
+public enum ShipwreckType
+{
+	SMALL("Small shipwreck", "Small"),
+	FISHERMANS("Fisherman's shipwreck", "Fishy"),
+	BARRACUDA("Barracuda shipwreck", "Barracuda"),
+	LARGE("Large shipwreck", "Large"),
+	PIRATE("Pirate shipwreck", "Plundered"),
+	MERCENARY("Mercenary shipwreck", "Martial"),
+	FREMENNIK("Fremennik shipwreck", "Fremennik"),
+	MERCHANT("Merchant shipwreck", "Opulent"),
+	UNKNOWN("Unknown", "unknown");
+
+	private final String displayName;
+	private final String salvageType;
+
+	public static ShipwreckType fromString(String text)
+	{
+		if (text == null)
+		{
+			return UNKNOWN;
+		}
+
+		String lowerText = text.toLowerCase().trim();
+		for (ShipwreckType type : ShipwreckType.values())
+		{
+			if (type.salvageType.toLowerCase().equals(lowerText) ||
+			    type.displayName.equalsIgnoreCase(text) ||
+			    lowerText.contains(type.salvageType.toLowerCase()))
+			{
+				return type;
+			}
+		}
+		return UNKNOWN;
+	}
+}
+
+package com.salvagesack;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+/**
+ * Sorting options for item display in the salvage panel.
+ * <p>
+ * Each option determines how items are ordered within each shipwreck section:
+ * <ul>
+ *   <li>ALPHABETICAL - Sort items by name (A-Z or Z-A)</li>
+ *   <li>CURRENT_RATE - Sort by actual drop rate calculated from player's data</li>
+ *   <li>EXPECTED_RATE - Sort by wiki-sourced expected drop rates</li>
+ *   <li>QUANTITY - Sort by total quantity received</li>
+ *   <li>LUCK - Sort by luck ratio (current/expected rate), grouping by color:
+ *       <ul>
+ *         <li>Green: ratio ≥ 1.1 (lucky - getting items more often)</li>
+ *         <li>Yellow: 0.9 ≤ ratio < 1.1 (neutral - at expected rate)</li>
+ *         <li>Red: ratio < 0.9 (unlucky - getting items less often)</li>
+ *         <li>Unknown: no expected rate data available</li>
+ *       </ul>
+ *   </li>
+ * </ul>
+ * The sort direction (ascending/descending) can be toggled independently.
+ * </p>
+ */
+@Getter
+@RequiredArgsConstructor
+public enum SortOption
+{
+	ALPHABETICAL("Alphabetical"),
+	CURRENT_RATE("Current Rate"),
+	EXPECTED_RATE("Expected Rate"),
+	QUANTITY("Quantity"),
+	LUCK("Luck");
+
+	private final String displayName;
+
+	@Override
+	public String toString()
+	{
+		return displayName;
 	}
 }
 

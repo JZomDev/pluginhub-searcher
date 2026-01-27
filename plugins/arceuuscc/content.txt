@@ -1,2455 +1,3 @@
-package com.arceuuscc.plugin.util;
-
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-
-public class DateTimeUtils
-{
-	public static final DateTimeFormatter ISO_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
-
-	public static LocalDateTime parseDateTime(String isoTime)
-	{
-		if (isoTime == null)
-		{
-			return LocalDateTime.MIN;
-		}
-		try
-		{
-			return LocalDateTime.parse(isoTime, ISO_FORMATTER);
-		}
-		catch (DateTimeParseException e)
-		{
-			return LocalDateTime.MIN;
-		}
-	}
-}
-
-package com.arceuuscc.plugin.util;
-
-import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
-import java.time.format.DateTimeParseException;
-
-/**
- * Utility methods for formatting display text.
- */
-public final class FormatUtils
-{
-	private static final DateTimeFormatter DISPLAY_FORMATTER = DateTimeFormatter.ofPattern("EEE, MMM d 'at' HH:mm");
-	private static final DateTimeFormatter INPUT_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
-
-	private FormatUtils() {}
-
-	public static String formatEventTime(String isoTime)
-	{
-		if (isoTime == null)
-		{
-			return "Unknown";
-		}
-		try
-		{
-			LocalDateTime dateTime = LocalDateTime.parse(isoTime, INPUT_FORMATTER);
-			return dateTime.format(DISPLAY_FORMATTER);
-		}
-		catch (DateTimeParseException e)
-		{
-			return isoTime;
-		}
-	}
-
-	public static String formatDuration(int minutes)
-	{
-		if (minutes == 0)
-		{
-			return "Open-ended";
-		}
-		if (minutes < 60)
-		{
-			return minutes + " min";
-		}
-		int hours = minutes / 60;
-		int mins = minutes % 60;
-		if (mins == 0)
-		{
-			return hours + "h";
-		}
-		return hours + "h " + mins + "m";
-	}
-
-	public static String escapeHtml(String text)
-	{
-		if (text == null)
-		{
-			return "";
-		}
-		return text.replace("&", "&amp;")
-			.replace("<", "&lt;")
-			.replace(">", "&gt;")
-			.replace("\"", "&quot;")
-			.replace("\n", "<br>");
-	}
-}
-
-package com.arceuuscc.plugin.http;
-
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-import com.arceuuscc.plugin.models.Event;
-import com.arceuuscc.plugin.models.Newsletter;
-import com.arceuuscc.plugin.models.PluginSettings;
-import com.google.gson.Gson;
-import com.google.gson.JsonArray;
-import com.google.gson.JsonObject;
-import com.google.gson.JsonParser;
-import com.google.gson.reflect.TypeToken;
-import lombok.extern.slf4j.Slf4j;
-import okhttp3.*;
-
-import java.io.IOException;
-import java.util.List;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
-
-@Slf4j
-public class HttpEventClient
-{
-	private static final MediaType JSON_MEDIA_TYPE = MediaType.get("application/json; charset=utf-8");
-	private static final String API_KEY = "arceuus-cc-runelite-2026";
-	private static final int DEFAULT_POLLING_INTERVAL = 30;
-
-	private final String apiUrl;
-	private final ArceuusCCPlugin plugin;
-	private final OkHttpClient httpClient;
-	private final Gson gson;
-	private final ScheduledExecutorService executor;
-
-	private ScheduledFuture<?> pollingTask;
-	private boolean connected = false;
-	private int pollingInterval = DEFAULT_POLLING_INTERVAL;
-
-	public HttpEventClient(String apiUrl, ArceuusCCPlugin plugin, OkHttpClient httpClient, Gson gson, ScheduledExecutorService executor)
-	{
-		this.apiUrl = apiUrl;
-		this.plugin = plugin;
-		this.httpClient = httpClient;
-		this.gson = gson;
-		this.executor = executor;
-	}
-
-	public void start()
-	{
-		if (pollingTask != null)
-		{
-			return;
-		}
-
-		// Fetch settings first, then start polling
-		requestSettings();
-
-		// Initial fetch
-		requestEvents();
-
-		// Poll at configured interval (default 30 seconds, 0 = disabled)
-		startPolling();
-		log.debug("HTTP Event Client started, polling {}", apiUrl);
-	}
-
-	private void startPolling()
-	{
-		// Cancel existing polling task if any
-		if (pollingTask != null)
-		{
-			pollingTask.cancel(false);
-			pollingTask = null;
-		}
-
-		// If polling interval is 0, polling is disabled
-		if (pollingInterval <= 0)
-		{
-			log.debug("Event polling disabled (interval = 0)");
-			return;
-		}
-
-		pollingTask = executor.scheduleAtFixedRate(() -> {
-			requestEvents();
-			requestLatestNewsletter();
-			requestNewsletters(10);
-		}, pollingInterval, pollingInterval, TimeUnit.SECONDS);
-		log.debug("Event and newsletter polling started with interval: {} seconds", pollingInterval);
-	}
-
-	public void updatePollingInterval(int newInterval)
-	{
-		if (newInterval != pollingInterval)
-		{
-			pollingInterval = newInterval;
-			startPolling();
-		}
-	}
-
-	public void stop()
-	{
-		if (pollingTask != null)
-		{
-			pollingTask.cancel(false);
-			pollingTask = null;
-		}
-		log.debug("HTTP Event Client stopped");
-	}
-
-	public boolean isConnected()
-	{
-		return connected;
-	}
-
-	public void requestEvents()
-	{
-		Request request = new Request.Builder()
-			.url(apiUrl)
-			.get()
-			.build();
-
-		httpClient.newCall(request).enqueue(new Callback()
-		{
-			@Override
-			public void onFailure(Call call, IOException e)
-			{
-				log.error("Failed to fetch events", e);
-				if (connected)
-				{
-					connected = false;
-					plugin.onConnectionStatusChanged(false);
-				}
-			}
-
-			@Override
-			public void onResponse(Call call, Response response) throws IOException
-			{
-				try (ResponseBody body = response.body())
-				{
-					if (!response.isSuccessful() || body == null)
-					{
-						log.error("Error response: {}", response.code());
-						if (connected)
-						{
-							connected = false;
-							plugin.onConnectionStatusChanged(false);
-						}
-						return;
-					}
-
-					String json = body.string();
-					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
-					JsonArray eventsArray = jsonObj.getAsJsonArray("events");
-					List<Event> events = gson.fromJson(eventsArray, new TypeToken<List<Event>>(){}.getType());
-
-					if (!connected)
-					{
-						connected = true;
-						plugin.onConnectionStatusChanged(true);
-					}
-
-					plugin.onEventsReceived(events);
-					log.debug("Fetched {} events", events.size());
-				}
-				catch (Exception e)
-				{
-					log.error("Error parsing events response", e);
-				}
-			}
-		});
-	}
-
-	public void sendSignup(String eventId, String osrsName)
-	{
-		JsonObject payload = new JsonObject();
-		payload.addProperty("eventId", eventId);
-		payload.addProperty("osrsName", osrsName);
-
-		Request request = new Request.Builder()
-			.url(apiUrl + "?action=signup")
-			.header("X-API-Key", API_KEY)
-			.post(RequestBody.create(JSON_MEDIA_TYPE, gson.toJson(payload)))
-			.build();
-
-		httpClient.newCall(request).enqueue(new Callback()
-		{
-			@Override
-			public void onFailure(Call call, IOException e)
-			{
-				log.error("Failed to sign up for event {}", eventId, e);
-			}
-
-			@Override
-			public void onResponse(Call call, Response response) throws IOException
-			{
-				try (ResponseBody body = response.body())
-				{
-					if (response.isSuccessful())
-					{
-						log.debug("Successfully signed up for event {}", eventId);
-						// Refresh events to get updated signups
-						requestEvents();
-					}
-					else
-					{
-						String errorBody = body != null ? body.string() : "Unknown error";
-						log.error("Signup failed: {}", errorBody);
-					}
-				}
-			}
-		});
-	}
-
-	public void sendUnsignup(String eventId, String osrsName)
-	{
-		JsonObject payload = new JsonObject();
-		payload.addProperty("eventId", eventId);
-		payload.addProperty("osrsName", osrsName);
-
-		Request request = new Request.Builder()
-			.url(apiUrl + "?action=unsignup")
-			.header("X-API-Key", API_KEY)
-			.post(RequestBody.create(JSON_MEDIA_TYPE, gson.toJson(payload)))
-			.build();
-
-		httpClient.newCall(request).enqueue(new Callback()
-		{
-			@Override
-			public void onFailure(Call call, IOException e)
-			{
-				log.error("Failed to unsign from event {}", eventId, e);
-			}
-
-			@Override
-			public void onResponse(Call call, Response response) throws IOException
-			{
-				try (ResponseBody body = response.body())
-				{
-					if (response.isSuccessful())
-					{
-						log.debug("Successfully unsigned from event {}", eventId);
-						// Refresh events to get updated signups
-						requestEvents();
-					}
-					else
-					{
-						String errorBody = body != null ? body.string() : "Unknown error";
-						log.error("Unsignup failed: {}", errorBody);
-					}
-				}
-			}
-		});
-	}
-
-	// ==================== NEWSLETTER METHODS ====================
-
-	/**
-	 * Request the latest newsletter from the API.
-	 */
-	public void requestLatestNewsletter()
-	{
-		String newsletterUrl = apiUrl.replace("events.php", "newsletters.php") + "?action=latest";
-
-		Request request = new Request.Builder()
-			.url(newsletterUrl)
-			.get()
-			.build();
-
-		httpClient.newCall(request).enqueue(new Callback()
-		{
-			@Override
-			public void onFailure(Call call, IOException e)
-			{
-				log.error("Failed to fetch latest newsletter", e);
-			}
-
-			@Override
-			public void onResponse(Call call, Response response) throws IOException
-			{
-				try (ResponseBody body = response.body())
-				{
-					if (!response.isSuccessful() || body == null)
-					{
-						log.error("Error fetching newsletter: {}", response.code());
-						return;
-					}
-
-					String json = body.string();
-					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
-
-					if (jsonObj.has("newsletter") && !jsonObj.get("newsletter").isJsonNull())
-					{
-						Newsletter newsletter = gson.fromJson(jsonObj.get("newsletter"), Newsletter.class);
-						plugin.onNewsletterReceived(newsletter);
-						log.debug("Fetched newsletter: {}", newsletter.getTitle());
-					}
-					else
-					{
-						// No newsletter exists - clear the latest
-						plugin.onNewsletterReceived(null);
-						log.debug("No newsletter available");
-					}
-				}
-				catch (Exception e)
-				{
-					log.error("Error parsing newsletter response", e);
-				}
-			}
-		});
-	}
-
-	/**
-	 * Request list of recent newsletters.
-	 */
-	public void requestNewsletters(int limit)
-	{
-		String newsletterUrl = apiUrl.replace("events.php", "newsletters.php") + "?limit=" + limit;
-
-		Request request = new Request.Builder()
-			.url(newsletterUrl)
-			.get()
-			.build();
-
-		httpClient.newCall(request).enqueue(new Callback()
-		{
-			@Override
-			public void onFailure(Call call, IOException e)
-			{
-				log.error("Failed to fetch newsletters", e);
-			}
-
-			@Override
-			public void onResponse(Call call, Response response) throws IOException
-			{
-				try (ResponseBody body = response.body())
-				{
-					if (!response.isSuccessful() || body == null)
-					{
-						log.error("Error fetching newsletters: {}", response.code());
-						return;
-					}
-
-					String json = body.string();
-					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
-					JsonArray newslettersArray = jsonObj.getAsJsonArray("newsletters");
-					List<Newsletter> newsletters = gson.fromJson(newslettersArray, new TypeToken<List<Newsletter>>(){}.getType());
-
-					plugin.onNewslettersReceived(newsletters);
-					log.debug("Fetched {} newsletters", newsletters.size());
-				}
-				catch (Exception e)
-				{
-					log.error("Error parsing newsletters response", e);
-				}
-			}
-		});
-	}
-
-	/**
-	 * Get newsletter image URL.
-	 */
-	public String getNewsletterImageUrl(int newsletterId)
-	{
-		return apiUrl.replace("events.php", "newsletters.php") + "?id=" + newsletterId + "&image=1";
-	}
-
-	// ==================== SETTINGS METHODS ====================
-
-	/**
-	 * Request plugin settings from the API.
-	 */
-	public void requestSettings()
-	{
-		String settingsUrl = apiUrl.replace("events.php", "settings.php");
-
-		Request request = new Request.Builder()
-			.url(settingsUrl)
-			.get()
-			.build();
-
-		httpClient.newCall(request).enqueue(new Callback()
-		{
-			@Override
-			public void onFailure(Call call, IOException e)
-			{
-				log.error("Failed to fetch plugin settings", e);
-				// Use defaults if settings fetch fails
-			}
-
-			@Override
-			public void onResponse(Call call, Response response) throws IOException
-			{
-				try (ResponseBody body = response.body())
-				{
-					if (!response.isSuccessful() || body == null)
-					{
-						log.error("Error fetching settings: {}", response.code());
-						return;
-					}
-
-					String json = body.string();
-					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
-
-					if (jsonObj.has("settings") && !jsonObj.get("settings").isJsonNull())
-					{
-						JsonObject settingsObj = jsonObj.getAsJsonObject("settings");
-
-						PluginSettings settings = PluginSettings.builder()
-							.eventPollingInterval(settingsObj.has("event_polling_interval") ?
-								settingsObj.get("event_polling_interval").getAsInt() : 30)
-							.requireClanMembership(settingsObj.has("require_clan_membership") ?
-								settingsObj.get("require_clan_membership").getAsBoolean() : true)
-							.clanName(settingsObj.has("clan_name") ?
-								settingsObj.get("clan_name").getAsString() : "Arceuus")
-							.showNewsletterNotifications(settingsObj.has("show_newsletter_notifications") ?
-								settingsObj.get("show_newsletter_notifications").getAsBoolean() : true)
-							.build();
-
-						// Update polling interval
-						int newInterval = settings.getEventPollingInterval();
-						if (newInterval != pollingInterval)
-						{
-							pollingInterval = newInterval;
-							// Don't restart polling here - it will be started in start()
-						}
-
-						plugin.onSettingsReceived(settings);
-						log.debug("Loaded plugin settings: polling={}s, requireClan={}, clanName={}, showNewsletterNotifications={}",
-							settings.getEventPollingInterval(),
-							settings.isRequireClanMembership(),
-							settings.getClanName(),
-							settings.isShowNewsletterNotifications());
-					}
-				}
-				catch (Exception e)
-				{
-					log.error("Error parsing settings response", e);
-				}
-			}
-		});
-	}
-}
-
-package com.arceuuscc.plugin.models;
-
-import lombok.Data;
-
-@Data
-public class Signup
-{
-	private String osrsName;
-	private String discordId;
-	private String source;
-	private String signupTime;
-}
-
-package com.arceuuscc.plugin.models;
-
-import lombok.Data;
-
-/**
- * Represents a newsletter from the API.
- */
-@Data
-public class Newsletter {
-    private int id;
-    private String title;
-    private String subtitle;
-    private String editorName;
-    private String monthYear;
-    private String layoutType;
-    private String publishedAt;
-    private String createdAt;
-    private String imageUrl;
-    private String contentJson; // Only populated when fetching full newsletter
-
-    /**
-     * Check if this newsletter was published after another.
-     */
-    public boolean isNewerThan(Newsletter other) {
-        if (other == null) return true;
-        if (this.publishedAt == null) return false;
-        if (other.publishedAt == null) return true;
-        return this.publishedAt.compareTo(other.publishedAt) > 0;
-    }
-}
-
-package com.arceuuscc.plugin.models;
-
-import lombok.Data;
-import java.util.List;
-
-@Data
-public class Event
-{
-	private String eventId;
-	private String title;
-	private String startTime;
-	private int durationMinutes;
-	private String description;
-	private String status;
-	private String codeword;
-	private List<Signup> signups;
-}
-
-package com.arceuuscc.plugin.models;
-
-import lombok.AllArgsConstructor;
-import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
-
-@Data
-@Builder
-@NoArgsConstructor
-@AllArgsConstructor
-public class PluginSettings
-{
-	@Builder.Default
-	private int eventPollingInterval = 30;
-
-	@Builder.Default
-	private boolean requireClanMembership = true;
-
-	@Builder.Default
-	private String clanName = "Arceuus";
-
-	@Builder.Default
-	private boolean showNewsletterNotifications = true;
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.models.Event;
-import com.arceuuscc.plugin.util.FormatUtils;
-
-import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JLabel;
-import javax.swing.JOptionPane;
-import javax.swing.JPanel;
-import javax.swing.JScrollPane;
-import javax.swing.JTextArea;
-import javax.swing.border.EmptyBorder;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Dimension;
-import java.awt.Font;
-import java.awt.GraphicsEnvironment;
-
-/**
- * Dialog showing full event details.
- */
-public class EventDetailsDialog
-{
-	private static final String EMOJI_FONT = getEmojiFontName();
-
-	private static String getEmojiFontName()
-	{
-		String[] emojiFonts = {"Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", "Segoe UI Symbol", "Arial"};
-		GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
-		String[] availableFonts = ge.getAvailableFontFamilyNames();
-
-		for (String emojiFont : emojiFonts)
-		{
-			for (String available : availableFonts)
-			{
-				if (available.equalsIgnoreCase(emojiFont))
-				{
-					return emojiFont;
-				}
-			}
-		}
-		return "Arial";
-	}
-
-	public static void show(Component parent, Event event)
-	{
-		JPanel dialogPanel = new JPanel();
-		dialogPanel.setLayout(new BoxLayout(dialogPanel, BoxLayout.Y_AXIS));
-		dialogPanel.setBackground(PanelColors.getDarkerGray());
-		dialogPanel.setBorder(new EmptyBorder(15, 15, 15, 15));
-
-		addTitle(dialogPanel, event);
-		addEventInfo(dialogPanel, event);
-		addDescription(dialogPanel, event);
-		addSignupsList(dialogPanel, event);
-
-		JOptionPane.showMessageDialog(parent, dialogPanel, "Event Details", JOptionPane.PLAIN_MESSAGE);
-	}
-
-	private static void addTitle(JPanel panel, Event event)
-	{
-		JLabel titleLabel = new JLabel(event.getTitle());
-		titleLabel.setFont(new Font("Arial", Font.BOLD, 16));
-		titleLabel.setForeground(PanelColors.UPCOMING_TITLE);
-		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(titleLabel);
-		panel.add(Box.createVerticalStrut(10));
-	}
-
-	private static void addEventInfo(JPanel panel, Event event)
-	{
-		addInfoLabel(panel, "When: " + FormatUtils.formatEventTime(event.getStartTime()) + " UTC");
-		addInfoLabel(panel, "Duration: " + FormatUtils.formatDuration(event.getDurationMinutes()));
-		addInfoLabel(panel, "Status: " + event.getStatus());
-
-		int signupCount = event.getSignups() != null ? event.getSignups().size() : 0;
-		addInfoLabel(panel, "Signups: " + signupCount);
-
-		panel.add(Box.createVerticalStrut(15));
-	}
-
-	private static void addInfoLabel(JPanel panel, String text)
-	{
-		JLabel label = new JLabel(text);
-		label.setFont(new Font("Arial", Font.PLAIN, 12));
-		label.setForeground(Color.WHITE);
-		label.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(label);
-	}
-
-	private static void addDescription(JPanel panel, Event event)
-	{
-		JLabel descHeader = new JLabel("Description:");
-		descHeader.setFont(new Font("Arial", Font.BOLD, 12));
-		descHeader.setForeground(Color.WHITE);
-		descHeader.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(descHeader);
-		panel.add(Box.createVerticalStrut(5));
-
-		JTextArea descArea = new JTextArea(event.getDescription());
-		descArea.setFont(new Font(EMOJI_FONT, Font.PLAIN, 12));
-		descArea.setForeground(Color.WHITE);
-		descArea.setBackground(PanelColors.getDarkGray());
-		descArea.setEditable(false);
-		descArea.setLineWrap(true);
-		descArea.setWrapStyleWord(true);
-		descArea.setBorder(new EmptyBorder(8, 8, 8, 8));
-
-		JScrollPane descScroll = new JScrollPane(descArea);
-		descScroll.setPreferredSize(new Dimension(350, 150));
-		descScroll.setAlignmentX(Component.LEFT_ALIGNMENT);
-		descScroll.setBorder(BorderFactory.createLineBorder(PanelColors.getMediumGray()));
-		panel.add(descScroll);
-	}
-
-	private static void addSignupsList(JPanel panel, Event event)
-	{
-		if (event.getSignups() == null || event.getSignups().isEmpty())
-		{
-			return;
-		}
-
-		panel.add(Box.createVerticalStrut(15));
-
-		JLabel signupsHeader = new JLabel("Signed Up Players:");
-		signupsHeader.setFont(new Font("Arial", Font.BOLD, 12));
-		signupsHeader.setForeground(Color.WHITE);
-		signupsHeader.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(signupsHeader);
-		panel.add(Box.createVerticalStrut(5));
-
-		StringBuilder signupsList = new StringBuilder();
-		for (int i = 0; i < event.getSignups().size(); i++)
-		{
-			if (i > 0)
-			{
-				signupsList.append(", ");
-			}
-			signupsList.append(event.getSignups().get(i).getOsrsName());
-		}
-
-		JTextArea signupsArea = new JTextArea(signupsList.toString());
-		signupsArea.setFont(new Font("Arial", Font.PLAIN, 11));
-		signupsArea.setForeground(PanelColors.getLightGray());
-		signupsArea.setBackground(PanelColors.getDarkGray());
-		signupsArea.setEditable(false);
-		signupsArea.setLineWrap(true);
-		signupsArea.setWrapStyleWord(true);
-		signupsArea.setBorder(new EmptyBorder(8, 8, 8, 8));
-
-		JScrollPane signupsScroll = new JScrollPane(signupsArea);
-		signupsScroll.setPreferredSize(new Dimension(350, 60));
-		signupsScroll.setAlignmentX(Component.LEFT_ALIGNMENT);
-		signupsScroll.setBorder(BorderFactory.createLineBorder(PanelColors.getMediumGray()));
-		panel.add(signupsScroll);
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JButton;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.border.EmptyBorder;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Font;
-
-/**
- * Header panel with title, connection status, and refresh button.
- */
-public class HeaderPanel extends JPanel
-{
-	private final JLabel connectionStatus;
-	private final JLabel playerInfoLabel;
-	private final JLabel clanStatusLabel;
-	private final JButton refreshButton;
-
-	public HeaderPanel(ArceuusCCPlugin plugin)
-	{
-		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-		setBackground(PanelColors.getDarkerGray());
-		setBorder(new EmptyBorder(10, 10, 10, 10));
-
-		JLabel titleLabel = new JLabel("Arceuus CC Events");
-		titleLabel.setFont(new Font("Arial", Font.BOLD, 16));
-		titleLabel.setForeground(Color.WHITE);
-		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		add(titleLabel);
-
-		add(Box.createVerticalStrut(5));
-
-		connectionStatus = new JLabel("Connecting...");
-		connectionStatus.setForeground(Color.ORANGE);
-		connectionStatus.setAlignmentX(Component.LEFT_ALIGNMENT);
-		add(connectionStatus);
-
-		add(Box.createVerticalStrut(5));
-
-		playerInfoLabel = new JLabel("");
-		playerInfoLabel.setForeground(Color.WHITE);
-		playerInfoLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		playerInfoLabel.setVisible(false);
-		add(playerInfoLabel);
-
-		clanStatusLabel = new JLabel("");
-		clanStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		add(clanStatusLabel);
-
-		add(Box.createVerticalStrut(10));
-
-		refreshButton = new JButton("Refresh");
-		refreshButton.setAlignmentX(Component.LEFT_ALIGNMENT);
-		refreshButton.addActionListener(e -> {
-			plugin.refreshEvents();
-			plugin.refreshNewsletters();
-		});
-		add(refreshButton);
-	}
-
-	public void updateConnectionStatus(boolean connected)
-	{
-		if (connected)
-		{
-			connectionStatus.setText("Connected");
-			connectionStatus.setForeground(PanelColors.CONNECTED);
-			refreshButton.setEnabled(true);
-		}
-		else
-		{
-			connectionStatus.setText("Disconnected");
-			connectionStatus.setForeground(PanelColors.DISCONNECTED);
-			refreshButton.setEnabled(false);
-		}
-	}
-
-	public void updatePlayerInfo(String playerName, boolean inClan)
-	{
-		if (playerName != null)
-		{
-			playerInfoLabel.setText("Player: " + playerName);
-			playerInfoLabel.setVisible(true);
-
-			if (inClan)
-			{
-				clanStatusLabel.setText("In Arceuus clan");
-				clanStatusLabel.setForeground(PanelColors.CONNECTED);
-			}
-			else
-			{
-				clanStatusLabel.setText("Not in Arceuus clan");
-				clanStatusLabel.setForeground(PanelColors.WARNING);
-			}
-			clanStatusLabel.setVisible(true);
-		}
-		else
-		{
-			playerInfoLabel.setVisible(false);
-			clanStatusLabel.setVisible(false);
-		}
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-import com.arceuuscc.plugin.models.Newsletter;
-
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JButton;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.border.EmptyBorder;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Dimension;
-import java.awt.FlowLayout;
-import java.awt.Font;
-import java.util.List;
-
-/**
- * Panel containing the newsletters list.
- */
-public class NewslettersTabPanel extends JPanel
-{
-	private final ArceuusCCPlugin plugin;
-	private final NewsletterPanelBuilder newsletterBuilder;
-
-	public NewslettersTabPanel(ArceuusCCPlugin plugin)
-	{
-		this.plugin = plugin;
-		this.newsletterBuilder = new NewsletterPanelBuilder(plugin);
-
-		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-		setBackground(PanelColors.getDarkGray());
-		setBorder(new EmptyBorder(10, 10, 10, 10));
-	}
-
-	public void refresh()
-	{
-		removeAll();
-
-		if (!plugin.hasPluginAccess())
-		{
-			add(new NoAccessPanel(plugin.getPluginSettings().getClanName()));
-			revalidate();
-			repaint();
-			return;
-		}
-
-		List<Newsletter> newsletters = plugin.getNewsletters();
-		Newsletter latest = plugin.getLatestNewsletter();
-
-		if ((newsletters == null || newsletters.isEmpty()) && latest == null)
-		{
-			JLabel label = new JLabel("No newsletters available");
-			label.setForeground(PanelColors.getLightGray());
-			label.setAlignmentX(Component.LEFT_ALIGNMENT);
-			add(label);
-		}
-		else
-		{
-			renderNewslettersList(newsletters, latest);
-		}
-
-		revalidate();
-		repaint();
-	}
-
-	private void renderNewslettersList(List<Newsletter> newsletters, Newsletter latest)
-	{
-		JButton markAllReadBtn = new JButton("Mark all as read");
-		markAllReadBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
-		markAllReadBtn.addActionListener(e -> plugin.markAllNewslettersAsRead());
-		add(markAllReadBtn);
-		add(Box.createVerticalStrut(10));
-
-		if (latest != null)
-		{
-			addSectionHeader("LATEST NEWSLETTER", PanelColors.NEWSLETTER_LATEST_BORDER);
-			add(newsletterBuilder.createNewsletterPanel(latest, true));
-			add(Box.createVerticalStrut(15));
-		}
-
-		if (newsletters != null && !newsletters.isEmpty())
-		{
-			addSectionHeader("NEWSLETTER HISTORY", Color.GRAY);
-
-			for (Newsletter newsletter : newsletters)
-			{
-				if (latest != null && newsletter.getId() == latest.getId())
-				{
-					continue;
-				}
-				add(newsletterBuilder.createNewsletterPanel(newsletter, false));
-				add(Box.createVerticalStrut(8));
-			}
-		}
-
-	}
-
-	private void addSectionHeader(String title, Color color)
-	{
-		JPanel header = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-		header.setBackground(PanelColors.getDarkGray());
-		header.setAlignmentX(Component.LEFT_ALIGNMENT);
-		header.setMaximumSize(new Dimension(Integer.MAX_VALUE, 25));
-
-		JLabel label = new JLabel(title);
-		label.setFont(new Font("Arial", Font.BOLD, 12));
-		label.setForeground(color);
-		header.add(label);
-
-		add(header);
-		add(Box.createVerticalStrut(5));
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-/**
- * Unicode mail icons for read/unread status indicators.
- */
-public final class MailIcons
-{
-	/** Closed envelope - indicates unread/new content (U+1F4E9 envelope with arrow) */
-	public static final String UNREAD = "\uD83D\uDCE9";
-
-	/** Open envelope - indicates read content (U+1F4E8 incoming envelope) */
-	public static final String READ = "\uD83D\uDCE8";
-
-	private MailIcons()
-	{
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-import com.arceuuscc.plugin.models.Event;
-import com.arceuuscc.plugin.util.FormatUtils;
-import lombok.extern.slf4j.Slf4j;
-
-import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JButton;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.border.EmptyBorder;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Dimension;
-import java.awt.FlowLayout;
-import java.awt.Font;
-import java.time.LocalDateTime;
-
-/**
- * Builds event card panels.
- */
-@Slf4j
-public class EventPanelBuilder
-{
-	private final ArceuusCCPlugin plugin;
-
-	public EventPanelBuilder(ArceuusCCPlugin plugin)
-	{
-		this.plugin = plugin;
-	}
-
-	public JPanel createEventPanel(Event event)
-	{
-		EventStatus status = new EventStatus(event, plugin);
-
-		// Create wrapper with BorderLayout to position mail icon in top-right
-		JPanel wrapper = new JPanel(new BorderLayout());
-		wrapper.setBackground(status.bgColor);
-		wrapper.setBorder(BorderFactory.createCompoundBorder(
-			BorderFactory.createLineBorder(status.borderColor, status.isUnseen ? 2 : 1),
-			new EmptyBorder(8, 8, 8, 8)
-		));
-		wrapper.setAlignmentX(Component.LEFT_ALIGNMENT);
-		wrapper.setMaximumSize(new Dimension(225, Integer.MAX_VALUE));
-
-		// Mail icon in top-right corner
-		JPanel topBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
-		topBar.setOpaque(false);
-		JLabel mailIcon = new JLabel(status.isUnseen ? MailIcons.UNREAD : MailIcons.READ);
-		mailIcon.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 14));
-		mailIcon.setForeground(status.isUnseen ? PanelColors.GOLD : PanelColors.getLightGray());
-		mailIcon.setToolTipText(status.isUnseen ? "Unread" : "Read");
-		topBar.add(mailIcon);
-		wrapper.add(topBar, BorderLayout.NORTH);
-
-		// Content panel
-		JPanel panel = new JPanel();
-		panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
-		panel.setOpaque(false);
-
-		addTitle(panel, event, status);
-		addTimeInfo(panel, event);
-		addSignupCount(panel, event);
-		addDescriptionPreview(panel, event);
-		addDetailsButton(panel, event);
-
-		// Allow signups for both UPCOMING and ACTIVE events
-		if (status.isUpcoming || status.isActive)
-		{
-			addSignupButton(panel, event, status.isActive);
-		}
-
-		wrapper.add(panel, BorderLayout.CENTER);
-		return wrapper;
-	}
-
-	private void addTitle(JPanel panel, Event event, EventStatus status)
-	{
-		String text = status.isCancelled
-			? "<html><s>" + event.getTitle() + "</s></html>"
-			: event.getTitle();
-
-		JLabel label = new JLabel(text);
-		label.setFont(new Font("Arial", Font.BOLD, 13));
-		label.setForeground(status.titleColor);
-		label.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(label);
-		panel.add(Box.createVerticalStrut(4));
-	}
-
-	private void addTimeInfo(JPanel panel, Event event)
-	{
-		JLabel timeLabel = new JLabel(FormatUtils.formatEventTime(event.getStartTime()) + " UTC");
-		timeLabel.setFont(new Font("Arial", Font.PLAIN, 11));
-		timeLabel.setForeground(Color.WHITE);
-		timeLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(timeLabel);
-
-		JLabel durationLabel = new JLabel("Duration: " + FormatUtils.formatDuration(event.getDurationMinutes()));
-		durationLabel.setFont(new Font("Arial", Font.PLAIN, 10));
-		durationLabel.setForeground(PanelColors.getLightGray());
-		durationLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(durationLabel);
-		panel.add(Box.createVerticalStrut(4));
-	}
-
-	private void addSignupCount(JPanel panel, Event event)
-	{
-		int count = event.getSignups() != null ? event.getSignups().size() : 0;
-		JLabel label = new JLabel("Signups: " + count);
-		label.setFont(new Font("Arial", Font.PLAIN, 10));
-		label.setForeground(PanelColors.getLightGray());
-		label.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(label);
-	}
-
-	private void addDescriptionPreview(JPanel panel, Event event)
-	{
-		String desc = event.getDescription();
-		if (desc == null || desc.isEmpty())
-		{
-			return;
-		}
-
-		panel.add(Box.createVerticalStrut(4));
-		String preview = desc.length() > 60 ? desc.substring(0, 57) + "..." : desc;
-		JLabel label = new JLabel("<html><i>" + FormatUtils.escapeHtml(preview) + "</i></html>");
-		label.setFont(new Font("Arial", Font.PLAIN, 10));
-		label.setForeground(PanelColors.getLightGray());
-		label.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(label);
-	}
-
-	private void addDetailsButton(JPanel panel, Event event)
-	{
-		panel.add(Box.createVerticalStrut(4));
-		JButton button = new JButton("View Details");
-		button.setFont(new Font("Arial", Font.PLAIN, 10));
-		button.setAlignmentX(Component.LEFT_ALIGNMENT);
-		button.setPreferredSize(new Dimension(90, 20));
-		button.setMaximumSize(new Dimension(90, 20));
-		button.addActionListener(e -> {
-			plugin.markEventAsSeen(event.getEventId());
-			EventDetailsDialog.show(panel, event);
-		});
-		panel.add(button);
-	}
-
-	private void addSignupButton(JPanel panel, Event event, boolean isActive)
-	{
-		// For active events, the event hasn't "passed" - it's still ongoing
-		boolean eventPassed = !isActive && hasEventPassed(event);
-		boolean isSignedUp = plugin.isSignedUp(event.getEventId());
-		boolean canSignUp = plugin.getPlayerName() != null && plugin.isInClan() && !eventPassed;
-
-		panel.add(Box.createVerticalStrut(6));
-
-		JButton button = isSignedUp
-			? createLeaveButton(event)
-			: createSignUpButton(event, canSignUp, eventPassed);
-
-		button.setAlignmentX(Component.LEFT_ALIGNMENT);
-		button.setForeground(Color.WHITE);
-		button.setFont(new Font("Arial", Font.BOLD, 11));
-		button.setPreferredSize(new Dimension(100, 24));
-		button.setMaximumSize(new Dimension(100, 24));
-		panel.add(button);
-	}
-
-	private boolean hasEventPassed(Event event)
-	{
-		if (event.getStartTime() == null)
-		{
-			return false;
-		}
-		try
-		{
-			LocalDateTime startTime = LocalDateTime.parse(event.getStartTime());
-			return startTime.isBefore(LocalDateTime.now());
-		}
-		catch (Exception e)
-		{
-			log.warn("Could not parse event time: {}", event.getStartTime());
-			return false;
-		}
-	}
-
-	private JButton createLeaveButton(Event event)
-	{
-		JButton button = new JButton("Leave Event");
-		button.setBackground(PanelColors.LEAVE_BUTTON);
-		button.addActionListener(e -> plugin.unSignUp(event.getEventId()));
-		return button;
-	}
-
-	private JButton createSignUpButton(Event event, boolean canSignUp, boolean eventPassed)
-	{
-		JButton button = new JButton("Sign Up");
-		button.setBackground(PanelColors.SIGNUP_BUTTON);
-		button.addActionListener(e -> plugin.signUp(event.getEventId()));
-
-		if (!canSignUp)
-		{
-			button.setEnabled(false);
-			button.setToolTipText(eventPassed ? "Event time has passed" : "Join Arceuus clan to sign up");
-		}
-		return button;
-	}
-
-	/**
-	 * Helper to compute event status colors.
-	 */
-	private static class EventStatus
-	{
-		final boolean isCancelled;
-		final boolean isActive;
-		final boolean isUpcoming;
-		final boolean isUnseen;
-		final Color bgColor;
-		final Color borderColor;
-		final Color titleColor;
-
-		EventStatus(Event event, ArceuusCCPlugin plugin)
-		{
-			isCancelled = "CANCELLED".equals(event.getStatus());
-			isActive = "ACTIVE".equals(event.getStatus());
-			isUpcoming = "UPCOMING".equals(event.getStatus());
-			boolean isCompleted = "COMPLETED".equals(event.getStatus());
-			isUnseen = isUpcoming && !plugin.isEventSeen(event.getEventId());
-
-			if (isCancelled)
-			{
-				bgColor = PanelColors.CANCELLED_BG;
-				borderColor = PanelColors.CANCELLED_BORDER;
-				titleColor = Color.GRAY;
-			}
-			else if (isActive)
-			{
-				bgColor = PanelColors.ACTIVE_BG;
-				borderColor = PanelColors.ACTIVE_BORDER;
-				titleColor = PanelColors.ACTIVE_TITLE;
-			}
-			else if (isCompleted)
-			{
-				bgColor = PanelColors.COMPLETED_BG;
-				borderColor = PanelColors.COMPLETED_BORDER;
-				titleColor = Color.GRAY;
-			}
-			else if (isUnseen)
-			{
-				bgColor = PanelColors.UNSEEN_BG;
-				borderColor = PanelColors.UNSEEN_BORDER;
-				titleColor = PanelColors.UPCOMING_TITLE;
-			}
-			else
-			{
-				bgColor = PanelColors.getDarkerGray();
-				borderColor = PanelColors.getMediumGray();
-				titleColor = PanelColors.UPCOMING_TITLE;
-			}
-		}
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-import com.arceuuscc.plugin.models.Newsletter;
-import lombok.extern.slf4j.Slf4j;
-
-import javax.imageio.ImageIO;
-import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.ImageIcon;
-import javax.swing.JButton;
-import javax.swing.JDialog;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.JScrollPane;
-import javax.swing.ScrollPaneConstants;
-import javax.swing.border.EmptyBorder;
-import java.awt.BorderLayout;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Cursor;
-import java.awt.Dimension;
-import java.awt.FlowLayout;
-import java.awt.Font;
-import java.awt.GraphicsEnvironment;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-import java.awt.image.BufferedImage;
-import java.net.URL;
-
-/**
- * Builds newsletter panel UI components.
- */
-@Slf4j
-public class NewsletterPanelBuilder
-{
-	private static final String FONT_ARIAL = "Arial";
-	private static final String FONT_SERIF = "Serif";
-
-	private final ArceuusCCPlugin plugin;
-
-	public NewsletterPanelBuilder(ArceuusCCPlugin plugin)
-	{
-		this.plugin = plugin;
-	}
-
-	/**
-	 * Creates a panel for displaying a newsletter.
-	 */
-	public JPanel createNewsletterPanel(Newsletter newsletter, boolean isLatest)
-	{
-		boolean isUnseen = !plugin.isNewsletterSeen(newsletter.getId());
-		Color bgColor = isLatest ? PanelColors.NEWSLETTER_LATEST_BG : PanelColors.getDarkerGray();
-		Color borderColor = isLatest ? PanelColors.NEWSLETTER_LATEST_BORDER : PanelColors.getMediumGray();
-
-		// Wrapper panel with BorderLayout for mail icon positioning
-		JPanel wrapper = new JPanel(new BorderLayout());
-		wrapper.setBackground(bgColor);
-		wrapper.setBorder(BorderFactory.createCompoundBorder(
-			BorderFactory.createLineBorder(borderColor, isLatest ? 2 : 1),
-			new EmptyBorder(10, 10, 10, 10)
-		));
-		wrapper.setAlignmentX(Component.LEFT_ALIGNMENT);
-		wrapper.setMaximumSize(new Dimension(225, 160));
-
-		// Mail icon in top-right corner
-		JPanel topBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
-		topBar.setOpaque(false);
-		JLabel mailIcon = new JLabel(isUnseen ? MailIcons.UNREAD : MailIcons.READ);
-		mailIcon.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 14));
-		mailIcon.setForeground(isUnseen ? PanelColors.GOLD : PanelColors.getLightGray());
-		mailIcon.setToolTipText(isUnseen ? "Unread" : "Read");
-		topBar.add(mailIcon);
-		wrapper.add(topBar, BorderLayout.NORTH);
-
-		// Content panel
-		JPanel panel = new JPanel();
-		panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
-		panel.setOpaque(false);
-
-		// Title
-		JLabel titleLabel = new JLabel(newsletter.getTitle());
-		titleLabel.setFont(new Font(FONT_SERIF, Font.BOLD, 14));
-		titleLabel.setForeground(isLatest ? PanelColors.GOLD : Color.WHITE);
-		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		panel.add(titleLabel);
-
-		// Month/Year
-		if (newsletter.getMonthYear() != null)
-		{
-			JLabel monthLabel = new JLabel(newsletter.getMonthYear());
-			monthLabel.setFont(new Font(FONT_ARIAL, Font.ITALIC, 11));
-			monthLabel.setForeground(PanelColors.getLightGray());
-			monthLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-			panel.add(monthLabel);
-		}
-
-		panel.add(Box.createVerticalStrut(5));
-
-		// Subtitle
-		if (newsletter.getSubtitle() != null && !newsletter.getSubtitle().isEmpty())
-		{
-			String subtitle = newsletter.getSubtitle();
-			if (subtitle.length() > 50)
-			{
-				subtitle = subtitle.substring(0, 47) + "...";
-			}
-			JLabel subtitleLabel = new JLabel("<html><i>" + escapeHtml(subtitle) + "</i></html>");
-			subtitleLabel.setFont(new Font(FONT_ARIAL, Font.PLAIN, 10));
-			subtitleLabel.setForeground(PanelColors.getLightGray());
-			subtitleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-			panel.add(subtitleLabel);
-		}
-
-		// Editor
-		if (newsletter.getEditorName() != null)
-		{
-			JLabel editorLabel = new JLabel(newsletter.getEditorName());
-			editorLabel.setFont(new Font(FONT_ARIAL, Font.PLAIN, 9));
-			editorLabel.setForeground(Color.GRAY);
-			editorLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-			panel.add(editorLabel);
-		}
-
-		panel.add(Box.createVerticalStrut(8));
-
-		// View button
-		JButton viewButton = new JButton("View Newsletter");
-		viewButton.setFont(new Font(FONT_ARIAL, Font.BOLD, 11));
-		viewButton.setAlignmentX(Component.LEFT_ALIGNMENT);
-		viewButton.setBackground(isLatest ? PanelColors.NEWSLETTER_LATEST_BORDER : PanelColors.getMediumGray());
-		viewButton.setForeground(Color.WHITE);
-		viewButton.setPreferredSize(new Dimension(130, 24));
-		viewButton.setMaximumSize(new Dimension(130, 24));
-		viewButton.addActionListener(e -> showNewsletterDialog(newsletter));
-		panel.add(viewButton);
-
-		wrapper.add(panel, BorderLayout.CENTER);
-
-		// Mark as read when clicked
-		wrapper.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				plugin.markNewsletterAsSeen(newsletter);
-			}
-		});
-		wrapper.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-
-		return wrapper;
-	}
-
-	/**
-	 * Shows a dialog with the full newsletter image.
-	 */
-	public void showNewsletterDialog(Newsletter newsletter)
-	{
-		// Mark as seen
-		plugin.markNewsletterAsSeen(newsletter);
-
-		// Get screen size to cap dialog dimensions
-		java.awt.Rectangle screenBounds = GraphicsEnvironment.getLocalGraphicsEnvironment()
-			.getMaximumWindowBounds();
-		int maxDialogWidth = Math.min(1200, screenBounds.width - 100);
-		int maxDialogHeight = Math.min(900, screenBounds.height - 100);
-
-		// Create dialog
-		JDialog dialog = new JDialog();
-		dialog.setTitle(newsletter.getTitle() + " - " + newsletter.getMonthYear());
-		dialog.setModal(true);
-		dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
-
-		JPanel contentPanel = new JPanel();
-		contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
-		contentPanel.setBackground(PanelColors.DIALOG_BG);
-		contentPanel.setBorder(new EmptyBorder(20, 20, 20, 20));
-
-		// Loading label
-		JLabel loadingLabel = new JLabel("Loading newsletter...");
-		loadingLabel.setFont(new Font(FONT_ARIAL, Font.PLAIN, 14));
-		loadingLabel.setForeground(Color.WHITE);
-		loadingLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-		contentPanel.add(loadingLabel);
-
-		// Scroll pane
-		JScrollPane scrollPane = new JScrollPane(contentPanel);
-		scrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
-		scrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
-		scrollPane.setBorder(null);
-		scrollPane.getVerticalScrollBar().setUnitIncrement(16);
-		scrollPane.getHorizontalScrollBar().setUnitIncrement(16);
-
-		dialog.add(scrollPane);
-		dialog.setSize(Math.min(900, maxDialogWidth), Math.min(800, maxDialogHeight));
-		dialog.setLocationRelativeTo(null);
-
-		// Load image in background
-		String imageUrl = plugin.getNewsletterImageUrl(newsletter.getId());
-		if (imageUrl != null)
-		{
-			loadNewsletterImage(imageUrl, contentPanel, loadingLabel, dialog, maxDialogWidth, maxDialogHeight);
-		}
-
-		dialog.setVisible(true);
-	}
-
-	private void loadNewsletterImage(String imageUrl, JPanel contentPanel, JLabel loadingLabel,
-		JDialog dialog, int maxDialogWidth, int maxDialogHeight)
-	{
-		new Thread(() -> {
-			try
-			{
-				BufferedImage image = ImageIO.read(new URL(imageUrl));
-				if (image != null)
-				{
-					ImageIcon icon = new ImageIcon(image);
-
-					javax.swing.SwingUtilities.invokeLater(() -> {
-						contentPanel.removeAll();
-
-						JLabel imageLabel = new JLabel(icon);
-						imageLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
-						contentPanel.add(imageLabel);
-
-						contentPanel.revalidate();
-						contentPanel.repaint();
-
-						// Resize dialog to fit image
-						int dialogWidth = Math.min(image.getWidth() + 60, maxDialogWidth);
-						int dialogHeight = Math.min(image.getHeight() + 80, maxDialogHeight);
-						dialog.setSize(dialogWidth, dialogHeight);
-						dialog.setLocationRelativeTo(null);
-					});
-				}
-			}
-			catch (Exception ex)
-			{
-				log.error("Failed to load newsletter image", ex);
-				javax.swing.SwingUtilities.invokeLater(() -> {
-					loadingLabel.setText("Failed to load newsletter image");
-					loadingLabel.setForeground(Color.RED);
-				});
-			}
-		}).start();
-	}
-
-	private String escapeHtml(String text)
-	{
-		if (text == null)
-		{
-			return "";
-		}
-		return text.replace("&", "&amp;")
-			.replace("<", "&lt;")
-			.replace(">", "&gt;")
-			.replace("\"", "&quot;")
-			.replace("\n", "<br>");
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import net.runelite.client.ui.ColorScheme;
-
-import java.awt.Color;
-
-/**
- * Color constants used throughout the plugin UI.
- */
-public final class PanelColors
-{
-	// Event status colors
-	public static final Color ACTIVE_BG = new Color(30, 50, 30);
-	public static final Color ACTIVE_BORDER = new Color(50, 150, 50);
-	public static final Color ACTIVE_TITLE = new Color(50, 200, 50);
-
-	public static final Color UPCOMING_TITLE = new Color(114, 137, 218);
-
-	public static final Color COMPLETED_BG = new Color(45, 45, 45);
-	public static final Color COMPLETED_BORDER = new Color(80, 80, 80);
-
-	public static final Color CANCELLED_BG = new Color(60, 40, 40);
-	public static final Color CANCELLED_BORDER = new Color(150, 50, 50);
-
-	public static final Color UNSEEN_BG = new Color(50, 45, 30);
-	public static final Color UNSEEN_BORDER = new Color(218, 165, 32);
-	public static final Color GOLD = new Color(218, 165, 32);
-
-	// Newsletter colors
-	public static final Color NEWSLETTER_LATEST_BG = new Color(60, 50, 30);
-	public static final Color NEWSLETTER_LATEST_BORDER = new Color(139, 69, 19);
-
-	// Status colors
-	public static final Color CONNECTED = new Color(0, 200, 83);
-	public static final Color DISCONNECTED = Color.RED;
-	public static final Color WARNING = Color.ORANGE;
-
-	// Button colors
-	public static final Color SIGNUP_BUTTON = new Color(50, 150, 50);
-	public static final Color LEAVE_BUTTON = new Color(150, 50, 50);
-
-	// No access panel colors
-	public static final Color NO_ACCESS_BG = new Color(60, 40, 30);
-	public static final Color NO_ACCESS_BORDER = new Color(139, 69, 19);
-	public static final Color NO_ACCESS_TITLE = new Color(255, 140, 0);
-
-	// Dialog colors
-	public static final Color DIALOG_BG = new Color(30, 30, 30);
-
-	// Delegate to ColorScheme for standard colors
-	public static Color getDarkGray()
-	{
-		return ColorScheme.DARK_GRAY_COLOR;
-	}
-
-	public static Color getDarkerGray()
-	{
-		return ColorScheme.DARKER_GRAY_COLOR;
-	}
-
-	public static Color getMediumGray()
-	{
-		return ColorScheme.MEDIUM_GRAY_COLOR;
-	}
-
-	public static Color getLightGray()
-	{
-		return ColorScheme.LIGHT_GRAY_COLOR;
-	}
-
-	private PanelColors()
-	{
-		// Utility class
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-import com.arceuuscc.plugin.models.Event;
-import com.arceuuscc.plugin.util.DateTimeUtils;
-
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JButton;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.border.EmptyBorder;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Dimension;
-import java.awt.FlowLayout;
-import java.awt.Font;
-import java.util.ArrayList;
-import java.util.Comparator;
-import java.util.List;
-
-/**
- * Panel containing the events list.
- */
-public class EventsTabPanel extends JPanel
-{
-	private final ArceuusCCPlugin plugin;
-	private final EventPanelBuilder eventBuilder;
-
-	public EventsTabPanel(ArceuusCCPlugin plugin)
-	{
-		this.plugin = plugin;
-		this.eventBuilder = new EventPanelBuilder(plugin);
-
-		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-		setBackground(PanelColors.getDarkGray());
-		setBorder(new EmptyBorder(10, 10, 10, 10));
-	}
-
-	public void refresh()
-	{
-		removeAll();
-
-		if (!plugin.hasPluginAccess())
-		{
-			add(new NoAccessPanel(plugin.getPluginSettings().getClanName()));
-			revalidate();
-			repaint();
-			return;
-		}
-
-		List<Event> events = plugin.getEvents();
-
-		if (events == null || events.isEmpty())
-		{
-			addNoEventsLabel();
-		}
-		else
-		{
-			renderEventsList(events);
-		}
-
-		revalidate();
-		repaint();
-	}
-
-	private void addNoEventsLabel()
-	{
-		JLabel label = new JLabel("No events");
-		label.setForeground(PanelColors.getLightGray());
-		label.setAlignmentX(Component.LEFT_ALIGNMENT);
-		add(label);
-	}
-
-	private void renderEventsList(List<Event> events)
-	{
-		if (plugin.hasUnseenEvents())
-		{
-			JButton markAllReadBtn = new JButton("Mark all as read");
-			markAllReadBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
-			markAllReadBtn.addActionListener(e -> plugin.markAllEventsAsRead());
-			add(markAllReadBtn);
-			add(Box.createVerticalStrut(10));
-		}
-
-		List<Event> live = new ArrayList<>();
-		List<Event> upcoming = new ArrayList<>();
-		List<Event> finished = new ArrayList<>();
-		categorizeEvents(events, live, upcoming, finished);
-
-		upcoming.sort(Comparator.comparing(e -> DateTimeUtils.parseDateTime(e.getStartTime())));
-		finished.sort((a, b) -> DateTimeUtils.parseDateTime(b.getStartTime())
-			.compareTo(DateTimeUtils.parseDateTime(a.getStartTime())));
-
-		renderSection("LIVE", PanelColors.ACTIVE_TITLE, live);
-		renderSection("UPCOMING", PanelColors.UPCOMING_TITLE, upcoming);
-		renderSection("FINISHED", Color.GRAY, finished);
-
-		if (live.isEmpty() && upcoming.isEmpty() && finished.isEmpty())
-		{
-			addNoEventsLabel();
-		}
-	}
-
-	private void categorizeEvents(List<Event> events, List<Event> live, List<Event> upcoming, List<Event> finished)
-	{
-		for (Event event : events)
-		{
-			String status = event.getStatus();
-			if ("ACTIVE".equals(status))
-			{
-				live.add(event);
-			}
-			else if ("UPCOMING".equals(status))
-			{
-				upcoming.add(event);
-			}
-			else if ("COMPLETED".equals(status) || "CANCELLED".equals(status))
-			{
-				finished.add(event);
-			}
-		}
-	}
-
-	private void renderSection(String title, Color color, List<Event> events)
-	{
-		if (events.isEmpty())
-		{
-			return;
-		}
-
-		addSectionHeader(title, color);
-		for (Event event : events)
-		{
-			add(eventBuilder.createEventPanel(event));
-			add(Box.createVerticalStrut(8));
-		}
-		add(Box.createVerticalStrut(10));
-	}
-
-	private void addSectionHeader(String title, Color color)
-	{
-		JPanel header = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
-		header.setBackground(PanelColors.getDarkGray());
-		header.setAlignmentX(Component.LEFT_ALIGNMENT);
-		header.setMaximumSize(new Dimension(Integer.MAX_VALUE, 25));
-
-		JLabel label = new JLabel(title);
-		label.setFont(new Font("Arial", Font.BOLD, 12));
-		label.setForeground(color);
-		header.add(label);
-
-		add(header);
-		add(Box.createVerticalStrut(5));
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.ArceuusCCConfig;
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-import com.arceuuscc.plugin.models.Event;
-import com.arceuuscc.plugin.util.DateTimeUtils;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayLayer;
-import net.runelite.client.ui.overlay.OverlayPosition;
-import net.runelite.client.ui.overlay.components.LineComponent;
-import net.runelite.client.ui.overlay.components.PanelComponent;
-import net.runelite.client.ui.overlay.components.TitleComponent;
-
-import javax.inject.Inject;
-import java.awt.Color;
-import java.awt.Dimension;
-import java.awt.Graphics2D;
-import java.time.LocalDateTime;
-import java.time.temporal.ChronoUnit;
-import java.util.List;
-
-public class ArceuusCCOverlay extends Overlay
-{
-	private static final Color ARCEUUS_PURPLE = new Color(128, 0, 128);
-	private static final Color LIVE_GREEN = new Color(50, 200, 50);
-	private static final Color ENDING_SOON_RED = new Color(255, 100, 100);
-	private static final Color STARTING_SOON_YELLOW = new Color(255, 220, 0);
-	private static final Color UPCOMING_BLUE = new Color(114, 137, 218);
-	private static final Color NEWSLETTER_GOLD = new Color(218, 165, 32);
-	private static final Color NO_ACCESS_ORANGE = new Color(255, 140, 0);
-
-	private final ArceuusCCPlugin plugin;
-	private final ArceuusCCConfig config;
-	private final PanelComponent panelComponent = new PanelComponent();
-
-	@Inject
-	public ArceuusCCOverlay(ArceuusCCPlugin plugin, ArceuusCCConfig config)
-	{
-		super(plugin);
-		this.plugin = plugin;
-		this.config = config;
-
-		setPosition(OverlayPosition.TOP_LEFT);
-		setLayer(OverlayLayer.ABOVE_SCENE);
-	}
-
-	@Override
-	public Dimension render(Graphics2D graphics)
-	{
-		if (!config.showOverlay())
-		{
-			return null;
-		}
-
-		// Check if user has plugin access (is in clan if required)
-		if (!plugin.hasPluginAccess())
-		{
-			return renderNoAccessMessage(graphics);
-		}
-
-		List<Event> events = plugin.getEvents();
-		LocalDateTime now = LocalDateTime.now();
-
-		Event activeEvent = null;
-		Event upcomingEvent = null;
-
-		if (events != null)
-		{
-			for (Event event : events)
-			{
-				if ("ACTIVE".equals(event.getStatus()))
-				{
-					activeEvent = event;
-				}
-				else if ("UPCOMING".equals(event.getStatus()) && upcomingEvent == null)
-				{
-					LocalDateTime startTime = parseDateTime(event.getStartTime());
-					long minutesUntil = ChronoUnit.MINUTES.between(now, startTime);
-					if (minutesUntil <= 180 && minutesUntil >= 0)
-					{
-						upcomingEvent = event;
-					}
-				}
-			}
-		}
-
-		boolean showActive = activeEvent != null && config.showActiveEvent();
-		boolean showUpcoming = upcomingEvent != null && config.showUpcoming();
-
-		boolean isStartingSoon = false;
-		if (upcomingEvent != null)
-		{
-			LocalDateTime startTime = parseDateTime(upcomingEvent.getStartTime());
-			long minutesUntil = ChronoUnit.MINUTES.between(now, startTime);
-			isStartingSoon = minutesUntil <= 30 && minutesUntil >= 0;
-
-			if (isStartingSoon && !config.showStartingSoon())
-			{
-				showUpcoming = false;
-			}
-		}
-
-		boolean isEndingSoon = false;
-		if (activeEvent != null)
-		{
-			LocalDateTime endTime = parseDateTime(activeEvent.getStartTime())
-				.plusMinutes(activeEvent.getDurationMinutes());
-			long minutesLeft = ChronoUnit.MINUTES.between(now, endTime);
-			isEndingSoon = minutesLeft <= 30 && minutesLeft >= 0;
-
-			if (isEndingSoon && !config.showEndingSoon())
-			{
-				isEndingSoon = false;
-			}
-		}
-
-		// Check if we should show newsletter notification
-		boolean showNewsletter = config.showNewsletterOverlay()
-			&& plugin.getPluginSettings().isShowNewsletterNotifications()
-			&& plugin.hasUnreadNewsletter();
-
-		// If nothing to show, return null
-		if (!showActive && !showUpcoming && !showNewsletter)
-		{
-			return null;
-		}
-
-		panelComponent.getChildren().clear();
-
-		boolean isMinimalMode = config.overlayMode() == ArceuusCCConfig.OverlayMode.MINIMAL;
-
-		// Set wider panel for minimal mode to fit content on fewer lines
-		if (isMinimalMode)
-		{
-			panelComponent.setPreferredSize(new Dimension(350, 0));
-		}
-		else
-		{
-			panelComponent.setPreferredSize(new Dimension(180, 0));
-		}
-
-		if (isMinimalMode)
-		{
-			// Minimal mode: compact display without header
-			if (showActive)
-			{
-				renderActiveEventMinimal(activeEvent, now, isEndingSoon);
-			}
-			if (showUpcoming)
-			{
-				renderUpcomingEventMinimal(upcomingEvent, now, isStartingSoon);
-			}
-		}
-		else
-		{
-			// Detailed mode: original multi-line display with header
-			panelComponent.getChildren().add(TitleComponent.builder()
-				.text("ARCEUUS")
-				.color(ARCEUUS_PURPLE)
-				.build());
-			if (showActive)
-			{
-				renderActiveEvent(activeEvent, now, isEndingSoon);
-			}
-
-			if (showUpcoming)
-			{
-				if (showActive)
-				{
-					panelComponent.getChildren().add(LineComponent.builder().build());
-				}
-				renderUpcomingEvent(upcomingEvent, now, isStartingSoon);
-			}
-		}
-
-		// Show new newsletter notification (same in both modes)
-		if (showNewsletter)
-		{
-			if (showActive || showUpcoming)
-			{
-				panelComponent.getChildren().add(LineComponent.builder().build());
-			}
-			renderNewsletterNotification();
-		}
-
-		return panelComponent.render(graphics);
-	}
-
-	private void renderNewsletterNotification()
-	{
-		var newsletter = plugin.getLatestNewsletter();
-		if (newsletter == null)
-		{
-			return;
-		}
-
-		panelComponent.getChildren().add(TitleComponent.builder()
-			.text("NEW NEWSLETTER")
-			.color(NEWSLETTER_GOLD)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left(newsletter.getTitle())
-			.leftColor(Color.WHITE)
-			.build());
-
-		if (newsletter.getMonthYear() != null)
-		{
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left(newsletter.getMonthYear())
-				.leftColor(Color.GRAY)
-				.build());
-		}
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("Check panel to read")
-			.leftColor(NEWSLETTER_GOLD)
-			.build());
-	}
-
-	private void renderActiveEvent(Event event, LocalDateTime now, boolean isEndingSoon)
-	{
-		LocalDateTime endTime = parseDateTime(event.getStartTime())
-			.plusMinutes(event.getDurationMinutes());
-		long secondsLeft = ChronoUnit.SECONDS.between(now, endTime);
-
-		String title = isEndingSoon ? "ENDING SOON" : "LIVE EVENT";
-		Color titleColor = isEndingSoon ? ENDING_SOON_RED : LIVE_GREEN;
-
-		panelComponent.getChildren().add(TitleComponent.builder()
-			.text(title)
-			.color(titleColor)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left(event.getTitle())
-			.leftColor(Color.WHITE)
-			.build());
-
-		if (secondsLeft > 0)
-		{
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("Ends in:")
-				.leftColor(Color.GRAY)
-				.right(formatCountdown(secondsLeft))
-				.rightColor(isEndingSoon ? ENDING_SOON_RED : Color.ORANGE)
-				.build());
-		}
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("Signups:")
-			.leftColor(Color.GRAY)
-			.right(String.valueOf(event.getSignups() != null ? event.getSignups().size() : 0))
-			.rightColor(Color.WHITE)
-			.build());
-
-		// Show codeword for active events
-		if (event.getCodeword() != null && !event.getCodeword().isEmpty())
-		{
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("Codeword:")
-				.leftColor(Color.GRAY)
-				.right(event.getCodeword())
-				.rightColor(STARTING_SOON_YELLOW)
-				.build());
-		}
-	}
-
-	private void renderActiveEventMinimal(Event event, LocalDateTime now, boolean isEndingSoon)
-	{
-		LocalDateTime endTime = parseDateTime(event.getStartTime())
-			.plusMinutes(event.getDurationMinutes());
-		long secondsLeft = ChronoUnit.SECONDS.between(now, endTime);
-
-		Color labelColor = isEndingSoon ? ENDING_SOON_RED : LIVE_GREEN;
-		boolean hasCodeword = event.getCodeword() != null && !event.getCodeword().isEmpty();
-
-		// Title line
-		panelComponent.getChildren().add(TitleComponent.builder()
-			.text(event.getTitle())
-			.color(Color.WHITE)
-			.build());
-
-		if (hasCodeword)
-		{
-			// Labels row: Ends In (left), Codeword (right)
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("Ends In")
-				.leftColor(labelColor)
-				.right("Codeword")
-				.rightColor(labelColor)
-				.build());
-
-			// Values row: time (left), codeword (right)
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left(formatCountdown(secondsLeft))
-				.leftColor(STARTING_SOON_YELLOW)
-				.right(event.getCodeword())
-				.rightColor(STARTING_SOON_YELLOW)
-				.build());
-		}
-		else
-		{
-			// Just show Ends In without codeword
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("Ends In:")
-				.leftColor(labelColor)
-				.right(formatCountdown(secondsLeft))
-				.rightColor(STARTING_SOON_YELLOW)
-				.build());
-		}
-	}
-
-	private void renderUpcomingEventMinimal(Event event, LocalDateTime now, boolean isStartingSoon)
-	{
-		LocalDateTime startTime = parseDateTime(event.getStartTime());
-		long secondsUntil = ChronoUnit.SECONDS.between(now, startTime);
-
-		Color labelColor = isStartingSoon ? STARTING_SOON_YELLOW : UPCOMING_BLUE;
-
-		// Title line
-		panelComponent.getChildren().add(TitleComponent.builder()
-			.text(event.getTitle())
-			.color(Color.WHITE)
-			.build());
-
-		if (secondsUntil > 0)
-		{
-			// Starts In line
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("Starts In:")
-				.leftColor(labelColor)
-				.right(formatCountdown(secondsUntil))
-				.rightColor(STARTING_SOON_YELLOW)
-				.build());
-		}
-		else
-		{
-			panelComponent.getChildren().add(TitleComponent.builder()
-				.text("Starting now!")
-				.color(STARTING_SOON_YELLOW)
-				.build());
-		}
-	}
-
-	private void renderUpcomingEvent(Event event, LocalDateTime now, boolean isStartingSoon)
-	{
-		LocalDateTime startTime = parseDateTime(event.getStartTime());
-		long secondsUntil = ChronoUnit.SECONDS.between(now, startTime);
-
-		String title = isStartingSoon ? "STARTING SOON" : "NEXT EVENT";
-		Color titleColor = isStartingSoon ? STARTING_SOON_YELLOW : UPCOMING_BLUE;
-
-		panelComponent.getChildren().add(TitleComponent.builder()
-			.text(title)
-			.color(titleColor)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left(event.getTitle())
-			.leftColor(Color.WHITE)
-			.build());
-
-		if (secondsUntil > 0)
-		{
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("Starts in:")
-				.leftColor(Color.GRAY)
-				.right(formatCountdown(secondsUntil))
-				.rightColor(isStartingSoon ? STARTING_SOON_YELLOW : Color.WHITE)
-				.build());
-		}
-		else
-		{
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("Starting now!")
-				.leftColor(STARTING_SOON_YELLOW)
-				.build());
-		}
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("Signups:")
-			.leftColor(Color.GRAY)
-			.right(String.valueOf(event.getSignups() != null ? event.getSignups().size() : 0))
-			.rightColor(Color.WHITE)
-			.build());
-
-		if (plugin.isSignedUp(event.getEventId()))
-		{
-			panelComponent.getChildren().add(LineComponent.builder()
-				.left("You are signed up!")
-				.leftColor(LIVE_GREEN)
-				.build());
-		}
-	}
-
-	private LocalDateTime parseDateTime(String isoTime)
-	{
-		return DateTimeUtils.parseDateTime(isoTime);
-	}
-
-	private String formatCountdown(long totalSeconds)
-	{
-		if (totalSeconds < 0)
-		{
-			return "0s";
-		}
-
-		if (totalSeconds < 60)
-		{
-			return totalSeconds + "s";
-		}
-
-		long totalMinutes = totalSeconds / 60;
-
-		if (totalMinutes < 60)
-		{
-			return totalMinutes + "m";
-		}
-
-		long hours = totalMinutes / 60;
-		long minutes = totalMinutes % 60;
-		if (hours < 24)
-		{
-			return hours + "h " + minutes + "m";
-		}
-
-		long days = hours / 24;
-		hours = hours % 24;
-		return days + "d " + hours + "h";
-	}
-
-	private Dimension renderNoAccessMessage(Graphics2D graphics)
-	{
-		panelComponent.getChildren().clear();
-
-		panelComponent.getChildren().add(TitleComponent.builder()
-			.text("ARCEUUS CC")
-			.color(ARCEUUS_PURPLE)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("Join the clan to use")
-			.leftColor(NO_ACCESS_ORANGE)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("this plugin")
-			.leftColor(NO_ACCESS_ORANGE)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder().build());
-
-		String clanName = plugin.getPluginSettings().getClanName();
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("Clan Chat:")
-			.leftColor(Color.GRAY)
-			.right(clanName)
-			.rightColor(Color.WHITE)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("Discord:")
-			.leftColor(Color.GRAY)
-			.build());
-
-		panelComponent.getChildren().add(LineComponent.builder()
-			.left("discord.gg/Ka3bVn6nkW")
-			.leftColor(UPCOMING_BLUE)
-			.build());
-
-		return panelComponent.render(graphics);
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import net.runelite.client.ui.PluginPanel;
-import net.runelite.client.util.LinkBrowser;
-
-import javax.swing.BorderFactory;
-import javax.swing.Box;
-import javax.swing.BoxLayout;
-import javax.swing.JLabel;
-import javax.swing.JPanel;
-import javax.swing.border.EmptyBorder;
-import java.awt.Color;
-import java.awt.Component;
-import java.awt.Cursor;
-import java.awt.Dimension;
-import java.awt.Font;
-import java.awt.event.MouseAdapter;
-import java.awt.event.MouseEvent;
-
-/**
- * Panel shown when user doesn't have access (not in clan).
- */
-public class NoAccessPanel extends JPanel
-{
-	public NoAccessPanel(String clanName)
-	{
-		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
-		setBackground(PanelColors.NO_ACCESS_BG);
-		setBorder(BorderFactory.createCompoundBorder(
-			BorderFactory.createLineBorder(PanelColors.NO_ACCESS_BORDER, 2),
-			new EmptyBorder(10, 10, 10, 10)
-		));
-		setAlignmentX(Component.LEFT_ALIGNMENT);
-		setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH - 10, Integer.MAX_VALUE));
-
-		JLabel titleLabel = new JLabel("<html><div style='width:170px'>Clan Membership Required</div></html>");
-		titleLabel.setFont(new Font("Arial", Font.BOLD, 12));
-		titleLabel.setForeground(PanelColors.NO_ACCESS_TITLE);
-		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		add(titleLabel);
-
-		add(Box.createVerticalStrut(8));
-
-		JLabel messageLabel = new JLabel("<html><div style='width:150px'>To use the Arceuus CC Plugin, please join the \"" +
-			clanName + "\" Clan Chat.</div></html>");
-		messageLabel.setFont(new Font("Arial", Font.PLAIN, 11));
-		messageLabel.setForeground(Color.WHITE);
-		messageLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		add(messageLabel);
-
-		add(Box.createVerticalStrut(15));
-
-		JLabel discordLabel = new JLabel("Join us on Discord:");
-		discordLabel.setFont(new Font("Arial", Font.BOLD, 11));
-		discordLabel.setForeground(PanelColors.getLightGray());
-		discordLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		add(discordLabel);
-
-		add(Box.createVerticalStrut(5));
-
-		JLabel linkLabel = new JLabel("<html><u>discord.gg/Ka3bVn6nkW</u></html>");
-		linkLabel.setFont(new Font("Arial", Font.PLAIN, 11));
-		linkLabel.setForeground(PanelColors.UPCOMING_TITLE);
-		linkLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
-		linkLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
-		linkLabel.addMouseListener(new MouseAdapter()
-		{
-			@Override
-			public void mouseClicked(MouseEvent e)
-			{
-				LinkBrowser.browse("https://discord.gg/Ka3bVn6nkW");
-			}
-		});
-		add(linkLabel);
-	}
-}
-
-package com.arceuuscc.plugin.ui;
-
-import com.arceuuscc.plugin.ArceuusCCPlugin;
-import net.runelite.client.ui.PluginPanel;
-
-import javax.swing.JScrollPane;
-import javax.swing.JTabbedPane;
-import javax.swing.ScrollPaneConstants;
-import java.awt.BorderLayout;
-import java.awt.Color;
-
-/**
- * Main plugin panel displayed in the RuneLite sidebar.
- */
-public class ArceuusCCPanel extends PluginPanel
-{
-	private final ArceuusCCPlugin plugin;
-	private final HeaderPanel headerPanel;
-	private final EventsTabPanel eventsTab;
-	private final NewslettersTabPanel newslettersTab;
-	private final JTabbedPane tabbedPane;
-
-	public ArceuusCCPanel(ArceuusCCPlugin plugin)
-	{
-		super(false);
-		this.plugin = plugin;
-
-		setLayout(new BorderLayout());
-		setBackground(PanelColors.getDarkGray());
-
-		headerPanel = new HeaderPanel(plugin);
-		add(headerPanel, BorderLayout.NORTH);
-
-		tabbedPane = new JTabbedPane();
-		tabbedPane.setBackground(PanelColors.getDarkGray());
-
-		eventsTab = new EventsTabPanel(plugin);
-		JScrollPane eventsScroll = new JScrollPane(eventsTab);
-		eventsScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-		eventsScroll.setBorder(null);
-		eventsScroll.getVerticalScrollBar().setUnitIncrement(16);
-		tabbedPane.addTab("Events", eventsScroll);
-
-		newslettersTab = new NewslettersTabPanel(plugin);
-		JScrollPane newslettersScroll = new JScrollPane(newslettersTab);
-		newslettersScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
-		newslettersScroll.setBorder(null);
-		newslettersScroll.getVerticalScrollBar().setUnitIncrement(16);
-		tabbedPane.addTab("Newsletters", newslettersScroll);
-
-		add(tabbedPane, BorderLayout.CENTER);
-
-		updateEvents();
-		updateNewsletters();
-	}
-
-	public void updateConnectionStatus(boolean connected)
-	{
-		headerPanel.updateConnectionStatus(connected);
-	}
-
-	public void updatePlayerInfo()
-	{
-		headerPanel.updatePlayerInfo(plugin.getPlayerName(), plugin.isInClan());
-		if (plugin.isInClan())
-		{
-			updateEvents();
-			updateNewsletters();
-		}
-	}
-
-	public void updateEvents()
-	{
-		eventsTab.refresh();
-		updateEventTabTitle();
-	}
-
-	public void updateNewsletters()
-	{
-		newslettersTab.refresh();
-		updateNewsletterTabTitle();
-	}
-
-	private void updateEventTabTitle()
-	{
-		if (plugin.hasUnseenEvents())
-		{
-			tabbedPane.setTitleAt(0, "Events *");
-			tabbedPane.setForegroundAt(0, PanelColors.GOLD);
-		}
-		else
-		{
-			tabbedPane.setTitleAt(0, "Events");
-			tabbedPane.setForegroundAt(0, null);
-		}
-	}
-
-	private void updateNewsletterTabTitle()
-	{
-		if (plugin.hasUnreadNewsletter())
-		{
-			tabbedPane.setTitleAt(1, "Newsletters *");
-			tabbedPane.setForegroundAt(1, new Color(255, 200, 0));
-		}
-		else
-		{
-			tabbedPane.setTitleAt(1, "Newsletters");
-			tabbedPane.setForegroundAt(1, null);
-		}
-	}
-}
-
 package com.arceuuscc.plugin;
 
 import net.runelite.client.config.Config;
@@ -3386,189 +934,533 @@ public class ArceuusCCPlugin extends Plugin
 	}
 }
 
-package com.arceuuscc.plugin.service;
+package com.arceuuscc.plugin.http;
 
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+import com.arceuuscc.plugin.models.Event;
+import com.arceuuscc.plugin.models.Newsletter;
+import com.arceuuscc.plugin.models.PluginSettings;
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParser;
+import com.google.gson.reflect.TypeToken;
 import lombok.extern.slf4j.Slf4j;
-import net.runelite.client.config.ConfigManager;
+import okhttp3.*;
 
-import java.util.HashSet;
-import java.util.Set;
+import java.io.IOException;
+import java.util.List;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
 
-/**
- * Service for managing the read/seen state of events and newsletters.
- * Persists state using RuneLite's ConfigManager.
- */
 @Slf4j
-public class ReadStateService
+public class HttpEventClient
 {
-	private static final String CONFIG_GROUP = "arceuuscc";
-	private static final String SEEN_EVENTS_KEY = "seenEventIds";
-	private static final String LAST_SEEN_NEWSLETTER_KEY = "lastSeenNewsletterId";
+	private static final MediaType JSON_MEDIA_TYPE = MediaType.get("application/json; charset=utf-8");
+	private static final String API_KEY = "arceuus-cc-runelite-2026";
+	private static final int DEFAULT_POLLING_INTERVAL = 30;
 
-	private final ConfigManager configManager;
-	private final Set<String> seenEventIds = new HashSet<>();
-	private int lastSeenNewsletterId = -1;
-	private int lastKnownNewsletterId = -1;
+	private final String apiUrl;
+	private final ArceuusCCPlugin plugin;
+	private final OkHttpClient httpClient;
+	private final Gson gson;
+	private final ScheduledExecutorService executor;
 
-	public ReadStateService(ConfigManager configManager)
+	private ScheduledFuture<?> pollingTask;
+	private boolean connected = false;
+	private int pollingInterval = DEFAULT_POLLING_INTERVAL;
+
+	public HttpEventClient(String apiUrl, ArceuusCCPlugin plugin, OkHttpClient httpClient, Gson gson, ScheduledExecutorService executor)
 	{
-		this.configManager = configManager;
+		this.apiUrl = apiUrl;
+		this.plugin = plugin;
+		this.httpClient = httpClient;
+		this.gson = gson;
+		this.executor = executor;
 	}
 
-	/**
-	 * Load persisted seen state from config.
-	 */
-	public void load()
+	public void start()
 	{
-		loadSeenEventIds();
-		loadLastSeenNewsletterId();
-	}
-
-	private void loadSeenEventIds()
-	{
-		String seenEventsStr = configManager.getConfiguration(CONFIG_GROUP, SEEN_EVENTS_KEY);
-		if (seenEventsStr != null && !seenEventsStr.isEmpty())
+		if (pollingTask != null)
 		{
-			seenEventIds.clear();
-			String[] ids = seenEventsStr.split(",");
-			for (String id : ids)
+			return;
+		}
+
+		// Fetch settings first, then start polling
+		requestSettings();
+
+		// Initial fetch
+		requestEvents();
+
+		// Poll at configured interval (default 30 seconds, 0 = disabled)
+		startPolling();
+		log.debug("HTTP Event Client started, polling {}", apiUrl);
+	}
+
+	private void startPolling()
+	{
+		// Cancel existing polling task if any
+		if (pollingTask != null)
+		{
+			pollingTask.cancel(false);
+			pollingTask = null;
+		}
+
+		// If polling interval is 0, polling is disabled
+		if (pollingInterval <= 0)
+		{
+			log.debug("Event polling disabled (interval = 0)");
+			return;
+		}
+
+		pollingTask = executor.scheduleAtFixedRate(() -> {
+			requestEvents();
+			requestLatestNewsletter();
+			requestNewsletters(10);
+		}, pollingInterval, pollingInterval, TimeUnit.SECONDS);
+		log.debug("Event and newsletter polling started with interval: {} seconds", pollingInterval);
+	}
+
+	public void updatePollingInterval(int newInterval)
+	{
+		if (newInterval != pollingInterval)
+		{
+			pollingInterval = newInterval;
+			startPolling();
+		}
+	}
+
+	public void stop()
+	{
+		if (pollingTask != null)
+		{
+			pollingTask.cancel(false);
+			pollingTask = null;
+		}
+		log.debug("HTTP Event Client stopped");
+	}
+
+	public boolean isConnected()
+	{
+		return connected;
+	}
+
+	public void requestEvents()
+	{
+		Request request = new Request.Builder()
+			.url(apiUrl)
+			.get()
+			.build();
+
+		httpClient.newCall(request).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
 			{
-				if (!id.isEmpty())
+				log.error("Failed to fetch events", e);
+				if (connected)
 				{
-					seenEventIds.add(id);
+					connected = false;
+					plugin.onConnectionStatusChanged(false);
 				}
 			}
-			log.debug("Loaded {} seen event IDs from config", seenEventIds.size());
-		}
-	}
 
-	private void loadLastSeenNewsletterId()
-	{
-		String lastNewsletterStr = configManager.getConfiguration(CONFIG_GROUP, LAST_SEEN_NEWSLETTER_KEY);
-		if (lastNewsletterStr != null && !lastNewsletterStr.isEmpty())
-		{
-			try
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
 			{
-				lastSeenNewsletterId = Integer.parseInt(lastNewsletterStr);
-				log.debug("Loaded last seen newsletter ID: {}", lastSeenNewsletterId);
+				try (ResponseBody body = response.body())
+				{
+					if (!response.isSuccessful() || body == null)
+					{
+						log.error("Error response: {}", response.code());
+						if (connected)
+						{
+							connected = false;
+							plugin.onConnectionStatusChanged(false);
+						}
+						return;
+					}
+
+					String json = body.string();
+					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
+					JsonArray eventsArray = jsonObj.getAsJsonArray("events");
+					List<Event> events = gson.fromJson(eventsArray, new TypeToken<List<Event>>(){}.getType());
+
+					if (!connected)
+					{
+						connected = true;
+						plugin.onConnectionStatusChanged(true);
+					}
+
+					plugin.onEventsReceived(events);
+					log.debug("Fetched {} events", events.size());
+				}
+				catch (Exception e)
+				{
+					log.error("Error parsing events response", e);
+				}
 			}
-			catch (NumberFormatException e)
-			{
-				log.warn("Invalid last seen newsletter ID in config: {}", lastNewsletterStr);
-			}
-		}
+		});
 	}
 
-	// ==================== EVENT METHODS ====================
-
-	/**
-	 * Mark an event as seen.
-	 */
-	public void markEventSeen(String eventId)
+	public void sendSignup(String eventId, String osrsName)
 	{
-		seenEventIds.add(eventId);
-		saveSeenEventIds();
-	}
+		JsonObject payload = new JsonObject();
+		payload.addProperty("eventId", eventId);
+		payload.addProperty("osrsName", osrsName);
 
-	/**
-	 * Mark multiple events as seen.
-	 */
-	public void markEventsSeen(Iterable<String> eventIds)
-	{
-		for (String id : eventIds)
+		Request request = new Request.Builder()
+			.url(apiUrl + "?action=signup")
+			.header("X-API-Key", API_KEY)
+			.post(RequestBody.create(JSON_MEDIA_TYPE, gson.toJson(payload)))
+			.build();
+
+		httpClient.newCall(request).enqueue(new Callback()
 		{
-			seenEventIds.add(id);
-		}
-		saveSeenEventIds();
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				log.error("Failed to sign up for event {}", eventId, e);
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
+			{
+				try (ResponseBody body = response.body())
+				{
+					if (response.isSuccessful())
+					{
+						log.debug("Successfully signed up for event {}", eventId);
+						// Refresh events to get updated signups
+						requestEvents();
+					}
+					else
+					{
+						String errorBody = body != null ? body.string() : "Unknown error";
+						log.error("Signup failed: {}", errorBody);
+					}
+				}
+			}
+		});
 	}
 
-	/**
-	 * Check if an event has been seen.
-	 */
-	public boolean isEventSeen(String eventId)
+	public void sendUnsignup(String eventId, String osrsName)
 	{
-		return seenEventIds.contains(eventId);
-	}
+		JsonObject payload = new JsonObject();
+		payload.addProperty("eventId", eventId);
+		payload.addProperty("osrsName", osrsName);
 
-	private void saveSeenEventIds()
-	{
-		String seenEventsStr = String.join(",", seenEventIds);
-		configManager.setConfiguration(CONFIG_GROUP, SEEN_EVENTS_KEY, seenEventsStr);
-		log.debug("Saved {} seen event IDs to config", seenEventIds.size());
+		Request request = new Request.Builder()
+			.url(apiUrl + "?action=unsignup")
+			.header("X-API-Key", API_KEY)
+			.post(RequestBody.create(JSON_MEDIA_TYPE, gson.toJson(payload)))
+			.build();
+
+		httpClient.newCall(request).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				log.error("Failed to unsign from event {}", eventId, e);
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
+			{
+				try (ResponseBody body = response.body())
+				{
+					if (response.isSuccessful())
+					{
+						log.debug("Successfully unsigned from event {}", eventId);
+						// Refresh events to get updated signups
+						requestEvents();
+					}
+					else
+					{
+						String errorBody = body != null ? body.string() : "Unknown error";
+						log.error("Unsignup failed: {}", errorBody);
+					}
+				}
+			}
+		});
 	}
 
 	// ==================== NEWSLETTER METHODS ====================
 
 	/**
-	 * Mark a newsletter as seen.
+	 * Request the latest newsletter from the API.
 	 */
-	public void markNewsletterSeen(int newsletterId)
+	public void requestLatestNewsletter()
 	{
-		if (newsletterId > lastSeenNewsletterId)
+		String newsletterUrl = apiUrl.replace("events.php", "newsletters.php") + "?action=latest";
+
+		Request request = new Request.Builder()
+			.url(newsletterUrl)
+			.get()
+			.build();
+
+		httpClient.newCall(request).enqueue(new Callback()
 		{
-			lastSeenNewsletterId = newsletterId;
-			saveLastSeenNewsletterId();
-		}
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				log.error("Failed to fetch latest newsletter", e);
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
+			{
+				try (ResponseBody body = response.body())
+				{
+					if (!response.isSuccessful() || body == null)
+					{
+						log.error("Error fetching newsletter: {}", response.code());
+						return;
+					}
+
+					String json = body.string();
+					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
+
+					if (jsonObj.has("newsletter") && !jsonObj.get("newsletter").isJsonNull())
+					{
+						Newsletter newsletter = gson.fromJson(jsonObj.get("newsletter"), Newsletter.class);
+						plugin.onNewsletterReceived(newsletter);
+						log.debug("Fetched newsletter: {}", newsletter.getTitle());
+					}
+					else
+					{
+						// No newsletter exists - clear the latest
+						plugin.onNewsletterReceived(null);
+						log.debug("No newsletter available");
+					}
+				}
+				catch (Exception e)
+				{
+					log.error("Error parsing newsletter response", e);
+				}
+			}
+		});
 	}
 
 	/**
-	 * Check if a newsletter has been seen.
+	 * Request list of recent newsletters.
 	 */
-	public boolean isNewsletterSeen(int newsletterId)
+	public void requestNewsletters(int limit)
 	{
-		return newsletterId <= lastSeenNewsletterId;
-	}
+		String newsletterUrl = apiUrl.replace("events.php", "newsletters.php") + "?limit=" + limit;
 
-	/**
-	 * Check if a newsletter is unread.
-	 */
-	public boolean isNewsletterUnread(int newsletterId)
-	{
-		return newsletterId > lastSeenNewsletterId;
-	}
+		Request request = new Request.Builder()
+			.url(newsletterUrl)
+			.get()
+			.build();
 
-	/**
-	 * Get the last seen newsletter ID.
-	 */
-	public int getLastSeenNewsletterId()
-	{
-		return lastSeenNewsletterId;
-	}
-
-	private void saveLastSeenNewsletterId()
-	{
-		configManager.setConfiguration(CONFIG_GROUP, LAST_SEEN_NEWSLETTER_KEY, String.valueOf(lastSeenNewsletterId));
-		log.debug("Saved last seen newsletter ID: {}", lastSeenNewsletterId);
-	}
-
-	// ==================== POLLING TRACKING ====================
-
-	/**
-	 * Get the last known newsletter ID (for polling detection).
-	 */
-	public int getLastKnownNewsletterId()
-	{
-		return lastKnownNewsletterId;
-	}
-
-	/**
-	 * Update the last known newsletter ID.
-	 */
-	public void updateLastKnownNewsletterId(int newsletterId)
-	{
-		if (newsletterId > lastKnownNewsletterId)
+		httpClient.newCall(request).enqueue(new Callback()
 		{
-			lastKnownNewsletterId = newsletterId;
-		}
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				log.error("Failed to fetch newsletters", e);
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
+			{
+				try (ResponseBody body = response.body())
+				{
+					if (!response.isSuccessful() || body == null)
+					{
+						log.error("Error fetching newsletters: {}", response.code());
+						return;
+					}
+
+					String json = body.string();
+					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
+					JsonArray newslettersArray = jsonObj.getAsJsonArray("newsletters");
+					List<Newsletter> newsletters = gson.fromJson(newslettersArray, new TypeToken<List<Newsletter>>(){}.getType());
+
+					plugin.onNewslettersReceived(newsletters);
+					log.debug("Fetched {} newsletters", newsletters.size());
+				}
+				catch (Exception e)
+				{
+					log.error("Error parsing newsletters response", e);
+				}
+			}
+		});
 	}
 
 	/**
-	 * Check if a newsletter is new since the last poll.
+	 * Get newsletter image URL.
 	 */
-	public boolean isNewSinceLastPoll(int newsletterId)
+	public String getNewsletterImageUrl(int newsletterId)
 	{
-		return newsletterId > lastKnownNewsletterId;
+		return apiUrl.replace("events.php", "newsletters.php") + "?id=" + newsletterId + "&image=1";
 	}
+
+	// ==================== SETTINGS METHODS ====================
+
+	/**
+	 * Request plugin settings from the API.
+	 */
+	public void requestSettings()
+	{
+		String settingsUrl = apiUrl.replace("events.php", "settings.php");
+
+		Request request = new Request.Builder()
+			.url(settingsUrl)
+			.get()
+			.build();
+
+		httpClient.newCall(request).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				log.error("Failed to fetch plugin settings", e);
+				// Use defaults if settings fetch fails
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
+			{
+				try (ResponseBody body = response.body())
+				{
+					if (!response.isSuccessful() || body == null)
+					{
+						log.error("Error fetching settings: {}", response.code());
+						return;
+					}
+
+					String json = body.string();
+					JsonObject jsonObj = new JsonParser().parse(json).getAsJsonObject();
+
+					if (jsonObj.has("settings") && !jsonObj.get("settings").isJsonNull())
+					{
+						JsonObject settingsObj = jsonObj.getAsJsonObject("settings");
+
+						PluginSettings settings = PluginSettings.builder()
+							.eventPollingInterval(settingsObj.has("event_polling_interval") ?
+								settingsObj.get("event_polling_interval").getAsInt() : 30)
+							.requireClanMembership(settingsObj.has("require_clan_membership") ?
+								settingsObj.get("require_clan_membership").getAsBoolean() : true)
+							.clanName(settingsObj.has("clan_name") ?
+								settingsObj.get("clan_name").getAsString() : "Arceuus")
+							.showNewsletterNotifications(settingsObj.has("show_newsletter_notifications") ?
+								settingsObj.get("show_newsletter_notifications").getAsBoolean() : true)
+							.build();
+
+						// Update polling interval
+						int newInterval = settings.getEventPollingInterval();
+						if (newInterval != pollingInterval)
+						{
+							pollingInterval = newInterval;
+							// Don't restart polling here - it will be started in start()
+						}
+
+						plugin.onSettingsReceived(settings);
+						log.debug("Loaded plugin settings: polling={}s, requireClan={}, clanName={}, showNewsletterNotifications={}",
+							settings.getEventPollingInterval(),
+							settings.isRequireClanMembership(),
+							settings.getClanName(),
+							settings.isShowNewsletterNotifications());
+					}
+				}
+				catch (Exception e)
+				{
+					log.error("Error parsing settings response", e);
+				}
+			}
+		});
+	}
+}
+
+package com.arceuuscc.plugin.models;
+
+import lombok.Data;
+import java.util.List;
+
+@Data
+public class Event
+{
+	private String eventId;
+	private String title;
+	private String startTime;
+	private int durationMinutes;
+	private String description;
+	private String status;
+	private String codeword;
+	private List<Signup> signups;
+}
+
+package com.arceuuscc.plugin.models;
+
+import lombok.Data;
+
+/**
+ * Represents a newsletter from the API.
+ */
+@Data
+public class Newsletter {
+    private int id;
+    private String title;
+    private String subtitle;
+    private String editorName;
+    private String monthYear;
+    private String layoutType;
+    private String publishedAt;
+    private String createdAt;
+    private String imageUrl;
+    private String contentJson; // Only populated when fetching full newsletter
+
+    /**
+     * Check if this newsletter was published after another.
+     */
+    public boolean isNewerThan(Newsletter other) {
+        if (other == null) return true;
+        if (this.publishedAt == null) return false;
+        if (other.publishedAt == null) return true;
+        return this.publishedAt.compareTo(other.publishedAt) > 0;
+    }
+}
+
+package com.arceuuscc.plugin.models;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+public class PluginSettings
+{
+	@Builder.Default
+	private int eventPollingInterval = 30;
+
+	@Builder.Default
+	private boolean requireClanMembership = true;
+
+	@Builder.Default
+	private String clanName = "Arceuus";
+
+	@Builder.Default
+	private boolean showNewsletterNotifications = true;
+}
+
+package com.arceuuscc.plugin.models;
+
+import lombok.Data;
+
+@Data
+public class Signup
+{
+	private String osrsName;
+	private String discordId;
+	private String source;
+	private String signupTime;
 }
 
 package com.arceuuscc.plugin.service;
@@ -3793,6 +1685,2114 @@ public class NotificationService
 		{
 			notifier.notify(NOTIFICATION_PREFIX + "New Newsletter: " + latestNewsletter.getTitle());
 		}
+	}
+}
+
+package com.arceuuscc.plugin.service;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.client.config.ConfigManager;
+
+import java.util.HashSet;
+import java.util.Set;
+
+/**
+ * Service for managing the read/seen state of events and newsletters.
+ * Persists state using RuneLite's ConfigManager.
+ */
+@Slf4j
+public class ReadStateService
+{
+	private static final String CONFIG_GROUP = "arceuuscc";
+	private static final String SEEN_EVENTS_KEY = "seenEventIds";
+	private static final String LAST_SEEN_NEWSLETTER_KEY = "lastSeenNewsletterId";
+
+	private final ConfigManager configManager;
+	private final Set<String> seenEventIds = new HashSet<>();
+	private int lastSeenNewsletterId = -1;
+	private int lastKnownNewsletterId = -1;
+
+	public ReadStateService(ConfigManager configManager)
+	{
+		this.configManager = configManager;
+	}
+
+	/**
+	 * Load persisted seen state from config.
+	 */
+	public void load()
+	{
+		loadSeenEventIds();
+		loadLastSeenNewsletterId();
+	}
+
+	private void loadSeenEventIds()
+	{
+		String seenEventsStr = configManager.getConfiguration(CONFIG_GROUP, SEEN_EVENTS_KEY);
+		if (seenEventsStr != null && !seenEventsStr.isEmpty())
+		{
+			seenEventIds.clear();
+			String[] ids = seenEventsStr.split(",");
+			for (String id : ids)
+			{
+				if (!id.isEmpty())
+				{
+					seenEventIds.add(id);
+				}
+			}
+			log.debug("Loaded {} seen event IDs from config", seenEventIds.size());
+		}
+	}
+
+	private void loadLastSeenNewsletterId()
+	{
+		String lastNewsletterStr = configManager.getConfiguration(CONFIG_GROUP, LAST_SEEN_NEWSLETTER_KEY);
+		if (lastNewsletterStr != null && !lastNewsletterStr.isEmpty())
+		{
+			try
+			{
+				lastSeenNewsletterId = Integer.parseInt(lastNewsletterStr);
+				log.debug("Loaded last seen newsletter ID: {}", lastSeenNewsletterId);
+			}
+			catch (NumberFormatException e)
+			{
+				log.warn("Invalid last seen newsletter ID in config: {}", lastNewsletterStr);
+			}
+		}
+	}
+
+	// ==================== EVENT METHODS ====================
+
+	/**
+	 * Mark an event as seen.
+	 */
+	public void markEventSeen(String eventId)
+	{
+		seenEventIds.add(eventId);
+		saveSeenEventIds();
+	}
+
+	/**
+	 * Mark multiple events as seen.
+	 */
+	public void markEventsSeen(Iterable<String> eventIds)
+	{
+		for (String id : eventIds)
+		{
+			seenEventIds.add(id);
+		}
+		saveSeenEventIds();
+	}
+
+	/**
+	 * Check if an event has been seen.
+	 */
+	public boolean isEventSeen(String eventId)
+	{
+		return seenEventIds.contains(eventId);
+	}
+
+	private void saveSeenEventIds()
+	{
+		String seenEventsStr = String.join(",", seenEventIds);
+		configManager.setConfiguration(CONFIG_GROUP, SEEN_EVENTS_KEY, seenEventsStr);
+		log.debug("Saved {} seen event IDs to config", seenEventIds.size());
+	}
+
+	// ==================== NEWSLETTER METHODS ====================
+
+	/**
+	 * Mark a newsletter as seen.
+	 */
+	public void markNewsletterSeen(int newsletterId)
+	{
+		if (newsletterId > lastSeenNewsletterId)
+		{
+			lastSeenNewsletterId = newsletterId;
+			saveLastSeenNewsletterId();
+		}
+	}
+
+	/**
+	 * Check if a newsletter has been seen.
+	 */
+	public boolean isNewsletterSeen(int newsletterId)
+	{
+		return newsletterId <= lastSeenNewsletterId;
+	}
+
+	/**
+	 * Check if a newsletter is unread.
+	 */
+	public boolean isNewsletterUnread(int newsletterId)
+	{
+		return newsletterId > lastSeenNewsletterId;
+	}
+
+	/**
+	 * Get the last seen newsletter ID.
+	 */
+	public int getLastSeenNewsletterId()
+	{
+		return lastSeenNewsletterId;
+	}
+
+	private void saveLastSeenNewsletterId()
+	{
+		configManager.setConfiguration(CONFIG_GROUP, LAST_SEEN_NEWSLETTER_KEY, String.valueOf(lastSeenNewsletterId));
+		log.debug("Saved last seen newsletter ID: {}", lastSeenNewsletterId);
+	}
+
+	// ==================== POLLING TRACKING ====================
+
+	/**
+	 * Get the last known newsletter ID (for polling detection).
+	 */
+	public int getLastKnownNewsletterId()
+	{
+		return lastKnownNewsletterId;
+	}
+
+	/**
+	 * Update the last known newsletter ID.
+	 */
+	public void updateLastKnownNewsletterId(int newsletterId)
+	{
+		if (newsletterId > lastKnownNewsletterId)
+		{
+			lastKnownNewsletterId = newsletterId;
+		}
+	}
+
+	/**
+	 * Check if a newsletter is new since the last poll.
+	 */
+	public boolean isNewSinceLastPoll(int newsletterId)
+	{
+		return newsletterId > lastKnownNewsletterId;
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.ArceuusCCConfig;
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+import com.arceuuscc.plugin.models.Event;
+import com.arceuuscc.plugin.util.DateTimeUtils;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayLayer;
+import net.runelite.client.ui.overlay.OverlayPosition;
+import net.runelite.client.ui.overlay.components.LineComponent;
+import net.runelite.client.ui.overlay.components.PanelComponent;
+import net.runelite.client.ui.overlay.components.TitleComponent;
+
+import javax.inject.Inject;
+import java.awt.Color;
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.List;
+
+public class ArceuusCCOverlay extends Overlay
+{
+	private static final Color ARCEUUS_PURPLE = new Color(128, 0, 128);
+	private static final Color LIVE_GREEN = new Color(50, 200, 50);
+	private static final Color ENDING_SOON_RED = new Color(255, 100, 100);
+	private static final Color STARTING_SOON_YELLOW = new Color(255, 220, 0);
+	private static final Color UPCOMING_BLUE = new Color(114, 137, 218);
+	private static final Color NEWSLETTER_GOLD = new Color(218, 165, 32);
+	private static final Color NO_ACCESS_ORANGE = new Color(255, 140, 0);
+
+	private final ArceuusCCPlugin plugin;
+	private final ArceuusCCConfig config;
+	private final PanelComponent panelComponent = new PanelComponent();
+
+	@Inject
+	public ArceuusCCOverlay(ArceuusCCPlugin plugin, ArceuusCCConfig config)
+	{
+		super(plugin);
+		this.plugin = plugin;
+		this.config = config;
+
+		setPosition(OverlayPosition.TOP_LEFT);
+		setLayer(OverlayLayer.ABOVE_SCENE);
+	}
+
+	@Override
+	public Dimension render(Graphics2D graphics)
+	{
+		if (!config.showOverlay())
+		{
+			return null;
+		}
+
+		// Check if user has plugin access (is in clan if required)
+		if (!plugin.hasPluginAccess())
+		{
+			return renderNoAccessMessage(graphics);
+		}
+
+		List<Event> events = plugin.getEvents();
+		LocalDateTime now = LocalDateTime.now();
+
+		Event activeEvent = null;
+		Event upcomingEvent = null;
+
+		if (events != null)
+		{
+			for (Event event : events)
+			{
+				if ("ACTIVE".equals(event.getStatus()))
+				{
+					activeEvent = event;
+				}
+				else if ("UPCOMING".equals(event.getStatus()) && upcomingEvent == null)
+				{
+					LocalDateTime startTime = parseDateTime(event.getStartTime());
+					long minutesUntil = ChronoUnit.MINUTES.between(now, startTime);
+					if (minutesUntil <= 180 && minutesUntil >= 0)
+					{
+						upcomingEvent = event;
+					}
+				}
+			}
+		}
+
+		boolean showActive = activeEvent != null && config.showActiveEvent();
+		boolean showUpcoming = upcomingEvent != null && config.showUpcoming();
+
+		boolean isStartingSoon = false;
+		if (upcomingEvent != null)
+		{
+			LocalDateTime startTime = parseDateTime(upcomingEvent.getStartTime());
+			long minutesUntil = ChronoUnit.MINUTES.between(now, startTime);
+			isStartingSoon = minutesUntil <= 30 && minutesUntil >= 0;
+
+			if (isStartingSoon && !config.showStartingSoon())
+			{
+				showUpcoming = false;
+			}
+		}
+
+		boolean isEndingSoon = false;
+		if (activeEvent != null)
+		{
+			LocalDateTime endTime = parseDateTime(activeEvent.getStartTime())
+				.plusMinutes(activeEvent.getDurationMinutes());
+			long minutesLeft = ChronoUnit.MINUTES.between(now, endTime);
+			isEndingSoon = minutesLeft <= 30 && minutesLeft >= 0;
+
+			if (isEndingSoon && !config.showEndingSoon())
+			{
+				isEndingSoon = false;
+			}
+		}
+
+		// Check if we should show newsletter notification
+		boolean showNewsletter = config.showNewsletterOverlay()
+			&& plugin.getPluginSettings().isShowNewsletterNotifications()
+			&& plugin.hasUnreadNewsletter();
+
+		// If nothing to show, return null
+		if (!showActive && !showUpcoming && !showNewsletter)
+		{
+			return null;
+		}
+
+		panelComponent.getChildren().clear();
+
+		boolean isMinimalMode = config.overlayMode() == ArceuusCCConfig.OverlayMode.MINIMAL;
+
+		// Set wider panel for minimal mode to fit content on fewer lines
+		if (isMinimalMode)
+		{
+			panelComponent.setPreferredSize(new Dimension(350, 0));
+		}
+		else
+		{
+			panelComponent.setPreferredSize(new Dimension(180, 0));
+		}
+
+		if (isMinimalMode)
+		{
+			// Minimal mode: compact display without header
+			if (showActive)
+			{
+				renderActiveEventMinimal(activeEvent, now, isEndingSoon);
+			}
+			if (showUpcoming)
+			{
+				renderUpcomingEventMinimal(upcomingEvent, now, isStartingSoon);
+			}
+		}
+		else
+		{
+			// Detailed mode: original multi-line display with header
+			panelComponent.getChildren().add(TitleComponent.builder()
+				.text("ARCEUUS")
+				.color(ARCEUUS_PURPLE)
+				.build());
+			if (showActive)
+			{
+				renderActiveEvent(activeEvent, now, isEndingSoon);
+			}
+
+			if (showUpcoming)
+			{
+				if (showActive)
+				{
+					panelComponent.getChildren().add(LineComponent.builder().build());
+				}
+				renderUpcomingEvent(upcomingEvent, now, isStartingSoon);
+			}
+		}
+
+		// Show new newsletter notification (same in both modes)
+		if (showNewsletter)
+		{
+			if (showActive || showUpcoming)
+			{
+				panelComponent.getChildren().add(LineComponent.builder().build());
+			}
+			renderNewsletterNotification();
+		}
+
+		return panelComponent.render(graphics);
+	}
+
+	private void renderNewsletterNotification()
+	{
+		var newsletter = plugin.getLatestNewsletter();
+		if (newsletter == null)
+		{
+			return;
+		}
+
+		panelComponent.getChildren().add(TitleComponent.builder()
+			.text("NEW NEWSLETTER")
+			.color(NEWSLETTER_GOLD)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left(newsletter.getTitle())
+			.leftColor(Color.WHITE)
+			.build());
+
+		if (newsletter.getMonthYear() != null)
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left(newsletter.getMonthYear())
+				.leftColor(Color.GRAY)
+				.build());
+		}
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("Check panel to read")
+			.leftColor(NEWSLETTER_GOLD)
+			.build());
+	}
+
+	private void renderActiveEvent(Event event, LocalDateTime now, boolean isEndingSoon)
+	{
+		LocalDateTime endTime = parseDateTime(event.getStartTime())
+			.plusMinutes(event.getDurationMinutes());
+		long secondsLeft = ChronoUnit.SECONDS.between(now, endTime);
+
+		String title = isEndingSoon ? "ENDING SOON" : "LIVE EVENT";
+		Color titleColor = isEndingSoon ? ENDING_SOON_RED : LIVE_GREEN;
+
+		panelComponent.getChildren().add(TitleComponent.builder()
+			.text(title)
+			.color(titleColor)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left(event.getTitle())
+			.leftColor(Color.WHITE)
+			.build());
+
+		if (secondsLeft > 0)
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Ends in:")
+				.leftColor(Color.GRAY)
+				.right(formatCountdown(secondsLeft))
+				.rightColor(isEndingSoon ? ENDING_SOON_RED : Color.ORANGE)
+				.build());
+		}
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("Signups:")
+			.leftColor(Color.GRAY)
+			.right(String.valueOf(event.getSignups() != null ? event.getSignups().size() : 0))
+			.rightColor(Color.WHITE)
+			.build());
+
+		// Show codeword for active events
+		if (event.getCodeword() != null && !event.getCodeword().isEmpty())
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Codeword:")
+				.leftColor(Color.GRAY)
+				.right(event.getCodeword())
+				.rightColor(STARTING_SOON_YELLOW)
+				.build());
+		}
+	}
+
+	private void renderActiveEventMinimal(Event event, LocalDateTime now, boolean isEndingSoon)
+	{
+		LocalDateTime endTime = parseDateTime(event.getStartTime())
+			.plusMinutes(event.getDurationMinutes());
+		long secondsLeft = ChronoUnit.SECONDS.between(now, endTime);
+
+		Color labelColor = isEndingSoon ? ENDING_SOON_RED : LIVE_GREEN;
+		boolean hasCodeword = event.getCodeword() != null && !event.getCodeword().isEmpty();
+
+		// Title line
+		panelComponent.getChildren().add(TitleComponent.builder()
+			.text(event.getTitle())
+			.color(Color.WHITE)
+			.build());
+
+		if (hasCodeword)
+		{
+			// Labels row: Ends In (left), Codeword (right)
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Ends In")
+				.leftColor(labelColor)
+				.right("Codeword")
+				.rightColor(labelColor)
+				.build());
+
+			// Values row: time (left), codeword (right)
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left(formatCountdown(secondsLeft))
+				.leftColor(STARTING_SOON_YELLOW)
+				.right(event.getCodeword())
+				.rightColor(STARTING_SOON_YELLOW)
+				.build());
+		}
+		else
+		{
+			// Just show Ends In without codeword
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Ends In:")
+				.leftColor(labelColor)
+				.right(formatCountdown(secondsLeft))
+				.rightColor(STARTING_SOON_YELLOW)
+				.build());
+		}
+	}
+
+	private void renderUpcomingEventMinimal(Event event, LocalDateTime now, boolean isStartingSoon)
+	{
+		LocalDateTime startTime = parseDateTime(event.getStartTime());
+		long secondsUntil = ChronoUnit.SECONDS.between(now, startTime);
+
+		Color labelColor = isStartingSoon ? STARTING_SOON_YELLOW : UPCOMING_BLUE;
+
+		// Title line
+		panelComponent.getChildren().add(TitleComponent.builder()
+			.text(event.getTitle())
+			.color(Color.WHITE)
+			.build());
+
+		if (secondsUntil > 0)
+		{
+			// Starts In line
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Starts In:")
+				.leftColor(labelColor)
+				.right(formatCountdown(secondsUntil))
+				.rightColor(STARTING_SOON_YELLOW)
+				.build());
+		}
+		else
+		{
+			panelComponent.getChildren().add(TitleComponent.builder()
+				.text("Starting now!")
+				.color(STARTING_SOON_YELLOW)
+				.build());
+		}
+	}
+
+	private void renderUpcomingEvent(Event event, LocalDateTime now, boolean isStartingSoon)
+	{
+		LocalDateTime startTime = parseDateTime(event.getStartTime());
+		long secondsUntil = ChronoUnit.SECONDS.between(now, startTime);
+
+		String title = isStartingSoon ? "STARTING SOON" : "NEXT EVENT";
+		Color titleColor = isStartingSoon ? STARTING_SOON_YELLOW : UPCOMING_BLUE;
+
+		panelComponent.getChildren().add(TitleComponent.builder()
+			.text(title)
+			.color(titleColor)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left(event.getTitle())
+			.leftColor(Color.WHITE)
+			.build());
+
+		if (secondsUntil > 0)
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Starts in:")
+				.leftColor(Color.GRAY)
+				.right(formatCountdown(secondsUntil))
+				.rightColor(isStartingSoon ? STARTING_SOON_YELLOW : Color.WHITE)
+				.build());
+		}
+		else
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("Starting now!")
+				.leftColor(STARTING_SOON_YELLOW)
+				.build());
+		}
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("Signups:")
+			.leftColor(Color.GRAY)
+			.right(String.valueOf(event.getSignups() != null ? event.getSignups().size() : 0))
+			.rightColor(Color.WHITE)
+			.build());
+
+		if (plugin.isSignedUp(event.getEventId()))
+		{
+			panelComponent.getChildren().add(LineComponent.builder()
+				.left("You are signed up!")
+				.leftColor(LIVE_GREEN)
+				.build());
+		}
+	}
+
+	private LocalDateTime parseDateTime(String isoTime)
+	{
+		return DateTimeUtils.parseDateTime(isoTime);
+	}
+
+	private String formatCountdown(long totalSeconds)
+	{
+		if (totalSeconds < 0)
+		{
+			return "0s";
+		}
+
+		if (totalSeconds < 60)
+		{
+			return totalSeconds + "s";
+		}
+
+		long totalMinutes = totalSeconds / 60;
+
+		if (totalMinutes < 60)
+		{
+			return totalMinutes + "m";
+		}
+
+		long hours = totalMinutes / 60;
+		long minutes = totalMinutes % 60;
+		if (hours < 24)
+		{
+			return hours + "h " + minutes + "m";
+		}
+
+		long days = hours / 24;
+		hours = hours % 24;
+		return days + "d " + hours + "h";
+	}
+
+	private Dimension renderNoAccessMessage(Graphics2D graphics)
+	{
+		panelComponent.getChildren().clear();
+
+		panelComponent.getChildren().add(TitleComponent.builder()
+			.text("ARCEUUS CC")
+			.color(ARCEUUS_PURPLE)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("Join the clan to use")
+			.leftColor(NO_ACCESS_ORANGE)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("this plugin")
+			.leftColor(NO_ACCESS_ORANGE)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder().build());
+
+		String clanName = plugin.getPluginSettings().getClanName();
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("Clan Chat:")
+			.leftColor(Color.GRAY)
+			.right(clanName)
+			.rightColor(Color.WHITE)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("Discord:")
+			.leftColor(Color.GRAY)
+			.build());
+
+		panelComponent.getChildren().add(LineComponent.builder()
+			.left("discord.gg/Ka3bVn6nkW")
+			.leftColor(UPCOMING_BLUE)
+			.build());
+
+		return panelComponent.render(graphics);
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+import net.runelite.client.ui.PluginPanel;
+
+import javax.swing.JScrollPane;
+import javax.swing.JTabbedPane;
+import javax.swing.ScrollPaneConstants;
+import java.awt.BorderLayout;
+import java.awt.Color;
+
+/**
+ * Main plugin panel displayed in the RuneLite sidebar.
+ */
+public class ArceuusCCPanel extends PluginPanel
+{
+	private final ArceuusCCPlugin plugin;
+	private final HeaderPanel headerPanel;
+	private final EventsTabPanel eventsTab;
+	private final NewslettersTabPanel newslettersTab;
+	private final JTabbedPane tabbedPane;
+
+	public ArceuusCCPanel(ArceuusCCPlugin plugin)
+	{
+		super(false);
+		this.plugin = plugin;
+
+		setLayout(new BorderLayout());
+		setBackground(PanelColors.getDarkGray());
+
+		headerPanel = new HeaderPanel(plugin);
+		add(headerPanel, BorderLayout.NORTH);
+
+		tabbedPane = new JTabbedPane();
+		tabbedPane.setBackground(PanelColors.getDarkGray());
+
+		eventsTab = new EventsTabPanel(plugin);
+		JScrollPane eventsScroll = new JScrollPane(eventsTab);
+		eventsScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		eventsScroll.setBorder(null);
+		eventsScroll.getVerticalScrollBar().setUnitIncrement(16);
+		tabbedPane.addTab("Events", eventsScroll);
+
+		newslettersTab = new NewslettersTabPanel(plugin);
+		JScrollPane newslettersScroll = new JScrollPane(newslettersTab);
+		newslettersScroll.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_NEVER);
+		newslettersScroll.setBorder(null);
+		newslettersScroll.getVerticalScrollBar().setUnitIncrement(16);
+		tabbedPane.addTab("Newsletters", newslettersScroll);
+
+		add(tabbedPane, BorderLayout.CENTER);
+
+		updateEvents();
+		updateNewsletters();
+	}
+
+	public void updateConnectionStatus(boolean connected)
+	{
+		headerPanel.updateConnectionStatus(connected);
+	}
+
+	public void updatePlayerInfo()
+	{
+		headerPanel.updatePlayerInfo(plugin.getPlayerName(), plugin.isInClan());
+		if (plugin.isInClan())
+		{
+			updateEvents();
+			updateNewsletters();
+		}
+	}
+
+	public void updateEvents()
+	{
+		eventsTab.refresh();
+		updateEventTabTitle();
+	}
+
+	public void updateNewsletters()
+	{
+		newslettersTab.refresh();
+		updateNewsletterTabTitle();
+	}
+
+	private void updateEventTabTitle()
+	{
+		if (plugin.hasUnseenEvents())
+		{
+			tabbedPane.setTitleAt(0, "Events *");
+			tabbedPane.setForegroundAt(0, PanelColors.GOLD);
+		}
+		else
+		{
+			tabbedPane.setTitleAt(0, "Events");
+			tabbedPane.setForegroundAt(0, null);
+		}
+	}
+
+	private void updateNewsletterTabTitle()
+	{
+		if (plugin.hasUnreadNewsletter())
+		{
+			tabbedPane.setTitleAt(1, "Newsletters *");
+			tabbedPane.setForegroundAt(1, new Color(255, 200, 0));
+		}
+		else
+		{
+			tabbedPane.setTitleAt(1, "Newsletters");
+			tabbedPane.setForegroundAt(1, null);
+		}
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.models.Event;
+import com.arceuuscc.plugin.util.FormatUtils;
+
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JLabel;
+import javax.swing.JOptionPane;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.JTextArea;
+import javax.swing.border.EmptyBorder;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.GraphicsEnvironment;
+
+/**
+ * Dialog showing full event details.
+ */
+public class EventDetailsDialog
+{
+	private static final String EMOJI_FONT = getEmojiFontName();
+
+	private static String getEmojiFontName()
+	{
+		String[] emojiFonts = {"Segoe UI Emoji", "Apple Color Emoji", "Noto Color Emoji", "Segoe UI Symbol", "Arial"};
+		GraphicsEnvironment ge = GraphicsEnvironment.getLocalGraphicsEnvironment();
+		String[] availableFonts = ge.getAvailableFontFamilyNames();
+
+		for (String emojiFont : emojiFonts)
+		{
+			for (String available : availableFonts)
+			{
+				if (available.equalsIgnoreCase(emojiFont))
+				{
+					return emojiFont;
+				}
+			}
+		}
+		return "Arial";
+	}
+
+	public static void show(Component parent, Event event)
+	{
+		JPanel dialogPanel = new JPanel();
+		dialogPanel.setLayout(new BoxLayout(dialogPanel, BoxLayout.Y_AXIS));
+		dialogPanel.setBackground(PanelColors.getDarkerGray());
+		dialogPanel.setBorder(new EmptyBorder(15, 15, 15, 15));
+
+		addTitle(dialogPanel, event);
+		addEventInfo(dialogPanel, event);
+		addDescription(dialogPanel, event);
+		addSignupsList(dialogPanel, event);
+
+		JOptionPane.showMessageDialog(parent, dialogPanel, "Event Details", JOptionPane.PLAIN_MESSAGE);
+	}
+
+	private static void addTitle(JPanel panel, Event event)
+	{
+		JLabel titleLabel = new JLabel(event.getTitle());
+		titleLabel.setFont(new Font("Arial", Font.BOLD, 16));
+		titleLabel.setForeground(PanelColors.UPCOMING_TITLE);
+		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(titleLabel);
+		panel.add(Box.createVerticalStrut(10));
+	}
+
+	private static void addEventInfo(JPanel panel, Event event)
+	{
+		addInfoLabel(panel, "When: " + FormatUtils.formatEventTime(event.getStartTime()) + " UTC");
+		addInfoLabel(panel, "Duration: " + FormatUtils.formatDuration(event.getDurationMinutes()));
+		addInfoLabel(panel, "Status: " + event.getStatus());
+
+		int signupCount = event.getSignups() != null ? event.getSignups().size() : 0;
+		addInfoLabel(panel, "Signups: " + signupCount);
+
+		panel.add(Box.createVerticalStrut(15));
+	}
+
+	private static void addInfoLabel(JPanel panel, String text)
+	{
+		JLabel label = new JLabel(text);
+		label.setFont(new Font("Arial", Font.PLAIN, 12));
+		label.setForeground(Color.WHITE);
+		label.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(label);
+	}
+
+	private static void addDescription(JPanel panel, Event event)
+	{
+		JLabel descHeader = new JLabel("Description:");
+		descHeader.setFont(new Font("Arial", Font.BOLD, 12));
+		descHeader.setForeground(Color.WHITE);
+		descHeader.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(descHeader);
+		panel.add(Box.createVerticalStrut(5));
+
+		JTextArea descArea = new JTextArea(event.getDescription());
+		descArea.setFont(new Font(EMOJI_FONT, Font.PLAIN, 12));
+		descArea.setForeground(Color.WHITE);
+		descArea.setBackground(PanelColors.getDarkGray());
+		descArea.setEditable(false);
+		descArea.setLineWrap(true);
+		descArea.setWrapStyleWord(true);
+		descArea.setBorder(new EmptyBorder(8, 8, 8, 8));
+
+		JScrollPane descScroll = new JScrollPane(descArea);
+		descScroll.setPreferredSize(new Dimension(350, 150));
+		descScroll.setAlignmentX(Component.LEFT_ALIGNMENT);
+		descScroll.setBorder(BorderFactory.createLineBorder(PanelColors.getMediumGray()));
+		panel.add(descScroll);
+	}
+
+	private static void addSignupsList(JPanel panel, Event event)
+	{
+		if (event.getSignups() == null || event.getSignups().isEmpty())
+		{
+			return;
+		}
+
+		panel.add(Box.createVerticalStrut(15));
+
+		JLabel signupsHeader = new JLabel("Signed Up Players:");
+		signupsHeader.setFont(new Font("Arial", Font.BOLD, 12));
+		signupsHeader.setForeground(Color.WHITE);
+		signupsHeader.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(signupsHeader);
+		panel.add(Box.createVerticalStrut(5));
+
+		StringBuilder signupsList = new StringBuilder();
+		for (int i = 0; i < event.getSignups().size(); i++)
+		{
+			if (i > 0)
+			{
+				signupsList.append(", ");
+			}
+			signupsList.append(event.getSignups().get(i).getOsrsName());
+		}
+
+		JTextArea signupsArea = new JTextArea(signupsList.toString());
+		signupsArea.setFont(new Font("Arial", Font.PLAIN, 11));
+		signupsArea.setForeground(PanelColors.getLightGray());
+		signupsArea.setBackground(PanelColors.getDarkGray());
+		signupsArea.setEditable(false);
+		signupsArea.setLineWrap(true);
+		signupsArea.setWrapStyleWord(true);
+		signupsArea.setBorder(new EmptyBorder(8, 8, 8, 8));
+
+		JScrollPane signupsScroll = new JScrollPane(signupsArea);
+		signupsScroll.setPreferredSize(new Dimension(350, 60));
+		signupsScroll.setAlignmentX(Component.LEFT_ALIGNMENT);
+		signupsScroll.setBorder(BorderFactory.createLineBorder(PanelColors.getMediumGray()));
+		panel.add(signupsScroll);
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+import com.arceuuscc.plugin.models.Event;
+import com.arceuuscc.plugin.util.FormatUtils;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.border.EmptyBorder;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
+import java.time.LocalDateTime;
+
+/**
+ * Builds event card panels.
+ */
+@Slf4j
+public class EventPanelBuilder
+{
+	private final ArceuusCCPlugin plugin;
+
+	public EventPanelBuilder(ArceuusCCPlugin plugin)
+	{
+		this.plugin = plugin;
+	}
+
+	public JPanel createEventPanel(Event event)
+	{
+		EventStatus status = new EventStatus(event, plugin);
+
+		// Create wrapper with BorderLayout to position mail icon in top-right
+		JPanel wrapper = new JPanel(new BorderLayout());
+		wrapper.setBackground(status.bgColor);
+		wrapper.setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createLineBorder(status.borderColor, status.isUnseen ? 2 : 1),
+			new EmptyBorder(8, 8, 8, 8)
+		));
+		wrapper.setAlignmentX(Component.LEFT_ALIGNMENT);
+		wrapper.setMaximumSize(new Dimension(225, Integer.MAX_VALUE));
+
+		// Mail icon in top-right corner
+		JPanel topBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+		topBar.setOpaque(false);
+		JLabel mailIcon = new JLabel(status.isUnseen ? MailIcons.UNREAD : MailIcons.READ);
+		mailIcon.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 14));
+		mailIcon.setForeground(status.isUnseen ? PanelColors.GOLD : PanelColors.getLightGray());
+		mailIcon.setToolTipText(status.isUnseen ? "Unread" : "Read");
+		topBar.add(mailIcon);
+		wrapper.add(topBar, BorderLayout.NORTH);
+
+		// Content panel
+		JPanel panel = new JPanel();
+		panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+		panel.setOpaque(false);
+
+		addTitle(panel, event, status);
+		addTimeInfo(panel, event);
+		addSignupCount(panel, event);
+		addDescriptionPreview(panel, event);
+		addDetailsButton(panel, event);
+
+		// Allow signups for both UPCOMING and ACTIVE events
+		if (status.isUpcoming || status.isActive)
+		{
+			addSignupButton(panel, event, status.isActive);
+		}
+
+		wrapper.add(panel, BorderLayout.CENTER);
+		return wrapper;
+	}
+
+	private void addTitle(JPanel panel, Event event, EventStatus status)
+	{
+		String text = status.isCancelled
+			? "<html><s>" + event.getTitle() + "</s></html>"
+			: event.getTitle();
+
+		JLabel label = new JLabel(text);
+		label.setFont(new Font("Arial", Font.BOLD, 13));
+		label.setForeground(status.titleColor);
+		label.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(label);
+		panel.add(Box.createVerticalStrut(4));
+	}
+
+	private void addTimeInfo(JPanel panel, Event event)
+	{
+		JLabel timeLabel = new JLabel(FormatUtils.formatEventTime(event.getStartTime()) + " UTC");
+		timeLabel.setFont(new Font("Arial", Font.PLAIN, 11));
+		timeLabel.setForeground(Color.WHITE);
+		timeLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(timeLabel);
+
+		JLabel durationLabel = new JLabel("Duration: " + FormatUtils.formatDuration(event.getDurationMinutes()));
+		durationLabel.setFont(new Font("Arial", Font.PLAIN, 10));
+		durationLabel.setForeground(PanelColors.getLightGray());
+		durationLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(durationLabel);
+		panel.add(Box.createVerticalStrut(4));
+	}
+
+	private void addSignupCount(JPanel panel, Event event)
+	{
+		int count = event.getSignups() != null ? event.getSignups().size() : 0;
+		JLabel label = new JLabel("Signups: " + count);
+		label.setFont(new Font("Arial", Font.PLAIN, 10));
+		label.setForeground(PanelColors.getLightGray());
+		label.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(label);
+	}
+
+	private void addDescriptionPreview(JPanel panel, Event event)
+	{
+		String desc = event.getDescription();
+		if (desc == null || desc.isEmpty())
+		{
+			return;
+		}
+
+		panel.add(Box.createVerticalStrut(4));
+		String preview = desc.length() > 60 ? desc.substring(0, 57) + "..." : desc;
+		JLabel label = new JLabel("<html><i>" + FormatUtils.escapeHtml(preview) + "</i></html>");
+		label.setFont(new Font("Arial", Font.PLAIN, 10));
+		label.setForeground(PanelColors.getLightGray());
+		label.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(label);
+	}
+
+	private void addDetailsButton(JPanel panel, Event event)
+	{
+		panel.add(Box.createVerticalStrut(4));
+		JButton button = new JButton("View Details");
+		button.setFont(new Font("Arial", Font.PLAIN, 10));
+		button.setAlignmentX(Component.LEFT_ALIGNMENT);
+		button.setPreferredSize(new Dimension(90, 20));
+		button.setMaximumSize(new Dimension(90, 20));
+		button.addActionListener(e -> {
+			plugin.markEventAsSeen(event.getEventId());
+			EventDetailsDialog.show(panel, event);
+		});
+		panel.add(button);
+	}
+
+	private void addSignupButton(JPanel panel, Event event, boolean isActive)
+	{
+		// For active events, the event hasn't "passed" - it's still ongoing
+		boolean eventPassed = !isActive && hasEventPassed(event);
+		boolean isSignedUp = plugin.isSignedUp(event.getEventId());
+		boolean canSignUp = plugin.getPlayerName() != null && plugin.isInClan() && !eventPassed;
+
+		panel.add(Box.createVerticalStrut(6));
+
+		JButton button = isSignedUp
+			? createLeaveButton(event)
+			: createSignUpButton(event, canSignUp, eventPassed);
+
+		button.setAlignmentX(Component.LEFT_ALIGNMENT);
+		button.setForeground(Color.WHITE);
+		button.setFont(new Font("Arial", Font.BOLD, 11));
+		button.setPreferredSize(new Dimension(100, 24));
+		button.setMaximumSize(new Dimension(100, 24));
+		panel.add(button);
+	}
+
+	private boolean hasEventPassed(Event event)
+	{
+		if (event.getStartTime() == null)
+		{
+			return false;
+		}
+		try
+		{
+			LocalDateTime startTime = LocalDateTime.parse(event.getStartTime());
+			return startTime.isBefore(LocalDateTime.now());
+		}
+		catch (Exception e)
+		{
+			log.warn("Could not parse event time: {}", event.getStartTime());
+			return false;
+		}
+	}
+
+	private JButton createLeaveButton(Event event)
+	{
+		JButton button = new JButton("Leave Event");
+		button.setBackground(PanelColors.LEAVE_BUTTON);
+		button.addActionListener(e -> plugin.unSignUp(event.getEventId()));
+		return button;
+	}
+
+	private JButton createSignUpButton(Event event, boolean canSignUp, boolean eventPassed)
+	{
+		JButton button = new JButton("Sign Up");
+		button.setBackground(PanelColors.SIGNUP_BUTTON);
+		button.addActionListener(e -> plugin.signUp(event.getEventId()));
+
+		if (!canSignUp)
+		{
+			button.setEnabled(false);
+			button.setToolTipText(eventPassed ? "Event time has passed" : "Join Arceuus clan to sign up");
+		}
+		return button;
+	}
+
+	/**
+	 * Helper to compute event status colors.
+	 */
+	private static class EventStatus
+	{
+		final boolean isCancelled;
+		final boolean isActive;
+		final boolean isUpcoming;
+		final boolean isUnseen;
+		final Color bgColor;
+		final Color borderColor;
+		final Color titleColor;
+
+		EventStatus(Event event, ArceuusCCPlugin plugin)
+		{
+			isCancelled = "CANCELLED".equals(event.getStatus());
+			isActive = "ACTIVE".equals(event.getStatus());
+			isUpcoming = "UPCOMING".equals(event.getStatus());
+			boolean isCompleted = "COMPLETED".equals(event.getStatus());
+			isUnseen = isUpcoming && !plugin.isEventSeen(event.getEventId());
+
+			if (isCancelled)
+			{
+				bgColor = PanelColors.CANCELLED_BG;
+				borderColor = PanelColors.CANCELLED_BORDER;
+				titleColor = Color.GRAY;
+			}
+			else if (isActive)
+			{
+				bgColor = PanelColors.ACTIVE_BG;
+				borderColor = PanelColors.ACTIVE_BORDER;
+				titleColor = PanelColors.ACTIVE_TITLE;
+			}
+			else if (isCompleted)
+			{
+				bgColor = PanelColors.COMPLETED_BG;
+				borderColor = PanelColors.COMPLETED_BORDER;
+				titleColor = Color.GRAY;
+			}
+			else if (isUnseen)
+			{
+				bgColor = PanelColors.UNSEEN_BG;
+				borderColor = PanelColors.UNSEEN_BORDER;
+				titleColor = PanelColors.UPCOMING_TITLE;
+			}
+			else
+			{
+				bgColor = PanelColors.getDarkerGray();
+				borderColor = PanelColors.getMediumGray();
+				titleColor = PanelColors.UPCOMING_TITLE;
+			}
+		}
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+import com.arceuuscc.plugin.models.Event;
+import com.arceuuscc.plugin.util.DateTimeUtils;
+
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.border.EmptyBorder;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+/**
+ * Panel containing the events list.
+ */
+public class EventsTabPanel extends JPanel
+{
+	private final ArceuusCCPlugin plugin;
+	private final EventPanelBuilder eventBuilder;
+
+	public EventsTabPanel(ArceuusCCPlugin plugin)
+	{
+		this.plugin = plugin;
+		this.eventBuilder = new EventPanelBuilder(plugin);
+
+		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+		setBackground(PanelColors.getDarkGray());
+		setBorder(new EmptyBorder(10, 10, 10, 10));
+	}
+
+	public void refresh()
+	{
+		removeAll();
+
+		if (!plugin.hasPluginAccess())
+		{
+			add(new NoAccessPanel(plugin.getPluginSettings().getClanName()));
+			revalidate();
+			repaint();
+			return;
+		}
+
+		List<Event> events = plugin.getEvents();
+
+		if (events == null || events.isEmpty())
+		{
+			addNoEventsLabel();
+		}
+		else
+		{
+			renderEventsList(events);
+		}
+
+		revalidate();
+		repaint();
+	}
+
+	private void addNoEventsLabel()
+	{
+		JLabel label = new JLabel("No events");
+		label.setForeground(PanelColors.getLightGray());
+		label.setAlignmentX(Component.LEFT_ALIGNMENT);
+		add(label);
+	}
+
+	private void renderEventsList(List<Event> events)
+	{
+		if (plugin.hasUnseenEvents())
+		{
+			JButton markAllReadBtn = new JButton("Mark all as read");
+			markAllReadBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+			markAllReadBtn.addActionListener(e -> plugin.markAllEventsAsRead());
+			add(markAllReadBtn);
+			add(Box.createVerticalStrut(10));
+		}
+
+		List<Event> live = new ArrayList<>();
+		List<Event> upcoming = new ArrayList<>();
+		List<Event> finished = new ArrayList<>();
+		categorizeEvents(events, live, upcoming, finished);
+
+		upcoming.sort(Comparator.comparing(e -> DateTimeUtils.parseDateTime(e.getStartTime())));
+		finished.sort((a, b) -> DateTimeUtils.parseDateTime(b.getStartTime())
+			.compareTo(DateTimeUtils.parseDateTime(a.getStartTime())));
+
+		renderSection("LIVE", PanelColors.ACTIVE_TITLE, live);
+		renderSection("UPCOMING", PanelColors.UPCOMING_TITLE, upcoming);
+		renderSection("FINISHED", Color.GRAY, finished);
+
+		if (live.isEmpty() && upcoming.isEmpty() && finished.isEmpty())
+		{
+			addNoEventsLabel();
+		}
+	}
+
+	private void categorizeEvents(List<Event> events, List<Event> live, List<Event> upcoming, List<Event> finished)
+	{
+		for (Event event : events)
+		{
+			String status = event.getStatus();
+			if ("ACTIVE".equals(status))
+			{
+				live.add(event);
+			}
+			else if ("UPCOMING".equals(status))
+			{
+				upcoming.add(event);
+			}
+			else if ("COMPLETED".equals(status) || "CANCELLED".equals(status))
+			{
+				finished.add(event);
+			}
+		}
+	}
+
+	private void renderSection(String title, Color color, List<Event> events)
+	{
+		if (events.isEmpty())
+		{
+			return;
+		}
+
+		addSectionHeader(title, color);
+		for (Event event : events)
+		{
+			add(eventBuilder.createEventPanel(event));
+			add(Box.createVerticalStrut(8));
+		}
+		add(Box.createVerticalStrut(10));
+	}
+
+	private void addSectionHeader(String title, Color color)
+	{
+		JPanel header = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+		header.setBackground(PanelColors.getDarkGray());
+		header.setAlignmentX(Component.LEFT_ALIGNMENT);
+		header.setMaximumSize(new Dimension(Integer.MAX_VALUE, 25));
+
+		JLabel label = new JLabel(title);
+		label.setFont(new Font("Arial", Font.BOLD, 12));
+		label.setForeground(color);
+		header.add(label);
+
+		add(header);
+		add(Box.createVerticalStrut(5));
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.border.EmptyBorder;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Font;
+
+/**
+ * Header panel with title, connection status, and refresh button.
+ */
+public class HeaderPanel extends JPanel
+{
+	private final JLabel connectionStatus;
+	private final JLabel playerInfoLabel;
+	private final JLabel clanStatusLabel;
+	private final JButton refreshButton;
+
+	public HeaderPanel(ArceuusCCPlugin plugin)
+	{
+		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+		setBackground(PanelColors.getDarkerGray());
+		setBorder(new EmptyBorder(10, 10, 10, 10));
+
+		JLabel titleLabel = new JLabel("Arceuus CC Events");
+		titleLabel.setFont(new Font("Arial", Font.BOLD, 16));
+		titleLabel.setForeground(Color.WHITE);
+		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		add(titleLabel);
+
+		add(Box.createVerticalStrut(5));
+
+		connectionStatus = new JLabel("Connecting...");
+		connectionStatus.setForeground(Color.ORANGE);
+		connectionStatus.setAlignmentX(Component.LEFT_ALIGNMENT);
+		add(connectionStatus);
+
+		add(Box.createVerticalStrut(5));
+
+		playerInfoLabel = new JLabel("");
+		playerInfoLabel.setForeground(Color.WHITE);
+		playerInfoLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		playerInfoLabel.setVisible(false);
+		add(playerInfoLabel);
+
+		clanStatusLabel = new JLabel("");
+		clanStatusLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		add(clanStatusLabel);
+
+		add(Box.createVerticalStrut(10));
+
+		refreshButton = new JButton("Refresh");
+		refreshButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+		refreshButton.addActionListener(e -> {
+			plugin.refreshEvents();
+			plugin.refreshNewsletters();
+		});
+		add(refreshButton);
+	}
+
+	public void updateConnectionStatus(boolean connected)
+	{
+		if (connected)
+		{
+			connectionStatus.setText("Connected");
+			connectionStatus.setForeground(PanelColors.CONNECTED);
+			refreshButton.setEnabled(true);
+		}
+		else
+		{
+			connectionStatus.setText("Disconnected");
+			connectionStatus.setForeground(PanelColors.DISCONNECTED);
+			refreshButton.setEnabled(false);
+		}
+	}
+
+	public void updatePlayerInfo(String playerName, boolean inClan)
+	{
+		if (playerName != null)
+		{
+			playerInfoLabel.setText("Player: " + playerName);
+			playerInfoLabel.setVisible(true);
+
+			if (inClan)
+			{
+				clanStatusLabel.setText("In Arceuus clan");
+				clanStatusLabel.setForeground(PanelColors.CONNECTED);
+			}
+			else
+			{
+				clanStatusLabel.setText("Not in Arceuus clan");
+				clanStatusLabel.setForeground(PanelColors.WARNING);
+			}
+			clanStatusLabel.setVisible(true);
+		}
+		else
+		{
+			playerInfoLabel.setVisible(false);
+			clanStatusLabel.setVisible(false);
+		}
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+/**
+ * Unicode mail icons for read/unread status indicators.
+ */
+public final class MailIcons
+{
+	/** Closed envelope - indicates unread/new content (U+1F4E9 envelope with arrow) */
+	public static final String UNREAD = "\uD83D\uDCE9";
+
+	/** Open envelope - indicates read content (U+1F4E8 incoming envelope) */
+	public static final String READ = "\uD83D\uDCE8";
+
+	private MailIcons()
+	{
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+import com.arceuuscc.plugin.models.Newsletter;
+import lombok.extern.slf4j.Slf4j;
+
+import javax.imageio.ImageIO;
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.ImageIcon;
+import javax.swing.JButton;
+import javax.swing.JDialog;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.JScrollPane;
+import javax.swing.ScrollPaneConstants;
+import javax.swing.border.EmptyBorder;
+import java.awt.BorderLayout;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Cursor;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
+import java.awt.GraphicsEnvironment;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.image.BufferedImage;
+import java.net.URL;
+
+/**
+ * Builds newsletter panel UI components.
+ */
+@Slf4j
+public class NewsletterPanelBuilder
+{
+	private static final String FONT_ARIAL = "Arial";
+	private static final String FONT_SERIF = "Serif";
+
+	private final ArceuusCCPlugin plugin;
+
+	public NewsletterPanelBuilder(ArceuusCCPlugin plugin)
+	{
+		this.plugin = plugin;
+	}
+
+	/**
+	 * Creates a panel for displaying a newsletter.
+	 */
+	public JPanel createNewsletterPanel(Newsletter newsletter, boolean isLatest)
+	{
+		boolean isUnseen = !plugin.isNewsletterSeen(newsletter.getId());
+		Color bgColor = isLatest ? PanelColors.NEWSLETTER_LATEST_BG : PanelColors.getDarkerGray();
+		Color borderColor = isLatest ? PanelColors.NEWSLETTER_LATEST_BORDER : PanelColors.getMediumGray();
+
+		// Wrapper panel with BorderLayout for mail icon positioning
+		JPanel wrapper = new JPanel(new BorderLayout());
+		wrapper.setBackground(bgColor);
+		wrapper.setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createLineBorder(borderColor, isLatest ? 2 : 1),
+			new EmptyBorder(10, 10, 10, 10)
+		));
+		wrapper.setAlignmentX(Component.LEFT_ALIGNMENT);
+		wrapper.setMaximumSize(new Dimension(225, 160));
+
+		// Mail icon in top-right corner
+		JPanel topBar = new JPanel(new FlowLayout(FlowLayout.RIGHT, 0, 0));
+		topBar.setOpaque(false);
+		JLabel mailIcon = new JLabel(isUnseen ? MailIcons.UNREAD : MailIcons.READ);
+		mailIcon.setFont(new Font("Segoe UI Emoji", Font.PLAIN, 14));
+		mailIcon.setForeground(isUnseen ? PanelColors.GOLD : PanelColors.getLightGray());
+		mailIcon.setToolTipText(isUnseen ? "Unread" : "Read");
+		topBar.add(mailIcon);
+		wrapper.add(topBar, BorderLayout.NORTH);
+
+		// Content panel
+		JPanel panel = new JPanel();
+		panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
+		panel.setOpaque(false);
+
+		// Title
+		JLabel titleLabel = new JLabel(newsletter.getTitle());
+		titleLabel.setFont(new Font(FONT_SERIF, Font.BOLD, 14));
+		titleLabel.setForeground(isLatest ? PanelColors.GOLD : Color.WHITE);
+		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		panel.add(titleLabel);
+
+		// Month/Year
+		if (newsletter.getMonthYear() != null)
+		{
+			JLabel monthLabel = new JLabel(newsletter.getMonthYear());
+			monthLabel.setFont(new Font(FONT_ARIAL, Font.ITALIC, 11));
+			monthLabel.setForeground(PanelColors.getLightGray());
+			monthLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+			panel.add(monthLabel);
+		}
+
+		panel.add(Box.createVerticalStrut(5));
+
+		// Subtitle
+		if (newsletter.getSubtitle() != null && !newsletter.getSubtitle().isEmpty())
+		{
+			String subtitle = newsletter.getSubtitle();
+			if (subtitle.length() > 50)
+			{
+				subtitle = subtitle.substring(0, 47) + "...";
+			}
+			JLabel subtitleLabel = new JLabel("<html><i>" + escapeHtml(subtitle) + "</i></html>");
+			subtitleLabel.setFont(new Font(FONT_ARIAL, Font.PLAIN, 10));
+			subtitleLabel.setForeground(PanelColors.getLightGray());
+			subtitleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+			panel.add(subtitleLabel);
+		}
+
+		// Editor
+		if (newsletter.getEditorName() != null)
+		{
+			JLabel editorLabel = new JLabel(newsletter.getEditorName());
+			editorLabel.setFont(new Font(FONT_ARIAL, Font.PLAIN, 9));
+			editorLabel.setForeground(Color.GRAY);
+			editorLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+			panel.add(editorLabel);
+		}
+
+		panel.add(Box.createVerticalStrut(8));
+
+		// View button
+		JButton viewButton = new JButton("View Newsletter");
+		viewButton.setFont(new Font(FONT_ARIAL, Font.BOLD, 11));
+		viewButton.setAlignmentX(Component.LEFT_ALIGNMENT);
+		viewButton.setBackground(isLatest ? PanelColors.NEWSLETTER_LATEST_BORDER : PanelColors.getMediumGray());
+		viewButton.setForeground(Color.WHITE);
+		viewButton.setPreferredSize(new Dimension(130, 24));
+		viewButton.setMaximumSize(new Dimension(130, 24));
+		viewButton.addActionListener(e -> showNewsletterDialog(newsletter));
+		panel.add(viewButton);
+
+		wrapper.add(panel, BorderLayout.CENTER);
+
+		// Mark as read when clicked
+		wrapper.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				plugin.markNewsletterAsSeen(newsletter);
+			}
+		});
+		wrapper.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+
+		return wrapper;
+	}
+
+	/**
+	 * Shows a dialog with the full newsletter image.
+	 */
+	public void showNewsletterDialog(Newsletter newsletter)
+	{
+		// Mark as seen
+		plugin.markNewsletterAsSeen(newsletter);
+
+		// Get screen size to cap dialog dimensions
+		java.awt.Rectangle screenBounds = GraphicsEnvironment.getLocalGraphicsEnvironment()
+			.getMaximumWindowBounds();
+		int maxDialogWidth = Math.min(1200, screenBounds.width - 100);
+		int maxDialogHeight = Math.min(900, screenBounds.height - 100);
+
+		// Create dialog
+		JDialog dialog = new JDialog();
+		dialog.setTitle(newsletter.getTitle() + " - " + newsletter.getMonthYear());
+		dialog.setModal(true);
+		dialog.setDefaultCloseOperation(JDialog.DISPOSE_ON_CLOSE);
+
+		JPanel contentPanel = new JPanel();
+		contentPanel.setLayout(new BoxLayout(contentPanel, BoxLayout.Y_AXIS));
+		contentPanel.setBackground(PanelColors.DIALOG_BG);
+		contentPanel.setBorder(new EmptyBorder(20, 20, 20, 20));
+
+		// Loading label
+		JLabel loadingLabel = new JLabel("Loading newsletter...");
+		loadingLabel.setFont(new Font(FONT_ARIAL, Font.PLAIN, 14));
+		loadingLabel.setForeground(Color.WHITE);
+		loadingLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+		contentPanel.add(loadingLabel);
+
+		// Scroll pane
+		JScrollPane scrollPane = new JScrollPane(contentPanel);
+		scrollPane.setHorizontalScrollBarPolicy(ScrollPaneConstants.HORIZONTAL_SCROLLBAR_AS_NEEDED);
+		scrollPane.setVerticalScrollBarPolicy(ScrollPaneConstants.VERTICAL_SCROLLBAR_AS_NEEDED);
+		scrollPane.setBorder(null);
+		scrollPane.getVerticalScrollBar().setUnitIncrement(16);
+		scrollPane.getHorizontalScrollBar().setUnitIncrement(16);
+
+		dialog.add(scrollPane);
+		dialog.setSize(Math.min(900, maxDialogWidth), Math.min(800, maxDialogHeight));
+		dialog.setLocationRelativeTo(null);
+
+		// Load image in background
+		String imageUrl = plugin.getNewsletterImageUrl(newsletter.getId());
+		if (imageUrl != null)
+		{
+			loadNewsletterImage(imageUrl, contentPanel, loadingLabel, dialog, maxDialogWidth, maxDialogHeight);
+		}
+
+		dialog.setVisible(true);
+	}
+
+	private void loadNewsletterImage(String imageUrl, JPanel contentPanel, JLabel loadingLabel,
+		JDialog dialog, int maxDialogWidth, int maxDialogHeight)
+	{
+		new Thread(() -> {
+			try
+			{
+				BufferedImage image = ImageIO.read(new URL(imageUrl));
+				if (image != null)
+				{
+					ImageIcon icon = new ImageIcon(image);
+
+					javax.swing.SwingUtilities.invokeLater(() -> {
+						contentPanel.removeAll();
+
+						JLabel imageLabel = new JLabel(icon);
+						imageLabel.setAlignmentX(Component.CENTER_ALIGNMENT);
+						contentPanel.add(imageLabel);
+
+						contentPanel.revalidate();
+						contentPanel.repaint();
+
+						// Resize dialog to fit image
+						int dialogWidth = Math.min(image.getWidth() + 60, maxDialogWidth);
+						int dialogHeight = Math.min(image.getHeight() + 80, maxDialogHeight);
+						dialog.setSize(dialogWidth, dialogHeight);
+						dialog.setLocationRelativeTo(null);
+					});
+				}
+			}
+			catch (Exception ex)
+			{
+				log.error("Failed to load newsletter image", ex);
+				javax.swing.SwingUtilities.invokeLater(() -> {
+					loadingLabel.setText("Failed to load newsletter image");
+					loadingLabel.setForeground(Color.RED);
+				});
+			}
+		}).start();
+	}
+
+	private String escapeHtml(String text)
+	{
+		if (text == null)
+		{
+			return "";
+		}
+		return text.replace("&", "&amp;")
+			.replace("<", "&lt;")
+			.replace(">", "&gt;")
+			.replace("\"", "&quot;")
+			.replace("\n", "<br>");
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import com.arceuuscc.plugin.ArceuusCCPlugin;
+import com.arceuuscc.plugin.models.Newsletter;
+
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JButton;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.border.EmptyBorder;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Dimension;
+import java.awt.FlowLayout;
+import java.awt.Font;
+import java.util.List;
+
+/**
+ * Panel containing the newsletters list.
+ */
+public class NewslettersTabPanel extends JPanel
+{
+	private final ArceuusCCPlugin plugin;
+	private final NewsletterPanelBuilder newsletterBuilder;
+
+	public NewslettersTabPanel(ArceuusCCPlugin plugin)
+	{
+		this.plugin = plugin;
+		this.newsletterBuilder = new NewsletterPanelBuilder(plugin);
+
+		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+		setBackground(PanelColors.getDarkGray());
+		setBorder(new EmptyBorder(10, 10, 10, 10));
+	}
+
+	public void refresh()
+	{
+		removeAll();
+
+		if (!plugin.hasPluginAccess())
+		{
+			add(new NoAccessPanel(plugin.getPluginSettings().getClanName()));
+			revalidate();
+			repaint();
+			return;
+		}
+
+		List<Newsletter> newsletters = plugin.getNewsletters();
+		Newsletter latest = plugin.getLatestNewsletter();
+
+		if ((newsletters == null || newsletters.isEmpty()) && latest == null)
+		{
+			JLabel label = new JLabel("No newsletters available");
+			label.setForeground(PanelColors.getLightGray());
+			label.setAlignmentX(Component.LEFT_ALIGNMENT);
+			add(label);
+		}
+		else
+		{
+			renderNewslettersList(newsletters, latest);
+		}
+
+		revalidate();
+		repaint();
+	}
+
+	private void renderNewslettersList(List<Newsletter> newsletters, Newsletter latest)
+	{
+		JButton markAllReadBtn = new JButton("Mark all as read");
+		markAllReadBtn.setAlignmentX(Component.LEFT_ALIGNMENT);
+		markAllReadBtn.addActionListener(e -> plugin.markAllNewslettersAsRead());
+		add(markAllReadBtn);
+		add(Box.createVerticalStrut(10));
+
+		if (latest != null)
+		{
+			addSectionHeader("LATEST NEWSLETTER", PanelColors.NEWSLETTER_LATEST_BORDER);
+			add(newsletterBuilder.createNewsletterPanel(latest, true));
+			add(Box.createVerticalStrut(15));
+		}
+
+		if (newsletters != null && !newsletters.isEmpty())
+		{
+			addSectionHeader("NEWSLETTER HISTORY", Color.GRAY);
+
+			for (Newsletter newsletter : newsletters)
+			{
+				if (latest != null && newsletter.getId() == latest.getId())
+				{
+					continue;
+				}
+				add(newsletterBuilder.createNewsletterPanel(newsletter, false));
+				add(Box.createVerticalStrut(8));
+			}
+		}
+
+	}
+
+	private void addSectionHeader(String title, Color color)
+	{
+		JPanel header = new JPanel(new FlowLayout(FlowLayout.LEFT, 0, 0));
+		header.setBackground(PanelColors.getDarkGray());
+		header.setAlignmentX(Component.LEFT_ALIGNMENT);
+		header.setMaximumSize(new Dimension(Integer.MAX_VALUE, 25));
+
+		JLabel label = new JLabel(title);
+		label.setFont(new Font("Arial", Font.BOLD, 12));
+		label.setForeground(color);
+		header.add(label);
+
+		add(header);
+		add(Box.createVerticalStrut(5));
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import net.runelite.client.ui.PluginPanel;
+import net.runelite.client.util.LinkBrowser;
+
+import javax.swing.BorderFactory;
+import javax.swing.Box;
+import javax.swing.BoxLayout;
+import javax.swing.JLabel;
+import javax.swing.JPanel;
+import javax.swing.border.EmptyBorder;
+import java.awt.Color;
+import java.awt.Component;
+import java.awt.Cursor;
+import java.awt.Dimension;
+import java.awt.Font;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+
+/**
+ * Panel shown when user doesn't have access (not in clan).
+ */
+public class NoAccessPanel extends JPanel
+{
+	public NoAccessPanel(String clanName)
+	{
+		setLayout(new BoxLayout(this, BoxLayout.Y_AXIS));
+		setBackground(PanelColors.NO_ACCESS_BG);
+		setBorder(BorderFactory.createCompoundBorder(
+			BorderFactory.createLineBorder(PanelColors.NO_ACCESS_BORDER, 2),
+			new EmptyBorder(10, 10, 10, 10)
+		));
+		setAlignmentX(Component.LEFT_ALIGNMENT);
+		setMaximumSize(new Dimension(PluginPanel.PANEL_WIDTH - 10, Integer.MAX_VALUE));
+
+		JLabel titleLabel = new JLabel("<html><div style='width:170px'>Clan Membership Required</div></html>");
+		titleLabel.setFont(new Font("Arial", Font.BOLD, 12));
+		titleLabel.setForeground(PanelColors.NO_ACCESS_TITLE);
+		titleLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		add(titleLabel);
+
+		add(Box.createVerticalStrut(8));
+
+		JLabel messageLabel = new JLabel("<html><div style='width:150px'>To use the Arceuus CC Plugin, please join the \"" +
+			clanName + "\" Clan Chat.</div></html>");
+		messageLabel.setFont(new Font("Arial", Font.PLAIN, 11));
+		messageLabel.setForeground(Color.WHITE);
+		messageLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		add(messageLabel);
+
+		add(Box.createVerticalStrut(15));
+
+		JLabel discordLabel = new JLabel("Join us on Discord:");
+		discordLabel.setFont(new Font("Arial", Font.BOLD, 11));
+		discordLabel.setForeground(PanelColors.getLightGray());
+		discordLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		add(discordLabel);
+
+		add(Box.createVerticalStrut(5));
+
+		JLabel linkLabel = new JLabel("<html><u>discord.gg/Ka3bVn6nkW</u></html>");
+		linkLabel.setFont(new Font("Arial", Font.PLAIN, 11));
+		linkLabel.setForeground(PanelColors.UPCOMING_TITLE);
+		linkLabel.setAlignmentX(Component.LEFT_ALIGNMENT);
+		linkLabel.setCursor(Cursor.getPredefinedCursor(Cursor.HAND_CURSOR));
+		linkLabel.addMouseListener(new MouseAdapter()
+		{
+			@Override
+			public void mouseClicked(MouseEvent e)
+			{
+				LinkBrowser.browse("https://discord.gg/Ka3bVn6nkW");
+			}
+		});
+		add(linkLabel);
+	}
+}
+
+package com.arceuuscc.plugin.ui;
+
+import net.runelite.client.ui.ColorScheme;
+
+import java.awt.Color;
+
+/**
+ * Color constants used throughout the plugin UI.
+ */
+public final class PanelColors
+{
+	// Event status colors
+	public static final Color ACTIVE_BG = new Color(30, 50, 30);
+	public static final Color ACTIVE_BORDER = new Color(50, 150, 50);
+	public static final Color ACTIVE_TITLE = new Color(50, 200, 50);
+
+	public static final Color UPCOMING_TITLE = new Color(114, 137, 218);
+
+	public static final Color COMPLETED_BG = new Color(45, 45, 45);
+	public static final Color COMPLETED_BORDER = new Color(80, 80, 80);
+
+	public static final Color CANCELLED_BG = new Color(60, 40, 40);
+	public static final Color CANCELLED_BORDER = new Color(150, 50, 50);
+
+	public static final Color UNSEEN_BG = new Color(50, 45, 30);
+	public static final Color UNSEEN_BORDER = new Color(218, 165, 32);
+	public static final Color GOLD = new Color(218, 165, 32);
+
+	// Newsletter colors
+	public static final Color NEWSLETTER_LATEST_BG = new Color(60, 50, 30);
+	public static final Color NEWSLETTER_LATEST_BORDER = new Color(139, 69, 19);
+
+	// Status colors
+	public static final Color CONNECTED = new Color(0, 200, 83);
+	public static final Color DISCONNECTED = Color.RED;
+	public static final Color WARNING = Color.ORANGE;
+
+	// Button colors
+	public static final Color SIGNUP_BUTTON = new Color(50, 150, 50);
+	public static final Color LEAVE_BUTTON = new Color(150, 50, 50);
+
+	// No access panel colors
+	public static final Color NO_ACCESS_BG = new Color(60, 40, 30);
+	public static final Color NO_ACCESS_BORDER = new Color(139, 69, 19);
+	public static final Color NO_ACCESS_TITLE = new Color(255, 140, 0);
+
+	// Dialog colors
+	public static final Color DIALOG_BG = new Color(30, 30, 30);
+
+	// Delegate to ColorScheme for standard colors
+	public static Color getDarkGray()
+	{
+		return ColorScheme.DARK_GRAY_COLOR;
+	}
+
+	public static Color getDarkerGray()
+	{
+		return ColorScheme.DARKER_GRAY_COLOR;
+	}
+
+	public static Color getMediumGray()
+	{
+		return ColorScheme.MEDIUM_GRAY_COLOR;
+	}
+
+	public static Color getLightGray()
+	{
+		return ColorScheme.LIGHT_GRAY_COLOR;
+	}
+
+	private PanelColors()
+	{
+		// Utility class
+	}
+}
+
+package com.arceuuscc.plugin.util;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+
+public class DateTimeUtils
+{
+	public static final DateTimeFormatter ISO_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
+
+	public static LocalDateTime parseDateTime(String isoTime)
+	{
+		if (isoTime == null)
+		{
+			return LocalDateTime.MIN;
+		}
+		try
+		{
+			return LocalDateTime.parse(isoTime, ISO_FORMATTER);
+		}
+		catch (DateTimeParseException e)
+		{
+			return LocalDateTime.MIN;
+		}
+	}
+}
+
+package com.arceuuscc.plugin.util;
+
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
+
+/**
+ * Utility methods for formatting display text.
+ */
+public final class FormatUtils
+{
+	private static final DateTimeFormatter DISPLAY_FORMATTER = DateTimeFormatter.ofPattern("EEE, MMM d 'at' HH:mm");
+	private static final DateTimeFormatter INPUT_FORMATTER = DateTimeFormatter.ISO_LOCAL_DATE_TIME;
+
+	private FormatUtils() {}
+
+	public static String formatEventTime(String isoTime)
+	{
+		if (isoTime == null)
+		{
+			return "Unknown";
+		}
+		try
+		{
+			LocalDateTime dateTime = LocalDateTime.parse(isoTime, INPUT_FORMATTER);
+			return dateTime.format(DISPLAY_FORMATTER);
+		}
+		catch (DateTimeParseException e)
+		{
+			return isoTime;
+		}
+	}
+
+	public static String formatDuration(int minutes)
+	{
+		if (minutes == 0)
+		{
+			return "Open-ended";
+		}
+		if (minutes < 60)
+		{
+			return minutes + " min";
+		}
+		int hours = minutes / 60;
+		int mins = minutes % 60;
+		if (mins == 0)
+		{
+			return hours + "h";
+		}
+		return hours + "h " + mins + "m";
+	}
+
+	public static String escapeHtml(String text)
+	{
+		if (text == null)
+		{
+			return "";
+		}
+		return text.replace("&", "&amp;")
+			.replace("<", "&lt;")
+			.replace(">", "&gt;")
+			.replace("\"", "&quot;")
+			.replace("\n", "<br>");
 	}
 }
 

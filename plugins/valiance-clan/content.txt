@@ -1,5 +1,154 @@
 package com.encryptiron.rest;
 
+import java.io.IOException;
+import java.net.MalformedURLException;
+import java.net.URL;
+
+import javax.inject.Inject;
+
+import com.encryptiron.ValianceConfig;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.events.GameTick;
+import net.runelite.client.eventbus.Subscribe;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Request.Builder;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+
+import com.google.gson.JsonObject;
+
+@Slf4j
+public abstract class BaseRestCommand {
+    private static final MediaType APPLICATION_JSON = MediaType.parse("application/json");
+    private static final String MESSAGING_PROTOCOL = "http://";
+    private static final int PORT = 8080;
+
+    private MessageSendStatus messageStatus = MessageSendStatus.None;
+    private IOException lastException;
+
+    @Inject
+    private OkHttpClient httpClient;
+
+    @Inject
+    public ValianceConfig config;
+
+    enum MessageSendStatus
+    {
+        Success,
+        Fail,
+        None
+    }
+
+    private void writeMessageToServer(JsonObject body)
+    {
+        if (MessageHeaderData.getPlayerName() == null)
+        {
+            // The player hasn't fully logged in yet, this means this message is the server catching us up
+            // on what the player has, after login / hop. We can skip sending this message as we don't care about it.
+            return;
+        }
+
+        URL url;
+        try
+        {
+            url = new URL(MESSAGING_PROTOCOL + config.valianceServerUrl() + ":" + PORT + endpoint());
+        } catch (MalformedURLException e)
+        {
+            log.error("MalformedURL : " + e.getMessage());
+            return;
+        }
+    
+        JsonObject header = MessageHeaderData.getMessageHeaderJson();
+        body.add("header", header);
+
+        RequestBody requestBody = RequestBody.create(APPLICATION_JSON, body.toString());
+
+        Request httpRequest = new Builder()
+            .url(url)
+            .header("User-Agent", "ValiancePlugin - " + MessageHeaderData.getPlayerName())
+            .post(requestBody)
+            .build();
+
+        httpClient.newCall(httpRequest).enqueue(new Callback() 
+        {
+            @Override
+            public void onFailure(Call call, final IOException ex) {
+                lastException = ex;
+                messageStatus = MessageSendStatus.Fail;
+                log.info("Failed to send request " + ex.getMessage());
+            }
+
+            @Override
+            public void onResponse(Call call, Response response) throws IOException {
+                try (ResponseBody responseBody = response.body())
+                {
+                    if (!response.isSuccessful())
+                    {
+                        onFailure(call, new IOException("Unexpected code: " + response.code()));
+                    }
+                    else
+                    {
+                        log.info("Successful " + requestType() + ", response: " + responseBody.string());
+                        messageStatus = MessageSendStatus.Success;
+                    }
+                }
+            }
+        });
+    }
+
+    public void send()
+    {
+        // Prepare the body outside of the thread, in case there are any delays
+        JsonObject body = body();
+        
+        Thread sendThread = new Thread(() -> {
+            writeMessageToServer(body);
+        });
+
+        sendThread.start();
+    }
+    
+    abstract String requestType();
+    abstract String endpoint();
+    abstract JsonObject body();
+
+    @Subscribe
+    public void onGameTick(GameTick gameTick)
+    {
+        if (messageStatus == MessageSendStatus.Success)
+        {
+            onSendSuccess();
+        }
+        else if (messageStatus == MessageSendStatus.Fail)
+        {
+            onSendFail(lastException);
+        }
+
+        messageStatus = MessageSendStatus.None;
+    }
+    
+    abstract void onSendSuccess();
+    abstract void onSendFail(IOException exception);
+}
+
+package com.encryptiron.rest;
+
+public abstract class GetCommand extends BaseRestCommand {
+    @Override
+    String requestType()
+    {
+        return "GET";
+    }
+}
+
+package com.encryptiron.rest;
+
 import java.time.Instant;
 
 import com.google.gson.JsonObject;
@@ -32,6 +181,307 @@ public final class MessageHeaderData
         return headerData;
     }
 }
+
+package com.encryptiron.rest;
+
+import java.io.IOException;
+
+import javax.inject.Inject;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.api.events.GameStateChanged;
+import net.runelite.client.config.RuneScapeProfileType;
+import net.runelite.client.eventbus.Subscribe;
+
+import com.google.gson.JsonObject;
+
+import net.runelite.api.events.VarbitChanged;
+
+@Slf4j
+public class NewCollectionLogEntry extends PostCommand
+{
+    public int collectionLogEntryId = 0;
+    private int lastKnownCollectionLogEntryId = 0;
+
+    @Inject
+    private Client client;
+
+    @Override
+    String endpoint() {
+        return "/api/member/new_collection_log";
+    }
+    
+    @Override
+    JsonObject body()
+    {
+        JsonObject json = new JsonObject();
+        json.addProperty("itemId", collectionLogEntryId);
+
+        return json;
+    }
+
+    @Subscribe
+    public void onGameStateChanged(GameStateChanged event)
+	{
+		if (event.getGameState() == GameState.LOGIN_SCREEN ||
+            event.getGameState() == GameState.HOPPING)
+		{
+            lastKnownCollectionLogEntryId = 0;
+		}
+    }
+
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged varbitChanged)
+    {
+        if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD)
+            return;
+        
+        // On log-in the game sends:
+        // Varbit 4623 = 0
+        // Varbit 4623 = <our last clog>
+        // Varbit 4623 = <new clog> (when we get one)
+
+        if (varbitChanged.getVarpId() == 4623)
+        {
+            int itemId = client.getVarpValue(varbitChanged.getVarpId());
+
+            if (itemId == 0)
+            {
+                // The first pass on log-in
+                return;
+            }
+
+            if (lastKnownCollectionLogEntryId == 0)
+            {
+                // On log-in, we load the last clog we've had, so this isn't actually a new clog.
+                // Let's ignore it
+                lastKnownCollectionLogEntryId = itemId;
+                return;
+            }
+
+            lastKnownCollectionLogEntryId = itemId;
+
+            if (lastKnownCollectionLogEntryId > 0)
+            {
+                collectionLogEntryId = lastKnownCollectionLogEntryId;
+                send();
+            }
+        }
+
+    }
+
+    @Override
+    void onSendSuccess()
+    {
+        if (!config.debug())
+            return;
+
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Sent the newly obtained collection log item to the Valiance server!", "ValianceClanPlugin");
+    }
+
+    @Override
+    void onSendFail(IOException exception)
+    {
+        log.debug("Failed to send collection log data: " + exception.getMessage());
+
+        if (!config.debug())
+            return;
+
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Failed to send the newly obtained collection log item to the Valiance server.", "ValianceClanPlugin");
+    }
+}
+
+package com.encryptiron.rest;
+
+import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
+
+import javax.inject.Inject;
+
+import com.google.gson.JsonObject;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.events.VarbitChanged;
+import net.runelite.api.gameval.VarPlayerID;
+import net.runelite.client.config.RuneScapeProfileType;
+import net.runelite.client.eventbus.Subscribe;
+
+@Slf4j
+public class OnBossKilled extends PostCommand
+{
+    private static final Map<Integer, String> varpIdToBossName;
+
+    static 
+    {
+        Map<Integer, String> tempMap = new HashMap<>();
+        
+        tempMap.put(VarPlayerID.TOTAL_ABYSSALSIRE_KILLS, "Abyssal Sire");
+        tempMap.put(VarPlayerID.TOTAL_HYDRABOSS_KILLS, "Alchemical Hydra");
+        tempMap.put(VarPlayerID.TOTAL_AMOXLIATL_KILLS, "Amoxliatl");
+        tempMap.put(VarPlayerID.TOTAL_ARAXXOR_KILLS, "Araxxor");
+        tempMap.put(VarPlayerID.TOTAL_ARTIO_KILLS, "Artio");
+        tempMap.put(VarPlayerID.TOTAL_BARROWS_CHESTS, "Barrows Chests");
+        tempMap.put(VarPlayerID.TOTAL_BRYOPHYTA_KILLS, "Bryophyta");
+        tempMap.put(VarPlayerID.TOTAL_CALLISTO_KILLS, "Callisto");
+        tempMap.put(VarPlayerID.TOTAL_CALVARION_KILLS, "Calvar'ion");
+        tempMap.put(VarPlayerID.TOTAL_CERBERUS_KILLS, "Cerberus");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_XERICCHAMBERS, "Chambers of Xeric");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_XERICCHAMBERS_CHALLENGE, "Chambers of Xeric: Challenge Mode");
+        tempMap.put(VarPlayerID.TOTAL_CHAOSELE_KILLS, "Chaos Elemental");
+        tempMap.put(VarPlayerID.TOTAL_CHAOSFANATIC_KILLS, "Chaos Fanatic");
+        tempMap.put(VarPlayerID.TOTAL_SARADOMIN_KILLS, "Commander Zilyana");
+        tempMap.put(VarPlayerID.TOTAL_CORP_KILLS, "Corporeal Beast");
+        tempMap.put(VarPlayerID.TOTAL_CRAZYARCHAEOLOGIST_KILLS, "Crazy Archaeologist");
+        tempMap.put(VarPlayerID.TOTAL_PRIME_KILLS, "Dagannoth Prime");
+        tempMap.put(VarPlayerID.TOTAL_REX_KILLS, "Dagannoth Rex");
+        tempMap.put(VarPlayerID.TOTAL_SUPREME_KILLS, "Dagannoth Supreme");
+        tempMap.put(VarPlayerID.TOTAL_DERANGEDARCHAEOLOGIST_KILLS, "Deranged Archaeologist");
+        tempMap.put(VarPlayerID.TOTAL_DUKE_SUCELLUS_KILLS, "Duke Sucellus");
+        tempMap.put(VarPlayerID.TOTAL_BANDOS_KILLS, "General Graardor");
+        tempMap.put(VarPlayerID.TOTAL_MOLE_KILLS, "Giant Mole");
+        tempMap.put(VarPlayerID.TOTAL_GARGBOSS_KILLS, "Grotesque Guardians");
+        tempMap.put(VarPlayerID.TOTAL_HESPORI_KILLS, "Hespori");
+        tempMap.put(VarPlayerID.TOTAL_KALPHITE_KILLS, "Kalphite Queen");
+        tempMap.put(VarPlayerID.TOTAL_KBD_KILLS, "King Black Dragon");
+        tempMap.put(VarPlayerID.TOTAL_KRAKEN_BOSS_KILLS, "Kraken");
+        tempMap.put(VarPlayerID.TOTAL_ARMADYL_KILLS, "Kree'Arra");
+        tempMap.put(VarPlayerID.TOTAL_ZAMORAK_KILLS, "K'ril Tsutsaroth");
+        tempMap.put(VarPlayerID.TOTAL_PMOON_CHESTS, "Lunar Chests");
+        tempMap.put(VarPlayerID.TOTAL_MIMIC_KILLS, "Mimic");
+        tempMap.put(VarPlayerID.TOTAL_NEX_KILLS, "Nex");
+        tempMap.put(VarPlayerID.TOTAL_NIGHTMARE_KILLS, "Nightmare");
+        tempMap.put(VarPlayerID.TOTAL_NIGHTMARE_CHALLENGE_KILLS, "Phosani's Nightmare");
+        tempMap.put(VarPlayerID.TOTAL_HILLGIANT_BOSS_KILLS, "Obor");
+        tempMap.put(VarPlayerID.TOTAL_MUSPAH_KILLS, "Phantom Muspah");
+        tempMap.put(VarPlayerID.TOTAL_SARACHNIS_KILLS, "Sarachnis");
+        tempMap.put(VarPlayerID.TOTAL_SCORPIA_KILLS, "Scorpia");
+        tempMap.put(VarPlayerID.TOTAL_RAT_BOSS_KILLS, "Scurrius");
+        tempMap.put(VarPlayerID.TOTAL_GRYPHON_BOSS_KILLS, "Shellbane Gryphon");
+        tempMap.put(VarPlayerID.TOTAL_CATA_BOSS_KILLS, "Skotizo");
+        tempMap.put(VarPlayerID.TOTAL_SOL_KILLS, "Sol Heredit");
+        tempMap.put(VarPlayerID.TOTAL_SPINDEL_KILLS, "Spindel");
+        tempMap.put(VarPlayerID.TOTAL_TEMPOROSS_KILLS, "Tempoross");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_GAUNTLET, "The Gauntlet");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_GAUNTLET_HM, "The Corrupted Gauntlet");
+        tempMap.put(VarPlayerID.TOTAL_HUEY_KILLS, "The Hueycoatl");
+        tempMap.put(VarPlayerID.TOTAL_LEVIATHAN_KILLS, "The Leviathan");
+        tempMap.put(VarPlayerID.TOTAL_ROYAL_TITAN_KILLS, "The Royal Titans");
+        tempMap.put(VarPlayerID.TOTAL_WHISPERER_KILLS, "The Whisperer");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_THEATREOFBLOOD, "Theatre of Blood");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_THEATREOFBLOOD_HARD, "Theatre of Blood: Hard Mode");
+        tempMap.put(VarPlayerID.TOTAL_THERMY_KILLS, "Thermonuclear Smoke Devil");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_TOMBSOFAMASCUT, "Tombs of Amascut");
+        tempMap.put(VarPlayerID.TOTAL_COMPLETED_TOMBSOFAMASCUT_EXPERT, "Tombs of Amascut: Expert Mode");
+        tempMap.put(VarPlayerID.TOTAL_ZUK_KILLS, "TzKal-Zuk");
+        tempMap.put(VarPlayerID.TOTAL_JAD_KILLS, "TzTok-Jad");
+        tempMap.put(VarPlayerID.TOTAL_VARDORVIS_KILLS, "Vardorvis");
+        tempMap.put(VarPlayerID.TOTAL_VENENATIS_KILLS, "Venenatis");
+        tempMap.put(VarPlayerID.TOTAL_VETION_KILLS, "Vet'ion");
+        tempMap.put(VarPlayerID.TOTAL_VORKATH_KILLS, "Vorkath");
+        tempMap.put(VarPlayerID.TOTAL_WINTERTODT_KILLS, "Wintertodt");
+        tempMap.put(VarPlayerID.TOTAL_YAMA_KILLS, "Yama");
+        tempMap.put(VarPlayerID.TOTAL_ZALCANO_KILLS, "Zalcano");
+        tempMap.put(VarPlayerID.TOTAL_SNAKEBOSS_KILLS, "Zulrah");
+
+        varpIdToBossName = tempMap;
+    }
+
+    private String bossKilled;
+    private int bossKillCount;
+
+    @Inject
+    private Client client;
+
+    @Override
+    String endpoint() {
+        return "/api/member/on_boss_killed";
+    }
+    
+    @Override
+    JsonObject body()
+    {
+        JsonObject body = new JsonObject();
+        body.addProperty("boss_killed", bossKilled);
+        body.addProperty("prev_kc", bossKillCount - 1);
+
+        JsonObject highscoreObject = new JsonObject();
+        for (Map.Entry<Integer, String> entry : varpIdToBossName.entrySet())
+        {
+            int killCount = client.getVarpValue(entry.getKey());
+            highscoreObject.addProperty(entry.getValue(), killCount);
+        }
+
+        // Doom is a combination of wave 8 and 8+
+        int wave8Completions = client.getVarpValue(VarPlayerID.DOM_LEVEL_8_COMPLETIONS);
+        int wave8PlusCompletions = client.getVarpValue(VarPlayerID.DOM_LEVEL_8_PLUS_COMPLETIONS);
+        highscoreObject.addProperty("Doom of Mokhaiotl", wave8Completions + wave8PlusCompletions);
+
+        body.add("highscore", highscoreObject);
+
+        return body;
+    }
+    
+    @Subscribe
+    public void onVarbitChanged(VarbitChanged varbitChanged)
+    {
+        if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD)
+            return;
+
+        // One of our boss values has changed. We want to inform the server
+        // that we've killed this boss, and update all of our kill counts
+        if (varpIdToBossName.containsKey(varbitChanged.getVarpId()))
+        {
+            bossKilled = varpIdToBossName.get(varbitChanged.getVarpId());
+            bossKillCount = client.getVarpValue(varbitChanged.getVarpId());
+
+            if (bossKillCount <= 0)
+            {
+                // This can happen on login / hop, ignore it
+                return;
+            }
+
+            send();
+        }
+    }
+
+    @Override
+    void onSendSuccess()
+    {
+        if (!config.debug())
+            return;
+
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Sent Boss Killed message to the Valiance server!", "ValianceClanPlugin");
+    }
+
+    @Override
+    void onSendFail(IOException exception)
+    {
+        log.debug("Failed to send boss killed message: " + exception.getMessage());
+
+        if (!config.debug())
+            return;
+
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Failed to send Boss Killed message to the Valiance server.", "ValianceClanPlugin");
+    }
+}
+
+package com.encryptiron.rest;
+
+public abstract class PostCommand extends BaseRestCommand {
+
+    @Override
+    String requestType()
+    {
+        return "POST";
+    }
+}
+
 
 package com.encryptiron.rest;
 
@@ -263,395 +713,6 @@ public class SendCollectionLog extends PostCommand
 
 package com.encryptiron.rest;
 
-public abstract class GetCommand extends BaseRestCommand {
-    @Override
-    String requestType()
-    {
-        return "GET";
-    }
-}
-
-package com.encryptiron.rest;
-
-import java.io.IOException;
-import java.util.HashMap;
-import java.util.Map;
-
-import javax.inject.Inject;
-
-import com.google.gson.JsonObject;
-
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.ChatMessageType;
-import net.runelite.api.Client;
-import net.runelite.api.events.VarbitChanged;
-import net.runelite.api.gameval.VarPlayerID;
-import net.runelite.client.config.RuneScapeProfileType;
-import net.runelite.client.eventbus.Subscribe;
-
-@Slf4j
-public class OnBossKilled extends PostCommand
-{
-    private static final Map<Integer, String> varpIdToBossName;
-
-    static 
-    {
-        Map<Integer, String> tempMap = new HashMap<>();
-        
-        tempMap.put(VarPlayerID.TOTAL_ABYSSALSIRE_KILLS, "Abyssal Sire");
-        tempMap.put(VarPlayerID.TOTAL_HYDRABOSS_KILLS, "Alchemical Hydra");
-        tempMap.put(VarPlayerID.TOTAL_AMOXLIATL_KILLS, "Amoxliatl");
-        tempMap.put(VarPlayerID.TOTAL_ARAXXOR_KILLS, "Araxxor");
-        tempMap.put(VarPlayerID.TOTAL_ARTIO_KILLS, "Artio");
-        tempMap.put(VarPlayerID.TOTAL_BARROWS_CHESTS, "Barrows Chests");
-        tempMap.put(VarPlayerID.TOTAL_BRYOPHYTA_KILLS, "Bryophyta");
-        tempMap.put(VarPlayerID.TOTAL_CALLISTO_KILLS, "Callisto");
-        tempMap.put(VarPlayerID.TOTAL_CALVARION_KILLS, "Calvar'ion");
-        tempMap.put(VarPlayerID.TOTAL_CERBERUS_KILLS, "Cerberus");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_XERICCHAMBERS, "Chambers of Xeric");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_XERICCHAMBERS_CHALLENGE, "Chambers of Xeric: Challenge Mode");
-        tempMap.put(VarPlayerID.TOTAL_CHAOSELE_KILLS, "Chaos Elemental");
-        tempMap.put(VarPlayerID.TOTAL_CHAOSFANATIC_KILLS, "Chaos Fanatic");
-        tempMap.put(VarPlayerID.TOTAL_SARADOMIN_KILLS, "Commander Zilyana");
-        tempMap.put(VarPlayerID.TOTAL_CORP_KILLS, "Corporeal Beast");
-        tempMap.put(VarPlayerID.TOTAL_CRAZYARCHAEOLOGIST_KILLS, "Crazy Archaeologist");
-        tempMap.put(VarPlayerID.TOTAL_PRIME_KILLS, "Dagannoth Prime");
-        tempMap.put(VarPlayerID.TOTAL_REX_KILLS, "Dagannoth Rex");
-        tempMap.put(VarPlayerID.TOTAL_SUPREME_KILLS, "Dagannoth Supreme");
-        tempMap.put(VarPlayerID.TOTAL_DERANGEDARCHAEOLOGIST_KILLS, "Deranged Archaeologist");
-        tempMap.put(VarPlayerID.TOTAL_DUKE_SUCELLUS_KILLS, "Duke Sucellus");
-        tempMap.put(VarPlayerID.TOTAL_BANDOS_KILLS, "General Graardor");
-        tempMap.put(VarPlayerID.TOTAL_MOLE_KILLS, "Giant Mole");
-        tempMap.put(VarPlayerID.TOTAL_GARGBOSS_KILLS, "Grotesque Guardians");
-        tempMap.put(VarPlayerID.TOTAL_HESPORI_KILLS, "Hespori");
-        tempMap.put(VarPlayerID.TOTAL_KALPHITE_KILLS, "Kalphite Queen");
-        tempMap.put(VarPlayerID.TOTAL_KBD_KILLS, "King Black Dragon");
-        tempMap.put(VarPlayerID.TOTAL_KRAKEN_BOSS_KILLS, "Kraken");
-        tempMap.put(VarPlayerID.TOTAL_ARMADYL_KILLS, "Kree'Arra");
-        tempMap.put(VarPlayerID.TOTAL_ZAMORAK_KILLS, "K'ril Tsutsaroth");
-        tempMap.put(VarPlayerID.TOTAL_PMOON_CHESTS, "Lunar Chests");
-        tempMap.put(VarPlayerID.TOTAL_MIMIC_KILLS, "Mimic");
-        tempMap.put(VarPlayerID.TOTAL_NEX_KILLS, "Nex");
-        tempMap.put(VarPlayerID.TOTAL_NIGHTMARE_KILLS, "Nightmare");
-        tempMap.put(VarPlayerID.TOTAL_NIGHTMARE_CHALLENGE_KILLS, "Phosani's Nightmare");
-        tempMap.put(VarPlayerID.TOTAL_HILLGIANT_BOSS_KILLS, "Obor");
-        tempMap.put(VarPlayerID.TOTAL_MUSPAH_KILLS, "Phantom Muspah");
-        tempMap.put(VarPlayerID.TOTAL_SARACHNIS_KILLS, "Sarachnis");
-        tempMap.put(VarPlayerID.TOTAL_SCORPIA_KILLS, "Scorpia");
-        tempMap.put(VarPlayerID.TOTAL_RAT_BOSS_KILLS, "Scurrius");
-        tempMap.put(VarPlayerID.TOTAL_GRYPHON_BOSS_KILLS, "Shellbane Gryphon");
-        tempMap.put(VarPlayerID.TOTAL_CATA_BOSS_KILLS, "Skotizo");
-        tempMap.put(VarPlayerID.TOTAL_SOL_KILLS, "Sol Heredit");
-        tempMap.put(VarPlayerID.TOTAL_SPINDEL_KILLS, "Spindel");
-        tempMap.put(VarPlayerID.TOTAL_TEMPOROSS_KILLS, "Tempoross");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_GAUNTLET, "The Gauntlet");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_GAUNTLET_HM, "The Corrupted Gauntlet");
-        tempMap.put(VarPlayerID.TOTAL_HUEY_KILLS, "The Hueycoatl");
-        tempMap.put(VarPlayerID.TOTAL_LEVIATHAN_KILLS, "The Leviathan");
-        tempMap.put(VarPlayerID.TOTAL_ROYAL_TITAN_KILLS, "The Royal Titans");
-        tempMap.put(VarPlayerID.TOTAL_WHISPERER_KILLS, "The Whisperer");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_THEATREOFBLOOD, "Theatre of Blood");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_THEATREOFBLOOD_HARD, "Theatre of Blood: Hard Mode");
-        tempMap.put(VarPlayerID.TOTAL_THERMY_KILLS, "Thermonuclear Smoke Devil");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_TOMBSOFAMASCUT, "Tombs of Amascut");
-        tempMap.put(VarPlayerID.TOTAL_COMPLETED_TOMBSOFAMASCUT_EXPERT, "Tombs of Amascut: Expert Mode");
-        tempMap.put(VarPlayerID.TOTAL_ZUK_KILLS, "TzKal-Zuk");
-        tempMap.put(VarPlayerID.TOTAL_JAD_KILLS, "TzTok-Jad");
-        tempMap.put(VarPlayerID.TOTAL_VARDORVIS_KILLS, "Vardorvis");
-        tempMap.put(VarPlayerID.TOTAL_VENENATIS_KILLS, "Venenatis");
-        tempMap.put(VarPlayerID.TOTAL_VETION_KILLS, "Vet'ion");
-        tempMap.put(VarPlayerID.TOTAL_VORKATH_KILLS, "Vorkath");
-        tempMap.put(VarPlayerID.TOTAL_WINTERTODT_KILLS, "Wintertodt");
-        tempMap.put(VarPlayerID.TOTAL_YAMA_KILLS, "Yama");
-        tempMap.put(VarPlayerID.TOTAL_ZALCANO_KILLS, "Zalcano");
-        tempMap.put(VarPlayerID.TOTAL_SNAKEBOSS_KILLS, "Zulrah");
-
-        varpIdToBossName = tempMap;
-    }
-
-    private String bossKilled;
-    private int bossKillCount;
-
-    @Inject
-    private Client client;
-
-    @Override
-    String endpoint() {
-        return "/api/member/on_boss_killed";
-    }
-    
-    @Override
-    JsonObject body()
-    {
-        JsonObject body = new JsonObject();
-        body.addProperty("boss_killed", bossKilled);
-        body.addProperty("prev_kc", bossKillCount - 1);
-
-        JsonObject highscoreObject = new JsonObject();
-        for (Map.Entry<Integer, String> entry : varpIdToBossName.entrySet())
-        {
-            int killCount = client.getVarpValue(entry.getKey());
-            highscoreObject.addProperty(entry.getValue(), killCount);
-        }
-
-        // Doom is a combination of wave 8 and 8+
-        int wave8Completions = client.getVarpValue(VarPlayerID.DOM_LEVEL_8_COMPLETIONS);
-        int wave8PlusCompletions = client.getVarpValue(VarPlayerID.DOM_LEVEL_8_PLUS_COMPLETIONS);
-        highscoreObject.addProperty("Doom of Mokhaiotl", wave8Completions + wave8PlusCompletions);
-
-        body.add("highscore", highscoreObject);
-
-        return body;
-    }
-    
-    @Subscribe
-    public void onVarbitChanged(VarbitChanged varbitChanged)
-    {
-        if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD)
-            return;
-
-        // One of our boss values has changed. We want to inform the server
-        // that we've killed this boss, and update all of our kill counts
-        if (varpIdToBossName.containsKey(varbitChanged.getVarpId()))
-        {
-            bossKilled = varpIdToBossName.get(varbitChanged.getVarpId());
-            bossKillCount = client.getVarpValue(varbitChanged.getVarpId());
-
-            if (bossKillCount <= 0)
-            {
-                // This can happen on login / hop, ignore it
-                return;
-            }
-
-            send();
-        }
-    }
-
-    @Override
-    void onSendSuccess()
-    {
-        if (!config.debug())
-            return;
-
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Sent Boss Killed message to the Valiance server!", "ValianceClanPlugin");
-    }
-
-    @Override
-    void onSendFail(IOException exception)
-    {
-        log.debug("Failed to send boss killed message: " + exception.getMessage());
-
-        if (!config.debug())
-            return;
-
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Failed to send Boss Killed message to the Valiance server.", "ValianceClanPlugin");
-    }
-}
-
-package com.encryptiron.rest;
-
-import java.io.IOException;
-
-import javax.inject.Inject;
-
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.ChatMessageType;
-import net.runelite.api.Client;
-import net.runelite.api.GameState;
-import net.runelite.api.events.GameStateChanged;
-import net.runelite.client.config.RuneScapeProfileType;
-import net.runelite.client.eventbus.Subscribe;
-
-import com.google.gson.JsonObject;
-
-import net.runelite.api.events.VarbitChanged;
-
-@Slf4j
-public class NewCollectionLogEntry extends PostCommand
-{
-    public int collectionLogEntryId = 0;
-    private int lastKnownCollectionLogEntryId = 0;
-
-    @Inject
-    private Client client;
-
-    @Override
-    String endpoint() {
-        return "/api/member/new_collection_log";
-    }
-    
-    @Override
-    JsonObject body()
-    {
-        JsonObject json = new JsonObject();
-        json.addProperty("itemId", collectionLogEntryId);
-
-        return json;
-    }
-
-    @Subscribe
-    public void onGameStateChanged(GameStateChanged event)
-	{
-		if (event.getGameState() == GameState.LOGIN_SCREEN ||
-            event.getGameState() == GameState.HOPPING)
-		{
-            lastKnownCollectionLogEntryId = 0;
-		}
-    }
-
-    @Subscribe
-    public void onVarbitChanged(VarbitChanged varbitChanged)
-    {
-        if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD)
-            return;
-        
-        // On log-in the game sends:
-        // Varbit 4623 = 0
-        // Varbit 4623 = <our last clog>
-        // Varbit 4623 = <new clog> (when we get one)
-
-        if (varbitChanged.getVarpId() == 4623)
-        {
-            int itemId = client.getVarpValue(varbitChanged.getVarpId());
-
-            if (itemId == 0)
-            {
-                // The first pass on log-in
-                return;
-            }
-
-            if (lastKnownCollectionLogEntryId == 0)
-            {
-                // On log-in, we load the last clog we've had, so this isn't actually a new clog.
-                // Let's ignore it
-                lastKnownCollectionLogEntryId = itemId;
-                return;
-            }
-
-            lastKnownCollectionLogEntryId = itemId;
-
-            if (lastKnownCollectionLogEntryId > 0)
-            {
-                collectionLogEntryId = lastKnownCollectionLogEntryId;
-                send();
-            }
-        }
-
-    }
-
-    @Override
-    void onSendSuccess()
-    {
-        if (!config.debug())
-            return;
-
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Sent the newly obtained collection log item to the Valiance server!", "ValianceClanPlugin");
-    }
-
-    @Override
-    void onSendFail(IOException exception)
-    {
-        log.debug("Failed to send collection log data: " + exception.getMessage());
-
-        if (!config.debug())
-            return;
-
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Failed to send the newly obtained collection log item to the Valiance server.", "ValianceClanPlugin");
-    }
-}
-
-package com.encryptiron.rest;
-
-import java.io.IOException;
-import java.util.Collection;
-
-import javax.inject.Inject;
-
-import com.formdev.flatlaf.json.Json;
-import com.google.gson.JsonObject;
-
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.ChatMessageType;
-import net.runelite.api.Client;
-import net.runelite.client.config.RuneScapeProfileType;
-import net.runelite.client.eventbus.Subscribe;
-import net.runelite.client.game.ItemStack;
-import net.runelite.client.plugins.loottracker.LootReceived;
-
-@Slf4j
-public class SendItemDrop extends PostCommand
-{
-    @Inject
-    private Client client;
-
-    private Collection<ItemStack> items;
-    private String npcName;
-    private Integer npcQuantity;
-
-    @Override
-    String endpoint() {
-        return "/api/member/send_item_drop";
-    }
-    
-    @Override
-    JsonObject body()
-    {
-        JsonObject itemsJson = new JsonObject();
-        
-        for (ItemStack item : items)
-        {
-            itemsJson.addProperty(Integer.toString(item.getId()), item.getQuantity());
-        }
-
-        JsonObject itemDrop = new JsonObject();
-        itemDrop.addProperty("name", npcName);
-        itemDrop.addProperty("quantity", npcQuantity);
-        itemDrop.add("items", itemsJson);
-
-        JsonObject itemDropObject = new JsonObject();
-        itemDropObject.add("item_drop", itemDrop);
-
-        log.info("Sending item drop: " + itemDropObject.toString());
-
-        return itemDropObject;
-    }
-    
-    @Subscribe
-    public void onLootReceived(final LootReceived event)
-    {
-        if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD)
-            return;
-
-        npcName = event.getName();
-        npcQuantity = event.getAmount();
-        items = event.getItems();
-
-        this.send();
-    }
-
-    @Override
-    void onSendSuccess()
-    {
-        if (!config.debug())
-            return;
-            
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Sent item drop to the Valiance Server!", "ValianceClanPlugin");
-    }
-
-    @Override
-    void onSendFail(IOException exception)
-    {
-        log.debug("Failed to send item drop data: " + exception.getMessage());
-        
-        if (!config.debug())
-            return;
-            
-        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Failed to send item drop to the Valiance server.", "ValianceClanPlugin");
-    }
-}
-
-package com.encryptiron.rest;
-
 import java.io.IOException;
 import java.util.HashMap;
 
@@ -800,183 +861,90 @@ public class SendCombatAchievements extends PostCommand
 package com.encryptiron.rest;
 
 import java.io.IOException;
-import java.net.MalformedURLException;
-import java.net.URL;
+import java.util.Collection;
 
 import javax.inject.Inject;
 
-import com.encryptiron.ValianceConfig;
-
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.events.GameTick;
-import net.runelite.client.eventbus.Subscribe;
-import okhttp3.Call;
-import okhttp3.Callback;
-import okhttp3.MediaType;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.Request.Builder;
-import okhttp3.RequestBody;
-import okhttp3.Response;
-import okhttp3.ResponseBody;
-
+import com.formdev.flatlaf.json.Json;
 import com.google.gson.JsonObject;
 
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.client.config.RuneScapeProfileType;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.game.ItemStack;
+import net.runelite.client.plugins.loottracker.LootReceived;
+
 @Slf4j
-public abstract class BaseRestCommand {
-    private static final MediaType APPLICATION_JSON = MediaType.parse("application/json");
-    private static final String MESSAGING_PROTOCOL = "http://";
-    private static final int PORT = 8080;
-
-    private MessageSendStatus messageStatus = MessageSendStatus.None;
-    private IOException lastException;
-
+public class SendItemDrop extends PostCommand
+{
     @Inject
-    private OkHttpClient httpClient;
+    private Client client;
 
-    @Inject
-    public ValianceConfig config;
-
-    enum MessageSendStatus
-    {
-        Success,
-        Fail,
-        None
-    }
-
-    private void writeMessageToServer(JsonObject body)
-    {
-        if (MessageHeaderData.getPlayerName() == null)
-        {
-            // The player hasn't fully logged in yet, this means this message is the server catching us up
-            // on what the player has, after login / hop. We can skip sending this message as we don't care about it.
-            return;
-        }
-
-        URL url;
-        try
-        {
-            url = new URL(MESSAGING_PROTOCOL + config.valianceServerUrl() + ":" + PORT + endpoint());
-        } catch (MalformedURLException e)
-        {
-            log.error("MalformedURL : " + e.getMessage());
-            return;
-        }
-    
-        JsonObject header = MessageHeaderData.getMessageHeaderJson();
-        body.add("header", header);
-
-        RequestBody requestBody = RequestBody.create(APPLICATION_JSON, body.toString());
-
-        Request httpRequest = new Builder()
-            .url(url)
-            .header("User-Agent", "ValiancePlugin - " + MessageHeaderData.getPlayerName())
-            .post(requestBody)
-            .build();
-
-        httpClient.newCall(httpRequest).enqueue(new Callback() 
-        {
-            @Override
-            public void onFailure(Call call, final IOException ex) {
-                lastException = ex;
-                messageStatus = MessageSendStatus.Fail;
-                log.info("Failed to send request " + ex.getMessage());
-            }
-
-            @Override
-            public void onResponse(Call call, Response response) throws IOException {
-                try (ResponseBody responseBody = response.body())
-                {
-                    if (!response.isSuccessful())
-                    {
-                        onFailure(call, new IOException("Unexpected code: " + response.code()));
-                    }
-                    else
-                    {
-                        log.info("Successful " + requestType() + ", response: " + responseBody.string());
-                        messageStatus = MessageSendStatus.Success;
-                    }
-                }
-            }
-        });
-    }
-
-    public void send()
-    {
-        // Prepare the body outside of the thread, in case there are any delays
-        JsonObject body = body();
-        
-        Thread sendThread = new Thread(() -> {
-            writeMessageToServer(body);
-        });
-
-        sendThread.start();
-    }
-    
-    abstract String requestType();
-    abstract String endpoint();
-    abstract JsonObject body();
-
-    @Subscribe
-    public void onGameTick(GameTick gameTick)
-    {
-        if (messageStatus == MessageSendStatus.Success)
-        {
-            onSendSuccess();
-        }
-        else if (messageStatus == MessageSendStatus.Fail)
-        {
-            onSendFail(lastException);
-        }
-
-        messageStatus = MessageSendStatus.None;
-    }
-    
-    abstract void onSendSuccess();
-    abstract void onSendFail(IOException exception);
-}
-
-package com.encryptiron.rest;
-
-public abstract class PostCommand extends BaseRestCommand {
+    private Collection<ItemStack> items;
+    private String npcName;
+    private Integer npcQuantity;
 
     @Override
-    String requestType()
-    {
-        return "POST";
+    String endpoint() {
+        return "/api/member/send_item_drop";
     }
-}
-
-
-package com.encryptiron;
-
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-
-@ConfigGroup("encryptiron")
-public interface ValianceConfig extends Config
-{
-    @ConfigItem(
-        keyName = "debug",
-        name = "Enable debug",
-        description = "Results in the plugin logging debug output to the users chatbox",
-        position = 1
-    )
-    default boolean debug()
+    
+    @Override
+    JsonObject body()
     {
-        return false;
+        JsonObject itemsJson = new JsonObject();
+        
+        for (ItemStack item : items)
+        {
+            itemsJson.addProperty(Integer.toString(item.getId()), item.getQuantity());
+        }
+
+        JsonObject itemDrop = new JsonObject();
+        itemDrop.addProperty("name", npcName);
+        itemDrop.addProperty("quantity", npcQuantity);
+        itemDrop.add("items", itemsJson);
+
+        JsonObject itemDropObject = new JsonObject();
+        itemDropObject.add("item_drop", itemDrop);
+
+        log.info("Sending item drop: " + itemDropObject.toString());
+
+        return itemDropObject;
+    }
+    
+    @Subscribe
+    public void onLootReceived(final LootReceived event)
+    {
+        if (RuneScapeProfileType.getCurrent(client) != RuneScapeProfileType.STANDARD)
+            return;
+
+        npcName = event.getName();
+        npcQuantity = event.getAmount();
+        items = event.getItems();
+
+        this.send();
     }
 
-    @ConfigItem(
-        keyName = "valianceServerUrl",
-        name = "Server URL",
-        description = "URL to the Valiance Server (don't change)",
-        position = 2
-    )
-    default String valianceServerUrl()
+    @Override
+    void onSendSuccess()
     {
-        return "valianceosrs.com";
+        if (!config.debug())
+            return;
+            
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Sent item drop to the Valiance Server!", "ValianceClanPlugin");
+    }
+
+    @Override
+    void onSendFail(IOException exception)
+    {
+        log.debug("Failed to send item drop data: " + exception.getMessage());
+        
+        if (!config.debug())
+            return;
+            
+        client.addChatMessage(ChatMessageType.GAMEMESSAGE, "", "Failed to send item drop to the Valiance server.", "ValianceClanPlugin");
     }
 }
 
@@ -1084,6 +1052,38 @@ public class ValianceClanPlugin extends Plugin
 		{
             MessageHeaderData.resetPlayerName();
 		}
+    }
+}
+
+package com.encryptiron;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup("encryptiron")
+public interface ValianceConfig extends Config
+{
+    @ConfigItem(
+        keyName = "debug",
+        name = "Enable debug",
+        description = "Results in the plugin logging debug output to the users chatbox",
+        position = 1
+    )
+    default boolean debug()
+    {
+        return false;
+    }
+
+    @ConfigItem(
+        keyName = "valianceServerUrl",
+        name = "Server URL",
+        description = "URL to the Valiance Server (don't change)",
+        position = 2
+    )
+    default String valianceServerUrl()
+    {
+        return "valianceosrs.com";
     }
 }
 

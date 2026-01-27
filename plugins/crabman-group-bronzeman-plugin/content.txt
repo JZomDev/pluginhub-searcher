@@ -1,5 +1,330 @@
 package mvdicarlo.crabmanmode;
 
+import java.lang.reflect.Type;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+
+import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
+
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+
+public class AzureTableApi {
+    private final OkHttpClient httpClient;
+    private final String sasUrl;
+    private final Gson gson;
+    private Integer pageSize;
+
+    public AzureTableApi(String sasUrl, Gson gson, OkHttpClient httpClient) {
+        this.httpClient = httpClient;
+        this.sasUrl = sasUrl;
+        this.gson = gson;
+        this.pageSize = null; // No limit by default
+    }
+
+    /**
+     * Sets the page size for list operations. Useful for testing pagination.
+     * @param pageSize The maximum number of entities to return per page, or null for no limit
+     */
+    public void setPageSize(Integer pageSize) {
+        this.pageSize = pageSize;
+    }
+
+    /**
+     * Gets the current page size setting.
+     * @return The page size, or null if no limit is set
+     */
+    public Integer getPageSize() {
+        return pageSize;
+    }
+
+    private static class AzureTableResponse {
+        List<Map<String, Object>> value;
+    }
+
+    private String buildUrl(String path, String queryParams) {
+        String baseUrl = sasUrl.split("\\?")[0];
+        String existingParams = sasUrl.split("\\?")[1];
+        return baseUrl + path + "?" + existingParams + (queryParams.isEmpty() ? "" : "&" + queryParams);
+    }
+
+    private static class RequestResult {
+        final String body;
+        final String nextPartitionKey;
+        final String nextRowKey;
+
+        RequestResult(String body, String nextPartitionKey, String nextRowKey) {
+            this.body = body;
+            this.nextPartitionKey = nextPartitionKey;
+            this.nextRowKey = nextRowKey;
+        }
+
+        boolean hasContinuation() {
+            return nextPartitionKey != null && nextRowKey != null;
+        }
+    }
+
+    private String sendRequest(Request request) throws Exception {
+        return sendRequestWithContinuation(request).body;
+    }
+
+    private RequestResult sendRequestWithContinuation(Request request) throws Exception {
+        try (Response response = httpClient.newCall(request).execute()) {
+            if (response.isSuccessful()) {
+                String body = response.body().string();
+                String nextPartitionKey = response.header("x-ms-continuation-NextPartitionKey");
+                String nextRowKey = response.header("x-ms-continuation-NextRowKey");
+                return new RequestResult(body, nextPartitionKey, nextRowKey);
+            } else {
+                throw new Exception("Request failed: " + response.body().string());
+            }
+        }
+    }
+
+    private List<UnlockedItemEntity> parseJsonListResponse(String jsonResponse) {
+        Type type = new TypeToken<AzureTableResponse>() {
+        }.getType();
+        AzureTableResponse response = gson.fromJson(jsonResponse, type);
+        return response.value.stream()
+                .map(UnlockedItemEntity::fromMap)
+                .collect(Collectors.toList());
+    }
+
+    private UnlockedItemEntity parseJsonResponse(String jsonResponse) {
+        Map<String, Object> map = gson.fromJson(jsonResponse, new TypeToken<Map<String, Object>>() {
+        }.getType());
+        return UnlockedItemEntity.fromMap(map);
+    }
+
+    public UnlockedItemEntity getEntity(String partitionKey, String rowKey) throws Exception {
+        String url = buildUrl("(PartitionKey='" + partitionKey + "',RowKey='" + rowKey + "')", "");
+        Request request = createRequestBuilder(url)
+                .get()
+                .build();
+        String jsonResponse = sendRequest(request);
+        UnlockedItemEntity entity = parseJsonResponse(jsonResponse);
+        return entity;
+    }
+
+    public List<UnlockedItemEntity> listEntities(String query) throws Exception {
+        List<UnlockedItemEntity> allEntities = new ArrayList<>();
+        String nextPartitionKey = null;
+        String nextRowKey = null;
+
+        do {
+            StringBuilder queryParams = new StringBuilder("$filter=" + query);
+            if (pageSize != null) {
+                queryParams.append("&$top=").append(pageSize);
+            }
+            if (nextPartitionKey != null && nextRowKey != null) {
+                queryParams.append("&NextPartitionKey=").append(nextPartitionKey);
+                queryParams.append("&NextRowKey=").append(nextRowKey);
+            }
+
+            String url = buildUrl("", queryParams.toString());
+            Request request = createRequestBuilder(url)
+                    .get()
+                    .build();
+            RequestResult result = sendRequestWithContinuation(request);
+            allEntities.addAll(parseJsonListResponse(result.body));
+
+            nextPartitionKey = result.nextPartitionKey;
+            nextRowKey = result.nextRowKey;
+        } while (nextPartitionKey != null && nextRowKey != null);
+
+        return allEntities;
+    }
+
+    public List<UnlockedItemEntity> listEntities() throws Exception {
+        List<UnlockedItemEntity> allEntities = new ArrayList<>();
+        String nextPartitionKey = null;
+        String nextRowKey = null;
+
+        do {
+            StringBuilder queryParams = new StringBuilder();
+            if (pageSize != null) {
+                queryParams.append("$top=").append(pageSize);
+            }
+            if (nextPartitionKey != null && nextRowKey != null) {
+                if (queryParams.length() > 0) {
+                    queryParams.append("&");
+                }
+                queryParams.append("NextPartitionKey=").append(nextPartitionKey);
+                queryParams.append("&NextRowKey=").append(nextRowKey);
+            }
+
+            String url = buildUrl("", queryParams.toString());
+            Request request = createRequestBuilder(url)
+                    .get()
+                    .build();
+            RequestResult result = sendRequestWithContinuation(request);
+            allEntities.addAll(parseJsonListResponse(result.body));
+
+            nextPartitionKey = result.nextPartitionKey;
+            nextRowKey = result.nextRowKey;
+        } while (nextPartitionKey != null && nextRowKey != null);
+
+        return allEntities;
+    }
+
+    public void deleteEntity(String partitionKey, String rowKey) throws Exception {
+        String url = buildUrl("(PartitionKey='" + partitionKey + "',RowKey='" + rowKey + "')", "");
+        Request request = createRequestBuilder(url)
+                .delete()
+                .header("If-Match", "*")
+                .build();
+        sendRequest(request);
+    }
+
+    public void insertEntity(UnlockedItemEntity entity) throws Exception {
+        String url = buildUrl("", "");
+        String jsonPayload = gson.toJson(entity.toMap());
+        RequestBody body = RequestBody.create(MediaType.parse("application/json"), jsonPayload);
+        Request request = createRequestBuilder(url)
+                .post(body)
+                .header("Content-Type", "application/json")
+                .build();
+        sendRequest(request);
+    }
+
+    private Request.Builder createRequestBuilder(String url) {
+        return new Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .header("User-Agent", "CrabManModePlugin");
+    }
+}
+package mvdicarlo.crabmanmode;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+
+@ConfigGroup(CrabmanModePlugin.CONFIG_GROUP)
+public interface CrabmanModeConfig extends Config {
+    @ConfigItem(keyName = "namesBronzeman", name = "Bronzeman Names", position = 1, description = "Configures names of bronzemen to highlight in chat. Format: (name), (name)")
+    default String namesBronzeman() {
+        return "";
+    }
+
+    @ConfigItem(keyName = "enableCrabman", name = "Enable group bronzeman for character name", position = 2, description = "Enables group bronzeman mode for provided character name.")
+    default String enableCrabman() {
+        return "";
+    }
+
+    @ConfigItem(secret = true, keyName = "databaseString", name = "Azure Storage Account SAS URL", position = 3, description = "The SAS Url string for your group storage account.")
+    default String databaseString() {
+        return "";
+    }
+}
+
+/*
+ * Copyright (c) 2019, CodePanter <https://github.com/codepanter>
+ * All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *
+ * 1. Redistributions of source code must retain the above copyright notice, this
+ *    list of conditions and the following disclaimer.
+ * 2. Redistributions in binary form must reproduce the above copyright notice,
+ *    this list of conditions and the following disclaimer in the documentation
+ *    and/or other materials provided with the distribution.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
+ * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ */
+package mvdicarlo.crabmanmode;
+
+import java.awt.Dimension;
+import java.awt.Graphics2D;
+import java.util.ArrayList;
+import java.util.List;
+
+import javax.inject.Inject;
+
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.Client;
+import net.runelite.api.GameState;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.ui.overlay.Overlay;
+import net.runelite.client.ui.overlay.OverlayPosition;
+
+@Slf4j
+public class CrabmanModeOverlay extends Overlay {
+
+    private final Client client;
+    private final CrabmanModePlugin plugin;
+
+    private Integer currentUnlock;
+    private long displayTime;
+    private int displayY;
+
+    private final List<Integer> itemUnlockList;
+
+    @Inject
+    private ItemManager itemManager;
+
+    @Inject
+    public CrabmanModeOverlay(Client client, CrabmanModePlugin plugin) {
+        super(plugin);
+        this.client = client;
+        this.plugin = plugin;
+        this.itemUnlockList = new ArrayList<>();
+        setPosition(OverlayPosition.TOP_CENTER);
+    }
+
+    public void addItemUnlock(int itemId) {
+        if (!itemUnlockList.contains(itemId))
+            itemUnlockList.add(itemId);
+    }
+
+    @Override
+    public Dimension render(Graphics2D graphics) {
+        if (client.getGameState() != GameState.LOGGED_IN || itemUnlockList.isEmpty()) {
+            return null;
+        }
+        if (itemManager == null) {
+            return null;
+        }
+        if (currentUnlock == null) {
+            currentUnlock = itemUnlockList.get(0);
+            displayTime = System.currentTimeMillis();
+            displayY = -20;
+            return null;
+        }
+
+        // Drawing unlock pop-up at the top of the screen.
+        graphics.drawImage(plugin.getUnlockImage(), -62, displayY, null);
+        graphics.drawImage(itemManager.getImage(currentUnlock, 1, false), -50, displayY + 7, null);
+        if (displayY < 10) {
+            displayY = displayY + 1;
+        }
+
+        if (System.currentTimeMillis() > displayTime + (5000)) {
+            itemUnlockList.remove(currentUnlock);
+            currentUnlock = null;
+        }
+        return null;
+    }
+}
+
+package mvdicarlo.crabmanmode;
+
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.ChatMessageType;
 import net.runelite.client.callback.ClientThread;
@@ -308,1382 +633,6 @@ public class CrabmanModePanel extends PluginPanel {
         }
     }
 }
-package mvdicarlo.crabmanmode;
-
-import java.lang.reflect.Type;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-import java.util.stream.Collectors;
-
-import com.google.gson.Gson;
-import com.google.gson.reflect.TypeToken;
-
-import okhttp3.MediaType;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.RequestBody;
-import okhttp3.Response;
-
-public class AzureTableApi {
-    private final OkHttpClient httpClient;
-    private final String sasUrl;
-    private final Gson gson;
-    private Integer pageSize;
-
-    public AzureTableApi(String sasUrl, Gson gson, OkHttpClient httpClient) {
-        this.httpClient = httpClient;
-        this.sasUrl = sasUrl;
-        this.gson = gson;
-        this.pageSize = null; // No limit by default
-    }
-
-    /**
-     * Sets the page size for list operations. Useful for testing pagination.
-     * @param pageSize The maximum number of entities to return per page, or null for no limit
-     */
-    public void setPageSize(Integer pageSize) {
-        this.pageSize = pageSize;
-    }
-
-    /**
-     * Gets the current page size setting.
-     * @return The page size, or null if no limit is set
-     */
-    public Integer getPageSize() {
-        return pageSize;
-    }
-
-    private static class AzureTableResponse {
-        List<Map<String, Object>> value;
-    }
-
-    private String buildUrl(String path, String queryParams) {
-        String baseUrl = sasUrl.split("\\?")[0];
-        String existingParams = sasUrl.split("\\?")[1];
-        return baseUrl + path + "?" + existingParams + (queryParams.isEmpty() ? "" : "&" + queryParams);
-    }
-
-    private static class RequestResult {
-        final String body;
-        final String nextPartitionKey;
-        final String nextRowKey;
-
-        RequestResult(String body, String nextPartitionKey, String nextRowKey) {
-            this.body = body;
-            this.nextPartitionKey = nextPartitionKey;
-            this.nextRowKey = nextRowKey;
-        }
-
-        boolean hasContinuation() {
-            return nextPartitionKey != null && nextRowKey != null;
-        }
-    }
-
-    private String sendRequest(Request request) throws Exception {
-        return sendRequestWithContinuation(request).body;
-    }
-
-    private RequestResult sendRequestWithContinuation(Request request) throws Exception {
-        try (Response response = httpClient.newCall(request).execute()) {
-            if (response.isSuccessful()) {
-                String body = response.body().string();
-                String nextPartitionKey = response.header("x-ms-continuation-NextPartitionKey");
-                String nextRowKey = response.header("x-ms-continuation-NextRowKey");
-                return new RequestResult(body, nextPartitionKey, nextRowKey);
-            } else {
-                throw new Exception("Request failed: " + response.body().string());
-            }
-        }
-    }
-
-    private List<UnlockedItemEntity> parseJsonListResponse(String jsonResponse) {
-        Type type = new TypeToken<AzureTableResponse>() {
-        }.getType();
-        AzureTableResponse response = gson.fromJson(jsonResponse, type);
-        return response.value.stream()
-                .map(UnlockedItemEntity::fromMap)
-                .collect(Collectors.toList());
-    }
-
-    private UnlockedItemEntity parseJsonResponse(String jsonResponse) {
-        Map<String, Object> map = gson.fromJson(jsonResponse, new TypeToken<Map<String, Object>>() {
-        }.getType());
-        return UnlockedItemEntity.fromMap(map);
-    }
-
-    public UnlockedItemEntity getEntity(String partitionKey, String rowKey) throws Exception {
-        String url = buildUrl("(PartitionKey='" + partitionKey + "',RowKey='" + rowKey + "')", "");
-        Request request = createRequestBuilder(url)
-                .get()
-                .build();
-        String jsonResponse = sendRequest(request);
-        UnlockedItemEntity entity = parseJsonResponse(jsonResponse);
-        return entity;
-    }
-
-    public List<UnlockedItemEntity> listEntities(String query) throws Exception {
-        List<UnlockedItemEntity> allEntities = new ArrayList<>();
-        String nextPartitionKey = null;
-        String nextRowKey = null;
-
-        do {
-            StringBuilder queryParams = new StringBuilder("$filter=" + query);
-            if (pageSize != null) {
-                queryParams.append("&$top=").append(pageSize);
-            }
-            if (nextPartitionKey != null && nextRowKey != null) {
-                queryParams.append("&NextPartitionKey=").append(nextPartitionKey);
-                queryParams.append("&NextRowKey=").append(nextRowKey);
-            }
-
-            String url = buildUrl("", queryParams.toString());
-            Request request = createRequestBuilder(url)
-                    .get()
-                    .build();
-            RequestResult result = sendRequestWithContinuation(request);
-            allEntities.addAll(parseJsonListResponse(result.body));
-
-            nextPartitionKey = result.nextPartitionKey;
-            nextRowKey = result.nextRowKey;
-        } while (nextPartitionKey != null && nextRowKey != null);
-
-        return allEntities;
-    }
-
-    public List<UnlockedItemEntity> listEntities() throws Exception {
-        List<UnlockedItemEntity> allEntities = new ArrayList<>();
-        String nextPartitionKey = null;
-        String nextRowKey = null;
-
-        do {
-            StringBuilder queryParams = new StringBuilder();
-            if (pageSize != null) {
-                queryParams.append("$top=").append(pageSize);
-            }
-            if (nextPartitionKey != null && nextRowKey != null) {
-                if (queryParams.length() > 0) {
-                    queryParams.append("&");
-                }
-                queryParams.append("NextPartitionKey=").append(nextPartitionKey);
-                queryParams.append("&NextRowKey=").append(nextRowKey);
-            }
-
-            String url = buildUrl("", queryParams.toString());
-            Request request = createRequestBuilder(url)
-                    .get()
-                    .build();
-            RequestResult result = sendRequestWithContinuation(request);
-            allEntities.addAll(parseJsonListResponse(result.body));
-
-            nextPartitionKey = result.nextPartitionKey;
-            nextRowKey = result.nextRowKey;
-        } while (nextPartitionKey != null && nextRowKey != null);
-
-        return allEntities;
-    }
-
-    public void deleteEntity(String partitionKey, String rowKey) throws Exception {
-        String url = buildUrl("(PartitionKey='" + partitionKey + "',RowKey='" + rowKey + "')", "");
-        Request request = createRequestBuilder(url)
-                .delete()
-                .header("If-Match", "*")
-                .build();
-        sendRequest(request);
-    }
-
-    public void insertEntity(UnlockedItemEntity entity) throws Exception {
-        String url = buildUrl("", "");
-        String jsonPayload = gson.toJson(entity.toMap());
-        RequestBody body = RequestBody.create(MediaType.parse("application/json"), jsonPayload);
-        Request request = createRequestBuilder(url)
-                .post(body)
-                .header("Content-Type", "application/json")
-                .build();
-        sendRequest(request);
-    }
-
-    private Request.Builder createRequestBuilder(String url) {
-        return new Request.Builder()
-                .url(url)
-                .header("Accept", "application/json")
-                .header("User-Agent", "CrabManModePlugin");
-    }
-}
-package mvdicarlo.crabmanmode.database;
-
-import java.util.concurrent.CompletableFuture;
-
-/**
- * Interface for database actions that can be queued and executed
- * asynchronously.
- * Each action encapsulates a specific database operation and returns a promise
- * that completes when the action is processed.
- * 
- * @param <T> The return type of the action
- */
-public interface DatabaseAction<T> {
-
-    /**
-     * Get a human-readable type identifier for this action
-     */
-    String getActionType();
-
-    /**
-     * Get a description of what this action does (for logging/debugging)
-     */
-    String getDescription();
-
-    /**
-     * Execute the action with the provided context
-     * 
-     * @param context The execution context containing API, cache, etc.
-     * @return The result of the action
-     * @throws Exception if the action fails
-     */
-    T execute(ActionExecutionContext context) throws Exception;
-
-    /**
-     * Get the promise that will be completed when this action is processed
-     */
-    CompletableFuture<T> getPromise();
-
-    /**
-     * Complete the action's promise exceptionally
-     */
-    void completeExceptionally(Throwable throwable);
-
-    /**
-     * Check if this action can be executed in the current state
-     */
-    default boolean canExecute(ActionExecutionContext context) {
-        return context.isReady();
-    }
-
-    /**
-     * Get the priority of this action (higher = more important)
-     * Default priority is 0 (normal)
-     */
-    default int getPriority() {
-        return 0;
-    }
-}
-
-package mvdicarlo.crabmanmode.database;
-
-import java.time.OffsetDateTime;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
-
-import com.google.gson.Gson;
-
-import lombok.extern.slf4j.Slf4j;
-import mvdicarlo.crabmanmode.AzureTableApi;
-import mvdicarlo.crabmanmode.UnlockedItemEntity;
-import okhttp3.OkHttpClient;
-
-/**
- * New database repository implementation using the action queue pattern.
- * All database operations are queued as actions and executed asynchronously.
- * This eliminates blocking operations and race conditions.
- */
-@Slf4j
-public class DatabaseRepository {
-    private final DatabaseActionQueue actionQueue;
-    private final DatabaseState databaseState;
-    private final Map<Integer, UnlockedItemEntity> unlockedItems = new HashMap<>();
-    private final ScheduledExecutorService scheduler;
-
-    // Pre-initialization queue for items inserted before database is ready
-    private final List<PendingInsert> preInitInsertQueue = new java.util.concurrent.CopyOnWriteArrayList<>();
-
-    // Track the periodic sync task so we can cancel it
-    private java.util.concurrent.ScheduledFuture<?> syncTask;
-
-    // Dependencies
-    private AzureTableApi api;
-    private String currentUser;
-    private Gson gson;
-    private OkHttpClient httpClient;
-
-    // Listeners
-    private final List<Consumer<List<UnlockedItemEntity>>> itemListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
-
-    // Helper class for pre-initialization inserts
-    private static class PendingInsert {
-        final UnlockedItemEntity item;
-        final CompletableFuture<UnlockedItemEntity> future;
-
-        PendingInsert(UnlockedItemEntity item, CompletableFuture<UnlockedItemEntity> future) {
-            this.item = item;
-            this.future = future;
-        }
-    }
-
-    public DatabaseRepository() {
-        this.actionQueue = new DatabaseActionQueue();
-        this.databaseState = new DatabaseState();
-        this.scheduler = Executors.newScheduledThreadPool(1, r -> {
-            Thread t = new Thread(r, "DatabaseRepository-Scheduler");
-            t.setDaemon(true);
-            return t;
-        });
-
-        // Update action queue context when state changes
-        databaseState.addStateListener(this::onStateChanged);
-    }
-
-    // === Public API ===
-
-    /**
-     * Initialize the database connection
-     */
-    public CompletableFuture<Void> initialize(String sasUrl, String user) {
-        log.info("Initializing database connection for user: {}", user);
-        databaseState.setState(DatabaseState.State.INITIALIZING);
-
-        this.currentUser = user;
-        this.api = new AzureTableApi(sasUrl, gson, httpClient);
-
-        // Update action queue context
-        updateActionQueueContext();
-
-        // Load all data
-        databaseState.setState(DatabaseState.State.LOADING_DATA);
-
-        return actionQueue.submit(new DatabaseActions.LoadAllItemsAction())
-                .thenAccept(items -> {
-                    synchronized (unlockedItems) {
-                        unlockedItems.clear();
-                        unlockedItems.putAll(items);
-                    }
-                    databaseState.setState(DatabaseState.State.READY);
-                    log.info("Database initialized successfully with {} items", items.size());
-
-                    // Process any pre-initialization inserts
-                    processPendingInserts();
-
-                    // Start periodic sync
-                    startPeriodicSync();
-                })
-                .exceptionally(throwable -> {
-                    log.error("Failed to initialize database", throwable);
-                    databaseState.setState(DatabaseState.State.ERROR, throwable);
-                    return null;
-                });
-    }
-
-    /**
-     * Insert a new unlocked item
-     */
-    public CompletableFuture<UnlockedItemEntity> insertItem(UnlockedItemEntity item) {
-        log.debug("Queuing insert for item: {}", item.getItemName());
-
-        // If database is not ready, queue the insert for later processing
-        if (!databaseState.isReady()) {
-            log.debug("Database not ready, queuing insert for later: {}", item.getItemName());
-            CompletableFuture<UnlockedItemEntity> future = new CompletableFuture<>();
-            preInitInsertQueue.add(new PendingInsert(item, future));
-            return future;
-        }
-
-        // Check if the item already exists in the cache
-        synchronized (unlockedItems) {
-            if (unlockedItems.containsKey(item.getItemId())) {
-                log.debug("Item {} already exists, returning cached instance", item.getItemName());
-                return CompletableFuture.completedFuture(unlockedItems.get(item.getItemId()));
-            }
-        }
-
-        // Database is ready, process normally
-        return actionQueue.submit(new DatabaseActions.InsertItemAction(item))
-                .thenApply(insertedItem -> {
-                    // Notify listeners of new item
-                    notifyItemListeners(List.of(insertedItem));
-                    return insertedItem;
-                });
-    }
-
-    /**
-     * Delete an unlocked item
-     */
-    public CompletableFuture<Void> deleteItem(int itemId) {
-        log.debug("Queuing delete for item ID: {}", itemId);
-
-        return actionQueue.submit(new DatabaseActions.DeleteItemAction(itemId));
-    }
-
-    /**
-     * Get current unlocked items (thread-safe snapshot)
-     */
-    public Map<Integer, UnlockedItemEntity> getUnlockedItems() {
-        synchronized (unlockedItems) {
-            return new HashMap<>(unlockedItems);
-        }
-    }
-
-    /**
-     * Get current database state
-     */
-    public DatabaseState.State getState() {
-        return databaseState.getCurrentState();
-    }
-
-    /**
-     * Check if database is ready for operations
-     */
-    public boolean isReady() {
-        return databaseState.isReady();
-    }
-
-    public boolean hasItem(int itemId) {
-        synchronized (unlockedItems) {
-            return unlockedItems.containsKey(itemId);
-        }
-    }
-
-    /**
-     * Add listener for new items
-     */
-    public void addItemListener(Consumer<List<UnlockedItemEntity>> listener) {
-        itemListeners.add(listener);
-    }
-
-    /**
-     * Add listener for state changes
-     */
-    public void addStateListener(Consumer<DatabaseState.State> listener) {
-        databaseState.addStateListener(listener);
-    }
-
-    /**
-     * Create a new unlocked item entity
-     */
-    public UnlockedItemEntity createNewItem(Integer itemId, String itemName) {
-        return new UnlockedItemEntity(itemName, itemId, currentUser);
-    }
-
-    /**
-     * Close the repository and clean up resources.
-     * This clears the queue and cached data but keeps the repository reusable.
-     */
-    public void close() {
-        log.info("Closing database repository");
-
-        databaseState.reset();
-        actionQueue.clear();
-
-        // Cancel the periodic sync task if it exists
-        if (syncTask != null && !syncTask.isCancelled()) {
-            log.debug("Cancelling periodic sync task");
-            syncTask.cancel(false); // Don't interrupt if currently running
-            syncTask = null;
-        }
-
-        synchronized (unlockedItems) {
-            unlockedItems.clear();
-        }
-
-        // Cancel any pending inserts
-        for (PendingInsert pending : preInitInsertQueue) {
-            pending.future.completeExceptionally(new IllegalStateException("Repository closed"));
-        }
-        preInitInsertQueue.clear();
-
-        api = null;
-        currentUser = null;
-    }
-
-    // === Configuration ===
-
-    public void setGson(Gson gson) {
-        this.gson = gson;
-    }
-
-    public void setHttpClient(OkHttpClient httpClient) {
-        this.httpClient = httpClient;
-    }
-
-    public String getCurrentUser() {
-        return currentUser != null ? currentUser : "";
-    }
-
-    // === Private Methods ===
-
-    private void onStateChanged(DatabaseState.State newState) {
-        updateActionQueueContext();
-    }
-
-    private void updateActionQueueContext() {
-        ActionExecutionContext context = new ActionExecutionContext(
-                api,
-                unlockedItems,
-                currentUser,
-                databaseState.isReady());
-
-        actionQueue.updateExecutionContext(context);
-    }
-
-    /**
-     * Process any inserts that were queued before database initialization
-     */
-    private void processPendingInserts() {
-        if (preInitInsertQueue.isEmpty()) {
-            return;
-        }
-
-        log.info("Processing {} pending inserts from before initialization", preInitInsertQueue.size());
-
-        // Process all pending inserts
-        for (PendingInsert pending : preInitInsertQueue) {
-            try {
-                // Check if the item is already in the cache
-                synchronized (unlockedItems) {
-                    if (unlockedItems.containsKey(pending.item.getItemId())) {
-                        log.debug("Item {} already exists, skipping insert", pending.item.getItemName());
-                        pending.future.complete(unlockedItems.get(pending.item.getItemId()));
-                        continue;
-                    }
-                }
-
-                // Now submit to the action queue with the properly initialized cache
-                actionQueue.submit(new DatabaseActions.InsertItemAction(pending.item))
-                        .thenApply(insertedItem -> {
-                            // Notify listeners of new item
-                            notifyItemListeners(List.of(insertedItem));
-                            return insertedItem;
-                        })
-                        .whenComplete((result, throwable) -> {
-                            if (throwable != null) {
-                                pending.future.completeExceptionally(throwable);
-                            } else {
-                                pending.future.complete(result);
-                            }
-                        });
-            } catch (Exception e) {
-                log.error("Failed to process pending insert for item: {}", pending.item.getItemName(), e);
-                pending.future.completeExceptionally(e);
-            }
-        }
-
-        // Clear the queue
-        preInitInsertQueue.clear();
-    }
-
-    private void startPeriodicSync() {
-        syncTask = scheduler.scheduleAtFixedRate(() -> {
-            if (databaseState.isReady()) {
-                performSync();
-            }
-        }, 5, 5, TimeUnit.MINUTES);
-    }
-
-    private void performSync() {
-        OffsetDateTime lastSync = getLastSyncTime();
-
-        actionQueue.submit(new DatabaseActions.SyncAction(lastSync, currentUser))
-                .thenAccept(newItemsFromOthers -> {
-                    if (!newItemsFromOthers.isEmpty()) {
-                        log.debug("Synced {} new items from other users", newItemsFromOthers.size());
-                        notifyItemListeners(newItemsFromOthers);
-                    }
-                })
-                .exceptionally(throwable -> {
-                    log.warn("Sync failed: {}", throwable.getMessage());
-                    return null;
-                });
-    }
-
-    private OffsetDateTime getLastSyncTime() {
-        synchronized (unlockedItems) {
-            return unlockedItems.values().stream()
-                    .map(UnlockedItemEntity::getAcquiredOn)
-                    .max(OffsetDateTime::compareTo)
-                    .orElse(OffsetDateTime.now().minusMinutes(10));
-        }
-    }
-
-    private void notifyItemListeners(List<UnlockedItemEntity> newItems) {
-        for (Consumer<List<UnlockedItemEntity>> listener : itemListeners) {
-            try {
-                listener.accept(newItems);
-            } catch (Exception e) {
-                log.error("Error notifying item listener", e);
-            }
-        }
-    }
-}
-
-package mvdicarlo.crabmanmode.database;
-
-import java.util.concurrent.CompletableFuture;
-import lombok.extern.slf4j.Slf4j;
-
-/**
- * Base implementation for database actions providing common functionality.
- * 
- * @param <T> The return type of the action
- */
-@Slf4j
-public abstract class BaseDatabaseAction<T> implements DatabaseAction<T> {
-
-    protected final CompletableFuture<T> promise = new CompletableFuture<>();
-
-    @Override
-    public CompletableFuture<T> getPromise() {
-        return promise;
-    }
-
-    @Override
-    public void completeExceptionally(Throwable throwable) {
-        log.warn("Action {} failed: {}", getActionType(), throwable.getMessage());
-        promise.completeExceptionally(throwable);
-    }
-
-    /**
-     * Complete the action's promise with a successful result
-     */
-    protected void complete(T result) {
-        log.debug("Action {} completed successfully", getActionType());
-        promise.complete(result);
-    }
-
-    /**
-     * Template method that handles the execution and promise completion.
-     * Subclasses should override executeInternal() instead of execute().
-     */
-    @Override
-    public final T execute(ActionExecutionContext context) throws Exception {
-        try {
-            log.debug("Executing action: {}", getDescription());
-            T result = executeInternal(context);
-            complete(result);
-            return result;
-        } catch (Exception e) {
-            log.error("Failed to execute action {}: {}", getActionType(), e.getMessage(), e);
-            throw e; // Let the queue handler deal with promise completion
-        }
-    }
-
-    /**
-     * Subclasses implement this method to perform the actual work
-     */
-    protected abstract T executeInternal(ActionExecutionContext context) throws Exception;
-}
-
-package mvdicarlo.crabmanmode.database;
-
-import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Consumer;
-import java.util.List;
-import java.util.concurrent.CopyOnWriteArrayList;
-
-import lombok.extern.slf4j.Slf4j;
-
-/**
- * Manages the state of the database connection and loading process.
- * Provides thread-safe state transitions and notifications.
- */
-@Slf4j
-public class DatabaseState {
-
-    public enum State {
-        NOT_INITIALIZED("Not initialized"),
-        INITIALIZING("Connecting to database..."),
-        LOADING_DATA("Loading unlocked items..."),
-        READY("Ready"),
-        ERROR("Connection failed");
-
-        private final String displayName;
-
-        State(String displayName) {
-            this.displayName = displayName;
-        }
-
-        public String getDisplayName() {
-            return displayName;
-        }
-
-        public boolean isReady() {
-            return this == READY;
-        }
-
-        public boolean canAcceptActions() {
-            return this != NOT_INITIALIZED && this != ERROR;
-        }
-    }
-
-    private final AtomicReference<State> currentState = new AtomicReference<>(State.NOT_INITIALIZED);
-    private final List<Consumer<State>> stateListeners = new CopyOnWriteArrayList<>();
-    private volatile Throwable lastError;
-
-    /**
-     * Get the current state
-     */
-    public State getCurrentState() {
-        return currentState.get();
-    }
-
-    /**
-     * Check if the database is ready for operations
-     */
-    public boolean isReady() {
-        return currentState.get().isReady();
-    }
-
-    /**
-     * Check if the database can accept new actions
-     */
-    public boolean canAcceptActions() {
-        return currentState.get().canAcceptActions();
-    }
-
-    /**
-     * Get the last error that occurred (if any)
-     */
-    public Throwable getLastError() {
-        return lastError;
-    }
-
-    /**
-     * Transition to a new state
-     */
-    public void setState(State newState) {
-        setState(newState, null);
-    }
-
-    /**
-     * Transition to a new state with an optional error
-     */
-    public void setState(State newState, Throwable error) {
-        State oldState = currentState.getAndSet(newState);
-
-        if (error != null) {
-            this.lastError = error;
-        } else if (newState != State.ERROR) {
-            // Clear error on successful state transitions
-            this.lastError = null;
-        }
-
-        if (oldState != newState) {
-            log.debug("Database state changed: {} -> {}", oldState, newState);
-            notifyListeners(newState);
-        }
-    }
-
-    /**
-     * Add a listener for state changes
-     */
-    public void addStateListener(Consumer<State> listener) {
-        stateListeners.add(listener);
-        // Immediately notify of current state
-        listener.accept(currentState.get());
-    }
-
-    /**
-     * Remove a state listener
-     */
-    public void removeStateListener(Consumer<State> listener) {
-        stateListeners.remove(listener);
-    }
-
-    /**
-     * Reset to initial state
-     */
-    public void reset() {
-        setState(State.NOT_INITIALIZED);
-        this.lastError = null;
-    }
-
-    private void notifyListeners(State newState) {
-        for (Consumer<State> listener : stateListeners) {
-            try {
-                listener.accept(newState);
-            } catch (Exception e) {
-                log.error("Error notifying state listener", e);
-            }
-        }
-    }
-}
-
-package mvdicarlo.crabmanmode.database;
-
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.ConcurrentLinkedQueue;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.Comparator;
-import java.util.List;
-import java.util.ArrayList;
-
-import lombok.extern.slf4j.Slf4j;
-
-/**
- * Queue processor that executes database actions sequentially with proper
- * ordering.
- * Actions are queued and processed in priority order (higher priority first).
- * Each action returns a CompletableFuture that completes when the action is
- * processed.
- */
-@Slf4j
-public class DatabaseActionQueue {
-    private final ConcurrentLinkedQueue<DatabaseAction<?>> actionQueue = new ConcurrentLinkedQueue<>();
-    private final ScheduledExecutorService executor;
-    private final AtomicBoolean isProcessing = new AtomicBoolean(false);
-
-    private volatile ActionExecutionContext executionContext;
-
-    public DatabaseActionQueue() {
-        this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "DatabaseActionQueue");
-            t.setDaemon(true);
-            return t;
-        });
-
-        // Start the processing loop
-        startProcessing();
-    }
-
-    /**
-     * Submit an action to be executed asynchronously
-     */
-    public <T> CompletableFuture<T> submit(DatabaseAction<T> action) {
-        log.debug("Queuing action: {}", action.getDescription());
-        actionQueue.offer(action);
-
-        // Trigger processing if not already running
-        triggerProcessing();
-
-        return action.getPromise();
-    }
-
-    /**
-     * Update the execution context (called when database state changes)
-     */
-    public void updateExecutionContext(ActionExecutionContext context) {
-        log.debug("Updating execution context - ready: {}", context.isReady());
-        this.executionContext = context;
-
-        // Trigger processing in case there are queued actions waiting for the context
-        triggerProcessing();
-    }
-
-    /**
-     * Get the current queue size
-     */
-    public int getQueueSize() {
-        return actionQueue.size();
-    }
-
-    /**
-     * Clear all pending actions without shutting down the queue.
-     * This allows the queue to be reused after clearing.
-     */
-    public void clear() {
-        log.info("Clearing database action queue");
-
-        // Cancel all pending actions
-        DatabaseAction<?> action;
-        while ((action = actionQueue.poll()) != null) {
-            action.completeExceptionally(new IllegalStateException("Queue cleared"));
-        }
-
-        // Clear execution context
-        this.executionContext = null;
-    }
-
-    private void startProcessing() {
-        executor.scheduleWithFixedDelay(this::processActions, 100, 50, TimeUnit.MILLISECONDS);
-    }
-
-    private void triggerProcessing() {
-        // The scheduled task will pick up new actions automatically
-        // This method exists for future optimization if needed
-    }
-
-    private void processActions() {
-        if (isProcessing.get()) {
-            return;
-        }
-
-        if (actionQueue.isEmpty() || executionContext == null) {
-            return;
-        }
-
-        if (!isProcessing.compareAndSet(false, true)) {
-            return; // Another thread is already processing
-        }
-
-        try {
-            // Process actions in batches, respecting priority
-            List<DatabaseAction<?>> batch = collectBatch();
-
-            for (DatabaseAction<?> action : batch) {
-                try {
-                    processAction(action);
-                } catch (Exception e) {
-                    log.error("Unexpected error processing action {}: {}", action.getActionType(), e.getMessage(), e);
-                    action.completeExceptionally(e);
-                }
-            }
-
-        } finally {
-            isProcessing.set(false);
-        }
-    }
-
-    private List<DatabaseAction<?>> collectBatch() {
-        List<DatabaseAction<?>> batch = new ArrayList<>();
-
-        // Collect all ready actions
-        DatabaseAction<?> action;
-        while ((action = actionQueue.poll()) != null) {
-            if (action.canExecute(executionContext)) {
-                batch.add(action);
-            } else {
-                // Put it back and break (will be retried later)
-                actionQueue.offer(action);
-                break;
-            }
-
-            // Limit batch size to prevent blocking too long
-            if (batch.size() >= 10) {
-                break;
-            }
-        }
-        // Sort by priority (higher first)
-        batch.sort(Comparator.<DatabaseAction<?>>comparingInt(DatabaseAction::getPriority).reversed());
-
-        return batch;
-    }
-
-    private void processAction(DatabaseAction<?> action) {
-        try {
-            log.debug("Processing action: {}", action.getDescription());
-            action.execute(executionContext);
-
-        } catch (Exception e) {
-            log.error("Action {} failed: {}", action.getActionType(), e.getMessage());
-            action.completeExceptionally(e);
-        }
-    }
-}
-
-package mvdicarlo.crabmanmode.database;
-
-import java.util.Map;
-import mvdicarlo.crabmanmode.AzureTableApi;
-import mvdicarlo.crabmanmode.UnlockedItemEntity;
-
-/**
- * Context provided to actions during execution.
- * Contains all the resources and state needed to execute database operations.
- */
-public class ActionExecutionContext {
-
-    private final AzureTableApi api;
-    private final Map<Integer, UnlockedItemEntity> localCache;
-    private final String currentUser;
-    private final boolean ready;
-
-    public ActionExecutionContext(AzureTableApi api,
-            Map<Integer, UnlockedItemEntity> localCache,
-            String currentUser,
-            boolean ready) {
-        this.api = api;
-        this.localCache = localCache;
-        this.currentUser = currentUser;
-        this.ready = ready;
-    }
-
-    /**
-     * Get the Azure Table API instance
-     */
-    public AzureTableApi getApi() {
-        return api;
-    }
-
-    /**
-     * Get the local cache of unlocked items (thread-safe access required)
-     */
-    public Map<Integer, UnlockedItemEntity> getLocalCache() {
-        return localCache;
-    }
-
-    /**
-     * Get the current user name
-     */
-    public String getCurrentUser() {
-        return currentUser;
-    }
-
-    /**
-     * Check if the system is ready for database operations
-     */
-    public boolean isReady() {
-        return ready && api != null && currentUser != null && !currentUser.isEmpty();
-    }
-}
-
-package mvdicarlo.crabmanmode.database;
-
-import java.time.OffsetDateTime;
-import java.util.ArrayList;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-import lombok.extern.slf4j.Slf4j;
-import mvdicarlo.crabmanmode.UnlockedItemEntity;
-
-/**
- * Concrete implementations of database actions.
- */
-@Slf4j
-public class DatabaseActions {
-
-    /**
-     * Action to insert a new unlocked item
-     */
-    public static class InsertItemAction extends BaseDatabaseAction<UnlockedItemEntity> {
-        private final UnlockedItemEntity item;
-
-        public InsertItemAction(UnlockedItemEntity item) {
-            this.item = item;
-        }
-
-        @Override
-        public String getActionType() {
-            return "INSERT_ITEM";
-        }
-
-        @Override
-        public String getDescription() {
-            return String.format("Insert item '%s' (ID: %d)", item.getItemName(), item.getItemId());
-        }
-
-        @Override
-        protected UnlockedItemEntity executeInternal(ActionExecutionContext context) throws Exception {
-            // Check if item already exists in local cache
-            synchronized (context.getLocalCache()) {
-                if (context.getLocalCache().containsKey(item.getItemId())) {
-                    log.debug("Item {} already exists, skipping insert", item.getItemName());
-                    return context.getLocalCache().get(item.getItemId());
-                }
-
-                // Set user and add to local cache optimistically
-                item.setAcquiredBy(context.getCurrentUser());
-                context.getLocalCache().put(item.getItemId(), item);
-            }
-
-            try {
-                // Send to remote database
-                context.getApi().insertEntity(item);
-                log.debug("Successfully inserted item '{}' to remote database", item.getItemName());
-                return item;
-
-            } catch (Exception e) {
-                // Remove from local cache if remote insert failed
-                synchronized (context.getLocalCache()) {
-                    context.getLocalCache().remove(item.getItemId());
-                }
-                throw new RuntimeException("Failed to insert item to remote database", e);
-            }
-        }
-
-        public UnlockedItemEntity getItem() {
-            return item;
-        }
-    }
-
-    /**
-     * Action to delete an unlocked item
-     */
-    public static class DeleteItemAction extends BaseDatabaseAction<Void> {
-        private final int itemId;
-
-        public DeleteItemAction(int itemId) {
-            this.itemId = itemId;
-        }
-
-        @Override
-        public String getActionType() {
-            return "DELETE_ITEM";
-        }
-
-        @Override
-        public String getDescription() {
-            return String.format("Delete item ID: %d", itemId);
-        }
-
-        @Override
-        protected Void executeInternal(ActionExecutionContext context) throws Exception {
-            UnlockedItemEntity removed = null;
-
-            // Remove from local cache optimistically
-            synchronized (context.getLocalCache()) {
-                removed = context.getLocalCache().remove(itemId);
-            }
-
-            try {
-                // Send delete to remote
-                context.getApi().deleteEntity(UnlockedItemEntity.PartitionKey, Integer.toString(itemId));
-                log.debug("Successfully deleted item ID {} from remote database", itemId);
-                return null;
-
-            } catch (Exception e) {
-                // Restore to local cache if remote delete failed
-                if (removed != null) {
-                    synchronized (context.getLocalCache()) {
-                        context.getLocalCache().put(itemId, removed);
-                    }
-                }
-                throw new RuntimeException("Failed to delete item from remote database", e);
-            }
-        }
-
-        public int getItemId() {
-            return itemId;
-        }
-    }
-
-    /**
-     * Action to load all items from the database (used during initialization)
-     */
-    public static class LoadAllItemsAction extends BaseDatabaseAction<Map<Integer, UnlockedItemEntity>> {
-
-        @Override
-        public String getActionType() {
-            return "LOAD_ALL_ITEMS";
-        }
-
-        @Override
-        public String getDescription() {
-            return "Load all unlocked items from database";
-        }
-
-        @Override
-        public int getPriority() {
-            return 100; // High priority for initialization
-        }
-
-        @Override
-        protected Map<Integer, UnlockedItemEntity> executeInternal(ActionExecutionContext context) throws Exception {
-            Map<Integer, UnlockedItemEntity> result = new HashMap<>();
-
-            try {
-                List<UnlockedItemEntity> items = context.getApi().listEntities();
-                for (UnlockedItemEntity item : items) {
-                    result.put(item.getItemId(), item);
-                }
-                log.info("Successfully loaded {} items from database", result.size());
-                return result;
-
-            } catch (Exception e) {
-                throw new RuntimeException("Failed to load items from database", e);
-            }
-        }
-
-        @Override
-        public boolean canExecute(ActionExecutionContext context) {
-            // Can execute even if not fully ready (used during initialization)
-            return context.getApi() != null;
-        }
-    }
-
-    /**
-     * Action to sync with remote database (periodic background sync)
-     */
-    public static class SyncAction extends BaseDatabaseAction<List<UnlockedItemEntity>> {
-        private final OffsetDateTime since;
-        private final String currentUser;
-
-        public SyncAction(OffsetDateTime since, String currentUser) {
-            this.since = since;
-            this.currentUser = currentUser;
-        }
-
-        @Override
-        public String getActionType() {
-            return "SYNC";
-        }
-
-        @Override
-        public String getDescription() {
-            return String.format("Sync items since %s", since);
-        }
-
-        @Override
-        public int getPriority() {
-            return -10; // Low priority for background sync
-        }
-
-        @Override
-        protected List<UnlockedItemEntity> executeInternal(ActionExecutionContext context) throws Exception {
-            try {
-                String filter = "Timestamp%20gt%20datetime'" + since.toString() + "'";
-                List<UnlockedItemEntity> newItems = context.getApi().listEntities(filter);
-
-                // Filter out items from current user and update local cache
-                List<UnlockedItemEntity> newItemsFromOthers = new ArrayList<>();
-
-                synchronized (context.getLocalCache()) {
-                    for (UnlockedItemEntity item : newItems) {
-                        context.getLocalCache().put(item.getItemId(), item);
-
-                        if (!item.getAcquiredBy().equals(currentUser)) {
-                            newItemsFromOthers.add(item);
-                        }
-                    }
-                }
-
-                log.debug("Synced {} new items ({} from others)", newItems.size(), newItemsFromOthers.size());
-                return newItemsFromOthers;
-
-            } catch (Exception e) {
-                log.warn("Failed to sync with remote database: {}", e.getMessage());
-                // Don't throw for sync failures - just log and continue
-                return new ArrayList<>();
-            }
-        }
-    }
-}
-
-package mvdicarlo.crabmanmode;
-
-import net.runelite.client.config.Config;
-import net.runelite.client.config.ConfigGroup;
-import net.runelite.client.config.ConfigItem;
-
-@ConfigGroup(CrabmanModePlugin.CONFIG_GROUP)
-public interface CrabmanModeConfig extends Config {
-    @ConfigItem(keyName = "namesBronzeman", name = "Bronzeman Names", position = 1, description = "Configures names of bronzemen to highlight in chat. Format: (name), (name)")
-    default String namesBronzeman() {
-        return "";
-    }
-
-    @ConfigItem(keyName = "enableCrabman", name = "Enable group bronzeman for character name", position = 2, description = "Enables group bronzeman mode for provided character name.")
-    default String enableCrabman() {
-        return "";
-    }
-
-    @ConfigItem(secret = true, keyName = "databaseString", name = "Azure Storage Account SAS URL", position = 3, description = "The SAS Url string for your group storage account.")
-    default String databaseString() {
-        return "";
-    }
-}
-
-package mvdicarlo.crabmanmode;
-
-import java.time.OffsetDateTime;
-import java.util.HashMap;
-import java.util.Map;
-
-public class UnlockedItemEntity {
-    public final static String PartitionKey = "UnlockedItem";
-    private String itemName;
-    private Integer itemId;
-    private String acquiredBy;
-    private OffsetDateTime acquiredOn;
-
-    public UnlockedItemEntity(String itemName, Integer itemId, String acquiredBy, OffsetDateTime acquiredOn) {
-        this.itemName = itemName;
-        this.itemId = itemId;
-        this.acquiredBy = acquiredBy;
-        this.acquiredOn = acquiredOn;
-    }
-
-    public UnlockedItemEntity(String itemName, Integer itemId, String acquiredBy) {
-        this(itemName, itemId, acquiredBy, OffsetDateTime.now());
-    }
-
-    public Integer getItemId() {
-        return itemId;
-    }
-
-    public String getAcquiredBy() {
-        return acquiredBy;
-    }
-
-    public String setAcquiredBy(String acquiredBy) {
-        return this.acquiredBy = acquiredBy;
-    }
-
-    public String getItemName() {
-        return itemName;
-    }
-
-    public OffsetDateTime getAcquiredOn() {
-        return acquiredOn;
-    }
-
-    public Map<String, Object> toMap() {
-        Map<String, Object> map = new HashMap<>();
-        map.put("PartitionKey", PartitionKey);
-        map.put("RowKey", itemId.toString());
-        map.put("ItemName", itemName);
-        map.put("AcquiredBy", acquiredBy);
-        // map.put("Timestamp", acquiredOn.toString()); // Fine to allow null
-        return map;
-    }
-
-    public static UnlockedItemEntity fromMap(Map<String, Object> map) {
-        String itemName = (String) map.get("ItemName");
-        Integer itemId = Integer.parseInt((String) map.get("RowKey"));
-        String acquiredBy = (String) map.get("AcquiredBy");
-        OffsetDateTime acquiredOn = OffsetDateTime.parse((String) map.get("Timestamp"));
-        return new UnlockedItemEntity(itemName, itemId, acquiredBy, acquiredOn);
-    }
-}
-package mvdicarlo.crabmanmode;
-
-import java.time.OffsetDateTime;
-import net.runelite.client.util.AsyncBufferedImage;
-
-public class ItemObject {
-    int id;
-    String name;
-    boolean tradeable;
-    OffsetDateTime acquiredOn;
-    AsyncBufferedImage icon;
-
-    public ItemObject(int id, String name, boolean tradeable, OffsetDateTime acquiredOn, AsyncBufferedImage icon) {
-        this.id = id;
-        this.name = name;
-        this.tradeable = tradeable;
-        this.acquiredOn = acquiredOn;
-        this.icon = icon;
-    }
-
-    public int getId() {
-        return id;
-    }
-
-    public String getName() {
-        return name;
-    }
-
-    public boolean isTradeable() {
-        return tradeable;
-    }
-
-    public OffsetDateTime getAcquiredOn() {
-        return acquiredOn;
-    }
-
-    public AsyncBufferedImage getIcon() {
-        return icon;
-    }
-}
-
 /*
  * Original License
  * Copyright (c) 2019, CodePanter <https://github.com/codepanter>
@@ -2576,6 +1525,1094 @@ public class CrabmanModePlugin extends Plugin {
     }
 }
 
+package mvdicarlo.crabmanmode.database;
+
+import java.util.Map;
+import mvdicarlo.crabmanmode.AzureTableApi;
+import mvdicarlo.crabmanmode.UnlockedItemEntity;
+
+/**
+ * Context provided to actions during execution.
+ * Contains all the resources and state needed to execute database operations.
+ */
+public class ActionExecutionContext {
+
+    private final AzureTableApi api;
+    private final Map<Integer, UnlockedItemEntity> localCache;
+    private final String currentUser;
+    private final boolean ready;
+
+    public ActionExecutionContext(AzureTableApi api,
+            Map<Integer, UnlockedItemEntity> localCache,
+            String currentUser,
+            boolean ready) {
+        this.api = api;
+        this.localCache = localCache;
+        this.currentUser = currentUser;
+        this.ready = ready;
+    }
+
+    /**
+     * Get the Azure Table API instance
+     */
+    public AzureTableApi getApi() {
+        return api;
+    }
+
+    /**
+     * Get the local cache of unlocked items (thread-safe access required)
+     */
+    public Map<Integer, UnlockedItemEntity> getLocalCache() {
+        return localCache;
+    }
+
+    /**
+     * Get the current user name
+     */
+    public String getCurrentUser() {
+        return currentUser;
+    }
+
+    /**
+     * Check if the system is ready for database operations
+     */
+    public boolean isReady() {
+        return ready && api != null && currentUser != null && !currentUser.isEmpty();
+    }
+}
+
+package mvdicarlo.crabmanmode.database;
+
+import java.util.concurrent.CompletableFuture;
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Base implementation for database actions providing common functionality.
+ * 
+ * @param <T> The return type of the action
+ */
+@Slf4j
+public abstract class BaseDatabaseAction<T> implements DatabaseAction<T> {
+
+    protected final CompletableFuture<T> promise = new CompletableFuture<>();
+
+    @Override
+    public CompletableFuture<T> getPromise() {
+        return promise;
+    }
+
+    @Override
+    public void completeExceptionally(Throwable throwable) {
+        log.warn("Action {} failed: {}", getActionType(), throwable.getMessage());
+        promise.completeExceptionally(throwable);
+    }
+
+    /**
+     * Complete the action's promise with a successful result
+     */
+    protected void complete(T result) {
+        log.debug("Action {} completed successfully", getActionType());
+        promise.complete(result);
+    }
+
+    /**
+     * Template method that handles the execution and promise completion.
+     * Subclasses should override executeInternal() instead of execute().
+     */
+    @Override
+    public final T execute(ActionExecutionContext context) throws Exception {
+        try {
+            log.debug("Executing action: {}", getDescription());
+            T result = executeInternal(context);
+            complete(result);
+            return result;
+        } catch (Exception e) {
+            log.error("Failed to execute action {}: {}", getActionType(), e.getMessage(), e);
+            throw e; // Let the queue handler deal with promise completion
+        }
+    }
+
+    /**
+     * Subclasses implement this method to perform the actual work
+     */
+    protected abstract T executeInternal(ActionExecutionContext context) throws Exception;
+}
+
+package mvdicarlo.crabmanmode.database;
+
+import java.util.concurrent.CompletableFuture;
+
+/**
+ * Interface for database actions that can be queued and executed
+ * asynchronously.
+ * Each action encapsulates a specific database operation and returns a promise
+ * that completes when the action is processed.
+ * 
+ * @param <T> The return type of the action
+ */
+public interface DatabaseAction<T> {
+
+    /**
+     * Get a human-readable type identifier for this action
+     */
+    String getActionType();
+
+    /**
+     * Get a description of what this action does (for logging/debugging)
+     */
+    String getDescription();
+
+    /**
+     * Execute the action with the provided context
+     * 
+     * @param context The execution context containing API, cache, etc.
+     * @return The result of the action
+     * @throws Exception if the action fails
+     */
+    T execute(ActionExecutionContext context) throws Exception;
+
+    /**
+     * Get the promise that will be completed when this action is processed
+     */
+    CompletableFuture<T> getPromise();
+
+    /**
+     * Complete the action's promise exceptionally
+     */
+    void completeExceptionally(Throwable throwable);
+
+    /**
+     * Check if this action can be executed in the current state
+     */
+    default boolean canExecute(ActionExecutionContext context) {
+        return context.isReady();
+    }
+
+    /**
+     * Get the priority of this action (higher = more important)
+     * Default priority is 0 (normal)
+     */
+    default int getPriority() {
+        return 0;
+    }
+}
+
+package mvdicarlo.crabmanmode.database;
+
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.Comparator;
+import java.util.List;
+import java.util.ArrayList;
+
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Queue processor that executes database actions sequentially with proper
+ * ordering.
+ * Actions are queued and processed in priority order (higher priority first).
+ * Each action returns a CompletableFuture that completes when the action is
+ * processed.
+ */
+@Slf4j
+public class DatabaseActionQueue {
+    private final ConcurrentLinkedQueue<DatabaseAction<?>> actionQueue = new ConcurrentLinkedQueue<>();
+    private final ScheduledExecutorService executor;
+    private final AtomicBoolean isProcessing = new AtomicBoolean(false);
+
+    private volatile ActionExecutionContext executionContext;
+
+    public DatabaseActionQueue() {
+        this.executor = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "DatabaseActionQueue");
+            t.setDaemon(true);
+            return t;
+        });
+
+        // Start the processing loop
+        startProcessing();
+    }
+
+    /**
+     * Submit an action to be executed asynchronously
+     */
+    public <T> CompletableFuture<T> submit(DatabaseAction<T> action) {
+        log.debug("Queuing action: {}", action.getDescription());
+        actionQueue.offer(action);
+
+        // Trigger processing if not already running
+        triggerProcessing();
+
+        return action.getPromise();
+    }
+
+    /**
+     * Update the execution context (called when database state changes)
+     */
+    public void updateExecutionContext(ActionExecutionContext context) {
+        log.debug("Updating execution context - ready: {}", context.isReady());
+        this.executionContext = context;
+
+        // Trigger processing in case there are queued actions waiting for the context
+        triggerProcessing();
+    }
+
+    /**
+     * Get the current queue size
+     */
+    public int getQueueSize() {
+        return actionQueue.size();
+    }
+
+    /**
+     * Clear all pending actions without shutting down the queue.
+     * This allows the queue to be reused after clearing.
+     */
+    public void clear() {
+        log.info("Clearing database action queue");
+
+        // Cancel all pending actions
+        DatabaseAction<?> action;
+        while ((action = actionQueue.poll()) != null) {
+            action.completeExceptionally(new IllegalStateException("Queue cleared"));
+        }
+
+        // Clear execution context
+        this.executionContext = null;
+    }
+
+    private void startProcessing() {
+        executor.scheduleWithFixedDelay(this::processActions, 100, 50, TimeUnit.MILLISECONDS);
+    }
+
+    private void triggerProcessing() {
+        // The scheduled task will pick up new actions automatically
+        // This method exists for future optimization if needed
+    }
+
+    private void processActions() {
+        if (isProcessing.get()) {
+            return;
+        }
+
+        if (actionQueue.isEmpty() || executionContext == null) {
+            return;
+        }
+
+        if (!isProcessing.compareAndSet(false, true)) {
+            return; // Another thread is already processing
+        }
+
+        try {
+            // Process actions in batches, respecting priority
+            List<DatabaseAction<?>> batch = collectBatch();
+
+            for (DatabaseAction<?> action : batch) {
+                try {
+                    processAction(action);
+                } catch (Exception e) {
+                    log.error("Unexpected error processing action {}: {}", action.getActionType(), e.getMessage(), e);
+                    action.completeExceptionally(e);
+                }
+            }
+
+        } finally {
+            isProcessing.set(false);
+        }
+    }
+
+    private List<DatabaseAction<?>> collectBatch() {
+        List<DatabaseAction<?>> batch = new ArrayList<>();
+
+        // Collect all ready actions
+        DatabaseAction<?> action;
+        while ((action = actionQueue.poll()) != null) {
+            if (action.canExecute(executionContext)) {
+                batch.add(action);
+            } else {
+                // Put it back and break (will be retried later)
+                actionQueue.offer(action);
+                break;
+            }
+
+            // Limit batch size to prevent blocking too long
+            if (batch.size() >= 10) {
+                break;
+            }
+        }
+        // Sort by priority (higher first)
+        batch.sort(Comparator.<DatabaseAction<?>>comparingInt(DatabaseAction::getPriority).reversed());
+
+        return batch;
+    }
+
+    private void processAction(DatabaseAction<?> action) {
+        try {
+            log.debug("Processing action: {}", action.getDescription());
+            action.execute(executionContext);
+
+        } catch (Exception e) {
+            log.error("Action {} failed: {}", action.getActionType(), e.getMessage());
+            action.completeExceptionally(e);
+        }
+    }
+}
+
+package mvdicarlo.crabmanmode.database;
+
+import java.time.OffsetDateTime;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+import lombok.extern.slf4j.Slf4j;
+import mvdicarlo.crabmanmode.UnlockedItemEntity;
+
+/**
+ * Concrete implementations of database actions.
+ */
+@Slf4j
+public class DatabaseActions {
+
+    /**
+     * Action to insert a new unlocked item
+     */
+    public static class InsertItemAction extends BaseDatabaseAction<UnlockedItemEntity> {
+        private final UnlockedItemEntity item;
+
+        public InsertItemAction(UnlockedItemEntity item) {
+            this.item = item;
+        }
+
+        @Override
+        public String getActionType() {
+            return "INSERT_ITEM";
+        }
+
+        @Override
+        public String getDescription() {
+            return String.format("Insert item '%s' (ID: %d)", item.getItemName(), item.getItemId());
+        }
+
+        @Override
+        protected UnlockedItemEntity executeInternal(ActionExecutionContext context) throws Exception {
+            // Check if item already exists in local cache
+            synchronized (context.getLocalCache()) {
+                if (context.getLocalCache().containsKey(item.getItemId())) {
+                    log.debug("Item {} already exists, skipping insert", item.getItemName());
+                    return context.getLocalCache().get(item.getItemId());
+                }
+
+                // Set user and add to local cache optimistically
+                item.setAcquiredBy(context.getCurrentUser());
+                context.getLocalCache().put(item.getItemId(), item);
+            }
+
+            try {
+                // Send to remote database
+                context.getApi().insertEntity(item);
+                log.debug("Successfully inserted item '{}' to remote database", item.getItemName());
+                return item;
+
+            } catch (Exception e) {
+                // Remove from local cache if remote insert failed
+                synchronized (context.getLocalCache()) {
+                    context.getLocalCache().remove(item.getItemId());
+                }
+                throw new RuntimeException("Failed to insert item to remote database", e);
+            }
+        }
+
+        public UnlockedItemEntity getItem() {
+            return item;
+        }
+    }
+
+    /**
+     * Action to delete an unlocked item
+     */
+    public static class DeleteItemAction extends BaseDatabaseAction<Void> {
+        private final int itemId;
+
+        public DeleteItemAction(int itemId) {
+            this.itemId = itemId;
+        }
+
+        @Override
+        public String getActionType() {
+            return "DELETE_ITEM";
+        }
+
+        @Override
+        public String getDescription() {
+            return String.format("Delete item ID: %d", itemId);
+        }
+
+        @Override
+        protected Void executeInternal(ActionExecutionContext context) throws Exception {
+            UnlockedItemEntity removed = null;
+
+            // Remove from local cache optimistically
+            synchronized (context.getLocalCache()) {
+                removed = context.getLocalCache().remove(itemId);
+            }
+
+            try {
+                // Send delete to remote
+                context.getApi().deleteEntity(UnlockedItemEntity.PartitionKey, Integer.toString(itemId));
+                log.debug("Successfully deleted item ID {} from remote database", itemId);
+                return null;
+
+            } catch (Exception e) {
+                // Restore to local cache if remote delete failed
+                if (removed != null) {
+                    synchronized (context.getLocalCache()) {
+                        context.getLocalCache().put(itemId, removed);
+                    }
+                }
+                throw new RuntimeException("Failed to delete item from remote database", e);
+            }
+        }
+
+        public int getItemId() {
+            return itemId;
+        }
+    }
+
+    /**
+     * Action to load all items from the database (used during initialization)
+     */
+    public static class LoadAllItemsAction extends BaseDatabaseAction<Map<Integer, UnlockedItemEntity>> {
+
+        @Override
+        public String getActionType() {
+            return "LOAD_ALL_ITEMS";
+        }
+
+        @Override
+        public String getDescription() {
+            return "Load all unlocked items from database";
+        }
+
+        @Override
+        public int getPriority() {
+            return 100; // High priority for initialization
+        }
+
+        @Override
+        protected Map<Integer, UnlockedItemEntity> executeInternal(ActionExecutionContext context) throws Exception {
+            Map<Integer, UnlockedItemEntity> result = new HashMap<>();
+
+            try {
+                List<UnlockedItemEntity> items = context.getApi().listEntities();
+                for (UnlockedItemEntity item : items) {
+                    result.put(item.getItemId(), item);
+                }
+                log.info("Successfully loaded {} items from database", result.size());
+                return result;
+
+            } catch (Exception e) {
+                throw new RuntimeException("Failed to load items from database", e);
+            }
+        }
+
+        @Override
+        public boolean canExecute(ActionExecutionContext context) {
+            // Can execute even if not fully ready (used during initialization)
+            return context.getApi() != null;
+        }
+    }
+
+    /**
+     * Action to sync with remote database (periodic background sync)
+     */
+    public static class SyncAction extends BaseDatabaseAction<List<UnlockedItemEntity>> {
+        private final OffsetDateTime since;
+        private final String currentUser;
+
+        public SyncAction(OffsetDateTime since, String currentUser) {
+            this.since = since;
+            this.currentUser = currentUser;
+        }
+
+        @Override
+        public String getActionType() {
+            return "SYNC";
+        }
+
+        @Override
+        public String getDescription() {
+            return String.format("Sync items since %s", since);
+        }
+
+        @Override
+        public int getPriority() {
+            return -10; // Low priority for background sync
+        }
+
+        @Override
+        protected List<UnlockedItemEntity> executeInternal(ActionExecutionContext context) throws Exception {
+            try {
+                String filter = "Timestamp%20gt%20datetime'" + since.toString() + "'";
+                List<UnlockedItemEntity> newItems = context.getApi().listEntities(filter);
+
+                // Filter out items from current user and update local cache
+                List<UnlockedItemEntity> newItemsFromOthers = new ArrayList<>();
+
+                synchronized (context.getLocalCache()) {
+                    for (UnlockedItemEntity item : newItems) {
+                        context.getLocalCache().put(item.getItemId(), item);
+
+                        if (!item.getAcquiredBy().equals(currentUser)) {
+                            newItemsFromOthers.add(item);
+                        }
+                    }
+                }
+
+                log.debug("Synced {} new items ({} from others)", newItems.size(), newItemsFromOthers.size());
+                return newItemsFromOthers;
+
+            } catch (Exception e) {
+                log.warn("Failed to sync with remote database: {}", e.getMessage());
+                // Don't throw for sync failures - just log and continue
+                return new ArrayList<>();
+            }
+        }
+    }
+}
+
+package mvdicarlo.crabmanmode.database;
+
+import java.time.OffsetDateTime;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+
+import com.google.gson.Gson;
+
+import lombok.extern.slf4j.Slf4j;
+import mvdicarlo.crabmanmode.AzureTableApi;
+import mvdicarlo.crabmanmode.UnlockedItemEntity;
+import okhttp3.OkHttpClient;
+
+/**
+ * New database repository implementation using the action queue pattern.
+ * All database operations are queued as actions and executed asynchronously.
+ * This eliminates blocking operations and race conditions.
+ */
+@Slf4j
+public class DatabaseRepository {
+    private final DatabaseActionQueue actionQueue;
+    private final DatabaseState databaseState;
+    private final Map<Integer, UnlockedItemEntity> unlockedItems = new HashMap<>();
+    private final ScheduledExecutorService scheduler;
+
+    // Pre-initialization queue for items inserted before database is ready
+    private final List<PendingInsert> preInitInsertQueue = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    // Track the periodic sync task so we can cancel it
+    private java.util.concurrent.ScheduledFuture<?> syncTask;
+
+    // Dependencies
+    private AzureTableApi api;
+    private String currentUser;
+    private Gson gson;
+    private OkHttpClient httpClient;
+
+    // Listeners
+    private final List<Consumer<List<UnlockedItemEntity>>> itemListeners = new java.util.concurrent.CopyOnWriteArrayList<>();
+
+    // Helper class for pre-initialization inserts
+    private static class PendingInsert {
+        final UnlockedItemEntity item;
+        final CompletableFuture<UnlockedItemEntity> future;
+
+        PendingInsert(UnlockedItemEntity item, CompletableFuture<UnlockedItemEntity> future) {
+            this.item = item;
+            this.future = future;
+        }
+    }
+
+    public DatabaseRepository() {
+        this.actionQueue = new DatabaseActionQueue();
+        this.databaseState = new DatabaseState();
+        this.scheduler = Executors.newScheduledThreadPool(1, r -> {
+            Thread t = new Thread(r, "DatabaseRepository-Scheduler");
+            t.setDaemon(true);
+            return t;
+        });
+
+        // Update action queue context when state changes
+        databaseState.addStateListener(this::onStateChanged);
+    }
+
+    // === Public API ===
+
+    /**
+     * Initialize the database connection
+     */
+    public CompletableFuture<Void> initialize(String sasUrl, String user) {
+        log.info("Initializing database connection for user: {}", user);
+        databaseState.setState(DatabaseState.State.INITIALIZING);
+
+        this.currentUser = user;
+        this.api = new AzureTableApi(sasUrl, gson, httpClient);
+
+        // Update action queue context
+        updateActionQueueContext();
+
+        // Load all data
+        databaseState.setState(DatabaseState.State.LOADING_DATA);
+
+        return actionQueue.submit(new DatabaseActions.LoadAllItemsAction())
+                .thenAccept(items -> {
+                    synchronized (unlockedItems) {
+                        unlockedItems.clear();
+                        unlockedItems.putAll(items);
+                    }
+                    databaseState.setState(DatabaseState.State.READY);
+                    log.info("Database initialized successfully with {} items", items.size());
+
+                    // Process any pre-initialization inserts
+                    processPendingInserts();
+
+                    // Start periodic sync
+                    startPeriodicSync();
+                })
+                .exceptionally(throwable -> {
+                    log.error("Failed to initialize database", throwable);
+                    databaseState.setState(DatabaseState.State.ERROR, throwable);
+                    return null;
+                });
+    }
+
+    /**
+     * Insert a new unlocked item
+     */
+    public CompletableFuture<UnlockedItemEntity> insertItem(UnlockedItemEntity item) {
+        log.debug("Queuing insert for item: {}", item.getItemName());
+
+        // If database is not ready, queue the insert for later processing
+        if (!databaseState.isReady()) {
+            log.debug("Database not ready, queuing insert for later: {}", item.getItemName());
+            CompletableFuture<UnlockedItemEntity> future = new CompletableFuture<>();
+            preInitInsertQueue.add(new PendingInsert(item, future));
+            return future;
+        }
+
+        // Check if the item already exists in the cache
+        synchronized (unlockedItems) {
+            if (unlockedItems.containsKey(item.getItemId())) {
+                log.debug("Item {} already exists, returning cached instance", item.getItemName());
+                return CompletableFuture.completedFuture(unlockedItems.get(item.getItemId()));
+            }
+        }
+
+        // Database is ready, process normally
+        return actionQueue.submit(new DatabaseActions.InsertItemAction(item))
+                .thenApply(insertedItem -> {
+                    // Notify listeners of new item
+                    notifyItemListeners(List.of(insertedItem));
+                    return insertedItem;
+                });
+    }
+
+    /**
+     * Delete an unlocked item
+     */
+    public CompletableFuture<Void> deleteItem(int itemId) {
+        log.debug("Queuing delete for item ID: {}", itemId);
+
+        return actionQueue.submit(new DatabaseActions.DeleteItemAction(itemId));
+    }
+
+    /**
+     * Get current unlocked items (thread-safe snapshot)
+     */
+    public Map<Integer, UnlockedItemEntity> getUnlockedItems() {
+        synchronized (unlockedItems) {
+            return new HashMap<>(unlockedItems);
+        }
+    }
+
+    /**
+     * Get current database state
+     */
+    public DatabaseState.State getState() {
+        return databaseState.getCurrentState();
+    }
+
+    /**
+     * Check if database is ready for operations
+     */
+    public boolean isReady() {
+        return databaseState.isReady();
+    }
+
+    public boolean hasItem(int itemId) {
+        synchronized (unlockedItems) {
+            return unlockedItems.containsKey(itemId);
+        }
+    }
+
+    /**
+     * Add listener for new items
+     */
+    public void addItemListener(Consumer<List<UnlockedItemEntity>> listener) {
+        itemListeners.add(listener);
+    }
+
+    /**
+     * Add listener for state changes
+     */
+    public void addStateListener(Consumer<DatabaseState.State> listener) {
+        databaseState.addStateListener(listener);
+    }
+
+    /**
+     * Create a new unlocked item entity
+     */
+    public UnlockedItemEntity createNewItem(Integer itemId, String itemName) {
+        return new UnlockedItemEntity(itemName, itemId, currentUser);
+    }
+
+    /**
+     * Close the repository and clean up resources.
+     * This clears the queue and cached data but keeps the repository reusable.
+     */
+    public void close() {
+        log.info("Closing database repository");
+
+        databaseState.reset();
+        actionQueue.clear();
+
+        // Cancel the periodic sync task if it exists
+        if (syncTask != null && !syncTask.isCancelled()) {
+            log.debug("Cancelling periodic sync task");
+            syncTask.cancel(false); // Don't interrupt if currently running
+            syncTask = null;
+        }
+
+        synchronized (unlockedItems) {
+            unlockedItems.clear();
+        }
+
+        // Cancel any pending inserts
+        for (PendingInsert pending : preInitInsertQueue) {
+            pending.future.completeExceptionally(new IllegalStateException("Repository closed"));
+        }
+        preInitInsertQueue.clear();
+
+        api = null;
+        currentUser = null;
+    }
+
+    // === Configuration ===
+
+    public void setGson(Gson gson) {
+        this.gson = gson;
+    }
+
+    public void setHttpClient(OkHttpClient httpClient) {
+        this.httpClient = httpClient;
+    }
+
+    public String getCurrentUser() {
+        return currentUser != null ? currentUser : "";
+    }
+
+    // === Private Methods ===
+
+    private void onStateChanged(DatabaseState.State newState) {
+        updateActionQueueContext();
+    }
+
+    private void updateActionQueueContext() {
+        ActionExecutionContext context = new ActionExecutionContext(
+                api,
+                unlockedItems,
+                currentUser,
+                databaseState.isReady());
+
+        actionQueue.updateExecutionContext(context);
+    }
+
+    /**
+     * Process any inserts that were queued before database initialization
+     */
+    private void processPendingInserts() {
+        if (preInitInsertQueue.isEmpty()) {
+            return;
+        }
+
+        log.info("Processing {} pending inserts from before initialization", preInitInsertQueue.size());
+
+        // Process all pending inserts
+        for (PendingInsert pending : preInitInsertQueue) {
+            try {
+                // Check if the item is already in the cache
+                synchronized (unlockedItems) {
+                    if (unlockedItems.containsKey(pending.item.getItemId())) {
+                        log.debug("Item {} already exists, skipping insert", pending.item.getItemName());
+                        pending.future.complete(unlockedItems.get(pending.item.getItemId()));
+                        continue;
+                    }
+                }
+
+                // Now submit to the action queue with the properly initialized cache
+                actionQueue.submit(new DatabaseActions.InsertItemAction(pending.item))
+                        .thenApply(insertedItem -> {
+                            // Notify listeners of new item
+                            notifyItemListeners(List.of(insertedItem));
+                            return insertedItem;
+                        })
+                        .whenComplete((result, throwable) -> {
+                            if (throwable != null) {
+                                pending.future.completeExceptionally(throwable);
+                            } else {
+                                pending.future.complete(result);
+                            }
+                        });
+            } catch (Exception e) {
+                log.error("Failed to process pending insert for item: {}", pending.item.getItemName(), e);
+                pending.future.completeExceptionally(e);
+            }
+        }
+
+        // Clear the queue
+        preInitInsertQueue.clear();
+    }
+
+    private void startPeriodicSync() {
+        syncTask = scheduler.scheduleAtFixedRate(() -> {
+            if (databaseState.isReady()) {
+                performSync();
+            }
+        }, 5, 5, TimeUnit.MINUTES);
+    }
+
+    private void performSync() {
+        OffsetDateTime lastSync = getLastSyncTime();
+
+        actionQueue.submit(new DatabaseActions.SyncAction(lastSync, currentUser))
+                .thenAccept(newItemsFromOthers -> {
+                    if (!newItemsFromOthers.isEmpty()) {
+                        log.debug("Synced {} new items from other users", newItemsFromOthers.size());
+                        notifyItemListeners(newItemsFromOthers);
+                    }
+                })
+                .exceptionally(throwable -> {
+                    log.warn("Sync failed: {}", throwable.getMessage());
+                    return null;
+                });
+    }
+
+    private OffsetDateTime getLastSyncTime() {
+        synchronized (unlockedItems) {
+            return unlockedItems.values().stream()
+                    .map(UnlockedItemEntity::getAcquiredOn)
+                    .max(OffsetDateTime::compareTo)
+                    .orElse(OffsetDateTime.now().minusMinutes(10));
+        }
+    }
+
+    private void notifyItemListeners(List<UnlockedItemEntity> newItems) {
+        for (Consumer<List<UnlockedItemEntity>> listener : itemListeners) {
+            try {
+                listener.accept(newItems);
+            } catch (Exception e) {
+                log.error("Error notifying item listener", e);
+            }
+        }
+    }
+}
+
+package mvdicarlo.crabmanmode.database;
+
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Consumer;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+
+import lombok.extern.slf4j.Slf4j;
+
+/**
+ * Manages the state of the database connection and loading process.
+ * Provides thread-safe state transitions and notifications.
+ */
+@Slf4j
+public class DatabaseState {
+
+    public enum State {
+        NOT_INITIALIZED("Not initialized"),
+        INITIALIZING("Connecting to database..."),
+        LOADING_DATA("Loading unlocked items..."),
+        READY("Ready"),
+        ERROR("Connection failed");
+
+        private final String displayName;
+
+        State(String displayName) {
+            this.displayName = displayName;
+        }
+
+        public String getDisplayName() {
+            return displayName;
+        }
+
+        public boolean isReady() {
+            return this == READY;
+        }
+
+        public boolean canAcceptActions() {
+            return this != NOT_INITIALIZED && this != ERROR;
+        }
+    }
+
+    private final AtomicReference<State> currentState = new AtomicReference<>(State.NOT_INITIALIZED);
+    private final List<Consumer<State>> stateListeners = new CopyOnWriteArrayList<>();
+    private volatile Throwable lastError;
+
+    /**
+     * Get the current state
+     */
+    public State getCurrentState() {
+        return currentState.get();
+    }
+
+    /**
+     * Check if the database is ready for operations
+     */
+    public boolean isReady() {
+        return currentState.get().isReady();
+    }
+
+    /**
+     * Check if the database can accept new actions
+     */
+    public boolean canAcceptActions() {
+        return currentState.get().canAcceptActions();
+    }
+
+    /**
+     * Get the last error that occurred (if any)
+     */
+    public Throwable getLastError() {
+        return lastError;
+    }
+
+    /**
+     * Transition to a new state
+     */
+    public void setState(State newState) {
+        setState(newState, null);
+    }
+
+    /**
+     * Transition to a new state with an optional error
+     */
+    public void setState(State newState, Throwable error) {
+        State oldState = currentState.getAndSet(newState);
+
+        if (error != null) {
+            this.lastError = error;
+        } else if (newState != State.ERROR) {
+            // Clear error on successful state transitions
+            this.lastError = null;
+        }
+
+        if (oldState != newState) {
+            log.debug("Database state changed: {} -> {}", oldState, newState);
+            notifyListeners(newState);
+        }
+    }
+
+    /**
+     * Add a listener for state changes
+     */
+    public void addStateListener(Consumer<State> listener) {
+        stateListeners.add(listener);
+        // Immediately notify of current state
+        listener.accept(currentState.get());
+    }
+
+    /**
+     * Remove a state listener
+     */
+    public void removeStateListener(Consumer<State> listener) {
+        stateListeners.remove(listener);
+    }
+
+    /**
+     * Reset to initial state
+     */
+    public void reset() {
+        setState(State.NOT_INITIALIZED);
+        this.lastError = null;
+    }
+
+    private void notifyListeners(State newState) {
+        for (Consumer<State> listener : stateListeners) {
+            try {
+                listener.accept(newState);
+            } catch (Exception e) {
+                log.error("Error notifying state listener", e);
+            }
+        }
+    }
+}
+
+package mvdicarlo.crabmanmode;
+
+import java.time.OffsetDateTime;
+import net.runelite.client.util.AsyncBufferedImage;
+
+public class ItemObject {
+    int id;
+    String name;
+    boolean tradeable;
+    OffsetDateTime acquiredOn;
+    AsyncBufferedImage icon;
+
+    public ItemObject(int id, String name, boolean tradeable, OffsetDateTime acquiredOn, AsyncBufferedImage icon) {
+        this.id = id;
+        this.name = name;
+        this.tradeable = tradeable;
+        this.acquiredOn = acquiredOn;
+        this.icon = icon;
+    }
+
+    public int getId() {
+        return id;
+    }
+
+    public String getName() {
+        return name;
+    }
+
+    public boolean isTradeable() {
+        return tradeable;
+    }
+
+    public OffsetDateTime getAcquiredOn() {
+        return acquiredOn;
+    }
+
+    public AsyncBufferedImage getIcon() {
+        return icon;
+    }
+}
+
 package mvdicarlo.crabmanmode;
 
 public enum SortOption {
@@ -2594,105 +2631,68 @@ public enum SortOption {
         return displayName;
     }
 }
-/*
- * Copyright (c) 2019, CodePanter <https://github.com/codepanter>
- * All rights reserved.
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice, this
- *    list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- *    this list of conditions and the following disclaimer in the documentation
- *    and/or other materials provided with the distribution.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
- * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR
- * ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
- * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
- * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
- * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
- * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
- * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
 package mvdicarlo.crabmanmode;
 
-import java.awt.Dimension;
-import java.awt.Graphics2D;
-import java.util.ArrayList;
-import java.util.List;
+import java.time.OffsetDateTime;
+import java.util.HashMap;
+import java.util.Map;
 
-import javax.inject.Inject;
+public class UnlockedItemEntity {
+    public final static String PartitionKey = "UnlockedItem";
+    private String itemName;
+    private Integer itemId;
+    private String acquiredBy;
+    private OffsetDateTime acquiredOn;
 
-import lombok.extern.slf4j.Slf4j;
-import net.runelite.api.Client;
-import net.runelite.api.GameState;
-import net.runelite.client.game.ItemManager;
-import net.runelite.client.ui.overlay.Overlay;
-import net.runelite.client.ui.overlay.OverlayPosition;
-
-@Slf4j
-public class CrabmanModeOverlay extends Overlay {
-
-    private final Client client;
-    private final CrabmanModePlugin plugin;
-
-    private Integer currentUnlock;
-    private long displayTime;
-    private int displayY;
-
-    private final List<Integer> itemUnlockList;
-
-    @Inject
-    private ItemManager itemManager;
-
-    @Inject
-    public CrabmanModeOverlay(Client client, CrabmanModePlugin plugin) {
-        super(plugin);
-        this.client = client;
-        this.plugin = plugin;
-        this.itemUnlockList = new ArrayList<>();
-        setPosition(OverlayPosition.TOP_CENTER);
+    public UnlockedItemEntity(String itemName, Integer itemId, String acquiredBy, OffsetDateTime acquiredOn) {
+        this.itemName = itemName;
+        this.itemId = itemId;
+        this.acquiredBy = acquiredBy;
+        this.acquiredOn = acquiredOn;
     }
 
-    public void addItemUnlock(int itemId) {
-        if (!itemUnlockList.contains(itemId))
-            itemUnlockList.add(itemId);
+    public UnlockedItemEntity(String itemName, Integer itemId, String acquiredBy) {
+        this(itemName, itemId, acquiredBy, OffsetDateTime.now());
     }
 
-    @Override
-    public Dimension render(Graphics2D graphics) {
-        if (client.getGameState() != GameState.LOGGED_IN || itemUnlockList.isEmpty()) {
-            return null;
-        }
-        if (itemManager == null) {
-            return null;
-        }
-        if (currentUnlock == null) {
-            currentUnlock = itemUnlockList.get(0);
-            displayTime = System.currentTimeMillis();
-            displayY = -20;
-            return null;
-        }
+    public Integer getItemId() {
+        return itemId;
+    }
 
-        // Drawing unlock pop-up at the top of the screen.
-        graphics.drawImage(plugin.getUnlockImage(), -62, displayY, null);
-        graphics.drawImage(itemManager.getImage(currentUnlock, 1, false), -50, displayY + 7, null);
-        if (displayY < 10) {
-            displayY = displayY + 1;
-        }
+    public String getAcquiredBy() {
+        return acquiredBy;
+    }
 
-        if (System.currentTimeMillis() > displayTime + (5000)) {
-            itemUnlockList.remove(currentUnlock);
-            currentUnlock = null;
-        }
-        return null;
+    public String setAcquiredBy(String acquiredBy) {
+        return this.acquiredBy = acquiredBy;
+    }
+
+    public String getItemName() {
+        return itemName;
+    }
+
+    public OffsetDateTime getAcquiredOn() {
+        return acquiredOn;
+    }
+
+    public Map<String, Object> toMap() {
+        Map<String, Object> map = new HashMap<>();
+        map.put("PartitionKey", PartitionKey);
+        map.put("RowKey", itemId.toString());
+        map.put("ItemName", itemName);
+        map.put("AcquiredBy", acquiredBy);
+        // map.put("Timestamp", acquiredOn.toString()); // Fine to allow null
+        return map;
+    }
+
+    public static UnlockedItemEntity fromMap(Map<String, Object> map) {
+        String itemName = (String) map.get("ItemName");
+        Integer itemId = Integer.parseInt((String) map.get("RowKey"));
+        String acquiredBy = (String) map.get("AcquiredBy");
+        OffsetDateTime acquiredOn = OffsetDateTime.parse((String) map.get("Timestamp"));
+        return new UnlockedItemEntity(itemName, itemId, acquiredBy, acquiredOn);
     }
 }
-
 package mvdicarlo.crabmanmode;
 
 import net.runelite.client.RuneLite;
