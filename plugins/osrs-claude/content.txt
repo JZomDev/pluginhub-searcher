@@ -1,0 +1,681 @@
+package com.zodomo.osrsclaude;
+
+import com.google.gson.Gson;
+import com.google.gson.JsonArray;
+import com.google.gson.JsonObject;
+import com.google.inject.Provides;
+import lombok.extern.slf4j.Slf4j;
+import net.runelite.api.ChatMessageType;
+import net.runelite.api.Client;
+import net.runelite.api.InventoryID;
+import net.runelite.api.Item;
+import net.runelite.api.ItemComposition;
+import net.runelite.api.ItemContainer;
+import net.runelite.api.Player;
+import net.runelite.api.Quest;
+import net.runelite.api.QuestState;
+import net.runelite.api.Skill;
+import net.runelite.api.coords.WorldPoint;
+import net.runelite.api.events.CommandExecuted;
+import net.runelite.client.game.ItemManager;
+import net.runelite.client.chat.ChatColorType;
+import net.runelite.client.chat.ChatMessageBuilder;
+import net.runelite.client.chat.ChatMessageManager;
+import net.runelite.client.chat.QueuedMessage;
+import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
+import net.runelite.client.eventbus.Subscribe;
+import net.runelite.client.plugins.Plugin;
+import net.runelite.client.plugins.PluginDescriptor;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
+import okhttp3.ResponseBody;
+
+import javax.inject.Inject;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+@Slf4j
+@PluginDescriptor(
+	name = "Claude Chat",
+	description = "Chat with Claude AI in-game using ::claude commands",
+	tags = {"claude", "ai", "chat", "anthropic"}
+)
+public class OsrsClaudePlugin extends Plugin
+{
+	private static final String COMMAND_NAME = "claude";
+	private static final String API_URL = "https://api.anthropic.com/v1/messages";
+	private static final MediaType JSON = MediaType.get("application/json; charset=utf-8");
+	private static final int MAX_CHARS_PER_MESSAGE = 200;
+
+	@Inject
+	private Client client;
+
+	@Inject
+	private ClientThread clientThread;
+
+	@Inject
+	private OsrsClaudeConfig config;
+
+	@Inject
+	private ChatMessageManager chatMessageManager;
+
+	@Inject
+	private ItemManager itemManager;
+
+	@Inject
+	private Gson gson;
+
+	@Inject
+	private OkHttpClient httpClient;
+
+	@Override
+	protected void startUp() throws Exception
+	{
+		log.info("Claude Chat plugin started");
+	}
+
+	@Override
+	protected void shutDown() throws Exception
+	{
+		log.info("Claude Chat plugin stopped");
+	}
+
+	@Subscribe
+	public void onCommandExecuted(CommandExecuted event)
+	{
+		if (!event.getCommand().equalsIgnoreCase(COMMAND_NAME))
+		{
+			return;
+		}
+
+		String[] args = event.getArguments();
+		if (args == null || args.length == 0)
+		{
+			sendChatMessage("Please provide a prompt after ::claude");
+			return;
+		}
+
+		String prompt = String.join(" ", args);
+
+		String apiKey = config.apiKey();
+		if (apiKey == null || apiKey.isEmpty())
+		{
+			sendChatMessage("Please set your Claude API key in the plugin settings");
+			return;
+		}
+
+		sendChatMessage("Asking Claude...");
+
+		// Defer API call to avoid script reentrance - Quest.getState() runs scripts
+		clientThread.invokeLater(() -> callClaudeApi(prompt));
+	}
+
+	private void callClaudeApi(String userPrompt)
+	{
+		int maxChars = MAX_CHARS_PER_MESSAGE * config.batchNumber();
+		String systemPrompt = buildSystemPrompt(maxChars);
+
+		JsonObject requestBody = new JsonObject();
+		requestBody.addProperty("model", config.model().getModelId());
+		requestBody.addProperty("max_tokens", 1024);
+		requestBody.addProperty("system", systemPrompt);
+
+		JsonArray messages = new JsonArray();
+		JsonObject userMessage = new JsonObject();
+		userMessage.addProperty("role", "user");
+		userMessage.addProperty("content", userPrompt);
+		messages.add(userMessage);
+		requestBody.add("messages", messages);
+
+		Request request = new Request.Builder()
+			.url(API_URL)
+			.header("Content-Type", "application/json")
+			.header("x-api-key", config.apiKey())
+			.header("anthropic-version", "2023-06-01")
+			.post(RequestBody.create(JSON, gson.toJson(requestBody)))
+			.build();
+
+		httpClient.newCall(request).enqueue(new Callback()
+		{
+			@Override
+			public void onFailure(Call call, IOException e)
+			{
+				log.error("Claude API call failed", e);
+				sendChatMessage("Error: Failed to reach Claude API");
+			}
+
+			@Override
+			public void onResponse(Call call, Response response) throws IOException
+			{
+				try (ResponseBody body = response.body())
+				{
+					if (!response.isSuccessful())
+					{
+						String errorBody = body != null ? body.string() : "Unknown error";
+						log.error("Claude API error {}: {}", response.code(), errorBody);
+						sendChatMessage("Error: Claude API returned " + response.code());
+						return;
+					}
+
+					if (body == null)
+					{
+						sendChatMessage("Error: Empty response from Claude");
+						return;
+					}
+
+					String responseJson = body.string();
+					String claudeResponse = parseClaudeResponse(responseJson);
+
+					if (claudeResponse != null && !claudeResponse.isEmpty())
+					{
+						displayResponse(claudeResponse);
+					}
+					else
+					{
+						sendChatMessage("Error: Could not parse Claude's response");
+					}
+				}
+			}
+		});
+	}
+
+	private String buildSystemPrompt(int maxChars)
+	{
+		String playerName = getPlayerName();
+		String skillBreakdown = getSkillBreakdown();
+		String completedQuests = getQuestsByState(QuestState.FINISHED);
+		String inProgressQuests = getQuestsByState(QuestState.IN_PROGRESS);
+		String inventoryItems = getInventoryItems();
+		String equippedItems = getEquippedItems();
+		String location = getPlayerLocation();
+
+		StringBuilder sb = new StringBuilder();
+		sb.append("You are Claude, an AI assistant responding to ").append(playerName).append(" in Old School RuneScape. ");
+		sb.append("Here is ").append(playerName).append("'s skill level breakdown: ").append(skillBreakdown).append(". ");
+		sb.append("Completed quests: ").append(completedQuests.isEmpty() ? "None" : completedQuests).append(". ");
+		sb.append("Quests in progress: ").append(inProgressQuests.isEmpty() ? "None" : inProgressQuests).append(". ");
+		sb.append("Inventory items: ").append(inventoryItems.isEmpty() ? "Empty" : inventoryItems).append(". ");
+		sb.append("Equipped items: ").append(equippedItems.isEmpty() ? "Nothing" : equippedItems).append(". ");
+		sb.append("Location: ").append(location).append(". ");
+		sb.append("You MUST keep your response under ").append(maxChars).append(" characters total. ");
+		sb.append("Be concise, helpful, and friendly. ");
+		sb.append("Do not use special formatting, markdown, or line breaks. ");
+		sb.append("Respond in plain text only.");
+
+		return sb.toString();
+	}
+
+	private String getPlayerName()
+	{
+		Player localPlayer = client.getLocalPlayer();
+		if (localPlayer != null && localPlayer.getName() != null)
+		{
+			return localPlayer.getName();
+		}
+		return "a player";
+	}
+
+	private String getSkillBreakdown()
+	{
+		StringBuilder sb = new StringBuilder();
+		Skill[] skills = {
+			Skill.ATTACK, Skill.STRENGTH, Skill.DEFENCE, Skill.RANGED, Skill.PRAYER,
+			Skill.MAGIC, Skill.RUNECRAFT, Skill.HITPOINTS, Skill.CRAFTING, Skill.MINING,
+			Skill.SMITHING, Skill.FISHING, Skill.COOKING, Skill.FIREMAKING, Skill.WOODCUTTING,
+			Skill.AGILITY, Skill.HERBLORE, Skill.THIEVING, Skill.FLETCHING, Skill.SLAYER,
+			Skill.FARMING, Skill.CONSTRUCTION, Skill.HUNTER, Skill.SAILING
+		};
+
+		for (int i = 0; i < skills.length; i++)
+		{
+			Skill skill = skills[i];
+			int level = client.getRealSkillLevel(skill);
+			int xp = client.getSkillExperience(skill);
+			String formattedXp = String.format("%,d", xp);
+			sb.append(formatSkillName(skill.getName())).append(" - ").append(level)
+				.append(" (").append(formattedXp).append(" XP)");
+			if (i < skills.length - 1)
+			{
+				sb.append(", ");
+			}
+		}
+
+		return sb.toString();
+	}
+
+	private String formatSkillName(String name)
+	{
+		if (name == null || name.isEmpty())
+		{
+			return name;
+		}
+		return name.substring(0, 1).toUpperCase() + name.substring(1).toLowerCase();
+	}
+
+	private String getQuestsByState(QuestState targetState)
+	{
+		List<String> quests = new ArrayList<>();
+		for (Quest quest : Quest.values())
+		{
+			try
+			{
+				QuestState state = quest.getState(client);
+				if (state == targetState)
+				{
+					quests.add(quest.getName());
+				}
+			}
+			catch (Exception e)
+			{
+				log.debug("Could not get state for quest: {}", quest.getName());
+			}
+		}
+		return String.join(", ", quests);
+	}
+
+	private String getInventoryItems()
+	{
+		ItemContainer inventory = client.getItemContainer(InventoryID.INVENTORY);
+		if (inventory == null)
+		{
+			return "";
+		}
+
+		List<String> items = new ArrayList<>();
+		for (Item item : inventory.getItems())
+		{
+			if (item.getId() != -1 && item.getQuantity() > 0)
+			{
+				String itemName = getItemName(item.getId());
+				if (itemName != null && !itemName.isEmpty())
+				{
+					if (item.getQuantity() > 1)
+					{
+						items.add(itemName + " x" + item.getQuantity());
+					}
+					else
+					{
+						items.add(itemName);
+					}
+				}
+			}
+		}
+		return String.join(", ", items);
+	}
+
+	private String getEquippedItems()
+	{
+		ItemContainer equipment = client.getItemContainer(InventoryID.EQUIPMENT);
+		if (equipment == null)
+		{
+			return "";
+		}
+
+		List<String> items = new ArrayList<>();
+		for (Item item : equipment.getItems())
+		{
+			if (item.getId() != -1 && item.getQuantity() > 0)
+			{
+				String itemName = getItemName(item.getId());
+				if (itemName != null && !itemName.isEmpty())
+				{
+					items.add(itemName);
+				}
+			}
+		}
+		return String.join(", ", items);
+	}
+
+	private String getItemName(int itemId)
+	{
+		try
+		{
+			ItemComposition composition = itemManager.getItemComposition(itemId);
+			if (composition != null)
+			{
+				return composition.getName();
+			}
+		}
+		catch (Exception e)
+		{
+			log.debug("Could not get name for item ID: {}", itemId);
+		}
+		return null;
+	}
+
+	private String getPlayerLocation()
+	{
+		Player localPlayer = client.getLocalPlayer();
+		if (localPlayer == null)
+		{
+			return "Unknown";
+		}
+
+		WorldPoint location = localPlayer.getWorldLocation();
+		if (location == null)
+		{
+			return "Unknown";
+		}
+
+		int x = location.getX();
+		int y = location.getY();
+		int plane = location.getPlane();
+		int regionId = location.getRegionID();
+
+		String areaName = getAreaName(regionId);
+		String coords = "(" + x + ", " + y + ", " + plane + ")";
+
+		if (areaName != null)
+		{
+			return areaName + " " + coords;
+		}
+		return "Region " + regionId + " " + coords;
+	}
+
+	private String getAreaName(int regionId)
+	{
+		Map<Integer, String> regionNames = new HashMap<>();
+
+		// Major Cities
+		regionNames.put(12850, "Lumbridge");
+		regionNames.put(12851, "Lumbridge");
+		regionNames.put(12593, "Lumbridge Swamp");
+		regionNames.put(12849, "Lumbridge");
+		regionNames.put(12853, "Varrock");
+		regionNames.put(12854, "Varrock");
+		regionNames.put(12597, "Varrock");
+		regionNames.put(12598, "Varrock");
+		regionNames.put(12852, "Varrock");
+		regionNames.put(11828, "Falador");
+		regionNames.put(11827, "Falador");
+		regionNames.put(11829, "Falador");
+		regionNames.put(12084, "Falador");
+		regionNames.put(10806, "Camelot");
+		regionNames.put(10807, "Camelot");
+		regionNames.put(10805, "Seers' Village");
+		regionNames.put(10549, "Catherby");
+		regionNames.put(10548, "Catherby");
+		regionNames.put(10804, "Ranging Guild");
+		regionNames.put(11310, "Ardougne");
+		regionNames.put(10547, "Ardougne");
+		regionNames.put(10290, "Ardougne");
+		regionNames.put(10291, "Ardougne");
+		regionNames.put(10292, "Yanille");
+		regionNames.put(10032, "Yanille");
+		regionNames.put(11571, "Burthorpe");
+		regionNames.put(11319, "Taverley");
+		regionNames.put(11575, "Warriors' Guild");
+
+		// Wilderness & PvP
+		regionNames.put(12342, "Edgeville");
+		regionNames.put(12341, "Edgeville");
+		regionNames.put(12343, "Barbarian Village");
+		regionNames.put(12088, "Draynor Village");
+		regionNames.put(12338, "Draynor Village");
+		regionNames.put(12089, "Draynor Manor");
+		regionNames.put(12603, "Wilderness");
+		regionNames.put(12604, "Wilderness");
+		regionNames.put(12605, "Wilderness");
+		regionNames.put(12859, "Wilderness");
+		regionNames.put(12860, "Wilderness");
+		regionNames.put(13115, "Wilderness");
+		regionNames.put(13116, "Wilderness");
+		regionNames.put(13117, "Wilderness");
+		regionNames.put(13371, "Wilderness");
+		regionNames.put(13372, "Wilderness");
+		regionNames.put(13373, "Wilderness");
+
+		// Desert & Al Kharid
+		regionNames.put(13105, "Al Kharid");
+		regionNames.put(13106, "Al Kharid");
+		regionNames.put(13361, "Shantay Pass");
+		regionNames.put(13107, "Duel Arena");
+		regionNames.put(12848, "Al Kharid Mine");
+
+		// Gnome Areas
+		regionNames.put(9781, "Tree Gnome Stronghold");
+		regionNames.put(9782, "Tree Gnome Stronghold");
+		regionNames.put(9525, "Tree Gnome Village");
+
+		// Morytania
+		regionNames.put(13622, "Canifis");
+		regionNames.put(13878, "Port Phasmatys");
+		regionNames.put(14646, "Barrows");
+		regionNames.put(14647, "Barrows");
+		regionNames.put(13875, "Slayer Tower");
+
+		// Kandarin
+		regionNames.put(10293, "Fight Caves");
+		regionNames.put(11062, "Fishing Guild");
+		regionNames.put(10294, "Port Khazard");
+
+		// Fremennik
+		regionNames.put(10553, "Rellekka");
+		regionNames.put(10297, "Rellekka");
+		regionNames.put(9275, "Waterbirth Island");
+
+		// Zeah (Kourend)
+		regionNames.put(6457, "Hosidius");
+		regionNames.put(6713, "Hosidius");
+		regionNames.put(6972, "Shayzien");
+		regionNames.put(7228, "Lovakengj");
+		regionNames.put(6459, "Port Piscarilius");
+		regionNames.put(6715, "Port Piscarilius");
+		regionNames.put(6971, "Arceuus");
+		regionNames.put(7227, "Arceuus");
+
+		// Dungeons
+		regionNames.put(12698, "Stronghold of Security");
+		regionNames.put(12954, "Stronghold of Security");
+		regionNames.put(11416, "Taverley Dungeon");
+		regionNames.put(11417, "Taverley Dungeon");
+		regionNames.put(11672, "Taverley Dungeon");
+		regionNames.put(11673, "Taverley Dungeon");
+		regionNames.put(12693, "Edgeville Dungeon");
+		regionNames.put(10388, "Brimhaven Dungeon");
+		regionNames.put(10644, "Brimhaven Dungeon");
+
+		// Islands
+		regionNames.put(11057, "Entrana");
+		regionNames.put(10537, "Karamja");
+		regionNames.put(10536, "Karamja");
+		regionNames.put(11054, "Crandor");
+		regionNames.put(14638, "Mos Le'Harmless");
+
+		// Banks
+		regionNames.put(12596, "Grand Exchange");
+
+		// Tutorial Island
+		regionNames.put(12336, "Tutorial Island");
+		regionNames.put(12335, "Tutorial Island");
+		regionNames.put(12592, "Tutorial Island");
+
+		return regionNames.get(regionId);
+	}
+
+	private String parseClaudeResponse(String json)
+	{
+		try
+		{
+			JsonObject response = gson.fromJson(json, JsonObject.class);
+			JsonArray content = response.getAsJsonArray("content");
+			if (content != null && content.size() > 0)
+			{
+				JsonObject firstBlock = content.get(0).getAsJsonObject();
+				if ("text".equals(firstBlock.get("type").getAsString()))
+				{
+					return firstBlock.get("text").getAsString();
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			log.error("Failed to parse Claude response", e);
+		}
+		return null;
+	}
+
+	private void displayResponse(String response)
+	{
+		List<String> chunks = splitIntoChunks(response, MAX_CHARS_PER_MESSAGE);
+		int maxBatches = config.batchNumber();
+
+		for (int i = 0; i < Math.min(chunks.size(), maxBatches); i++)
+		{
+			String chunk = chunks.get(i);
+			String prefix = chunks.size() > 1 ? "[" + (i + 1) + "/" + Math.min(chunks.size(), maxBatches) + "] " : "";
+			sendChatMessage(prefix + chunk);
+		}
+
+		if (chunks.size() > maxBatches)
+		{
+			sendChatMessage("(Response truncated - increase batch number for longer responses)");
+		}
+	}
+
+	private List<String> splitIntoChunks(String text, int chunkSize)
+	{
+		List<String> chunks = new ArrayList<>();
+		int index = 0;
+
+		while (index < text.length())
+		{
+			int end = Math.min(index + chunkSize, text.length());
+
+			// Try to break at a space if we're not at the end
+			if (end < text.length())
+			{
+				int lastSpace = text.lastIndexOf(' ', end);
+				if (lastSpace > index)
+				{
+					end = lastSpace;
+				}
+			}
+
+			chunks.add(text.substring(index, end).trim());
+			index = end;
+
+			// Skip the space we broke on
+			if (index < text.length() && text.charAt(index) == ' ')
+			{
+				index++;
+			}
+		}
+
+		return chunks;
+	}
+
+	private void sendChatMessage(String message)
+	{
+		String formattedMessage = new ChatMessageBuilder()
+			.append(ChatColorType.HIGHLIGHT)
+			.append("[Claude] ")
+			.append(ChatColorType.NORMAL)
+			.append(message)
+			.build();
+
+		chatMessageManager.queue(QueuedMessage.builder()
+			.type(ChatMessageType.GAMEMESSAGE)
+			.runeLiteFormattedMessage(formattedMessage)
+			.build());
+	}
+
+	@Provides
+	OsrsClaudeConfig provideConfig(ConfigManager configManager)
+	{
+		return configManager.getConfig(OsrsClaudeConfig.class);
+	}
+}
+
+package com.zodomo.osrsclaude;
+
+import net.runelite.client.config.Config;
+import net.runelite.client.config.ConfigGroup;
+import net.runelite.client.config.ConfigItem;
+import net.runelite.client.config.Range;
+
+@ConfigGroup("osrsclaude")
+public interface OsrsClaudeConfig extends Config
+{
+	@ConfigItem(
+		keyName = "apiKey",
+		name = "Claude API Key",
+		description = "Your Anthropic API key for Claude",
+		secret = true,
+		position = 1
+	)
+	default String apiKey()
+	{
+		return "";
+	}
+
+	@ConfigItem(
+		keyName = "batchNumber",
+		name = "Response Batches",
+		description = "Number of 200-character message batches for responses (max chars = 200 * this value)",
+		position = 2
+	)
+	@Range(min = 1, max = 10)
+	default int batchNumber()
+	{
+		return 3;
+	}
+
+	@ConfigItem(
+		keyName = "model",
+		name = "Model",
+		description = "Which Claude model to use",
+		position = 3
+	)
+	default ClaudeModel model()
+	{
+		return ClaudeModel.HAIKU;
+	}
+}
+
+package com.zodomo.osrsclaude;
+
+import lombok.Getter;
+import lombok.RequiredArgsConstructor;
+
+@Getter
+@RequiredArgsConstructor
+public enum ClaudeModel
+{
+	HAIKU("claude-haiku-4-5-20251001", "Haiku 4.5"),
+	SONNET("claude-sonnet-4-5-20250929", "Sonnet 4.5"),
+	OPUS("claude-opus-4-5-20251124", "Opus 4.5");
+
+	private final String modelId;
+	private final String displayName;
+
+	@Override
+	public String toString()
+	{
+		return displayName;
+	}
+}
+
+package com.zodomo.osrsclaude;
+
+import net.runelite.client.RuneLite;
+import net.runelite.client.externalplugins.ExternalPluginManager;
+
+public class OsrsClaudePluginTest
+{
+	public static void main(String[] args) throws Exception
+	{
+		ExternalPluginManager.loadBuiltin(OsrsClaudePlugin.class);
+		RuneLite.main(args);
+	}
+}
+
