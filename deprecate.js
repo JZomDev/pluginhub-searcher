@@ -20,17 +20,28 @@ const installs = (async() => {
 })();
 let fileContent = new Map();
 async function readPluginApi(manifest) {
-	fileContent.set(manifest.internalName, [])
-
 	let text = [];
 
-	let result = await getConent('JZomDev', 'pluginhub-searcher', manifest.internalName);
-		
-	for (let i = 0; i < fileContent.get(manifest.internalName).length; i++)
-	{
-		text = text.concat(fileContent.get(manifest.internalName)[i].split("\n"));
+	await getConent('JZomDev', 'pluginhub-searcher', manifest.internalName);
+	const files = fileContent.get(manifest.internalName) || [];
+	const lines = [];
+	for (let f of files) {
+		let filePath = null;
+		let content = "";
+		if (!f) continue;
+		if (typeof f === "string") {
+			filePath = f;
+			content = "";
+		} else {
+			filePath = f.filePath || f.fileName || null;
+			content = f.content || "";
+		}
+		const parts = content.split("\n");
+		for (let i = 0; i < parts.length; i++) {
+			lines.push({text: parts[i], file: filePath, line: i + 1});
+		}
 	}
-	return text;
+	return lines;
 }
 
 async function getConent(user, repo, internalName, files) {
@@ -38,17 +49,57 @@ async function getConent(user, repo, internalName, files) {
     if (!getConent._bundlePromise) {
         getConent._bundlePromise = (async () => {
             try {
-                const res = await fetch("plugins/plugins.json");
-                if (!res.ok) {
-                    getConent._bundle = {};
-                    return;
-                }
-                const arr = await res.json();
-                const map = Object.create(null);
-                for (const p of arr) {
-                    if (!p || !p.internalName) continue;
-                    map[p.internalName] = p.content ? [p.content] : [];
-                }
+				// support split plugin lists: plugins/plugins_splits.json
+				// which contains an array of filenames (e.g. ["plugins_0.json", ...])
+				let arr = null;
+				try {
+					const splitsRes = await fetch("plugins/plugins_splits.json");
+					if (splitsRes.ok) {
+						const splits = await splitsRes.json();
+						arr = [];
+						for (const name of splits) {
+							if (!name) continue;
+							try {
+								const partRes = await fetch(`plugins/${name}`);
+								if (!partRes.ok) continue;
+								const part = await partRes.json();
+								if (Array.isArray(part)) arr.push(...part);
+							} catch (e) {
+								// ignore individual part failures
+							}
+						}
+					}
+				} catch (e) {
+					// fall through to single-file fallback
+				}
+
+				if (arr === null) {
+					const res = await fetch("plugins/plugins.json");
+					if (!res.ok) {
+						getConent._bundle = {};
+						return;
+					}
+					arr = await res.json();
+				}
+				const map = Object.create(null);
+				for (const p of arr) {
+					if (!p || !p.internalName) continue;
+					const contents = [];
+					if (p.content) {
+						contents.push({filePath: null, content: p.content});
+					}
+					if (Array.isArray(p.files)) {
+						for (const f of p.files) {
+							if (!f) continue;
+							if (typeof f === "string") {
+								contents.push({filePath: f, content: null});
+							} else {
+								contents.push({filePath: f.filePath || f.fileName || null, content: f.content || null});
+							}
+						}
+					}
+					map[p.internalName] = contents;
+				}
                 getConent._bundle = map;
             } catch (e) {
                 getConent._bundle = {};
@@ -79,22 +130,32 @@ async function amap(limit, array, asyncMapper) {
 }
 
 const byUsage = (async() => {
+	const symbolLocations = new Map();
 	let out = new Map();
 	await amap(64, (await manifest).jars, async (plugin) => {
 		let api = await readPluginApi(plugin);
-		for (let k of api) {
+		for (let lineObj of api) {
+			let k = lineObj.text;
 			if (k == "") {
-				continue
+				continue;
 			}
 			let ps = out.get(k);
 			if (!ps) {
 				out.set(k, ps = [])
 			}
 			ps.push(plugin.internalName);
+
+			let locs = symbolLocations.get(k);
+			if (!locs) {
+				symbolLocations.set(k, locs = []);
+			}
+			locs.push({plugin: plugin.internalName, file: lineObj.file, line: lineObj.line});
 		}
 	});
 	let es = [...out.entries()];
 	es.sort(([a], [b]) => a.localeCompare(b));
+	// expose symbolLocations for later use in UI
+	es.symbolLocations = symbolLocations;
 	return es
 })();
 
@@ -117,6 +178,8 @@ class AutoMap extends Map {
 	let mf = await manifest;
 
 	let usages = await byUsage;
+	// symbolLocations stored on the byUsage result
+	let symbolLocations = usages.symbolLocations || new Map();
 	let installMap = await installs;
 	const differenceInMs = new Date() - sd;
 
@@ -190,7 +253,7 @@ class AutoMap extends Map {
 					for (let [sym, plugins] of usages) {
 						let match = re.exec(sym);
 						if (match) {
-							symbols.push(sym + " --- " + plugins[0]);
+							symbols.push({text: sym, plugin: plugins[0]});
 							for (let plugin of plugins) {
 								allMatches.add(plugin)
 							}
@@ -239,6 +302,28 @@ class AutoMap extends Map {
 			methods: {
 				getInstalls(name) {
 					return installMap[name] || "";
+				},
+				async openLine(item) {
+					try {
+						const locs = (symbolLocations && symbolLocations.get(item.text)) || [];
+						const loc = locs.find(l => l.plugin === item.plugin) || locs[0];
+						let req = await fetch(`https://raw.githubusercontent.com/runelite/plugin-hub/master/plugins/${item.plugin}`);
+						let text = await req.text();
+						let prop = {};
+						for (let line of text.split("\n")) {
+							let kv = line.split("=", 2);
+							if (kv.length == 2) prop[kv[0]] = kv[1];
+						}
+						const repo = (prop.repository || "").replace(/\.git$/, "");
+						const commit = prop.commit || "";
+						if (loc && loc.file) {
+							window.open(`${repo}/tree/${commit}/${loc.file}#L${loc.line}`);
+						} else {
+							window.open(`${repo}/tree/${commit}`);
+						}
+					} catch (e) {
+						console.error(e);
+					}
 				}
 			},
 			template: `
@@ -254,9 +339,10 @@ class AutoMap extends Map {
 		<List :list="entry.allMatches" :active="!entry.groups" name="plugins" v-slot="{item}">
 			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
 		</List>
-		<List :list="entry.symbols" name="lines of text" v-slot="{item}">
-			<code>{{item}}</code>
-		</List>
+			<List :list="entry.symbols" name="lines of text" v-slot="{item}">
+				<a href="#" @click.prevent="openLine(item)"><code>{{item.text}}</code></a>
+				--- <span class="plugin" :data-name="item.plugin">{{item.plugin}}</span>
+			</List>
 	</div>
 </div>
 `,
