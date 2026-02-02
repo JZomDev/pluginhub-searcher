@@ -219,7 +219,7 @@ class AutoMap extends Map {
 <div class="list">
 	<div class="header" @click="active_=!active_">[ {{active_ ? "-" : "+"}} ] {{list.length}} {{name}}</div>
 	<ul v-if="active_">
-		<li v-for="item of list">
+		<li v-for="(item, idx) of list" :key="idx">
 			<slot :item="item"></slot>
 		</li>
 	</ul>
@@ -253,9 +253,22 @@ class AutoMap extends Map {
 					for (let [sym, plugins] of usages) {
 						let match = re.exec(sym);
 						if (match) {
-							symbols.push({text: sym, plugin: plugins[0]});
-							for (let plugin of plugins) {
-								allMatches.add(plugin)
+							let locations = (symbolLocations && symbolLocations.get(sym)) || [];
+							if (locations.length > 0) {
+								for (let loc of locations) {
+									symbols.push(Object.freeze({
+										text: sym,
+										plugin: loc.plugin,
+										file: loc.file,
+										line: loc.line,
+									}));
+									allMatches.add(loc.plugin);
+								}
+							} else {
+								for (let plugin of plugins) {
+									symbols.push(Object.freeze({text: sym, plugin}));
+									allMatches.add(plugin);
+								}
 							}
 							if (match.groups) {
 								for (let group in match.groups) {
@@ -305,8 +318,6 @@ class AutoMap extends Map {
 				},
 				async openLine(item) {
 					try {
-						const locs = (symbolLocations && symbolLocations.get(item.text)) || [];
-						const loc = locs.find(l => l.plugin === item.plugin) || locs[0];
 						let req = await fetch(`https://raw.githubusercontent.com/runelite/plugin-hub/master/plugins/${item.plugin}`);
 						let text = await req.text();
 						let prop = {};
@@ -316,8 +327,10 @@ class AutoMap extends Map {
 						}
 						const repo = (prop.repository || "").replace(/\.git$/, "");
 						const commit = prop.commit || "";
-						if (loc && loc.file) {
-							window.open(`${repo}/tree/${commit}/${loc.file}#L${loc.line}`);
+						if (item && item.file) {
+							const safeFile = item.file.replace(/^\/+/, "");
+							const lineNumber = item.line || 1;
+							window.open(`${repo}/tree/${commit}/${safeFile}#L${lineNumber}`);
 						} else {
 							window.open(`${repo}/tree/${commit}`);
 						}
