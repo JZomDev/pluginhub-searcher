@@ -231,6 +231,48 @@ class AutoMap extends Map {
 		plugins.sort((a, b) => (installMap[b] || 0) - (installMap[a] || 0));
 		return plugins;
 	}
+
+	async function getPluginsLastUpdated() {
+		let files = [];
+		try {
+			const splitsRes = await fetch("plugins/plugins_splits.json");
+			if (splitsRes.ok) {
+				const splits = await splitsRes.json();
+				if (Array.isArray(splits)) {
+					files = splits.filter(Boolean);
+				}
+			}
+		} catch (e) {
+			// ignore and fall back
+		}
+
+		if (files.length === 0) {
+			files = ["plugins.json"];
+		}
+
+		const dates = await Promise.all(files.map(async (name) => {
+			try {
+				const res = await fetch(`plugins/${name}`, { method: "HEAD" });
+				if (!res.ok) return null;
+				const lastModified = res.headers.get("Last-Modified");
+				if (!lastModified) return null;
+				const dt = new Date(lastModified);
+				return isNaN(dt) ? null : dt;
+			} catch (e) {
+				return null;
+			}
+		}));
+
+		const latest = dates.filter(Boolean).sort((a, b) => b - a)[0];
+		if (!latest) return "Unknown";
+		return latest.toLocaleString(undefined, {
+			year: "numeric",
+			month: "short",
+			day: "2-digit",
+			hour: "2-digit",
+			minute: "2-digit",
+		});
+	}
 	
 	class Search {
 		static numEntries = 1;
@@ -362,7 +404,7 @@ class AutoMap extends Map {
 		}
 	}
 
-	Vue.createApp({
+	const app = Vue.createApp({
 		data() {
 			let entries;
 			try {
@@ -376,10 +418,14 @@ class AutoMap extends Map {
 			}
 			return {
 				entries: entries || [new Search("Toa Keris Cam")],
+				lastUpdated: "Loading...",
 			}
 		},
 		template: `
-<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
+<div class="content">
+	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
+</div>
+<footer class="footer">Last updated: {{lastUpdated}}</footer>
 `,
 		components: {
 			Search: Search.component,
@@ -405,4 +451,11 @@ class AutoMap extends Map {
 		methods: {
 		},
 	}).mount("#app");
+
+	try {
+		app.lastUpdated = await getPluginsLastUpdated();
+	} catch (e) {
+		console.error(e);
+		app.lastUpdated = "Unknown";
+	}
 })().catch(e => console.error(e));
