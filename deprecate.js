@@ -279,6 +279,8 @@ class AutoMap extends Map {
 		constructor(regex) {
 			this.id = Search.numEntries++;
 			this.regex = regex || "";
+			this.debounceTimer = null;
+			this.tempValue = regex || "";
 		}
 
 		set regex(value) {
@@ -358,6 +360,25 @@ class AutoMap extends Map {
 				getInstalls(name) {
 					return installMap[name] || "";
 				},
+				handleInput(value) {
+					this.entry.tempValue = value;
+					if (this.entry.debounceTimer) {
+						clearTimeout(this.entry.debounceTimer);
+					}
+					this.entry.debounceTimer = setTimeout(() => {
+						this.entry.regex = value;
+						this.entry.debounceTimer = null;
+					}, 500);
+				},
+				handleKeydown(event) {
+					if (event.key === "Enter") {
+						if (this.entry.debounceTimer) {
+							clearTimeout(this.entry.debounceTimer);
+							this.entry.debounceTimer = null;
+						}
+						this.entry.regex = this.entry.tempValue;
+					}
+				},
 				async openLine(item) {
 					try {
 						let req = await fetch(`https://raw.githubusercontent.com/runelite/plugin-hub/master/plugins/${item.plugin}`);
@@ -383,7 +404,7 @@ class AutoMap extends Map {
 			},
 			template: `
 <div class="search">
-	<input v-model="entry.regex" placeholder="Toa Keris Cam" @focus="entry.focused=true" @blur="entry.focused=false">
+	<input :value="entry.tempValue" @input="handleInput($event.target.value)" @keydown="handleKeydown" placeholder="Toa Keris Cam" @focus="entry.focused=true" @blur="entry.focused=false">
 	<div v-if="entry.error" class="error">{{entry.error}}</div>
 	<div v-if="!entry.error">
 		<List v-if="entry.groups" v-for="grouping of entry.groups" :list="grouping[1]" :name="'groups by ' + grouping[0]" :active="true" v-slot="{item}">
