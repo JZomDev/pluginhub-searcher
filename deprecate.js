@@ -6,7 +6,7 @@ const version = (async() => {
 
 const root = "https://repo.runelite.net/plugins/"
 
-const manifest = (async() => {
+const manifest = (async () => {
 	let req = await fetch(`${root}manifest/${await version}_full.js`);
 	let buf = new DataView(await req.arrayBuffer());
 	let skip = 4 + buf.getUint32(0);
@@ -14,14 +14,27 @@ const manifest = (async() => {
 	return JSON.parse(text);
 })();
 
-const installs = (async() => {
+const installs = (async () => {
 	let req = await fetch(`https://api.runelite.net/runelite-${await version}/pluginhub`);
 	return await req.json();
 })();
-let fileContent = new Map();
-async function readPluginApi(manifest) {
-	let text = [];
 
+let fileContent = new Map();
+let usages = [];
+let symbolLocations = new Map();
+let installMap = {};
+let searchReady = false;
+let searchIndexLoading = false;
+let appInstance = null;
+
+function ensureSearchIndexLoaded() {
+	if (!searchReady && !searchIndexLoading) {
+		searchIndexLoading = true;
+		loadSearchIndex();
+	}
+}
+
+async function readPluginApi(manifest) {
 	await getConent('JZomDev', 'pluginhub-searcher', manifest.internalName);
 	const files = fileContent.get(manifest.internalName) || [];
 	const lines = [];
@@ -45,12 +58,9 @@ async function readPluginApi(manifest) {
 }
 
 async function getConent(user, repo, internalName, files) {
-    // ensure we fetch /plugins/plugins.json only once (dedupe concurrent callers)
-    if (!getConent._bundlePromise) {
-        getConent._bundlePromise = (async () => {
-            try {
-				// support split plugin lists: plugins/plugins_splits.json
-				// which contains an array of filenames (e.g. ["plugins_0.json", ...])
+	if (!getConent._bundlePromise) {
+		getConent._bundlePromise = (async () => {
+			try {
 				let arr = null;
 				try {
 					const splitsRes = await fetch("plugins/plugins_splits.json");
@@ -100,21 +110,21 @@ async function getConent(user, repo, internalName, files) {
 					}
 					map[p.internalName] = contents;
 				}
-                getConent._bundle = map;
-            } catch (e) {
-                getConent._bundle = {};
-            }
-        })();
-    }
+				getConent._bundle = map;
+			} catch (e) {
+				getConent._bundle = {};
+			}
+		})();
+	}
 
-    await getConent._bundlePromise;
+	await getConent._bundlePromise;
 
-    const bundle = getConent._bundle || {};
-    if (bundle[internalName]) {
-        fileContent.set(internalName, bundle[internalName]);
-        return true;
-    }
-    return false;
+	const bundle = getConent._bundle || {};
+	if (bundle[internalName]) {
+		fileContent.set(internalName, bundle[internalName]);
+		return true;
+	}
+	return false;
 }
 
 async function amap(limit, array, asyncMapper) {
@@ -129,7 +139,7 @@ async function amap(limit, array, asyncMapper) {
 	return out;
 }
 
-const byUsage = (async() => {
+async function buildUsageIndex() {
 	const symbolLocations = new Map();
 	let out = new Map();
 	await amap(64, (await manifest).jars, async (plugin) => {
@@ -154,10 +164,26 @@ const byUsage = (async() => {
 	});
 	let es = [...out.entries()];
 	es.sort(([a], [b]) => a.localeCompare(b));
-	// expose symbolLocations for later use in UI
 	es.symbolLocations = symbolLocations;
-	return es
-})();
+	return es;
+}
+
+async function loadSearchIndex() {
+	try {
+		const result = await buildUsageIndex();
+		usages = result || [];
+		symbolLocations = result.symbolLocations || new Map();
+		searchReady = true;
+		if (appInstance) {
+			for (const entry of appInstance.entries) {
+				entry.regex = entry.regex;
+			}
+		}
+		console.log('Search index loaded with', usages.length, 'symbols');
+	} catch (e) {
+		console.error('Failed to load search index', e);
+	}
+}
 
 class AutoMap extends Map {
 	constructor(factory) {
@@ -173,49 +199,21 @@ class AutoMap extends Map {
 	}
 }
 
-(async () => {
-	const sd = new Date();
-	let mf = await manifest;
-
-	let usages = await byUsage;
-	// symbolLocations stored on the byUsage result
-	let symbolLocations = usages.symbolLocations || new Map();
-	let installMap = await installs;
-	const differenceInMs = new Date() - sd;
-
-	console.log(`Loaded manifest v${mf.version} with ${mf.jars.length} plugins and ${usages.length} symbols in ${differenceInMs}ms`);
-	document.body.addEventListener("click", async ev => {
-		if (ev?.target?.classList?.contains("plugin")) {
-			ev.preventDefault();
-			let name = ev.target.dataset.name;
-			let req = await fetch(`https://raw.githubusercontent.com/runelite/plugin-hub/master/plugins/${name}`);
-			let text = await req.text();
-			let prop = {};
-			for (let line of text.split("\n")) {
-				let kv = line.split("=", 2);
-				if (kv.length == 2) {
-					prop[kv[0]] = kv[1];
-				}
-			}
-			window.open(`${prop.repository.replace(/\.git$/, "")}/tree/${prop.commit}`);
+const List = {
+	props: {
+		list: {},
+		name: {},
+		active: {
+			type: Boolean,
+			default: false,
 		}
-	});
-
-	const List = {
-		props: {
-			list: {},
-			name: {},
-			active: {
-				type: Boolean,
-				default: false,
-			}
-		},
-		data() {
-			return {
-				active_: this.active,
-			}
-		},
-		template: `
+	},
+	data() {
+		return {
+			active_: this.active,
+		};
+	},
+	template: `
 <div class="list">
 	<div class="header" @click="active_=!active_">[ {{active_ ? "-" : "+"}} ] {{list.length}} {{name}}</div>
 	<ul v-if="active_">
@@ -225,184 +223,185 @@ class AutoMap extends Map {
 	</ul>
 </div>
 `,
-	};
+};
 
-	function sortPlugins(plugins) {
-		plugins.sort((a, b) => (installMap[b] || 0) - (installMap[a] || 0));
-		return plugins;
+function sortPlugins(plugins) {
+	plugins.sort((a, b) => (installMap[b] || 0) - (installMap[a] || 0));
+	return plugins;
+}
+
+async function getPluginsLastUpdated() {
+	let files = [];
+	try {
+		const splitsRes = await fetch("plugins/plugins_splits.json");
+		if (splitsRes.ok) {
+			const splits = await splitsRes.json();
+			if (Array.isArray(splits)) {
+				files = splits.filter(Boolean);
+			}
+		}
+	} catch (e) {
+		// ignore and fall back
 	}
 
-	async function getPluginsLastUpdated() {
-		let files = [];
+	if (files.length === 0) {
+		files = ["plugins.json"];
+	}
+
+	const dates = await Promise.all(files.map(async (name) => {
 		try {
-			const splitsRes = await fetch("plugins/plugins_splits.json");
-			if (splitsRes.ok) {
-				const splits = await splitsRes.json();
-				if (Array.isArray(splits)) {
-					files = splits.filter(Boolean);
-				}
-			}
+			const res = await fetch(`plugins/${name}`, { method: "HEAD" });
+			if (!res.ok) return null;
+			const lastModified = res.headers.get("Last-Modified");
+			if (!lastModified) return null;
+			const dt = new Date(lastModified);
+			return isNaN(dt) ? null : dt;
 		} catch (e) {
-			// ignore and fall back
+			return null;
 		}
+	}));
 
-		if (files.length === 0) {
-			files = ["plugins.json"];
-		}
+	const latest = dates.filter(Boolean).sort((a, b) => b - a)[0];
+	if (!latest) return "Unknown";
+	return latest.toLocaleString(undefined, {
+		year: "numeric",
+		month: "short",
+		day: "2-digit",
+		hour: "2-digit",
+		minute: "2-digit",
+	});
+}
 
-		const dates = await Promise.all(files.map(async (name) => {
-			try {
-				const res = await fetch(`plugins/${name}`, { method: "HEAD" });
-				if (!res.ok) return null;
-				const lastModified = res.headers.get("Last-Modified");
-				if (!lastModified) return null;
-				const dt = new Date(lastModified);
-				return isNaN(dt) ? null : dt;
-			} catch (e) {
-				return null;
-			}
-		}));
-
-		const latest = dates.filter(Boolean).sort((a, b) => b - a)[0];
-		if (!latest) return "Unknown";
-		return latest.toLocaleString(undefined, {
-			year: "numeric",
-			month: "short",
-			day: "2-digit",
-			hour: "2-digit",
-			minute: "2-digit",
-		});
+class Search {
+	static numEntries = 1;
+	constructor(regex) {
+		this.id = Search.numEntries++;
+		this.regex = regex || "";
+		this.debounceTimer = null;
+		this.tempValue = regex || "";
 	}
-	
-	class Search {
-		static numEntries = 1;
-		constructor(regex) {
-			this.id = Search.numEntries++;
-			this.regex = regex || "";
-			this.debounceTimer = null;
-			this.tempValue = regex || "";
-		}
 
-		set regex(value) {
-			this._regex = value;
-			let error = "";
-			let allMatches = new Set();
-			// Map<Group, Map<Value, Set<Plugin>>>
-			let groups = new AutoMap(() => new AutoMap(() => new Set()));
-			let symbols = [];
-			if (value != "" && value != "^")
-			{
-				try {
-					let re = new RegExp(value);
-					for (let [sym, plugins] of usages) {
-						let match = re.exec(sym);
-						if (match) {
-							let locations = (symbolLocations && symbolLocations.get(sym)) || [];
-							if (locations.length > 0) {
-								for (let loc of locations) {
-									symbols.push(Object.freeze({
-										text: sym,
-										plugin: loc.plugin,
-										file: loc.file,
-										line: loc.line,
-									}));
-									allMatches.add(loc.plugin);
-								}
-							} else {
-								for (let plugin of plugins) {
-									symbols.push(Object.freeze({text: sym, plugin}));
-									allMatches.add(plugin);
-								}
+	set regex(value) {
+		this._regex = value;
+		let error = "";
+		let allMatches = new Set();
+		let groups = new AutoMap(() => new AutoMap(() => new Set()));
+		let symbols = [];
+		if (!searchReady) {
+			error = "Search index loading...";
+		} else if (value != "" && value != "^") {
+			try {
+				let re = new RegExp(value);
+				for (let [sym, plugins] of usages) {
+					let match = re.exec(sym);
+					if (match) {
+						let locations = (symbolLocations && symbolLocations.get(sym)) || [];
+						if (locations.length > 0) {
+							for (let loc of locations) {
+								symbols.push(Object.freeze({
+								text: sym,
+								plugin: loc.plugin,
+								file: loc.file,
+								line: loc.line,
+							}));
+								allMatches.add(loc.plugin);
 							}
-							if (match.groups) {
-								for (let group in match.groups) {
-									let groupMatches = groups.get(group).get(match.groups[group]);
-									for (let plugin of plugins) {
-										groupMatches.add(plugin)
-									}
+						} else {
+							for (let plugin of plugins) {
+								symbols.push(Object.freeze({text: sym, plugin}));
+								allMatches.add(plugin);
+							}
+						}
+						if (match.groups) {
+							for (let group in match.groups) {
+								let groupMatches = groups.get(group).get(match.groups[group]);
+								for (let plugin of plugins) {
+									groupMatches.add(plugin);
 								}
 							}
 						}
 					}
-					
-				} catch (e) {
-					console.error(e);
-					error = e + "";
 				}
+			} catch (e) {
+				console.error(e);
+				error = e + "";
 			}
+		}
 
-			this.error = error;
-			this.allMatches = Object.freeze(sortPlugins([...allMatches]));
-			this.symbols = Object.freeze(symbols);
-			if (groups.size > 0) {
-				groups = [...groups.entries()].map(([name, group]) => {
-					group = [...group.entries()].map(([name, plugins]) => {
-						plugins = sortPlugins([...plugins]);
-						return Object.freeze([name, Object.freeze(plugins)]);
-					})
-					group.sort(([, a], [, b]) => b.length - a.length)
-					return Object.freeze([name, Object.freeze(group)]);
+		this.error = error;
+		this.allMatches = Object.freeze(sortPlugins([...allMatches]));
+		this.symbols = Object.freeze(symbols);
+		if (groups.size > 0) {
+			groups = [...groups.entries()].map(([name, group]) => {
+				group = [...group.entries()].map(([name, plugins]) => {
+					plugins = sortPlugins([...plugins]);
+					return Object.freeze([name, Object.freeze(plugins)]);
 				});
-				groups.sort(([, a], [, b]) => b.length - a.length);
-				this.groups = Object.freeze(groups);
-			} else {
-				this.groups = undefined;
-			}
+				group.sort(([, a], [, b]) => b.length - a.length);
+				return Object.freeze([name, Object.freeze(group)]);
+			});
+			groups.sort(([, a], [, b]) => b.length - a.length);
+			this.groups = Object.freeze(groups);
+		} else {
+			this.groups = undefined;
 		}
-		get regex() {
-			return this._regex;
-		}
+	}
+	get regex() {
+		return this._regex;
+	}
 
-		static component = {
-			props: ["entry"],
-			components: {List},
-			methods: {
-				getInstalls(name) {
-					return installMap[name] || "";
-				},
-				handleInput(value) {
-					this.entry.tempValue = value;
+	static component = {
+		props: ["entry"],
+		components: {List},
+		methods: {
+			getInstalls(name) {
+				return installMap[name] || "";
+			},
+			handleInput(value) {
+				ensureSearchIndexLoaded();
+				this.entry.tempValue = value;
+				if (this.entry.debounceTimer) {
+					clearTimeout(this.entry.debounceTimer);
+				}
+				this.entry.debounceTimer = setTimeout(() => {
+					this.entry.regex = value;
+					this.entry.debounceTimer = null;
+				}, 500);
+			},
+			handleKeydown(event) {
+				ensureSearchIndexLoaded();
+				if (event.key === "Enter") {
 					if (this.entry.debounceTimer) {
 						clearTimeout(this.entry.debounceTimer);
-					}
-					this.entry.debounceTimer = setTimeout(() => {
-						this.entry.regex = value;
 						this.entry.debounceTimer = null;
-					}, 500);
-				},
-				handleKeydown(event) {
-					if (event.key === "Enter") {
-						if (this.entry.debounceTimer) {
-							clearTimeout(this.entry.debounceTimer);
-							this.entry.debounceTimer = null;
-						}
-						this.entry.regex = this.entry.tempValue;
 					}
-				},
-				async openLine(item) {
-					try {
-						let req = await fetch(`https://raw.githubusercontent.com/runelite/plugin-hub/master/plugins/${item.plugin}`);
-						let text = await req.text();
-						let prop = {};
-						for (let line of text.split("\n")) {
-							let kv = line.split("=", 2);
-							if (kv.length == 2) prop[kv[0]] = kv[1];
-						}
-						const repo = (prop.repository || "").replace(/\.git$/, "");
-						const commit = prop.commit || "";
-						if (item && item.file) {
-							const safeFile = item.file.replace(/^\/+/, "");
-							const lineNumber = item.line || 1;
-							window.open(`${repo}/tree/${commit}/${safeFile}#L${lineNumber}`);
-						} else {
-							window.open(`${repo}/tree/${commit}`);
-						}
-					} catch (e) {
-						console.error(e);
-					}
+					this.entry.regex = this.entry.tempValue;
 				}
 			},
-			template: `
+			async openLine(item) {
+				try {
+					let req = await fetch(`https://raw.githubusercontent.com/runelite/plugin-hub/master/plugins/${item.plugin}`);
+					let text = await req.text();
+					let prop = {};
+					for (let line of text.split("\n")) {
+						let kv = line.split("=", 2);
+						if (kv.length == 2) prop[kv[0]] = kv[1];
+					}
+					const repo = (prop.repository || "").replace(/\.git$/, "");
+					const commit = prop.commit || "";
+					if (item && item.file) {
+						const safeFile = item.file.replace(/^\/+/, "");
+						const lineNumber = item.line || 1;
+						window.open(`${repo}/tree/${commit}/${safeFile}#L${lineNumber}`);
+					} else {
+						window.open(`${repo}/tree/${commit}`);
+					}
+				} catch (e) {
+					console.error(e);
+				}
+			}
+		},
+		template: `
 <div class="search">
 	<input :value="entry.tempValue" @input="handleInput($event.target.value)" @keydown="handleKeydown" placeholder="Toa Keris Cam" @focus="entry.focused=true" @blur="entry.focused=false">
 	<div v-if="entry.error" class="error">{{entry.error}}</div>
@@ -415,68 +414,90 @@ class AutoMap extends Map {
 		<List :list="entry.allMatches" :active="!entry.groups" name="plugins" v-slot="{item}">
 			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
 		</List>
-			<List :list="entry.symbols" name="lines of text" v-slot="{item}">
-				<a href="#" @click.prevent="openLine(item)"><code>{{item.text}}</code></a>
-				--- <span class="plugin" :data-name="item.plugin">{{item.plugin}}</span>
-			</List>
+		<List :list="entry.symbols" name="lines of text" v-slot="{item}">
+			<a href="#" @click.prevent="openLine(item)"><code>{{item.text}}</code></a>
+			--- <span class="plugin" :data-name="item.plugin">{{item.plugin}}</span>
+		</List>
 	</div>
 </div>
 `,
-		}
-	}
+	};
+}
 
-	const app = Vue.createApp({
-		data() {
-			let entries;
-			try {
-				let hash = window.location.hash;
-				hash = hash.substr(1);
-				hash = atob(hash);
-				hash = JSON.parse(hash);
-				entries = hash.map(v => new Search(v));
-			} catch (e) {
-				console.log("loading hash:", e);
-			}
-			return {
-				entries: entries || [new Search("Toa Keris Cam")],
-				lastUpdated: "Loading...",
-			}
-		},
-		template: `
+const app = Vue.createApp({
+	data() {
+		let entries;
+		try {
+			let hash = window.location.hash;
+			hash = hash.substr(1);
+			hash = atob(hash);
+			hash = JSON.parse(hash);
+			entries = hash.map(v => new Search(v));
+		} catch (e) {
+			console.log("loading hash:", e);
+		}
+		return {
+			entries: entries || [new Search("Toa Keris Cam")],
+			lastUpdated: "Loading...",
+		};
+	},
+	template: `
 <div class="content">
 	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
 </div>
 <footer class="footer">Last updated: {{lastUpdated}}</footer>
 `,
-		components: {
-			Search: Search.component,
-		},
-		created() {
-			this.$watch("entries", () => {
-				history.replaceState(undefined, undefined, "#" + btoa(JSON.stringify(this.entries.map(s => s.regex))));
+	components: {
+		Search: Search.component,
+	},
+	created() {
+		this.$watch("entries", () => {
+			history.replaceState(undefined, undefined, "#" + btoa(JSON.stringify(this.entries.map(s => s.regex))));
 
-				if (this.entries.length == 0 || this.entries[this.entries.length - 1].regex != "") {
-					this.entries.push(new Search());
+			if (this.entries.length == 0 || this.entries[this.entries.length - 1].regex != "") {
+				this.entries.push(new Search());
+			}
+			for (let i = this.entries.length - 2; i >= 0; i--) {
+				if (this.entries[i].regex == "" && !this.entries[i].focused) {
+					this.entries.splice(i, 1);
 				}
-				for (let i = this.entries.length - 2; i >= 0; i--) {
-					if (this.entries[i].regex == "" && !this.entries[i].focused) {
-						this.entries.splice(i, 1);
-					}
-				}
-			}, {deep: true});
-		},
-		watch: {
-		},
-		computed: {
-		},
-		methods: {
-		},
-	}).mount("#app");
+			}
+		}, {deep: true});
+	},
+});
 
-	try {
-		app.lastUpdated = await getPluginsLastUpdated();
-	} catch (e) {
-		console.error(e);
-		app.lastUpdated = "Unknown";
+const mountedApp = app.mount("#app");
+appInstance = mountedApp;
+
+installs.then((map) => {
+	installMap = map || {};
+}).catch((e) => {
+	console.error('Failed to load installs', e);
+});
+
+mountedApp.lastUpdated = "Loading...";
+getPluginsLastUpdated().then((value) => {
+	mountedApp.lastUpdated = value;
+}).catch((e) => {
+	console.error(e);
+	mountedApp.lastUpdated = "Unknown";
+});
+
+window.addEventListener('click', async ev => {
+	if (ev?.target?.classList?.contains('plugin')) {
+		ev.preventDefault();
+		let name = ev.target.dataset.name;
+		try {
+			let req = await fetch(`https://raw.githubusercontent.com/runelite/plugin-hub/master/plugins/${name}`);
+			let text = await req.text();
+			let prop = {};
+			for (let line of text.split("\n")) {
+				let kv = line.split("=", 2);
+				if (kv.length == 2) prop[kv[0]] = kv[1];
+			}
+			window.open(`${prop.repository.replace(/\.git$/, "")}/tree/${prop.commit}`);
+		} catch (e) {
+			console.error(e);
+		}
 	}
-})().catch(e => console.error(e));
+});
