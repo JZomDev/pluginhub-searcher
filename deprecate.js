@@ -28,13 +28,16 @@ let searchIndexLoading = false;
 let appInstance = null;
 
 function ensureSearchIndexLoaded() {
+	console.log('ensureSearchIndexLoaded', { searchReady, searchIndexLoading });
 	if (!searchReady && !searchIndexLoading) {
 		searchIndexLoading = true;
+		console.log('ensureSearchIndexLoaded: calling loadSearchIndex');
 		loadSearchIndex();
 	}
 }
 
 async function readPluginApi(manifest) {
+	console.log('readPluginApi start', manifest && manifest.internalName);
 	await getConent('JZomDev', 'pluginhub-searcher', manifest.internalName);
 	const files = fileContent.get(manifest.internalName) || [];
 	const lines = [];
@@ -58,7 +61,9 @@ async function readPluginApi(manifest) {
 }
 
 async function getConent(user, repo, internalName, files) {
+	console.log('getConent called', { user, repo, internalName });
 	if (!getConent._bundlePromise) {
+		console.log('getConent: initializing bundle promise');
 		getConent._bundlePromise = (async () => {
 			try {
 				let arr = null;
@@ -111,7 +116,9 @@ async function getConent(user, repo, internalName, files) {
 					map[p.internalName] = contents;
 				}
 				getConent._bundle = map;
+				console.log('getConent: bundle loaded, plugins mapped', Object.keys(map).length);
 			} catch (e) {
+				console.error('getConent: bundle load failed', e);
 				getConent._bundle = {};
 			}
 		})();
@@ -120,7 +127,9 @@ async function getConent(user, repo, internalName, files) {
 	await getConent._bundlePromise;
 
 	const bundle = getConent._bundle || {};
-	if (bundle[internalName]) {
+	const found = Boolean(bundle[internalName]);
+	console.log('getConent: bundle resolved', { internalName, found });
+	if (found) {
 		fileContent.set(internalName, bundle[internalName]);
 		return true;
 	}
@@ -140,9 +149,16 @@ async function amap(limit, array, asyncMapper) {
 }
 
 async function buildUsageIndex() {
+	console.log('buildUsageIndex: start');
 	const symbolLocations = new Map();
 	let out = new Map();
-	await amap(64, (await manifest).jars, async (plugin) => {
+	const jars = await manifest.then(m => m.jars).catch((e) => {
+		console.error('buildUsageIndex: manifest fetch failed', e);
+		return [];
+	});
+	console.log('buildUsageIndex: manifest jars count', Array.isArray(jars) ? jars.length : 0, jars && jars.length ? jars.slice(0, 5).map(p => p.internalName) : []);
+	await amap(64, jars, async (plugin, idx) => {
+		console.log('buildUsageIndex: processing plugin', idx, plugin && plugin.internalName);
 		let api = await readPluginApi(plugin);
 		for (let lineObj of api) {
 			let k = lineObj.text;
@@ -169,6 +185,7 @@ async function buildUsageIndex() {
 }
 
 async function loadSearchIndex() {
+	console.log('loadSearchIndex: start');
 	try {
 		const result = await buildUsageIndex();
 		usages = result || [];
@@ -176,9 +193,12 @@ async function loadSearchIndex() {
 		searchReady = true;
 		if (appInstance) {
 			for (const entry of appInstance.entries) {
-				entry.regex = entry.regex;
+				if (entry.tempValue && entry.tempValue !== "" && entry.tempValue !== "^") {
+					entry.regex = entry.tempValue;
+				}
 			}
 		}
+		console.log('loadSearchIndex: result', { symbols: usages.length, locations: symbolLocations.size });
 		console.log('Search index loaded with', usages.length, 'symbols');
 	} catch (e) {
 		console.error('Failed to load search index', e);
@@ -287,9 +307,10 @@ class Search {
 		let allMatches = new Set();
 		let groups = new AutoMap(() => new AutoMap(() => new Set()));
 		let symbols = [];
-		if (!searchReady) {
-			error = "Search index loading...";
-		} else if (value != "" && value != "^") {
+		if (value != "" && value != "^") {
+			if (!searchReady) {
+				error = "Search index loading...";
+			} else {
 			try {
 				let re = new RegExp(value);
 				for (let [sym, plugins] of usages) {
@@ -429,9 +450,11 @@ const app = Vue.createApp({
 		let entries;
 		try {
 			let hash = window.location.hash;
+			console.log('app init: raw hash', hash);
 			if (hash && hash.length > 1) {
 				hash = hash.substr(1);
 				hash = atob(hash);
+				console.log('app init: decoded hash', hash);
 				hash = JSON.parse(hash);
 				if (Array.isArray(hash)) {
 					entries = hash.map(v => new Search(v));
