@@ -429,10 +429,14 @@ const app = Vue.createApp({
 		let entries;
 		try {
 			let hash = window.location.hash;
-			hash = hash.substr(1);
-			hash = atob(hash);
-			hash = JSON.parse(hash);
-			entries = hash.map(v => new Search(v));
+			if (hash && hash.length > 1) {
+				hash = hash.substr(1);
+				hash = atob(hash);
+				hash = JSON.parse(hash);
+				if (Array.isArray(hash)) {
+					entries = hash.map(v => new Search(v));
+				}
+			}
 		} catch (e) {
 			console.log("loading hash:", e);
 		}
