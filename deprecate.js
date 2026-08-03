@@ -46,6 +46,16 @@ async function fetchJson(url) {
 	return decodeJson(buf);
 }
 
+// Normalize both supported split-manifest formats:
+//   ["plugins_0.json.gz", ...]
+//   [{zipname: "plugins_0.json.gz", content: [...]}, ...]
+function getSplitFileNames(splits) {
+	if (!Array.isArray(splits)) return [];
+	return splits
+		.map((split) => typeof split === "string" ? split : split?.zipname)
+		.filter((name) => typeof name === "string" && name.trim().length > 0);
+}
+
 async function readPluginApi(manifest) {
 	let text = [];
 
@@ -77,15 +87,15 @@ async function readPluginApi(manifest) {
 // The optional progress callbacks let the UI show which phase is running and how
 // far along it is. Returns a map of internalName -> [{filePath, content}, ...].
 async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} = {}) {
-	// Resolve the list of data files. Split lists (plugins/plugins_splits.json)
-	// name an array of parts (e.g. ["plugins_0.json.gz", ...]); otherwise fall
-	// back to a single plugins.json.
+	// Resolve the list of data files. Split manifests (plugins/plugins_splits.json)
+	// contain either filenames or objects with a zipname; otherwise fall back to
+	// a single plugins.json.
 	let fileNames = null;
 	try {
 		const splitsRes = await fetch("plugins/plugins_splits.json");
 		if (splitsRes.ok) {
 			const splits = await splitsRes.json();
-			if (Array.isArray(splits)) fileNames = splits.filter(Boolean);
+			fileNames = getSplitFileNames(splits);
 		}
 	} catch (e) {
 		// fall through to single-file fallback
@@ -292,9 +302,7 @@ class AutoMap extends Map {
 			const splitsRes = await fetch("plugins/plugins_splits.json");
 			if (splitsRes.ok) {
 				const splits = await splitsRes.json();
-				if (Array.isArray(splits)) {
-					files = splits.filter(Boolean);
-				}
+				files = getSplitFileNames(splits);
 			}
 		} catch (e) {
 			// ignore and fall back
