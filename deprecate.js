@@ -18,7 +18,6 @@ const installs = (async() => {
     let req = await fetch(`https://api.runelite.net/runelite-${await version}/pluginhub`);
     return await req.json();
 })();
-let fileContent = new Map();
 
 // Decode an ArrayBuffer that may be gzip-compressed into a parsed JSON value.
 // Detects the gzip magic number (0x1f 0x8b) and decompresses in-browser via
@@ -106,7 +105,14 @@ class AutoMap extends Map {
 `,
     };
 
-    function sortPlugins(plugins) {
+    function getSplitFileNames(splits) {
+        if (!Array.isArray(splits)) return [];
+        return splits
+            .map((split) => typeof split === "string" ? split : split?.zipname)
+            .filter((name) => typeof name === "string" && name.trim().length > 0);
+    }
+
+        function sortPlugins(plugins) {
         plugins.sort((a, b) => (installMap[b] || 0) - (installMap[a] || 0));
         return plugins;
     }
@@ -153,15 +159,16 @@ class AutoMap extends Map {
 
     class Search {
         static numEntries = 1;
-        constructor(regex) {
+        constructor(init) {
             this.id = Search.numEntries++;
-            this._regex = regex || "";
+            this.searchType = "regex";
+            this._regex = init || "";
             this.error = "";
             this.allMatches = [];
             this.symbols = [];
             this.groups = undefined;
             this.debounceTimer = null;
-            this.tempValue = regex || "";
+            this.tempValue = this._regex;
         }
 
         set regex(value) {
@@ -198,7 +205,7 @@ class AutoMap extends Map {
                             } else {
                                 for (let plugin of plugins) {
                                     symbols.push(Object.freeze({text: sym, plugin}));
-                                    allMatches.add(plugin);
+                                    allMatches.add(plugin.plugin);
                                 }
                             }
                             if (match.groups) {
@@ -303,8 +310,8 @@ class AutoMap extends Map {
 			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
 		</List>
 			<List :list="entry.symbols" name="lines of text" v-slot="{item}">
-				<a href="#" @click.prevent="openLine(item)"><code>{{item.text}}</code></a>
-				--- <span class="plugin" :data-name="item.plugin">{{item.plugin}} ({{getInstalls(item.plugin)}})</span>
+				<a href="#" @click.prevent="openLine(item.plugin)"><code>{{item.text}}</code></a>
+				--- <span class="plugin" :data-name="item.plugin">{{item.plugin.plugin}} ({{getInstalls(item.plugin.plugin)}})</span>
 			</List>
 	</div>
 </div>
@@ -344,7 +351,7 @@ class AutoMap extends Map {
 	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
 </div>
 <footer class="footer">
-  <a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated</a>
+  <a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated {{lastUpdated}}</a>
 </footer>`,
         components: {
             Search: Search.component,
@@ -388,7 +395,6 @@ class AutoMap extends Map {
         app.progress.current = count;
     });
     app.usages = indexedUsages;
-    let symbolLocations = indexedUsages.symbolLocations || new Map();
     const differenceInMs = new Date() - sd2;
     console.log(`Indexed ${indexedUsages.length} symbols from ${mf.jars.length} plugins in ${differenceInMs}ms`);
     app.progress.current = mf.jars.length;
