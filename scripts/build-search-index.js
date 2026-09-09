@@ -67,7 +67,8 @@ async function decodeJson(buf) {
 
     if (isGzip) {
         try {
-            text = zlib.gunzipSync(bytes).toString("utf8");
+            const stream = new Response(buf).body.pipeThrough(new DecompressionStream("gzip"));
+            text = await new Response(stream).text();
         } catch (error) {
             throw new Error(
                 `Failed to gunzip ${buf}: ${error.message}`
