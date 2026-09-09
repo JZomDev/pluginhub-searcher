@@ -4,8 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
-const PLUGINS_DIR = path.join(process.cwd(), '../plugins');
-const OUT_DIR = path.join(process.cwd(), '../docs');
+const PLUGINS_DIR = path.join(process.cwd(), 'plugins');
+const OUT_DIR = path.join(process.cwd(), 'docs');
 const OUT_FILE = path.join(OUT_DIR, 'search-index.json.gz');
 
 const root = "https://repo.runelite.net/plugins/";
