@@ -18,7 +18,6 @@ const installs = (async() => {
     let req = await fetch(`https://api.runelite.net/runelite-${await version}/pluginhub`);
     return await req.json();
 })();
-let fileContent = new Map();
 
 // Decode an ArrayBuffer that may be gzip-compressed into a parsed JSON value.
 // Detects the gzip magic number (0x1f 0x8b) and decompresses in-browser via
@@ -38,197 +37,12 @@ async function decodeJson(buf) {
     return JSON.parse(text);
 }
 
-// Fetch a JSON resource that may be gzip-compressed (.gz).
-async function fetchJson(url) {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const buf = await res.arrayBuffer();
-    return decodeJson(buf);
-}
-
-// Normalize both supported split-manifest formats:
-//   ["plugins_0.json.gz", ...]
-//   [{zipname: "plugins_0.json.gz", content: [...]}, ...]
-function getSplitFileNames(splits) {
-    if (!Array.isArray(splits)) return [];
-    return splits
-        .map((split) => typeof split === "string" ? split : split?.zipname)
-        .filter((name) => typeof name === "string" && name.trim().length > 0);
-}
-
-async function readPluginApi(manifest) {
-    let text = [];
-
-    await getContent('JZomDev', 'pluginhub-searcher', manifest.internalName);
-    const files = fileContent.get(manifest.internalName) || [];
-    const lines = [];
-    for (let f of files) {
-        let filePath = null;
-        let content = "";
-        if (!f) continue;
-        if (typeof f === "string") {
-            filePath = f;
-            content = "";
-        } else {
-            filePath = f.filePath || f.fileName || null;
-            content = f.content || "";
-        }
-        const parts = content.split("\n");
-        for (let i = 0; i < parts.length; i++) {
-            lines.push({text: parts[i], file: filePath, line: i + 1});
-        }
-    }
-    return lines;
-}
-
-// Load the full plugin data bundle in two observable phases:
-//   1. fetch  — download each (possibly split) data file over the network
-//   2. unzip  — decompress + JSON-parse each downloaded file
-// The optional progress callbacks let the UI show which phase is running and how
-// far along it is. Returns a map of internalName -> [{filePath, content}, ...].
-async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} = {}) {
-    // Resolve the list of data files. Split manifests (plugins/plugins_splits.json)
-    // contain either filenames or objects with a zipname; otherwise fall back to
-    // a single plugins.json.
-    let fileNames = null;
-    try {
-        const splitsRes = await fetch("plugins/plugins_splits.json");
-        if (splitsRes.ok) {
-            const splits = await splitsRes.json();
-            fileNames = getSplitFileNames(splits);
-        }
-    } catch (e) {
-        // fall through to single-file fallback
-    }
-    if (!fileNames || fileNames.length === 0) {
-        fileNames = ["plugins.json"];
-    }
-
-    // Phase 1 (fetch): download raw bytes for every file, reporting progress as
-    // each one lands. .map preserves order so the merge below is deterministic.
-    if (onFetchStart) onFetchStart(fileNames.length);
-    let fetched = 0;
-    const buffers = await Promise.all(fileNames.map(async (name) => {
-        try {
-            const res = await fetch(`plugins/${name}`);
-            if (!res.ok) return null;
-            return await res.arrayBuffer();
-        } catch (e) {
-            // ignore individual part failures
-            return null;
-        } finally {
-            if (onFetch) onFetch(++fetched);
-        }
-    }));
-
-    // Phase 2 (unzip): decompress + parse every downloaded file, reporting progress.
-    if (onUnzipStart) onUnzipStart(buffers.length);
-    let unzipped = 0;
-    const parts = await Promise.all(buffers.map(async (buf) => {
-        try {
-            if (!buf) return null;
-            const part = await decodeJson(buf);
-            return Array.isArray(part) ? part : null;
-        } catch (e) {
-            return null;
-        } finally {
-            if (onUnzip) onUnzip(++unzipped);
-        }
-    }));
-
-    // Merge parts in order and index by internalName (same shape as before).
-    const map = Object.create(null);
-    for (const part of parts) {
-        if (!part) continue;
-        for (const p of part) {
-            if (!p || !p.internalName) continue;
-            const contents = [];
-            if (p.content) {
-                contents.push({filePath: null, content: p.content});
-            }
-            if (Array.isArray(p.files)) {
-                for (const f of p.files) {
-                    if (!f) continue;
-                    if (typeof f === "string") {
-                        contents.push({filePath: f, content: null});
-                    } else {
-                        contents.push({filePath: f.filePath || f.fileName || null, content: f.content || null});
-                    }
-                }
-            }
-            map[p.internalName] = contents;
-        }
-    }
-    return map;
-}
-
-async function getContent(user, repo, internalName, files) {
-    // Load the bundle once and share it across concurrent callers.
-    if (!getContent._bundlePromise) {
-        getContent._bundlePromise = (async () => {
-            try {
-                getContent._bundle = await loadPluginBundle();
-            } catch (e) {
-                getContent._bundle = {};
-            }
-        })();
-    }
-
-    await getContent._bundlePromise;
-
-    const bundle = getContent._bundle || {};
-    if (bundle[internalName]) {
-        fileContent.set(internalName, bundle[internalName]);
-        return true;
-    }
-    return false;
-}
-
-async function amap(limit, array, asyncMapper) {
-    let out = new Array(array.length);
-    let todo = new Array(array.length).fill(0).map((_, i) => i);
-    await Promise.all(new Array(limit).fill(0).map(async () => {
-        for (; todo.length > 0; ) {
-            let i = todo.pop();
-            out[i] = await asyncMapper(array[i]);
-        }
-    }));
-    return out;
-}
-
 async function buildIndex(manifest, onProgress = () => {}) {
-    const symbolLocations = new Map();
-    let out = new Map();
-    let indexedCount = 0;
-    await amap(64, manifest.jars, async (plugin) => {
-        let api = await readPluginApi(plugin);
-        for (let lineObj of api) {
-            let k = lineObj.text;
-            if (k == "") {
-                continue;
-            }
-            let ps = out.get(k);
-            if (!ps) {
-                out.set(k, ps = [])
-            }
-            ps.push(plugin.internalName);
+    await fetch("docs/search-index.json.gz");
 
-            let locs = symbolLocations.get(k);
-            if (!locs) {
-                symbolLocations.set(k, locs = []);
-            }
-            locs.push({plugin: plugin.internalName, file: lineObj.file, line: lineObj.line});
-        }
-        indexedCount++;
-        if (indexedCount % 10 === 0) {
-            onProgress(indexedCount);
-        }
-    });
-    let es = [...out.entries()];
-    es.sort(([a], [b]) => a.localeCompare(b));
-    // expose symbolLocations for later use in UI
-    es.symbolLocations = symbolLocations;
-    return es
+    const t = await decodeJson(await fetch("docs/search-index.json.gz").then(r => r.arrayBuffer()));
+
+    return t;
 }
 
 class AutoMap extends Map {
@@ -291,7 +105,14 @@ class AutoMap extends Map {
 `,
     };
 
-    function sortPlugins(plugins) {
+    function getSplitFileNames(splits) {
+        if (!Array.isArray(splits)) return [];
+        return splits
+            .map((split) => typeof split === "string" ? split : split?.zipname)
+            .filter((name) => typeof name === "string" && name.trim().length > 0);
+    }
+
+        function sortPlugins(plugins) {
         plugins.sort((a, b) => (installMap[b] || 0) - (installMap[a] || 0));
         return plugins;
     }
@@ -338,15 +159,16 @@ class AutoMap extends Map {
 
     class Search {
         static numEntries = 1;
-        constructor(regex) {
+        constructor(init) {
             this.id = Search.numEntries++;
-            this._regex = regex || "";
+            this.searchType = "regex";
+            this._regex = init || "";
             this.error = "";
             this.allMatches = [];
             this.symbols = [];
             this.groups = undefined;
             this.debounceTimer = null;
-            this.tempValue = regex || "";
+            this.tempValue = this._regex;
         }
 
         set regex(value) {
@@ -362,6 +184,9 @@ class AutoMap extends Map {
                     let re = new RegExp(value);
                     // Handle case where app.usages might not be initialized yet
                     let usagesToSearch = (typeof app !== 'undefined' && app.usages) ? app.usages : [];
+                    if (!Array.isArray(usagesToSearch)) {
+                        usagesToSearch = Object.entries(usagesToSearch || {}).map(([k, v]) => [k, v]);
+                    }
                     let symbolLocations = usagesToSearch.symbolLocations || new Map();
                     for (let [sym, plugins] of usagesToSearch) {
                         let match = re.exec(sym);
@@ -380,7 +205,7 @@ class AutoMap extends Map {
                             } else {
                                 for (let plugin of plugins) {
                                     symbols.push(Object.freeze({text: sym, plugin}));
-                                    allMatches.add(plugin);
+                                    allMatches.add(plugin.plugin);
                                 }
                             }
                             if (match.groups) {
@@ -485,8 +310,8 @@ class AutoMap extends Map {
 			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
 		</List>
 			<List :list="entry.symbols" name="lines of text" v-slot="{item}">
-				<a href="#" @click.prevent="openLine(item)"><code>{{item.text}}</code></a>
-				--- <span class="plugin" :data-name="item.plugin">{{item.plugin}}</span>
+				<a href="#" @click.prevent="openLine(item.plugin)"><code>{{item.text}}</code></a>
+				--- <span class="plugin" :data-name="item.plugin">{{item.plugin.plugin}} ({{getInstalls(item.plugin.plugin)}})</span>
 			</List>
 	</div>
 </div>
@@ -525,8 +350,9 @@ class AutoMap extends Map {
 	</div>
 	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
 </div>
-<footer class="footer" <p></p><a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated: {{lastUpdated}}</a></p></footer>
-`,
+<footer class="footer">
+  <a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated {{lastUpdated}}</a>
+</footer>`,
         components: {
             Search: Search.component,
         },
@@ -560,18 +386,6 @@ class AutoMap extends Map {
         },
     }).mount("#app");
 
-    // Phase 1 (fetch) + Phase 2 (unzip): download and decompress the plugin data
-    // bundle, driving the progress UI through each phase as files complete.
-    const bundle = await loadPluginBundle({
-        onFetchStart: (n) => { app.progress.phase = "fetch"; app.progress.current = 0; app.progress.total = n; },
-        onFetch: (n) => { app.progress.current = n; },
-        onUnzipStart: (n) => { app.progress.phase = "unzip"; app.progress.current = 0; app.progress.total = n; },
-        onUnzip: (n) => { app.progress.current = n; },
-    });
-    // Share the already-loaded bundle with getContent so buildIndex won't refetch.
-    getContent._bundle = bundle;
-    getContent._bundlePromise = Promise.resolve();
-
     // Phase 3 (index): build the searchable regex map from the decompressed content.
     app.progress.phase = "index";
     app.progress.current = 0;
@@ -581,7 +395,6 @@ class AutoMap extends Map {
         app.progress.current = count;
     });
     app.usages = indexedUsages;
-    let symbolLocations = indexedUsages.symbolLocations || new Map();
     const differenceInMs = new Date() - sd2;
     console.log(`Indexed ${indexedUsages.length} symbols from ${mf.jars.length} plugins in ${differenceInMs}ms`);
     app.progress.current = mf.jars.length;
