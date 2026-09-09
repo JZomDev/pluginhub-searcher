@@ -109,33 +109,53 @@ function buildIndex() {
      */
     const index = Object.create(null);
 
-    function addToIndex(token, filename) {
+    function addToIndex(token, internalName, line = null) {
         if (!token) return;
 
         if (!index[token]) {
             index[token] = [];
         }
 
-        if (!index[token].includes(filename)) {
-            index[token].push(filename);
+        const entry = {
+            internalName,
+            line
+        };
+
+        const exists = index[token].some(
+            item =>
+                item.internalName === internalName &&
+                item.line === line
+        );
+
+        if (!exists) {
+            index[token].push(entry);
         }
     }
 
     for (const [internalName, contents] of Object.entries(map)) {
-        addToIndex(internalName.toLowerCase(), internalName);
+        // Index the plugin name itself.
+        addToIndex(internalName.toLowerCase(), internalName, null);
 
         for (const item of contents) {
             if (item.filePath) {
-                addToIndex(item.filePath.toLowerCase(), internalName);
+                // File paths don't correspond to a content line.
+                addToIndex(item.filePath.toLowerCase(), internalName, null);
             }
 
             if (item.content) {
-                const tokens = String(item.content)
-                    .toLowerCase()
-                    .match(/[a-zA-Z0-9_./-]+/g) || [];
+                const lines = String(item.content).split(/\r?\n/);
 
-                for (const token of tokens) {
-                    addToIndex(token, internalName);
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    const normalizedLine = line.trim().toLowerCase();
+
+                    if (normalizedLine && normalizedLine !== '}' || normalizedLine !== '{') {
+                        addToIndex(
+                            line.trim(),
+                            internalName,
+                            i + 1
+                        );
+                    }
                 }
             }
         }
