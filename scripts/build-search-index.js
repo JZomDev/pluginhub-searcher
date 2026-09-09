@@ -286,39 +286,26 @@ function writeSymbolsLocation(symbolLocations) {
 
     gzip.pipe(outputStream);
 
-    gzip.write("{");
+    gzip.write('{');
 
     let first = true;
 
     for (const [key, value] of symbolLocations) {
         if (!first) {
-            gzip.write(",");
+            gzip.write(',');
         }
         first = false;
 
         gzip.write(JSON.stringify(key));
-        gzip.write(":");
+        gzip.write(':');
         gzip.write(JSON.stringify(value));
     }
 
-    gzip.write("}");
+    gzip.write('}');
     gzip.end();
 
-    outputStream.on('finish', () => {
-        console.log(
-            `Successfully wrote ${OUT_FILE} (${jsonString.length} bytes JSON)`
-        );
-
-    });
-
-    outputStream.on('error', error => {
-        console.error(`Failed to write ${OUT_FILE}:`, error);
-        process.exitCode = 1;
-    });
-
-    // console.log(
-    //     `Wrote ${symbolLocations.size} symbols to ${outputPath}`
-    // );
+    console.log("gzip end")
+    return true;
 }
 
 (async () => {
@@ -367,10 +354,20 @@ function writeSymbolsLocation(symbolLocations) {
         );
 
         // Write the requested JSON file.
-        writeSymbolsLocation(symbolLocations);
+        var b = writeSymbolsLocation(symbolLocations);
 
-        console.log("Done!");
-        process.exit(0);
+        if (b)
+        {
+            console.log("Done!");
+            process.exit(0);
+        }
+        else
+        {
+            console.log("error")
+        }
+        //
+        // console.log("Done!");
+        // process.exit(0);
     } catch (error) {
         console.error("Script failed:");
         console.error(error);
