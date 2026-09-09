@@ -55,10 +55,6 @@ async function getManifest(version) {
 
 // Decode an ArrayBuffer that may be gzip-compressed.
 async function decodeJson(buf) {
-    const bytes = Buffer.from(buf);
-
-    let text;
-
     const isGzip =
         buf.endsWith(".gz") ||
         (bytes.length >= 2 &&
@@ -67,25 +63,31 @@ async function decodeJson(buf) {
 
     if (isGzip) {
         try {
-            const stream = new Response(buf).body.pipeThrough(new DecompressionStream("gzip"));
-            text = await new Response(stream).text();
+            const source = fs.createReadStream(buf);
+            const unzip = zlib.createGunzip();
+
+            // We accumulate the string chunks as they unzip
+            let jsonString = '';
+
+            unzip.on('data', (chunk) => {
+                jsonString += chunk.toString('utf8');
+            });
+
+            try {
+                // pipeline handles error forwarding and clean cleanup of streams
+                await pipeline(readStream, unzip);
+
+                const jsonObject = JSON.parse(jsonString);
+                return jsonObject;
+            } catch (error) {
+                console.error('Failed to decompress or parse JSON:', error);
+                throw error;
+            }
         } catch (error) {
             throw new Error(
                 `Failed to gunzip ${buf}: ${error.message}`
             );
         }
-    } else {
-        text = bytes.toString("utf8");
-    }
-
-    try {
-        return JSON.parse(text);
-    } catch (error) {
-        console.error(`Invalid JSON in ${buf}`);
-        console.error(`First 200 characters:`);
-        console.error(text.substring(0, 200));
-
-        throw error;
     }
 }
 
