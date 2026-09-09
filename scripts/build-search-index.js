@@ -165,11 +165,11 @@ function buildIndex() {
         }
     }
     
-    console.log(index;)
+    console.log(index);
 
     const entries = Object.entries(index);
 
-    console.log(entries;)
+    console.log(entries);
 
 
     // Placeholder until symbol-location extraction is implemented.
