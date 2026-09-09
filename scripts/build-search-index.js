@@ -54,13 +54,13 @@ async function getManifest(version) {
 }
 
 // Decode an ArrayBuffer that may be gzip-compressed.
-async function decodeJson(buf, name) {
+async function decodeJson(buf) {
     const bytes = Buffer.from(buf);
 
     let text;
 
     const isGzip =
-        name.endsWith(".gz") ||
+        buf.endsWith(".gz") ||
         (bytes.length >= 2 &&
             bytes[0] === 0x1f &&
             bytes[1] === 0x8b);
@@ -70,7 +70,7 @@ async function decodeJson(buf, name) {
             text = zlib.gunzipSync(bytes).toString("utf8");
         } catch (error) {
             throw new Error(
-                `Failed to gunzip ${name}: ${error.message}`
+                `Failed to gunzip ${buf}: ${error.message}`
             );
         }
     } else {
@@ -80,7 +80,7 @@ async function decodeJson(buf, name) {
     try {
         return JSON.parse(text);
     } catch (error) {
-        console.error(`Invalid JSON in ${name}`);
+        console.error(`Invalid JSON in ${buf}`);
         console.error(`First 200 characters:`);
         console.error(text.substring(0, 200));
 
@@ -133,7 +133,7 @@ async function loadPluginBundle() {
                 }
 
                 console.log(buf);
-                const part = await decodeJson(buf, buf.name);
+                const part = await decodeJson(buf);
 
                 return Array.isArray(part) ? part : null;
             } catch (error) {
