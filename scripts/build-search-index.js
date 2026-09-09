@@ -3,7 +3,6 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const pipeline = require('node:stream/promises');
 
 const PLUGINS_DIR = path.join(process.cwd(), 'plugins');
 const OUT_DIR = path.join(process.cwd(), 'docs');
@@ -74,9 +73,6 @@ async function decodeJson(buf) {
             });
 
             try {
-                // pipeline handles error forwarding and clean cleanup of streams
-                await pipeline(source, unzip);
-
                 const jsonObject = JSON.parse(jsonString);
                 return jsonObject;
             } catch (error) {
