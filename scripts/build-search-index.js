@@ -3,7 +3,6 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const pipeline = require('stream/promises');
 
 const PLUGINS_DIR = path.join(process.cwd(), 'plugins');
 const OUT_DIR = path.join(process.cwd(), 'docs');
@@ -63,24 +62,15 @@ async function decodeJson(buf) {
 
     if (isGzip) {
         try {
+            // 1. Read the raw compressed buffer from disk
             const source = fs.createReadStream(buf);
-            const unzip = zlib.createGunzip();
-            
-            // We accumulate the string chunks as they unzip
-            let jsonString = '';
+            // 2. Decompress the buffer
+            const decompressedBuffer = await gunzip(source);
 
-            unzip.on('data', (chunk) => {
-                jsonString += chunk.toString('utf8');
-            });
+            // 3. Parse the buffer directly into a JavaScript object
+            const jsonObject = JSON.parse(decompressedBuffer.toString('utf8'));
+            return jsonObject
 
-            try {
-                await pipeline(source, unzip);
-                const jsonObject = JSON.parse(jsonString);
-                return jsonObject;
-            } catch (error) {
-                console.error('Failed to decompress or parse JSON:', error);
-                throw error;
-            }
         } catch (error) {
             throw new Error(
                 `Failed to gunzip ${buf}: ${error.message}`
