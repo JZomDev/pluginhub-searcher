@@ -65,7 +65,7 @@ async function decodeJson(buf) {
         try {
             const source = fs.createReadStream(buf);
             const unzip = zlib.createGunzip();
-
+            
             // We accumulate the string chunks as they unzip
             let jsonString = '';
 
@@ -75,7 +75,7 @@ async function decodeJson(buf) {
 
             try {
                 // pipeline handles error forwarding and clean cleanup of streams
-                await pipeline(readStream, unzip);
+                await pipeline(source, unzip);
 
                 const jsonObject = JSON.parse(jsonString);
                 return jsonObject;
