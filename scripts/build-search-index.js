@@ -144,17 +144,13 @@ function buildIndex() {
     const entries = Object.entries(index);
 
     // Placeholder until symbol-location extraction is implemented.
-    const symbolLocations = Object.create(null);
 
     ensureOutDir();
 
     const out = {
-        generatedAt: new Date().toISOString(),
         files: filesMeta,
         index,
-        entries,
-        symbolLocations
-    };
+        entries};
 
     const jsonString = JSON.stringify(out);
 
