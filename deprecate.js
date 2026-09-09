@@ -228,7 +228,7 @@ async function buildIndex(manifest, onProgress = () => {}) {
     // es.sort(([a], [b]) => a.localeCompare(b));
     // expose symbolLocations for later use in UI
     // es.symbolLocations = symbolLocations;
-    return symbolLocations
+    return out.entries();
 }
 
 class AutoMap extends Map {
