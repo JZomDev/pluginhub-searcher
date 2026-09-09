@@ -28,12 +28,42 @@ const installs = (async() => {
 async function decodeJson(buf) {
     const bytes = new Uint8Array(buf);
     let text;
+
     if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+        // Decompress the gzip stream
         const stream = new Response(buf).body.pipeThrough(new DecompressionStream("gzip"));
-        text = await new Response(stream).text();
+        const reader = stream.getReader();
+        const chunks = [];
+
+        try {
+            while (true) {
+                const {done, value} = await reader.read();
+                if (done) break;
+                chunks.push(value);
+            }
+        }
+            catch (err) {
+            console.error("DecompressionStream error:", err);
+            }
+         finally {
+            // console.log("DecompressionStream closed: " + text.length + " bytes");
+            reader.releaseLock();
+        }
+
+        // Combine chunks and decode once
+        const totalLength = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        const decompressed = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of chunks) {
+            decompressed.set(chunk, offset);
+            offset += chunk.length;
+        }
+
+        text = new TextDecoder("utf-8").decode(decompressed);
     } else {
         text = new TextDecoder("utf-8").decode(bytes);
     }
+
     return JSON.parse(text);
 }
 
