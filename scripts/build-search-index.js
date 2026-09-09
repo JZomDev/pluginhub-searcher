@@ -280,29 +280,43 @@ async function buildIndex(manifest, bundle) {
     return entries;
 }
 
-function writeSymbolsLocation(symbolLocations) {
-    const outputStream = fs.createWriteStream(OUT_FILE);
+async function writeSymbolsLocation(symbolLocations) {
+    const output = fs.createWriteStream(OUT_FILE);
     const gzip = zlib.createGzip();
 
-    gzip.pipe(outputStream);
+    gzip.pipe(output);
 
-    gzip.write('{');
+    // Wrap the writing logic in a Promise so we can await its actual disk completion
+    await new Promise((resolve, reject) => {
+        // Track stream errors so the script doesn't silently hang or crash
+        gzip.on('error', reject);
+        output.on('error', reject);
 
-    let first = true;
+        // This fires ONLY when the OS completely flushes all bytes to disk
+        output.on('finish', resolve);
 
-    for (const [key, value] of symbolLocations) {
-        if (!first) {
-            gzip.write(',');
+        gzip.write('{');
+
+        let first = true;
+        for (const [key, value] of symbolLocations) {
+            if (!first) {
+                gzip.write(',');
+            }
+            first = false;
+
+            gzip.write(JSON.stringify(key));
+            gzip.write(':');
+            gzip.write(JSON.stringify(value));
         }
-        first = false;
 
-        gzip.write(JSON.stringify(key));
-        gzip.write(':');
-        gzip.write(JSON.stringify(value));
-    }
+        gzip.write('}');
 
-    gzip.write('}');
-    gzip.end();
+        // Signal that we are done generating input; this triggers zlib to clear its buffer
+        gzip.end();
+    });
+
+    // Now it is completely safe to log or terminate the script
+    console.log(`Wrote to file ${OUT_FILE}`);
 
     console.log("gzip end")
     return true;
@@ -354,7 +368,7 @@ function writeSymbolsLocation(symbolLocations) {
         );
 
         // Write the requested JSON file.
-        var b = writeSymbolsLocation(symbolLocations);
+        var b = await writeSymbolsLocation(symbolLocations);
 
         if (b)
         {
