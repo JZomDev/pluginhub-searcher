@@ -132,7 +132,7 @@ async function loadPluginBundle() {
                     return null;
                 }
 
-                const part = await decodeJson(buf);
+                const part = await decodeJson(buf, buf.name);
 
                 return Array.isArray(part) ? part : null;
             } catch (error) {
