@@ -132,6 +132,7 @@ async function loadPluginBundle() {
                     return null;
                 }
 
+                console.log(buf);
                 const part = await decodeJson(buf, buf.name);
 
                 return Array.isArray(part) ? part : null;
