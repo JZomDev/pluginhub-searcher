@@ -4,8 +4,8 @@ const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
 
-const PLUGINS_DIR = path.join(process.cwd(), 'plugins');
-const OUT_DIR = path.join(process.cwd(), 'docs');
+const PLUGINS_DIR = path.join(process.cwd(), '../plugins');
+const OUT_DIR = path.join(process.cwd(), '../docs');
 const OUT_FILE = path.join(OUT_DIR, 'search-index.json.gz');
 
 const root = "https://repo.runelite.net/plugins/";
@@ -54,56 +54,26 @@ async function getManifest(version) {
 
 // Decode an ArrayBuffer that may be gzip-compressed.
 async function decodeJson(buf) {
-    const isGzip =
-        buf.endsWith(".gz") ||
-        (bytes.length >= 2 &&
-            bytes[0] === 0x1f &&
-            bytes[1] === 0x8b);
-
-    if (isGzip) {
         try {
-            const stream = new Response(buf).body.pipeThrough(new DecompressionStream("gzip"));
-            text = await new Response(stream).text();
-            console.log(text)
-            return jsonObject
+
+            const buffer = fs.readFileSync(path.join(PLUGINS_DIR, buf));
+            const bytes = new Uint8Array(buffer);
+            const isGzip = bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b;
+            if (isGzip) {
+                const decompressed = zlib.gunzipSync(buffer);
+                const text = decompressed.toString('utf8');
+                return JSON.parse(text);
+            }
 
         } catch (error) {
             throw new Error(
                 `Failed to gunzip ${buf}: ${error.message}`
             );
         }
-    }
-}
 
-
-// Normalize both supported split-manifest formats:
-//
-// ["plugins_0.json.gz", ...]
-//
-// or
-//
-// [{ zipname: "plugins_0.json.gz", content: [...] }, ...]
-function getSplitFileNames(splits) {
-    if (!Array.isArray(splits)) {
-        return [];
-    }
-
-    return splits
-        .map(split =>
-            typeof split === "string"
-                ? split
-                : split?.zipname
-        )
-        .filter(
-            name =>
-                typeof name === "string" &&
-                name.trim().length > 0
-        );
 }
 
 async function loadPluginBundle() {
-    let fileNames = null;
-
     const buffers = fs
         .readdirSync(PLUGINS_DIR)
         .filter(f => f.endsWith('.gz'))
@@ -311,27 +281,19 @@ async function buildIndex(manifest, bundle) {
 }
 
 function writeSymbolsLocation(symbolLocations) {
-    // const outputPath = path.join(
-    //     __dirname,
-    //     "symbolsLocation.json"
-    // );
-
-    // Map cannot be directly JSON.stringify'd.
-    // Convert it to a normal object first.
     const output = Object.fromEntries(symbolLocations);
-
+    const jsonString = JSON.stringify(output);  // <-- convert to string
     const gzip = zlib.createGzip();
     const outputStream = fs.createWriteStream(OUT_FILE);
 
     gzip.pipe(outputStream);
-    gzip.end(output);
+    gzip.end(jsonString);
 
     outputStream.on('finish', () => {
         console.log(
             `Successfully wrote ${OUT_FILE} (${jsonString.length} bytes JSON)`
         );
-        console.log(`Processed ${unzipped}/${files.length} plugin files.`);
-        console.log(`Indexed ${entries.length} tokens.`);
+
     });
 
     outputStream.on('error', error => {
