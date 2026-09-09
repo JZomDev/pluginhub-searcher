@@ -370,6 +370,7 @@ function writeSymbolsLocation(symbolLocations) {
         writeSymbolsLocation(symbolLocations);
 
         console.log("Done!");
+        process.exit(0);
     } catch (error) {
         console.error("Script failed:");
         console.error(error);
