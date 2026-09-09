@@ -40,7 +40,7 @@ function buildIndex() {
     let unzipped = 0;
 
     for (const file of files) {
-        if ('${file}' !== 'plugins_0.json.gz')
+        if ((''+`${file}`) !== 'plugins_0.json.gz')
         {
             continue;
         }
