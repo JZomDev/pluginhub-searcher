@@ -1,6 +1,13 @@
+#!/usr/bin/env node
+
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
+
+
+const PLUGINS_DIR = path.join(process.cwd(), 'plugins');
+const OUT_DIR = path.join(process.cwd(), 'docs');
+const OUT_FILE = path.join(OUT_DIR, 'search-index.json.gz');
 
 const root = "https://repo.runelite.net/plugins/";
 
@@ -305,11 +312,24 @@ function writeSymbolsLocation(symbolLocations) {
     // Convert it to a normal object first.
     const output = Object.fromEntries(symbolLocations);
 
-    fs.writeFileSync(
-        outputPath,
-        JSON.stringify(output, null, 2),
-        "utf8"
-    );
+    const gzip = zlib.createGzip();
+    const outputStream = fs.createWriteStream(OUT_FILE);
+
+    gzip.pipe(outputStream);
+    gzip.end(output);
+
+    outputStream.on('finish', () => {
+        console.log(
+            `Successfully wrote ${OUT_FILE} (${jsonString.length} bytes JSON)`
+        );
+        console.log(`Processed ${unzipped}/${files.length} plugin files.`);
+        console.log(`Indexed ${entries.length} tokens.`);
+    });
+
+    outputStream.on('error', error => {
+        console.error(`Failed to write ${OUT_FILE}:`, error);
+        process.exitCode = 1;
+    });
 
     console.log(
         `Wrote ${symbolLocations.size} symbols to ${outputPath}`
