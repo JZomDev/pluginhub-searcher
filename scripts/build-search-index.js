@@ -54,20 +54,40 @@ async function getManifest(version) {
 }
 
 // Decode an ArrayBuffer that may be gzip-compressed.
-async function decodeJson(buf) {
+async function decodeJson(buf, name) {
     const bytes = Buffer.from(buf);
 
     let text;
 
-    // Gzip magic number: 1f 8b
-    if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
-        text = zlib.gunzipSync(bytes).toString('utf8');
+    const isGzip =
+        name.endsWith(".gz") ||
+        (bytes.length >= 2 &&
+            bytes[0] === 0x1f &&
+            bytes[1] === 0x8b);
+
+    if (isGzip) {
+        try {
+            text = zlib.gunzipSync(bytes).toString("utf8");
+        } catch (error) {
+            throw new Error(
+                `Failed to gunzip ${name}: ${error.message}`
+            );
+        }
     } else {
-        text = bytes.toString('utf8');
+        text = bytes.toString("utf8");
     }
 
-    return JSON.parse(text);
+    try {
+        return JSON.parse(text);
+    } catch (error) {
+        console.error(`Invalid JSON in ${name}`);
+        console.error(`First 200 characters:`);
+        console.error(text.substring(0, 200));
+
+        throw error;
+    }
 }
+
 
 // Normalize both supported split-manifest formats:
 //
@@ -303,10 +323,10 @@ async function buildIndex(manifest, bundle) {
 }
 
 function writeSymbolsLocation(symbolLocations) {
-    const outputPath = path.join(
-        __dirname,
-        "symbolsLocation.json"
-    );
+    // const outputPath = path.join(
+    //     __dirname,
+    //     "symbolsLocation.json"
+    // );
 
     // Map cannot be directly JSON.stringify'd.
     // Convert it to a normal object first.
@@ -331,9 +351,9 @@ function writeSymbolsLocation(symbolLocations) {
         process.exitCode = 1;
     });
 
-    console.log(
-        `Wrote ${symbolLocations.size} symbols to ${outputPath}`
-    );
+    // console.log(
+    //     `Wrote ${symbolLocations.size} symbols to ${outputPath}`
+    // );
 }
 
 (async () => {
