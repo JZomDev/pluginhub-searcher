@@ -224,7 +224,7 @@ async function buildIndex(manifest, onProgress = () => {}) {
             onProgress(indexedCount);
         }
     });
-    let es = [...out.entries()];
+    // let es = [...out.entries()];
     // es.sort(([a], [b]) => a.localeCompare(b));
     // expose symbolLocations for later use in UI
     es.symbolLocations = symbolLocations;
