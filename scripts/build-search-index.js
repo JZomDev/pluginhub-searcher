@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const zlib = require('zlib');
-const { pipeline } require( 'node:stream/promises');
+const pipeline = require('stream/promises');
 
 const PLUGINS_DIR = path.join(process.cwd(), 'plugins');
 const OUT_DIR = path.join(process.cwd(), 'docs');
