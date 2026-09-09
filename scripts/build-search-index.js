@@ -74,7 +74,7 @@ async function decodeJson(buf) {
             });
 
             try {
-                await pipeline(readStream, gunzip);
+                await pipeline(source, unzip);
                 const jsonObject = JSON.parse(jsonString);
                 return jsonObject;
             } catch (error) {
