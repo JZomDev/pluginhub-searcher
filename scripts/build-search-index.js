@@ -40,6 +40,10 @@ function buildIndex() {
     let unzipped = 0;
 
     for (const file of files) {
+        if (${file} !== 'plugins_0.json.gz')
+        {
+            continue;
+        }
         const filePath = path.join(PLUGINS_DIR, file);
 
         try {
@@ -160,8 +164,13 @@ function buildIndex() {
             }
         }
     }
+    
+    console.log(index;)
 
     const entries = Object.entries(index);
+
+    console.log(entries;)
+
 
     // Placeholder until symbol-location extraction is implemented.
 
