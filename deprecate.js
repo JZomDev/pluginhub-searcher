@@ -38,14 +38,6 @@ async function decodeJson(buf) {
     return JSON.parse(text);
 }
 
-// Fetch a JSON resource that may be gzip-compressed (.gz).
-async function fetchJson(url) {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const buf = await res.arrayBuffer();
-    return decodeJson(buf);
-}
-
 // Normalize both supported split-manifest formats:
 //   ["plugins_0.json.gz", ...]
 //   [{zipname: "plugins_0.json.gz", content: [...]}, ...]
@@ -525,8 +517,9 @@ class AutoMap extends Map {
 	</div>
 	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
 </div>
-<footer class="footer" <p></p><a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated: {{lastUpdated}}</a></p></footer>
-`,
+<footer class="footer">
+  <a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated</a>
+</footer>`,
         components: {
             Search: Search.component,
         },

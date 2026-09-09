@@ -7,104 +7,94 @@ const zlib = require('zlib');
 // Configuration
 const PLUGINS_DIR = path.join(process.cwd(), 'plugins');
 const OUT_DIR = path.join(process.cwd(), 'docs');
-const OUT_FILE = path.join(OUT_DIR, 'search-index.json');
-
-function tokenize(text) {
-  return Array.from(new Set(
-    text.toLowerCase()
-      .split(/[^a-z0-9]+/i)
-      .filter(Boolean)
-  ));
-}
+const OUT_FILE = path.join(OUT_DIR, 'search-index.json.gz');
 
 function ensureOutDir() {
-  if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
+    if (!fs.existsSync(OUT_DIR)) fs.mkdirSync(OUT_DIR, { recursive: true });
 }
 
+function decodeJson(buf) {
+    const bytes = new Uint8Array(buf);
+    let text;
+    if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+        const stream = new Response(buf).body.pipeThrough(new DecompressionStream("gzip"));
+        text = new Response(stream).text();
+    }
+    return JSON.parse(text);
+}
+
+
 function buildIndex() {
-  if (!fs.existsSync(PLUGINS_DIR)) {
-    console.error(`Plugins directory not found: ${PLUGINS_DIR}`);
-    process.exitCode = 1;
-    return;
-  }
-
-  const files = fs.readdirSync(PLUGINS_DIR).filter(f => f.endsWith('.gz'));
-  const index = Object.create(null); // token -> array of filenames
-  const filesMeta = Object.create(null);
-  const symbolLocations = Object.create(null); // token -> array of {plugin, file, line}
-
-  for (const filename of files) {
-    const filePath = path.join(PLUGINS_DIR, filename);
-    let gz;
-    try {
-      gz = fs.readFileSync(filePath);
-    } catch (err) {
-      console.warn(`Failed to read ${filePath}: ${err.message}`);
-      continue;
+    if (!fs.existsSync(PLUGINS_DIR)) {
+        console.error(`Plugins directory not found: ${PLUGINS_DIR}`);
+        process.exitCode = 1;
+        return;
     }
 
-    let buf;
-    try {
-      buf = zlib.gunzipSync(gz);
-    } catch (err) {
-      console.warn(`Failed to gunzip ${filename}: ${err.message}`);
-      continue;
+    const files = fs.readdirSync(PLUGINS_DIR).filter(f => f.endsWith('.gz'));
+
+    let unzipped = 0;
+    const parts = Promise.all(files.map(async (buf) => {
+        try {
+            if (!buf) return null;
+            const part = decodeJson(buf);
+            return Array.isArray(part) ? part : null;
+        } catch (e) {
+            return null;
+        } finally {
+            if (onUnzip) onUnzip(++unzipped);
+        }
+    }));
+
+    // Merge parts in order and index by internalName (same shape as before).
+    const map = Object.create(null);
+    for (const part of parts) {
+        if (!part) continue;
+        for (const p of part) {
+            if (!p || !p.internalName) continue;
+            const contents = [];
+            if (p.content) {
+                contents.push({filePath: null, content: p.content});
+            }
+            if (Array.isArray(p.files)) {
+                for (const f of p.files) {
+                    if (!f) continue;
+                    if (typeof f === "string") {
+                        contents.push({filePath: f, content: null});
+                    } else {
+                        contents.push({filePath: f.filePath || f.fileName || null, content: f.content || null});
+                    }
+                }
+            }
+            map[p.internalName] = contents;
+        }
     }
 
-    const text = buf.toString('utf8');
-
-    // Track file metadata
-    filesMeta[filename] = {
-      size: buf.length,
-      url: `/plugins/${filename}`
+    ensureOutDir();
+    const out = {
+        generatedAt: new Date().toISOString(),
+        files: filesMeta,            // existing metadata
+        index,                       // object mapping token -> [filenames] (backwards-compatible)
+        entries,                     // array of [token, [filenames]] — matches your buildIndex() result shape
+        symbolLocations              // mapping token -> [{plugin, file, line}]
     };
 
-    // Tokenize whole content for the index (which maps token -> filenames)
-    const tokens = tokenize(text);
-    for (const t of tokens) {
-      if (!index[t]) index[t] = [];
-      index[t].push(filename);
-    }
+    // 2. Convert JSON object to a string
+    const jsonString = JSON.stringify(out)
 
-    // Build symbolLocations by scanning line-by-line so we can record line numbers
-    const lines = text.split(/\r?\n/);
-    for (let i = 0; i < lines.length; i++) {
-      const lineText = lines[i];
-      if (!lineText) continue;
-      const lineTokens = tokenize(lineText);
-      for (const t of lineTokens) {
-        if (!symbolLocations[t]) symbolLocations[t] = [];
-        // file is left null because we don't have internal path; change if available
-        symbolLocations[t].push({ plugin: filename, file: null, line: i + 1 });
-      }
-    }
-  }
+    // 3. Create a write stream and pipe the compressed data into it
+    const gzip = zlib.createGzip();
+    const outputStream = fs.createWriteStream(OUT_FILE);
 
-  // Stable sorting for cleaner diffs and stable entries order
-  for (const t of Object.keys(index)) index[t].sort();
-  const entries = Object.keys(index)
-    .sort((a, b) => a.localeCompare(b))
-    .map(k => [k, index[k]]);
+    // Pass the string to the gzip stream and output to the file
+    gzip.pipe(outputStream);
+    gzip.write(jsonString);
+    gzip.end();
 
-  // Convert symbolLocations sets to stable arrays (already arrays) — optionally sort by plugin/name/line
-  for (const k of Object.keys(symbolLocations)) {
-    symbolLocations[k].sort((a, b) => {
-      if (a.plugin !== b.plugin) return a.plugin.localeCompare(b.plugin);
-      return a.line - b.line;
+    outputStream.on('finish', () => {
+        console.log('Successfully wrote JSON content to data.json.gz');
     });
-  }
 
-  ensureOutDir();
-  const out = {
-    generatedAt: new Date().toISOString(),
-    files: filesMeta,            // existing metadata
-    index,                       // object mapping token -> [filenames] (backwards-compatible)
-    entries,                     // array of [token, [filenames]] — matches your buildIndex() result shape
-    symbolLocations              // mapping token -> [{plugin, file, line}]
-  };
-
-  fs.writeFileSync(OUT_FILE, JSON.stringify(out));
-  console.log(`Wrote search index with ${entries.length} tokens for ${Object.keys(filesMeta).length} files to ${OUT_FILE}`);
 }
 
 buildIndex();
