@@ -62,10 +62,9 @@ async function decodeJson(buf) {
 
     if (isGzip) {
         try {
-            // 1. Read the raw compressed buffer from disk
             const source = fs.createReadStream(buf);
             // 2. Decompress the buffer
-            const decompressedBuffer = await gunzip(source);
+            const decompressedBuffer = await zlib.gunzipSync(compressedBuffer);
 
             // 3. Parse the buffer directly into a JavaScript object
             const jsonObject = JSON.parse(decompressedBuffer.toString('utf8'));
