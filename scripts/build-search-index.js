@@ -281,13 +281,28 @@ async function buildIndex(manifest, bundle) {
 }
 
 function writeSymbolsLocation(symbolLocations) {
-    const output = Object.fromEntries(symbolLocations);
-    const jsonString = JSON.stringify(output);  // <-- convert to string
-    const gzip = zlib.createGzip();
     const outputStream = fs.createWriteStream(OUT_FILE);
+    const gzip = zlib.createGzip();
 
     gzip.pipe(outputStream);
-    gzip.end(jsonString);
+
+    gzip.write("{");
+
+    let first = true;
+
+    for (const [key, value] of symbolLocations) {
+        if (!first) {
+            gzip.write(",");
+        }
+        first = false;
+
+        gzip.write(JSON.stringify(key));
+        gzip.write(":");
+        gzip.write(JSON.stringify(value));
+    }
+
+    gzip.write("}");
+    gzip.end();
 
     outputStream.on('finish', () => {
         console.log(
