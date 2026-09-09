@@ -149,7 +149,7 @@ function buildIndex() {
                     const line = lines[i];
                     const normalizedLine = line.trim().toLowerCase();
 
-                    if (normalizedLine && normalizedLine !== '}' || normalizedLine !== '{') {
+                    if (normalizedLine && normalizedLine !== '}' && normalizedLine !== '{') {
                         addToIndex(
                             line.trim(),
                             internalName,
