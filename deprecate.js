@@ -43,14 +43,6 @@ async function decodeJson(buf) {
     return JSON.parse(text);
 }
 
-// Fetch a JSON resource that may be gzip-compressed (.gz).
-async function fetchJson(url) {
-    const res = await fetch(url);
-    if (!res.ok) return null;
-    const buf = await res.arrayBuffer();
-    return decodeJson(buf);
-}
-
 // Normalize both supported split-manifest formats:
 //   ["plugins_0.json.gz", ...]
 //   [{zipname: "plugins_0.json.gz", content: [...]}, ...]
@@ -331,12 +323,10 @@ class AutoMap extends Map {
             {
                 try {
                     let re = new RegExp(value);
-                    let usagesToSearch = app.usages;
-                    let symbolLocations = usagesToSearch.symbolLocations || new Map();
-                    for (let [sym, plugins] of usagesToSearch) {
+                    let symbolLocations = app.symbolLocations || new Map();
+                    for (let [sym, locations] of symbolLocations) {
                         let match = re.exec(sym);
                         if (match) {
-                            let locations = (symbolLocations && symbolLocations.get(sym)) || [];
                             if (locations.length > 0) {
                                 for (let loc of locations) {
                                     symbols.push(Object.freeze({
@@ -346,19 +336,6 @@ class AutoMap extends Map {
                                         line: loc.line,
                                     }));
                                     allMatches.add(loc.plugin);
-                                }
-                            } else {
-                                for (let plugin of plugins) {
-                                    symbols.push(Object.freeze({text: sym, plugin}));
-                                    allMatches.add(plugin.plugin);
-                                }
-                            }
-                            if (match.groups) {
-                                for (let group in match.groups) {
-                                    let groupMatches = groups.get(group).get(match.groups[group]);
-                                    for (let plugin of plugins) {
-                                        groupMatches.add(plugin)
-                                    }
                                 }
                             }
                         }
@@ -479,7 +456,6 @@ class AutoMap extends Map {
             return {
                 entries: entries || [new Search("Toa Keris Cam")],
                 lastUpdated: "Loading...",
-                usages: [],
                 progress: {
                     phase: "fetch",
                     current: 0,
@@ -552,10 +528,10 @@ class AutoMap extends Map {
     let indexedUsages = await buildIndex(mf, (count) => {
         app.progress.current = count;
     });
-    app.usages = [...indexedUsages];
-    app.usages.symbolLocations = indexedUsages.symbolLocations || new Map();
+    app.symbolLocations = indexedUsages;
+    app.indexedCount = indexedUsages.size;
     const differenceInMs = new Date() - sd2;
-    console.log(`Indexed ${indexedUsages.length} symbols from ${mf.jars.length} plugins in ${differenceInMs}ms`);
+    console.log(`Indexed ${indexedUsages.size} symbols from ${mf.jars.length} plugins in ${differenceInMs}ms`);
     app.progress.current = mf.jars.length;
     app.progress.phase = "done";
     app.progress.indexing = false;
