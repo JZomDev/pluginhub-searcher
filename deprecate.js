@@ -53,61 +53,61 @@ function getSplitFileNames(splits) {
         .filter((name) => typeof name === "string" && name.trim().length > 0);
 }
 
-// Load the full plugin data bundle in two observable phases:
-//   1. fetch  — download each (possibly split) data file over the network
-//   2. unzip  — decompress + JSON-parse each downloaded file
-// The optional progress callbacks let the UI show which phase is running and how
-// far along it is. Returns a map of internalName -> [{filePath, content}, ...].
-async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} = {}) {
-    // Resolve the list of data files. Split manifests (plugins/plugins_splits.json)
-    // contain either filenames or objects with a zipname; otherwise fall back to
-    // a single plugins.json.
-    let fileNames = null;
+// Process a single .gz file: fetch → uncompress → process JSON → return part.
+// This encapsulates the complete lifecycle of one file so it can move through
+// the pipeline independently without waiting for other files.
+async function processFile(fileNames, index) {
+    const name = fileNames[index];
     try {
-        const splitsRes = await fetch("plugins/plugins_splits.json");
-        if (splitsRes.ok) {
-            const splits = await splitsRes.json();
-            fileNames = getSplitFileNames(splits);
-        }
+        const res = await fetch(`plugins/${name}`);
+        if (!res.ok) return null;
+        const buf = await res.arrayBuffer();
+        const part = await decodeJson(buf);
+        return Array.isArray(part) ? part : null;
     } catch (e) {
-        // fall through to single-file fallback
+        return null;
     }
-    if (!fileNames || fileNames.length === 0) {
-        fileNames = ["plugins.json"];
+}
+
+// Load the full plugin data bundle with per-file pipelining:
+// Each .gz file moves through fetch → uncompress → process independently,
+// rather than waiting for all files to complete each stage.
+// The optional progress callbacks let the UI show how far along it is.
+// Returns a map of internalName -> [{filePath, content}, ...].
+async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} = {}) {
+
+
+    // Phase 1 fetch the names of the .gz files
+    let fileNames = null;
+    const splitsRes = await fetch("plugins/plugins_splits.json");
+    if (splitsRes.ok) {
+        const splits = await splitsRes.json();
+        fileNames = getSplitFileNames(splits);
     }
+
+    if (fileNames == null)
+    {
+        return
+    }
+
     loadPluginBundle._splitFileNames = fileNames;
 
-    // Phase 1 (fetch): download raw bytes for every file, reporting progress as
-    // each one lands. .map preserves order so the merge below is deterministic.
+    // Per-file pipeline: each file is processed independently through fetch →
+    // uncompress → process. Promise.all preserves input order regardless of
+    // which file finishes first. Progress is reported as each file completes
+    // its full pipeline.
     if (onFetchStart) onFetchStart(fileNames.length);
-    let fetched = 0;
-    const buffers = await Promise.all(fileNames.map(async (name) => {
-        try {
-            const res = await fetch(`plugins/${name}`);
-            if (!res.ok) return null;
-            return await res.arrayBuffer();
-        } catch (e) {
-            // ignore individual part failures
-            return null;
-        } finally {
-            if (onFetch) onFetch(++fetched);
-        }
-    }));
+    if (onUnzipStart) onUnzipStart(fileNames.length);
 
-    // Phase 2 (unzip): decompress + parse every downloaded file, reporting progress.
-    if (onUnzipStart) onUnzipStart(buffers.length);
-    let unzipped = 0;
-    const parts = await Promise.all(buffers.map(async (buf) => {
-        try {
-            if (!buf) return null;
-            const part = await decodeJson(buf);
-            return Array.isArray(part) ? part : null;
-        } catch (e) {
-            return null;
-        } finally {
-            if (onUnzip) onUnzip(++unzipped);
-        }
-    }));
+    const parts = await Promise.all(
+        fileNames.map(async (name, index) => {
+            const result = await processFile(fileNames, index);
+            // Report progress for both fetch and unzip phases as each file finishes.
+            if (onFetch) onFetch(index + 1);
+            if (onUnzip) onUnzip(index + 1);
+            return result;
+        })
+    );
 
     // Merge parts in order and index by internalName (same shape as before).
     const map = Object.create(null);
@@ -122,11 +122,7 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} =
             if (Array.isArray(p.files)) {
                 for (const f of p.files) {
                     if (!f) continue;
-                    if (typeof f === "string") {
-                        contents.push({filePath: f, content: null});
-                    } else {
-                        contents.push({filePath: f.filePath || f.fileName || null, content: f.content || null});
-                    }
+                    contents.push({filePath: f.filePath || null, content: f.content || null});
                 }
             }
             map[p.internalName] = contents;
