@@ -432,8 +432,8 @@ class AutoMap extends Map {
 			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
 		</List>
 			<List :list="entry.symbols" name="lines of text" v-slot="{item}">
-				<a href="#" @click.prevent="openLine(item.plugin)"><code>{{item.text}}</code></a>
-				--- <span class="plugin" :data-name="item.plugin">{{item.plugin.plugin}}</span>
+				<a href="#" @click.prevent="openLine(item)"><code>{{item.text}}</code></a>
+				--- <span class="plugin" :data-name="item.plugin">{{item.plugin}}</span>
 			</List>
 	</div>
 </div>
@@ -460,13 +460,13 @@ class AutoMap extends Map {
                     phase: "fetch",
                     current: 0,
                     total: 0,
-                    indexing: true
+                    loading: true
                 }
             }
         },
         template: `
 <div class="content">
-	<div v-if="progress.indexing">
+	<div v-if="progress.loading">
 		{{ progressLabel }}: {{ progress.current }}/{{ progress.total }}
 	</div>
 	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
@@ -534,7 +534,7 @@ class AutoMap extends Map {
     console.log(`Indexed ${indexedUsages.size} symbols from ${mf.jars.length} plugins in ${differenceInMs}ms`);
     app.progress.current = mf.jars.length;
     app.progress.phase = "done";
-    app.progress.indexing = false;
+    app.progress.loading = false;
 
     // Trigger regex setter on all initial searches to populate results
     for (let entry of app.entries) {
