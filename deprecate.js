@@ -446,10 +446,20 @@ class AutoMap extends Map {
             let entries;
             try {
                 let hash = window.location.hash;
-                hash = hash.substr(1);
-                hash = atob(hash);
-                hash = JSON.parse(hash);
-                entries = hash.map(v => new Search(v));
+                if (hash)
+                {
+                    if (hash.startsWith("#search?str="))
+                    {
+                        entries = [new Search(hash.substr("#search?str=".length))];
+                    }
+                    else if (hash.startsWith("#"))
+                    {
+                        hash = hash.substr(1);
+                        hash = atob(hash);
+                        hash = JSON.parse(hash);
+                        entries = hash.map(v => new Search(v));
+                    }
+                }
             } catch (e) {
                 console.log("loading hash:", e);
             }
