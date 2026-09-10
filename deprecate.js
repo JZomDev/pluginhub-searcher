@@ -61,29 +61,6 @@ function getSplitFileNames(splits) {
         .filter((name) => typeof name === "string" && name.trim().length > 0);
 }
 
-async function readPluginApi(manifest) {
-    await getContent('JZomDev', 'pluginhub-searcher', manifest.internalName);
-    const files = fileContent.get(manifest.internalName) || [];
-    const lines = [];
-    for (let f of files) {
-        let filePath = null;
-        let content = "";
-        if (!f) continue;
-        if (typeof f === "string") {
-            filePath = f;
-            content = "";
-        } else {
-            filePath = f.filePath || f.fileName || null;
-            content = f.content || "";
-        }
-        const parts = content.split("\n");
-        for (let i = 0; i < parts.length; i++) {
-            lines.push({text: parts[i], file: filePath, line: i + 1});
-        }
-    }
-    return lines;
-}
-
 // Load the full plugin data bundle in two observable phases:
 //   1. fetch  — download each (possibly split) data file over the network
 //   2. unzip  — decompress + JSON-parse each downloaded file
@@ -204,28 +181,35 @@ async function buildIndex(manifest, onProgress = () => {}) {
     const symbolLocations = new Map();
     let indexedCount = 0;
     await amap(64, manifest.jars, async (plugin) => {
-        let api = await readPluginApi(plugin);
-        for (let lineObj of api) {
-            let k = lineObj.text;
-            if (k == "") {
-                continue;
+        await getContent('JZomDev', 'pluginhub-searcher', plugin.internalName);
+        const files = fileContent.get(plugin.internalName) || [];
+        for (let f of files) {
+            if (!f) continue;
+            let filePath = null;
+            let content = "";
+            if (typeof f === "string") {
+                filePath = f;
+                content = "";
+            } else {
+                filePath = f.filePath || f.fileName || null;
+                content = f.content || "";
             }
-
-            let locs = symbolLocations.get(k);
-            if (!locs) {
-                symbolLocations.set(k, locs = []);
+            const parts = content.split("\n");
+            for (let i = 0; i < parts.length; i++) {
+                let k = parts[i];
+                if (k == "") continue;
+                let locs = symbolLocations.get(k);
+                if (!locs) {
+                    symbolLocations.set(k, locs = []);
+                }
+                locs.push({plugin: plugin.internalName, file: filePath, line: i + 1});
             }
-            locs.push({plugin: plugin.internalName, file: lineObj.file, line: lineObj.line});
         }
         indexedCount++;
         if (indexedCount % 10 === 0) {
             onProgress(indexedCount);
         }
     });
-    // let es = [...out.entries()];
-    // es.sort(([a], [b]) => a.localeCompare(b));
-    // expose symbolLocations for later use in UI
-    // es.symbolLocations = symbolLocations;
     return symbolLocations;
 }
 
