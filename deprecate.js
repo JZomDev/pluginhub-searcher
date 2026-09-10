@@ -186,15 +186,28 @@ async function buildIndex(manifest, onProgress = () => {}) {
                 filePath = f.filePath || f.fileName || null;
                 content = f.content || "";
             }
-            const parts = content.split("\n");
-            for (let i = 0; i < parts.length; i++) {
-                let k = parts[i];
-                if (k == "") continue;
+            let lineStart = 0;
+            let lineNum = 1;
+            let idx, k;
+            while ((idx = content.indexOf("\n", lineStart)) !== -1) {
+                k = content.slice(lineStart, idx);
+                if (k != "") {
+                    let locs = symbolLocations.get(k);
+                    if (!locs) {
+                        symbolLocations.set(k, locs = []);
+                    }
+                    locs.push({plugin: plugin.internalName, file: filePath, line: lineNum});
+                }
+                lineStart = idx + 1;
+                lineNum++;
+            }
+            k = content.slice(lineStart);
+            if (k != "") {
                 let locs = symbolLocations.get(k);
                 if (!locs) {
                     symbolLocations.set(k, locs = []);
                 }
-                locs.push({plugin: plugin.internalName, file: filePath, line: i + 1});
+                locs.push({plugin: plugin.internalName, file: filePath, line: lineNum});
             }
         }
         indexedCount++;
