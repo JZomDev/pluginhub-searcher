@@ -74,7 +74,9 @@ async function processFile(fileNames, index) {
 // rather than waiting for all files to complete each stage.
 // The optional progress callbacks let the UI show how far along it is.
 // Returns a map of internalName -> [{filePath, content}, ...].
-async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} = {}) {
+// When `onIndexed` is provided, it's called for each plugin as its file's
+// data is merged into the map, enabling incremental indexing.
+async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip, onIndexed} = {}) {
 
 
     // Phase 1 fetch the names of the .gz files
@@ -111,7 +113,12 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} =
 
     // Merge parts in order and index by internalName (same shape as before).
     const map = Object.create(null);
-    for (const part of parts) {
+    // Track which internalName came from which filename for incremental indexing.
+    const splitLookup = Object.create(null); // filename → internalNames[]
+    for (let i = 0; i < parts.length; i++) {
+        const part = parts[i];
+        const fn = fileNames[i];
+        const thisPluginNames = [];
         if (!part) continue;
         for (const p of part) {
             if (!p || !p.internalName) continue;
@@ -126,8 +133,14 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} =
                 }
             }
             map[p.internalName] = contents;
+            thisPluginNames.push(p.internalName);
+            if (onIndexed) onIndexed(p.internalName, contents, p);
+        }
+        if (thisPluginNames.length > 0) {
+            splitLookup[fn] = thisPluginNames;
         }
     }
+    loadPluginBundle._splitLookup = splitLookup;
     return map;
 }
 
@@ -153,65 +166,43 @@ async function getContent(user, repo, internalName, files) {
     return false;
 }
 
-async function amap(limit, array, asyncMapper) {
-    let out = new Array(array.length);
-    let todo = new Array(array.length).fill(0).map((_, i) => i);
-    await Promise.all(new Array(limit).fill(0).map(async () => {
-        for (; todo.length > 0; ) {
-            let i = todo.pop();
-            out[i] = await asyncMapper(array[i]);
+// Core indexing loop: parse file contents line-by-line, extract symbols, push to symbolLocations.
+function _indexPlugin(pluginName, contents, symbolLocations) {
+    for (let f of contents) {
+        if (!f) continue;
+        let filePath = null;
+        let content = "";
+        if (typeof f === "string") {
+            filePath = f;
+            content = "";
+        } else {
+            filePath = f.filePath || f.fileName || null;
+            content = f.content || "";
         }
-    }));
-    return out;
-}
-
-async function buildIndex(manifest, onProgress = () => {}) {
-    const symbolLocations = new Map();
-    let indexedCount = 0;
-    await amap(64, manifest.jars, async (plugin) => {
-        await getContent('JZomDev', 'pluginhub-searcher', plugin.internalName);
-        const files = fileContent.get(plugin.internalName) || [];
-        for (let f of files) {
-            if (!f) continue;
-            let filePath = null;
-            let content = "";
-            if (typeof f === "string") {
-                filePath = f;
-                content = "";
-            } else {
-                filePath = f.filePath || f.fileName || null;
-                content = f.content || "";
-            }
-            let lineStart = 0;
-            let lineNum = 1;
-            let idx, k;
-            while ((idx = content.indexOf("\n", lineStart)) !== -1) {
-                k = content.slice(lineStart, idx);
-                if (k != "") {
-                    let locs = symbolLocations.get(k);
-                    if (!locs) {
-                        symbolLocations.set(k, locs = []);
-                    }
-                    locs.push({plugin: plugin.internalName, file: filePath, line: lineNum});
-                }
-                lineStart = idx + 1;
-                lineNum++;
-            }
-            k = content.slice(lineStart);
+        let lineStart = 0;
+        let lineNum = 1;
+        let idx, k;
+        while ((idx = content.indexOf("\n", lineStart)) !== -1) {
+            k = content.slice(lineStart, idx);
             if (k != "") {
                 let locs = symbolLocations.get(k);
                 if (!locs) {
                     symbolLocations.set(k, locs = []);
                 }
-                locs.push({plugin: plugin.internalName, file: filePath, line: lineNum});
+                locs.push({plugin: pluginName, file: filePath, line: lineNum});
             }
+            lineStart = idx + 1;
+            lineNum++;
         }
-        indexedCount++;
-        if (indexedCount % 10 === 0) {
-            onProgress(indexedCount);
+        k = content.slice(lineStart);
+        if (k != "") {
+            let locs = symbolLocations.get(k);
+            if (!locs) {
+                symbolLocations.set(k, locs = []);
+            }
+            locs.push({plugin: pluginName, file: filePath, line: lineNum});
         }
-    });
-    return symbolLocations;
+    }
 }
 
 class AutoMap extends Map {
@@ -527,33 +518,34 @@ class AutoMap extends Map {
         },
     }).mount("#app");
 
-    // Phase 1 (fetch) + Phase 2 (unzip): download and decompress the plugin data
-    // bundle, driving the progress UI through each phase as files complete.
+    // Phase 1 (fetch) + Phase 2 (unzip) + Phase 3 (index): download, decompress, and
+    // build the searchable regex map from the plugin data bundle. Indexing happens
+    // incrementally inside loadPluginBundle via the onIndexed callback.
+    const symbolLocations = new Map();
+    let indexedCount = 0;
     const bundle = await loadPluginBundle({
         onFetchStart: (n) => { app.progress.phase = "fetch"; app.progress.current = 0; app.progress.total = n; },
         onFetch: (n) => { app.progress.current = n; },
         onUnzipStart: (n) => { app.progress.phase = "unzip"; app.progress.current = 0; app.progress.total = n; },
         onUnzip: (n) => { app.progress.current = n; },
+        onIndexed: (internalName, contents, plugin) => {
+            if (app.progress.phase !== "index") {
+                app.progress.phase = "index";
+                app.progress.current = 0;
+                app.progress.total = mf.jars.length;
+            }
+            app.progress.current = ++indexedCount;
+            _indexPlugin(plugin.internalName, contents, symbolLocations);
+        }
     });
-    // Share the already-loaded bundle with getContent so buildIndex won't refetch.
-    getContent._bundle = bundle;
-    getContent._bundlePromise = Promise.resolve();
 
-    // Phase 3 (index): build the searchable regex map from the decompressed content.
-    app.progress.phase = "index";
-    app.progress.current = 0;
-    app.progress.total = mf.jars.length;
-    const sd2 = new Date();
-    let indexedUsages = await buildIndex(mf, (count) => {
-        app.progress.current = count;
-    });
-    app.symbolLocations = indexedUsages;
-    app.indexedCount = indexedUsages.size;
-    const differenceInMs = new Date() - sd2;
-    console.log(`Indexed ${indexedUsages.size} symbols from ${mf.jars.length} plugins in ${differenceInMs}ms`);
+    // Finish progress reporting
     app.progress.current = mf.jars.length;
     app.progress.phase = "done";
     app.progress.loading = false;
+    app.symbolLocations = symbolLocations;
+    app.indexedCount = symbolLocations.size;
+    console.log(`Indexed ${symbolLocations.size} symbols from ${mf.jars.length} plugins`);
 
     // Trigger regex setter on all initial searches to populate results
     for (let entry of app.entries) {
