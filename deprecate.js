@@ -1,23 +1,28 @@
-const version = (async() => {
+// Memoized fetch cache — prevents redundant network requests when this module
+// is re-imported or reloaded in the same session.
+let _cachedVersion = null;
+async function setVersion(){
     let req = await fetch("https://raw.githubusercontent.com/runelite/plugin-hub/master/runelite.version");
-    let version = await req.text();
-    return version.trim();
-})();
+    _cachedVersion = (await req.text()).trim();
+}
 
 const root = "https://repo.runelite.net/plugins/"
 
-const manifest = (async() => {
-    let req = await fetch(`${root}manifest/${await version}_full.js`);
+let _cachedManifest = null;
+async function setManifest(){
+    let req = await fetch(`${root}manifest/${_cachedVersion}_full.js`);
     let buf = new DataView(await req.arrayBuffer());
     let skip = 4 + buf.getUint32(0);
     let text = new TextDecoder("utf-8").decode(new Uint8Array(buf.buffer.slice(skip)));
-    return JSON.parse(text);
-})();
+    _cachedManifest = JSON.parse(text);
+}
 
-const installs = (async() => {
-    let req = await fetch(`https://api.runelite.net/runelite-${await version}/pluginhub`);
-    return await req.json();
-})();
+let _cachedInstalls = null;
+async function setInstalls(){
+
+    let req = await fetch(`https://api.runelite.net/runelite-${_cachedVersion}/pluginhub`);
+    _cachedInstalls = await req.json();
+}
 let fileContent = new Map();
 
 // Decode an ArrayBuffer that may be gzip-compressed into a parsed JSON value.
@@ -57,8 +62,6 @@ function getSplitFileNames(splits) {
 }
 
 async function readPluginApi(manifest) {
-    let text = [];
-
     await getContent('JZomDev', 'pluginhub-searcher', manifest.internalName);
     const files = fileContent.get(manifest.internalName) || [];
     const lines = [];
@@ -103,6 +106,7 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip} =
     if (!fileNames || fileNames.length === 0) {
         fileNames = ["plugins.json"];
     }
+    loadPluginBundle._splitFileNames = fileNames;
 
     // Phase 1 (fetch): download raw bytes for every file, reporting progress as
     // each one lands. .map preserves order so the merge below is deterministic.
@@ -228,7 +232,7 @@ async function buildIndex(manifest, onProgress = () => {}) {
     // es.sort(([a], [b]) => a.localeCompare(b));
     // expose symbolLocations for later use in UI
     // es.symbolLocations = symbolLocations;
-    return out.entries();
+    return symbolLocations;
 }
 
 class AutoMap extends Map {
@@ -246,8 +250,11 @@ class AutoMap extends Map {
 }
 
 (async () => {
-    let mf = await manifest;
-    let installMap = await installs;
+    await setVersion();
+    await setManifest();
+    await setInstalls();
+    let mf = _cachedManifest;
+    let installMap = _cachedInstalls;
     document.body.addEventListener("click", async ev => {
         if (ev?.target?.classList?.contains("plugin")) {
             ev.preventDefault();
@@ -297,22 +304,7 @@ class AutoMap extends Map {
     }
 
     async function getPluginsLastUpdated() {
-        let files = [];
-        try {
-            const splitsRes = await fetch("plugins/plugins_splits.json");
-            if (splitsRes.ok) {
-                const splits = await splitsRes.json();
-                files = getSplitFileNames(splits);
-            }
-        } catch (e) {
-            // ignore and fall back
-        }
-
-        if (files.length === 0) {
-            files = ["plugins.json"];
-        }
-
-        const dates = await Promise.all(files.map(async (name) => {
+        const dates = await Promise.all(loadPluginBundle._splitFileNames.map(async (name) => {
             try {
                 const res = await fetch(`plugins/${name}`, { method: "HEAD" });
                 if (!res.ok) return null;
@@ -341,6 +333,7 @@ class AutoMap extends Map {
         constructor(regex) {
             this.id = Search.numEntries++;
             this._regex = regex || "";
+            this._symbolLocations = new Map();
             this.error = "";
             this.allMatches = [];
             this.symbols = [];
@@ -360,8 +353,7 @@ class AutoMap extends Map {
             {
                 try {
                     let re = new RegExp(value);
-                    // Handle case where app.usages might not be initialized yet
-                    let usagesToSearch = (typeof app !== 'undefined' && app.usages) ? app.usages : [];
+                    let usagesToSearch = app.usages;
                     let symbolLocations = usagesToSearch.symbolLocations || new Map();
                     for (let [sym, plugins] of usagesToSearch) {
                         let match = re.exec(sym);
@@ -482,11 +474,11 @@ class AutoMap extends Map {
 			</List>
 		</List>
 		<List :list="entry.allMatches" :active="!entry.groups" name="plugins" v-slot="{item}">
-			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
+			<span class="plugin" :data-name="item">{{item.plugin}} <span class="noselect">({{getInstalls(item.plugin)}})</span></span>
 		</List>
 			<List :list="entry.symbols" name="lines of text" v-slot="{item}">
-				<a href="#" @click.prevent="openLine(item)"><code>{{item.text}}</code></a>
-				--- <span class="plugin" :data-name="item.plugin">{{item.plugin}}</span>
+				<a href="#" @click.prevent="openLine(item.plugin)"><code>{{item.text}}</code></a>
+				--- <span class="plugin" :data-name="item.plugin">{{item.plugin.plugin}}</span>
 			</List>
 	</div>
 </div>
@@ -525,7 +517,9 @@ class AutoMap extends Map {
 	</div>
 	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
 </div>
-<footer class="footer" <p></p><a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated: {{lastUpdated}}</a></p></footer>
+<footer class="footer">
+<a href="https://github.com/JZomDev/pluginhub-searcher/commits/main">Last updated: {{lastUpdated}}</a>
+</footer>
 `,
         components: {
             Search: Search.component,
@@ -580,8 +574,8 @@ class AutoMap extends Map {
     let indexedUsages = await buildIndex(mf, (count) => {
         app.progress.current = count;
     });
-    app.usages = indexedUsages;
-    let symbolLocations = indexedUsages.symbolLocations || new Map();
+    app.usages = [...indexedUsages];
+    app.usages.symbolLocations = indexedUsages.symbolLocations || new Map();
     const differenceInMs = new Date() - sd2;
     console.log(`Indexed ${indexedUsages.length} symbols from ${mf.jars.length} plugins in ${differenceInMs}ms`);
     app.progress.current = mf.jars.length;
