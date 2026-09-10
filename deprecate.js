@@ -202,7 +202,6 @@ async function amap(limit, array, asyncMapper) {
 
 async function buildIndex(manifest, onProgress = () => {}) {
     const symbolLocations = new Map();
-    let out = new Map();
     let indexedCount = 0;
     await amap(64, manifest.jars, async (plugin) => {
         let api = await readPluginApi(plugin);
@@ -211,11 +210,6 @@ async function buildIndex(manifest, onProgress = () => {}) {
             if (k == "") {
                 continue;
             }
-            let ps = out.get(k);
-            if (!ps) {
-                out.set(k, ps = [])
-            }
-            ps.push(plugin.internalName);
 
             let locs = symbolLocations.get(k);
             if (!locs) {
@@ -372,7 +366,7 @@ class AutoMap extends Map {
                             } else {
                                 for (let plugin of plugins) {
                                     symbols.push(Object.freeze({text: sym, plugin}));
-                                    allMatches.add(plugin);
+                                    allMatches.add(plugin.plugin);
                                 }
                             }
                             if (match.groups) {
@@ -474,7 +468,7 @@ class AutoMap extends Map {
 			</List>
 		</List>
 		<List :list="entry.allMatches" :active="!entry.groups" name="plugins" v-slot="{item}">
-			<span class="plugin" :data-name="item">{{item.plugin}} <span class="noselect">({{getInstalls(item.plugin)}})</span></span>
+			<span class="plugin" :data-name="item">{{item}} <span class="noselect">({{getInstalls(item)}})</span></span>
 		</List>
 			<List :list="entry.symbols" name="lines of text" v-slot="{item}">
 				<a href="#" @click.prevent="openLine(item.plugin)"><code>{{item.text}}</code></a>
