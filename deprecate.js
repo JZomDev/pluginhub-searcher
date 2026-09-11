@@ -203,7 +203,8 @@ class AutoMap extends Map {
 }
 
 // Core indexing loop: parse file contents line-by-line, extract symbols, push to symbolLocations.
-// OPTIMIZED: Uses split() for batch processing, skips empty lines, leverages AutoMap for faster lookups.
+// OPTIMIZED: Uses indexOf('\n') with substring slicing for memory efficiency.
+// Avoids creating intermediate array for 2M+ lines; only keeps current line in memory.
 function _indexPlugin(pluginName, contents, symbolLocations) {
     for (let f of contents) {
         if (!f) continue;
@@ -220,15 +221,24 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
         // Skip empty content entirely
         if (!content) continue;
         
-        // Split all lines at once (batch operation, much faster than indexOf loop)
-        const lines = content.split('\n');
-        for (let lineNum = 0; lineNum < lines.length; lineNum++) {
-            const k = lines[lineNum];
-            // Skip empty or whitespace-only lines
+        let lineStart = 0;
+        let lineNum = 1;
+        let idx;
+        
+        // Single pass: scan for newlines, extract only current line as substring
+        while ((idx = content.indexOf('\n', lineStart)) !== -1) {
+            const k = content.substring(lineStart, idx);
             if (k) {
-                // Leverage AutoMap: get() auto-creates empty array on first access
-                symbolLocations.get(k).push({plugin: pluginName, file: filePath, line: lineNum + 1});
+                symbolLocations.get(k).push({plugin: pluginName, file: filePath, line: lineNum});
             }
+            lineStart = idx + 1;
+            lineNum++;
+        }
+        
+        // Handle final line (no trailing newline)
+        const k = content.substring(lineStart);
+        if (k) {
+            symbolLocations.get(k).push({plugin: pluginName, file: filePath, line: lineNum});
         }
     }
 }
