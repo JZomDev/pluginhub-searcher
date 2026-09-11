@@ -547,7 +547,7 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
             progressLabel() {
                 switch (this.progress.phase) {
                     case "fetch-unzip": 
-                        return `Downloading & Decompressing: Download ${this.progress.fetchCount}/${this.progress.total}, Decompress ${this.progress.unzipCount}/${this.progress.total}`;
+                        return `Decompressing: ${this.progress.unzipCount}/${this.progress.total}`;
                     case "index": 
                         return `Building search index: ${this.progress.current}/${this.progress.total} plugins`;
                     default: 
