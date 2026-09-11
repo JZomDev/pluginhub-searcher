@@ -56,16 +56,28 @@ function getSplitFileNames(splits) {
 // Process a single .gz file: fetch → uncompress → process JSON → return part.
 // This encapsulates the complete lifecycle of one file so it can move through
 // the pipeline independently without waiting for other files.
-async function processFile(fileNames, index) {
+// OPTIMIZATION: Captures Last-Modified header during fetch to avoid redundant HEAD requests.
+async function processFile(fileNames, index, captureHeaders) {
     const name = fileNames[index];
     try {
         const res = await fetch(`plugins/${name}`);
-        if (!res.ok) return null;
+        if (!res.ok) return { data: null, headers: null };
+        
+        // Capture Last-Modified header while we have the response
+        // This avoids needing separate HEAD requests later
+        let lastModified = null;
+        if (captureHeaders) {
+            lastModified = res.headers.get("Last-Modified");
+        }
+        
         const buf = await res.arrayBuffer();
         const part = await decodeJson(buf);
-        return Array.isArray(part) ? part : null;
+        return {
+            data: Array.isArray(part) ? part : null,
+            headers: lastModified ? { lastModified } : null
+        };
     } catch (e) {
-        return null;
+        return { data: null, headers: null };
     }
 }
 
@@ -103,7 +115,7 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip, o
 
     const parts = await Promise.all(
         fileNames.map(async (name, index) => {
-            const result = await processFile(fileNames, index);
+            const result = await processFile(fileNames, index, true);
             // Report progress for both fetch and unzip phases as each file finishes.
             if (onFetch) onFetch(index + 1);
             if (onUnzip) onUnzip(index + 1);
@@ -115,10 +127,19 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip, o
     const map = Object.create(null);
     // Track which internalName came from which filename for incremental indexing.
     const splitLookup = Object.create(null); // filename → internalNames[]
+    // Collect file headers for use by getPluginsLastUpdated
+    const fileHeaders = Object.create(null); // filename → { lastModified }
+    
     for (let i = 0; i < parts.length; i++) {
-        const part = parts[i];
+        const part = parts[i].data;
+        const headers = parts[i].headers;
         const fn = fileNames[i];
         const thisPluginNames = [];
+        
+        if (headers) {
+            fileHeaders[fn] = headers;
+        }
+        
         if (!part) continue;
         for (const p of part) {
             if (!p || !p.internalName) continue;
@@ -141,6 +162,7 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip, o
         }
     }
     loadPluginBundle._splitLookup = splitLookup;
+    loadPluginBundle._fileHeaders = fileHeaders;
     return map;
 }
 
@@ -266,20 +288,25 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
     }
 
     async function getPluginsLastUpdated() {
-        const dates = await Promise.all(loadPluginBundle._splitFileNames.map(async (name) => {
+        // OPTIMIZATION: Use headers captured during initial fetch instead of making N additional HEAD requests
+        const fileHeaders = loadPluginBundle._fileHeaders || {};
+        const dates = [];
+        
+        for (const name of (loadPluginBundle._splitFileNames || [])) {
             try {
-                const res = await fetch(`plugins/${name}`, { method: "HEAD" });
-                if (!res.ok) return null;
-                const lastModified = res.headers.get("Last-Modified");
-                if (!lastModified) return null;
-                const dt = new Date(lastModified);
-                return isNaN(dt) ? null : dt;
+                const header = fileHeaders[name];
+                if (!header || !header.lastModified) continue;
+                
+                const dt = new Date(header.lastModified);
+                if (!isNaN(dt)) {
+                    dates.push(dt);
+                }
             } catch (e) {
-                return null;
+                // Skip on error
             }
-        }));
+        }
 
-        const latest = dates.filter(Boolean).sort((a, b) => b - a)[0];
+        const latest = dates.sort((a, b) => b - a)[0];
         if (!latest) return "Unknown";
         return latest.toLocaleString(undefined, {
             year: "numeric",
@@ -540,6 +567,9 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
     app.indexedCount = symbolLocations.size;
     console.log(`Indexed ${symbolLocations.size} symbols from ${mf.jars.length} plugins`);
 
+    // OPTIMIZATION: Defer initial search to let UI render first, avoiding blocking on regex evaluation
+    await new Promise(resolve => setTimeout(resolve, 0));
+    
     // Trigger regex setter on all initial searches to populate results
     for (let entry of app.entries) {
         entry.regex = entry._regex;
