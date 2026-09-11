@@ -88,7 +88,7 @@ async function processFile(fileNames, index, captureHeaders) {
 // Returns a map of internalName -> [{filePath, content}, ...].
 // When `onIndexed` is provided, it's called for each plugin as its file's
 // data is merged into the map, enabling incremental indexing.
-async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip, onIndexed} = {}) {
+async function loadPluginBundle({onFetchStart, onFetch, onIndexed} = {}) {
 
 
     // Phase 1 fetch the names of the .gz files
@@ -111,14 +111,22 @@ async function loadPluginBundle({onFetchStart, onFetch, onUnzipStart, onUnzip, o
     // which file finishes first. Progress is reported as each file completes
     // its full pipeline.
     if (onFetchStart) onFetchStart(fileNames.length);
-    if (onUnzipStart) onUnzipStart(fileNames.length);
+
+    // Track completion counts for both fetch and unzip operations
+    let fetchCompleted = 0;
+    let unzipCompleted = 0;
 
     const parts = await Promise.all(
         fileNames.map(async (name, index) => {
             const result = await processFile(fileNames, index, true);
-            // Report progress for both fetch and unzip phases as each file finishes.
-            if (onFetch) onFetch(index + 1);
-            if (onUnzip) onUnzip(index + 1);
+            
+            // Increment both counters as file completes (fetch + unzip)
+            fetchCompleted++;
+            unzipCompleted++;
+            
+            // Report combined progress: fetch and unzip counts
+            if (onFetch) onFetch(fetchCompleted, unzipCompleted);
+            
             return result;
         })
     );
@@ -496,7 +504,9 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
                 entries: entries || [new Search("Toa Keris Cam")],
                 lastUpdated: "Loading...",
                 progress: {
-                    phase: "fetch",
+                    phase: "fetch-unzip",
+                    fetchCount: 0,
+                    unzipCount: 0,
                     current: 0,
                     total: 0,
                     loading: true
@@ -506,7 +516,7 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
         template: `
 <div class="content">
 	<div v-if="progress.loading">
-		{{ progressLabel }}: {{ progress.current }}/{{ progress.total }}
+		{{ progressLabel }}
 	</div>
 	<Search v-for="entry of entries" :key="entry.id" :entry="entry"></Search>
 </div>
@@ -536,10 +546,12 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
         computed: {
             progressLabel() {
                 switch (this.progress.phase) {
-                    case "fetch": return "Downloading plugin data (files)";
-                    case "unzip": return "Decompressing plugin data (files)";
-                    case "index": return "Building search index (plugins)";
-                    default: return "Loading";
+                    case "fetch-unzip": 
+                        return `Downloading & Decompressing: Download ${this.progress.fetchCount}/${this.progress.total}, Decompress ${this.progress.unzipCount}/${this.progress.total}`;
+                    case "index": 
+                        return `Building search index: ${this.progress.current}/${this.progress.total} plugins`;
+                    default: 
+                        return "Loading";
                 }
             },
         },
@@ -554,10 +566,16 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
     const symbolLocations = new AutoMap(() => []);
     let indexedCount = 0;
     const bundle = await loadPluginBundle({
-        onFetchStart: (n) => { app.progress.phase = "fetch"; app.progress.current = 0; app.progress.total = n; },
-        onFetch: (n) => { app.progress.current = n; },
-        onUnzipStart: (n) => { app.progress.phase = "unzip"; app.progress.current = 0; app.progress.total = n; },
-        onUnzip: (n) => { app.progress.current = n; },
+        onFetchStart: (n) => { 
+            app.progress.phase = "fetch-unzip"; 
+            app.progress.fetchCount = 0;
+            app.progress.unzipCount = 0;
+            app.progress.total = n; 
+        },
+        onFetch: (fetchCount, unzipCount) => { 
+            app.progress.fetchCount = fetchCount;
+            app.progress.unzipCount = unzipCount;
+        },
         onIndexed: (internalName, contents, plugin) => {
             if (app.progress.phase !== "index") {
                 app.progress.phase = "index";
@@ -570,7 +588,6 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
     });
 
     // Finish progress reporting
-    app.progress.current = mf.jars.length;
     app.progress.phase = "done";
     app.progress.loading = false;
     app.symbolLocations = symbolLocations;
