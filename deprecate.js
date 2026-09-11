@@ -567,9 +567,6 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
     app.indexedCount = symbolLocations.size;
     console.log(`Indexed ${symbolLocations.size} symbols from ${mf.jars.length} plugins`);
 
-    // OPTIMIZATION: Defer initial search to let UI render first, avoiding blocking on regex evaluation
-    await new Promise(resolve => setTimeout(resolve, 0));
-    
     // Trigger regex setter on all initial searches to populate results
     for (let entry of app.entries) {
         entry.regex = entry._regex;
