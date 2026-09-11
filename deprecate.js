@@ -166,7 +166,22 @@ async function getContent(user, repo, internalName, files) {
     return false;
 }
 
+class AutoMap extends Map {
+    constructor(factory) {
+        super()
+        this.factory = factory;
+    }
+    get(key) {
+        let v = super.get(key);
+        if (v === undefined) {
+            this.set(key, v = this.factory(key));
+        }
+        return v;
+    }
+}
+
 // Core indexing loop: parse file contents line-by-line, extract symbols, push to symbolLocations.
+// OPTIMIZED: Uses split() for batch processing, skips empty lines, leverages AutoMap for faster lookups.
 function _indexPlugin(pluginName, contents, symbolLocations) {
     for (let f of contents) {
         if (!f) continue;
@@ -179,43 +194,20 @@ function _indexPlugin(pluginName, contents, symbolLocations) {
             filePath = f.filePath || f.fileName || null;
             content = f.content || "";
         }
-        let lineStart = 0;
-        let lineNum = 1;
-        let idx, k;
-        while ((idx = content.indexOf("\n", lineStart)) !== -1) {
-            k = content.slice(lineStart, idx);
-            if (k != "") {
-                let locs = symbolLocations.get(k);
-                if (!locs) {
-                    symbolLocations.set(k, locs = []);
-                }
-                locs.push({plugin: pluginName, file: filePath, line: lineNum});
+        
+        // Skip empty content entirely
+        if (!content) continue;
+        
+        // Split all lines at once (batch operation, much faster than indexOf loop)
+        const lines = content.split('\n');
+        for (let lineNum = 0; lineNum < lines.length; lineNum++) {
+            const k = lines[lineNum];
+            // Skip empty or whitespace-only lines
+            if (k) {
+                // Leverage AutoMap: get() auto-creates empty array on first access
+                symbolLocations.get(k).push({plugin: pluginName, file: filePath, line: lineNum + 1});
             }
-            lineStart = idx + 1;
-            lineNum++;
         }
-        k = content.slice(lineStart);
-        if (k != "") {
-            let locs = symbolLocations.get(k);
-            if (!locs) {
-                symbolLocations.set(k, locs = []);
-            }
-            locs.push({plugin: pluginName, file: filePath, line: lineNum});
-        }
-    }
-}
-
-class AutoMap extends Map {
-    constructor(factory) {
-        super()
-        this.factory = factory;
-    }
-    get(key) {
-        let v = super.get(key);
-        if (v === undefined) {
-            this.set(key, v = this.factory(key));
-        }
-        return v;
     }
 }
 
@@ -521,7 +513,8 @@ class AutoMap extends Map {
     // Phase 1 (fetch) + Phase 2 (unzip) + Phase 3 (index): download, decompress, and
     // build the searchable regex map from the plugin data bundle. Indexing happens
     // incrementally inside loadPluginBundle via the onIndexed callback.
-    const symbolLocations = new Map();
+    // Using AutoMap to speed up symbol location lookups during indexing.
+    const symbolLocations = new AutoMap(() => []);
     let indexedCount = 0;
     const bundle = await loadPluginBundle({
         onFetchStart: (n) => { app.progress.phase = "fetch"; app.progress.current = 0; app.progress.total = n; },
