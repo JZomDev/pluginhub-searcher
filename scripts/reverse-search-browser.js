@@ -12,6 +12,8 @@
     // Decoded chunks are re-created from the compressed copies kept in memory.
     const CHUNK_CACHE_CHARS = 64 * 1024 * 1024;
     const SHARD_CACHE_ENTRIES = 256;
+    // Partial results are reported at most this often while a search runs.
+    const PROGRESS_INTERVAL_MS = 200;
     const textEncoder = new TextEncoder();
     const textDecoder = new TextDecoder();
 
@@ -181,12 +183,15 @@
             this.fetch = fetchFunction;
             this.manifest = null;
             this.compressed = new Map();
+            // Names of index files downloaded so far, by searches or prefetch.
+            this.loadedFiles = new Set();
             this.shardCache = new Map();
             this.chunkCache = new Map();
             this.chunkCacheChars = 0;
             this.activeSearches = 0;
             this.idle = Promise.resolve();
             this.prefetching = null;
+            this.prefetchStatus = null;
         }
 
         async _fetchBytes(path, init) {
@@ -212,7 +217,10 @@
         _compressed(name) {
             if (!this.compressed.has(name)) {
                 const promise = this._fetchBytes(`${name}?v=${this.manifest.build}`);
-                promise.catch(() => this.compressed.delete(name));
+                promise.then(() => {
+                    this.loadedFiles.add(name);
+                    this.prefetchStatus?.report();
+                }, () => this.compressed.delete(name));
                 this.compressed.set(name, promise);
             }
             return this.compressed.get(name);
@@ -283,6 +291,10 @@
 
         // Downloads every shard, then every chunk, in the background. Pauses
         // while a search is running so it never competes for bandwidth.
+        // onProgress(done, total, failed, paused) is called when it starts,
+        // whenever any index file finishes downloading (searches included, so
+        // `done` counts files a search already fetched), whenever it pauses for
+        // or resumes after searches, and once more with done === total at the end.
         prefetch(onProgress = () => {}) {
             if (!this.prefetching) {
                 const { shardCount, chunks } = this.manifest;
@@ -290,20 +302,40 @@
                     ...Array.from({ length: shardCount }, (_, index) => indexFileName('shards', index)),
                     ...chunks.map((_, index) => indexFileName('chunks', index))
                 ];
-                let done = 0;
-                let failed = 0;
+                // Capped below total until every file has been tried, so 100% always
+                // means the download is over.
+                const done = () => status.finished ? names.length : Math.min(this.loadedFiles.size, names.length - 1);
+                let reportedFinish = false;
+                const status = this.prefetchStatus = {
+                    finished: false,
+                    failed: 0,
+                    report: () => {
+                        if (reportedFinish) return;
+                        reportedFinish = status.finished;
+                        onProgress(done(), names.length, status.failed, !status.finished && this.activeSearches > 0);
+                    }
+                };
+                status.report();
                 this.prefetching = mapConcurrent(names, PREFETCH_CONCURRENCY, async name => {
                     while (this.activeSearches) await this.idle;
                     try {
                         await this._compressed(name);
                     } catch (error) {
-                        failed++;
+                        status.failed++;
                         console.warn(`Prefetch of ${name} failed:`, error);
+                        status.report();
                     }
-                    onProgress(++done, names.length, failed);
+                }).then(() => {
+                    status.finished = true;
+                    status.report();
                 });
             }
             return this.prefetching;
+        }
+
+        _prefetchPauseChanged() {
+            const status = this.prefetchStatus;
+            if (status && !status.finished) status.report();
         }
 
         // Sorted candidate file ids, or null when every file must be scanned.
@@ -330,13 +362,21 @@
         // only options.limit lines are kept (highest options.priority(plugin)
         // first), so huge result sets never exhaust memory. plugins lists every
         // matching plugin with its line count. options.signal cancels the search.
+        // options.onProgress receives the results so far, plus `scanned` and
+        // `total` text chunks, every PROGRESS_INTERVAL_MS until the search ends.
         async search(query, options = {}) {
             if (!this.manifest) throw new Error('Search index is not loaded');
-            if (this.activeSearches++ === 0) this.idle = new Promise(resolve => { this.resolveIdle = resolve; });
+            if (this.activeSearches++ === 0) {
+                this.idle = new Promise(resolve => { this.resolveIdle = resolve; });
+                this._prefetchPauseChanged();
+            }
             try {
                 return await this._search(query, options);
             } finally {
-                if (--this.activeSearches === 0) this.resolveIdle();
+                if (--this.activeSearches === 0) {
+                    this.resolveIdle();
+                    this._prefetchPauseChanged();
+                }
             }
         }
 
@@ -381,6 +421,8 @@
                 return { results: kept.map(({ fileId, priority, ...result }) => result), lineCount, plugins: matched };
             };
 
+            let scanned = 0;
+            let lastReport = 0;
             await mapConcurrent([...wanted], FETCH_CONCURRENCY, async ([chunk, fileIds]) => {
                 const files = await this._chunk(chunk);
                 if (signal?.aborted) return;
@@ -411,6 +453,12 @@
                         lineCount += fileMatches;
                         pluginLines.set(pluginIndex, (pluginLines.get(pluginIndex) || 0) + fileMatches);
                     }
+                }
+                scanned++;
+                const now = Date.now();
+                if (scanned < wanted.size && now - lastReport >= PROGRESS_INTERVAL_MS) {
+                    lastReport = now;
+                    onProgress({ ...snapshot(), scanned, total: wanted.size });
                 }
             }, () => signal?.aborted);
             signal?.throwIfAborted();

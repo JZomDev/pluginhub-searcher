@@ -140,11 +140,57 @@ test('reverse index searches source lines and preserves exact result metadata', 
     await prefetcher.load();
     const reports = [];
     await prefetcher.prefetch((done, total) => reports.push([done, total]));
-    assert.deepEqual(reports.at(-1), [reports.length, reports.length]);
+    const total = reports[0][1];
+    assert.deepEqual(reports[0], [0, total]);
+    assert.deepEqual(reports.at(-1), [total, total]);
     prefetchRequests.length = 0;
     assert.deepEqual(await find(prefetcher, 'Toa Keris Cam', { caseSensitive: true }), phrase);
     assert.equal((await find(prefetcher, '^.{0,2}$', { isRegex: true })).length, 1);
     assert.deepEqual(prefetchRequests, []);
+});
+
+test('searches report partial results and pause the index download', async t => {
+    const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-index-'));
+    t.after(() => fs.rmSync(temporaryDirectory, { recursive: true, force: true }));
+
+    // Each file is bigger than one text chunk, so the search spans three chunks.
+    const dataDirectory = path.join(temporaryDirectory, 'data');
+    fs.mkdirSync(dataDirectory);
+    for (const name of ['first', 'second', 'third']) {
+        fs.writeFileSync(path.join(dataDirectory, `${name}.json`), JSON.stringify({
+            files: [{ filePath: 'src/Big.java', content: `needle\n${'x'.repeat(600 * 1024)}\n` }]
+        }));
+    }
+    const indexDirectory = path.join(temporaryDirectory, 'index');
+    buildIndex(dataDirectory, indexDirectory, 1);
+
+    const searcher = new BrowserReverseSearcher('https://pages.example/index/', fileFetch(indexDirectory));
+    await searcher.load();
+    const partials = [];
+    const found = await searcher.search('needle', { onProgress: partial => partials.push(partial) });
+    assert.equal(found.lineCount, 3);
+    assert.ok(partials.length >= 1);
+    for (const partial of partials) {
+        assert.equal(partial.total, 3);
+        assert.ok(partial.scanned < partial.total);
+        assert.equal(partial.lineCount, partial.scanned);
+        assert.equal(partial.results.length, partial.scanned);
+    }
+
+    // The download reports itself paused while a search runs, then resumed,
+    // and counts the files earlier searches already fetched.
+    const reports = [];
+    const running = searcher.search('needle');
+    const prefetching = searcher.prefetch((done, total, failed, paused) => reports.push({ done, total, paused }));
+    assert.equal(reports.length, 1);
+    assert.equal(reports[0].paused, true);
+    assert.equal(reports[0].done, searcher.loadedFiles.size);
+    assert.ok(reports[0].done > 3);
+    await running;
+    assert.equal(reports.at(-1).paused, false);
+    await prefetching;
+    assert.deepEqual(reports.at(-1), { done: reports[0].total, total: reports[0].total, paused: false });
+    assert.ok(reports.every((report, index) => !index || report.done >= reports[index - 1].done));
 });
 
 test('required regex literals are conservative', () => {
