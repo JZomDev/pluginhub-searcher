@@ -134,6 +134,8 @@
             abort: null,
             // 'idle', 'searching' or 'done'.
             state: 'idle',
+            // Query and options of the current search, so repeats are skipped.
+            searchKey: '',
             progress: 0,
             startedAt: 0,
             elapsed: 0,
@@ -314,6 +316,9 @@
     async function performSearch(entry) {
         const value = entry.input.value.trim();
         if (!value) return;
+        const searchKey = JSON.stringify([value, isRegex, caseSensitive]);
+        if (searchKey === entry.searchKey && entry.state !== 'idle') return;
+        entry.searchKey = searchKey;
         const request = ++entry.request;
         entry.abort?.abort();
         const controller = entry.abort = new AbortController();
