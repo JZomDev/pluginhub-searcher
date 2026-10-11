@@ -7,6 +7,7 @@
     const regexElement = document.getElementById('regex');
     const caseSensitiveElement = document.getElementById('case-sensitive');
     const indexStatusElement = document.getElementById('index-status');
+    const indexBarElement = document.getElementById('index-bar');
     const pluginCountElement = document.getElementById('plugin-count');
     const searcher = new window.ReverseSearchBrowser.BrowserReverseSearcher(INDEX_URL.href);
     const indexReady = searcher.load();
@@ -78,6 +79,20 @@
         summary.className = 'result-summary';
         summary.hidden = true;
 
+        // Fixed width and hidden rather than removed when idle, so the search
+        // box never changes size as the status text changes.
+        const status = document.createElement('div');
+        status.className = 'search-status idle';
+        status.setAttribute('role', 'status');
+        const statusIcon = document.createElement('span');
+        statusIcon.setAttribute('aria-hidden', 'true');
+        const statusText = document.createElement('span');
+        status.append(statusIcon, statusText);
+
+        const row = document.createElement('div');
+        row.className = 'search-row';
+        row.append(input, status);
+
         const pluginCount = document.createElement('div');
         pluginCount.className = 'plugin-count noselect';
         pluginCount.tabIndex = 0;
@@ -98,7 +113,7 @@
         lineList.hidden = true;
 
         summary.append(pluginCount, pluginList, lineCount, lineList);
-        container.append(input, error, summary);
+        container.append(row, error, summary);
         entriesElement.append(container);
 
         const entry = {
@@ -107,6 +122,9 @@
             input,
             error,
             summary,
+            status,
+            statusIcon,
+            statusText,
             pluginCount,
             pluginList,
             lineCount,
@@ -114,7 +132,11 @@
             timer: null,
             request: 0,
             abort: null,
-            searching: false,
+            // 'idle', 'searching' or 'done'.
+            state: 'idle',
+            progress: 0,
+            startedAt: 0,
+            elapsed: 0,
             results: [],
             lineTotal: 0,
             plugins: []
@@ -136,7 +158,7 @@
                 } else {
                     entry.abort?.abort();
                     entry.request++;
-                    entry.searching = false;
+                    entry.state = 'idle';
                     applyResults(entry, { results: [], lineCount: 0, plugins: [] });
                     renderEntry(entry);
                 }
@@ -178,9 +200,29 @@
     function renderCounts(entry) {
         const pluginsExpanded = entry.pluginCount.getAttribute('aria-expanded') === 'true';
         const linesExpanded = entry.lineCount.getAttribute('aria-expanded') === 'true';
-        const searching = entry.searching ? ' (searching…)' : '';
-        entry.pluginCount.textContent = `${pluginsExpanded ? '−' : '+'} ${entry.plugins.length.toLocaleString()} plugins${searching}`;
-        entry.lineCount.textContent = `${linesExpanded ? '−' : '+'} ${entry.lineTotal.toLocaleString()} lines of text${searching}`;
+        entry.pluginCount.textContent = `${pluginsExpanded ? '−' : '+'} ${entry.plugins.length.toLocaleString()} plugins`;
+        entry.lineCount.textContent = `${linesExpanded ? '−' : '+'} ${entry.lineTotal.toLocaleString()} lines of text`;
+    }
+
+    function renderStatus(entry) {
+        const done = entry.state === 'done';
+        entry.status.className = `search-status ${entry.state}`;
+        entry.summary.setAttribute('aria-busy', String(entry.state === 'searching'));
+        // The icon element is reused, so the spinner keeps turning between updates.
+        const iconClass = done ? 'search-check' : entry.state === 'searching' ? 'spinner' : '';
+        if (entry.statusIcon.className !== iconClass) {
+            entry.statusIcon.className = iconClass;
+            entry.statusIcon.textContent = done ? '✓' : '';
+        }
+        if (done) {
+            const seconds = (entry.elapsed / 1000).toFixed(1);
+            entry.statusText.textContent = entry.lineTotal ? `Done in ${seconds}s` : `No matches (${seconds}s)`;
+        } else if (entry.state === 'searching') {
+            const percent = entry.progress ? ` ${Math.floor(entry.progress * 100)}%` : '';
+            entry.statusText.textContent = `Searching…${percent}`;
+        } else {
+            entry.statusText.textContent = '';
+        }
     }
 
     function installs(plugin) {
@@ -193,13 +235,18 @@
             installs(right.plugin) - installs(left.plugin) || left.plugin.localeCompare(right.plugin));
         const pluginsExpanded = entry.pluginCount.getAttribute('aria-expanded') !== 'false';
         const linesExpanded = entry.lineCount.getAttribute('aria-expanded') === 'true';
-        entry.summary.hidden = entry.lineTotal === 0 && !entry.searching;
+        const hasResults = entry.lineTotal > 0;
+        entry.summary.hidden = entry.state === 'idle' || !hasResults;
+        entry.pluginCount.hidden = entry.lineCount.hidden = !hasResults;
         entry.pluginCount.setAttribute('aria-expanded', String(pluginsExpanded));
-        entry.pluginList.hidden = !pluginsExpanded;
+        entry.pluginList.hidden = !hasResults || !pluginsExpanded;
         entry.lineCount.setAttribute('aria-expanded', String(linesExpanded));
-        entry.lineList.hidden = !linesExpanded;
+        entry.lineList.hidden = !hasResults || !linesExpanded;
+        renderStatus(entry);
         renderCounts(entry);
 
+        // Lists are rebuilt as partial results arrive; keep the reader's place.
+        const scrollTop = entry.pluginList.scrollTop;
         entry.pluginList.replaceChildren();
         for (const [pluginIndex, { plugin, repository, commit }] of plugins.entries()) {
             const item = document.createElement('div');
@@ -218,6 +265,7 @@
             item.append(link, count);
             entry.pluginList.append(item);
         }
+        entry.pluginList.scrollTop = scrollTop;
 
         renderLines(entry);
     }
@@ -225,6 +273,7 @@
     // Line rows are only built while the (initially collapsed) list is open.
     function renderLines(entry) {
         const results = entry.results;
+        const scrollTop = entry.lineList.scrollTop;
         entry.lineList.replaceChildren();
         if (entry.lineList.hidden) return;
         const fragment = document.createDocumentFragment();
@@ -253,6 +302,7 @@
             overflow.textContent = `${entry.lineTotal.toLocaleString()} total results (showing ${results.length.toLocaleString()})`;
             entry.lineList.append(overflow);
         }
+        entry.lineList.scrollTop = scrollTop;
     }
 
     function applyResults(entry, { results, lineCount, plugins }) {
@@ -268,27 +318,36 @@
         entry.abort?.abort();
         const controller = entry.abort = new AbortController();
         entry.error.hidden = true;
+        entry.state = 'searching';
+        entry.progress = 0;
+        entry.startedAt = performance.now();
+        applyResults(entry, { results: [], lineCount: 0, plugins: [] });
+        renderEntry(entry);
         try {
             await indexReady;
             if (request !== entry.request) return;
-            entry.searching = true;
-            applyResults(entry, { results: [], lineCount: 0, plugins: [] });
-            renderEntry(entry);
             const found = await searcher.search(value, {
                 caseSensitive,
                 isRegex,
                 limit: MAX_RESULTS,
                 priority: installs,
-                signal: controller.signal
+                signal: controller.signal,
+                onProgress: partial => {
+                    if (request !== entry.request) return;
+                    entry.progress = partial.scanned / partial.total;
+                    applyResults(entry, partial);
+                    renderEntry(entry);
+                }
             });
             if (request !== entry.request) return;
-            entry.searching = false;
+            entry.state = 'done';
+            entry.elapsed = performance.now() - entry.startedAt;
             applyResults(entry, found);
             renderEntry(entry);
             saveQueries();
         } catch (error) {
             if (request !== entry.request) return;
-            entry.searching = false;
+            entry.state = 'idle';
             applyResults(entry, { results: [], lineCount: 0, plugins: [] });
             entry.error.textContent = error.message;
             entry.error.hidden = false;
@@ -296,13 +355,24 @@
         }
     }
 
+    function showIndexProgress(percent, state, text) {
+        indexBarElement.hidden = false;
+        indexBarElement.className = `index-bar ${state}`;
+        indexBarElement.setAttribute('aria-valuenow', String(percent));
+        indexBarElement.firstElementChild.style.width = `${percent}%`;
+        indexStatusElement.textContent = text;
+    }
+
+    // The full index downloads in the background and pauses during searches.
     function startPrefetch() {
         if (prefetchStarted) return;
         prefetchStarted = true;
-        searcher.prefetch((done, total, failed) => {
-            if (done < total) indexStatusElement.textContent = `Loading index: ${Math.floor(done / total * 100)}%`;
-            else if (failed) indexStatusElement.textContent = `Index loaded except ${failed} files (they load when a search needs them)`;
-            else indexStatusElement.textContent = 'Index loaded';
+        searcher.prefetch((done, total, failed, paused) => {
+            const percent = Math.floor(done / total * 100);
+            if (done < total && paused) showIndexProgress(percent, 'paused', `Index ${percent}%, paused for search`);
+            else if (done < total) showIndexProgress(percent, '', `Loading index: ${percent}%`);
+            else if (failed) showIndexProgress(100, 'paused', `Index loaded except ${failed} files (they load when a search needs them)`);
+            else showIndexProgress(100, 'done', '✓ Index loaded');
         });
     }
 
@@ -362,6 +432,7 @@
         // The rest of the index downloads only after the page's own queries finish.
         indexReady.then(() => {
             pluginCountElement.textContent = ` Currently ${searcher.manifest.plugins.length.toLocaleString()} plugins active.`;
+            if (!prefetchStarted) showIndexProgress(0, 'paused', 'Index 0%, paused for search');
             return Promise.allSettled(initialSearches).then(startPrefetch);
         }).catch(error => {
             const entry = entriesElement.firstElementChild._searchEntry;
