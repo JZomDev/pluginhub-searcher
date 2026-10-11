@@ -11,7 +11,7 @@ const python = process.env.PYTHON || 'python3';
 
 function buildIndex(dataDirectory, indexDirectory, workers) {
     execFileSync(python, [
-        path.join(__dirname, '..', 'build_reverse_index.py'),
+        path.join(__dirname, '..', 'builders', 'build_reverse_index.py'),
         dataDirectory,
         indexDirectory,
         String(workers)
