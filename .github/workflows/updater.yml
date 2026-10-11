@@ -1,15 +1,27 @@
-name: Run Java then Python on Schedule
+name: Update plugins and deploy site
 
 on:
   workflow_dispatch: # Allows manual triggering from the Actions tab
+  push:
+    branches: [main] # Publishes merged site changes; the bot's own pushes don't trigger this
 
 permissions:
   contents: write
+  pages: write
+  id-token: write
+
+# One run at a time, so two updates never push over each other.
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
 
 jobs:
-  run-java:
+  update:
     runs-on: self-hosted
-    
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -27,24 +39,65 @@ jobs:
         with:
           python-version: '3.11' # Specify your required Python version
 
-      - name: Run JAR file
+      - name: Update plugin data
         run: |
           java -jar HubSearcher-all.jar ./plugins/data ./plugins ./plugins ./plugins/data 2>&1 | tee /tmp/java-output.txt
 
-      - name: Run Python File
+      - name: Build search index
         run: |
           python3 build_reverse_index.py plugins/data plugins/index
 
-      - name: Commit and push search index if changed
+      # The index is published to Pages below rather than committed. The
+      # `git rm` untracks the copy committed before that; afterwards it's a no-op.
+      - name: Commit plugin data if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add . || true
+          git rm -r -q --cached --ignore-unmatch plugins/index
+          git add plugins
 
           if ! git diff --cached --quiet; then
             COMMIT_MESSAGE=$(cat /tmp/java-output.txt)
             git commit -m "$COMMIT_MESSAGE"
             git push
           else
-            echo "No changes to plugin data or search index"
+            echo "No changes to plugin data"
           fi
+
+      # site-version.txt is a hash of everything else in the site, so a run
+      # only deploys when something actually changed.
+      - name: Assemble site
+        run: |
+          rm -rf _site
+          mkdir -p _site/plugins
+          cp index.html _site/
+          cp -R scripts _site/
+          cp -R plugins/index _site/plugins/
+          find _site -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 > site-version.txt
+          mv site-version.txt _site/
+
+      - name: Configure Pages
+        id: pages
+        uses: actions/configure-pages@v5
+
+      - name: Check whether the live site is current
+        id: live
+        run: |
+          LIVE_VERSION=$(curl -fsS "${{ steps.pages.outputs.base_url }}/site-version.txt" || true)
+          if [ "$LIVE_VERSION" = "$(cat _site/site-version.txt)" ]; then
+            echo "Live site is already current"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload site
+        if: steps.live.outputs.deploy == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+      - name: Deploy to GitHub Pages
+        if: steps.live.outputs.deploy == 'true'
+        id: deployment
+        uses: actions/deploy-pages@v4
