@@ -48,21 +48,6 @@ Two GitHub Actions workflows keep the site current:
 - **`updater.yml`** runs the fetcher, rebuilds the index if anything changed, commits the new plugin data, and deploys to GitHub Pages. It can be started manually from the Actions tab.
 - **`deploy.yml`** redeploys the site when code changes are pushed to `main`. The index isn't committed, so it is rebuilt from `plugins/data` on each deploy.
 
-## Running locally
-
-Requires Python 3.11+.
-
-```sh
-# Download plugin sources into plugins/data
-npm run fetch-plugins
-
-# Build the search index into plugins/index
-npm run build-index
-
-# Serve the site, e.g.
-python3 -m http.server
-```
-
 ## License
 
 [BSD 2-Clause](LICENSE)
