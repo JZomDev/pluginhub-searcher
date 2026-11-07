@@ -70,6 +70,10 @@
         input.placeholder = 'Toa Keris Cam';
         input.value = initialQuery;
         input.setAttribute('aria-label', 'Search source code');
+        // Stop iOS Safari smart punctuation turning " into curly quotes.
+        input.setAttribute('autocorrect', 'off');
+        input.setAttribute('autocapitalize', 'off');
+        input.spellcheck = false;
 
         const error = document.createElement('div');
         error.className = 'error';
