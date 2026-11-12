@@ -57,8 +57,8 @@
         return counts;
     }
 
-    // Loads the set of internal names RuneLite currently lists. Plugins that
-    // were disabled are absent from it, and are left out of search results.
+    // Loads the set of internal names of plugins RuneLite currently offers.
+    // Plugins that are unlisted or marked unavailable are left out of search results.
     async function loadActivePlugins() {
         const versionResponse = await fetch('https://raw.githubusercontent.com/runelite/plugin-hub/master/runelite.version', { signal: AbortSignal.timeout(MANIFEST_TIMEOUT_MS) });
         if (!versionResponse.ok) throw new Error(`Could not load RuneLite version: HTTP ${versionResponse.status}`);
@@ -72,7 +72,11 @@
         if (start < 0) throw new Error('Invalid plugin manifest');
         const display = JSON.parse(text.slice(start)).display;
         if (!Array.isArray(display)) throw new Error('Invalid plugin manifest');
-        const names = new Set(display.map(entry => entry?.internalName).filter(name => typeof name === 'string'));
+        // Disabled plugins stay in the list with an unavailableReason.
+        const names = new Set(display
+            .filter(entry => entry && !entry.unavailableReason)
+            .map(entry => entry.internalName)
+            .filter(name => typeof name === 'string'));
         if (!names.size) throw new Error('Empty plugin manifest');
         return names;
     }
