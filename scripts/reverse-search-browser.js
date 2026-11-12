@@ -407,6 +407,7 @@
 
             const limit = options.limit ?? Infinity;
             const priority = options.priority || (() => 0);
+            const isPluginActive = options.isPluginActive || (() => true);
             const compare = (left, right) => right.priority - left.priority || left.fileId - right.fileId || left.line - right.line;
             let kept = [];
             let lineCount = 0;
@@ -430,10 +431,11 @@
                 const ids = fileIds || files.map((_, index) => first + index);
                 for (const fileId of ids) {
                     const [pluginIndex, filePath, content] = files[fileId - first];
+                    const [plugin, repository, commit] = plugins[pluginIndex];
+                    if (!isPluginActive(plugin)) continue;
                     const searchable = caseSensitive ? content : content.toLowerCase();
                     if (!pattern && !searchable.includes(needle)) continue;
                     const lines = splitLines(content);
-                    const [plugin, repository, commit] = plugins[pluginIndex];
                     const rank = Number(priority(plugin)) || 0;
                     let fileMatches = 0;
                     for (let index = 0; index < lines.length; index++) {
