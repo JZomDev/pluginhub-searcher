@@ -3,6 +3,7 @@
 
     const INDEX_URL = new URL('plugins/index/', document.baseURI);
     const MAX_RESULTS = 5000;
+    const MANIFEST_TIMEOUT_MS = 10000;
     const entriesElement = document.getElementById('entries');
     const regexElement = document.getElementById('regex');
     const caseSensitiveElement = document.getElementById('case-sensitive');
@@ -11,6 +12,9 @@
     const pluginCountElement = document.getElementById('plugin-count');
     const searcher = new window.ReverseSearchBrowser.BrowserReverseSearcher(INDEX_URL.href);
     const indexReady = searcher.load();
+    // Internal names of plugins in RuneLite's current plugin manifest; null
+    // (nothing filtered) when the manifest can't be loaded.
+    let activePlugins = null;
     let prefetchStarted = false;
     let installCounts = {};
     let isRegex = regexElement.checked;
@@ -51,6 +55,35 @@
         const counts = await response.json();
         if (!counts || typeof counts !== 'object' || Array.isArray(counts)) throw new Error('Invalid plugin install-count data');
         return counts;
+    }
+
+    // Loads the set of internal names RuneLite currently lists. Plugins that
+    // were disabled are absent from it, and are left out of search results.
+    async function loadActivePlugins() {
+        const versionResponse = await fetch('https://raw.githubusercontent.com/runelite/plugin-hub/master/runelite.version', { signal: AbortSignal.timeout(MANIFEST_TIMEOUT_MS) });
+        if (!versionResponse.ok) throw new Error(`Could not load RuneLite version: HTTP ${versionResponse.status}`);
+        const version = (await versionResponse.text()).trim();
+        if (!/^\d+(?:\.\d+)+$/.test(version)) throw new Error('Invalid RuneLite version');
+        const response = await fetch(`https://repo.runelite.net/plugins/manifest/${version}_full.js`, { signal: AbortSignal.timeout(MANIFEST_TIMEOUT_MS) });
+        if (!response.ok) throw new Error(`Could not load plugin manifest: HTTP ${response.status}`);
+        // The list follows a binary signature.
+        const text = (await response.text()).replace(/[\r\n]/g, '');
+        const start = text.indexOf('{"display":[');
+        if (start < 0) throw new Error('Invalid plugin manifest');
+        const display = JSON.parse(text.slice(start)).display;
+        if (!Array.isArray(display)) throw new Error('Invalid plugin manifest');
+        const names = new Set(display.map(entry => entry?.internalName).filter(name => typeof name === 'string'));
+        if (!names.size) throw new Error('Empty plugin manifest');
+        return names;
+    }
+
+    // Never rejects: on failure searches proceed unfiltered.
+    const activePluginsReady = loadActivePlugins().then(names => {
+        activePlugins = names;
+    }).catch(error => console.warn('Plugin manifest unavailable, showing all plugins:', error));
+
+    function isPluginActive(plugin) {
+        return !activePlugins || activePlugins.has(plugin);
     }
 
     function saveQueries() {
@@ -333,13 +366,14 @@
         applyResults(entry, { results: [], lineCount: 0, plugins: [] });
         renderEntry(entry);
         try {
-            await indexReady;
+            await Promise.all([indexReady, activePluginsReady]);
             if (request !== entry.request) return;
             const found = await searcher.search(value, {
                 caseSensitive,
                 isRegex,
                 limit: MAX_RESULTS,
                 priority: installs,
+                isPluginActive,
                 signal: controller.signal,
                 onProgress: partial => {
                     if (request !== entry.request) return;
@@ -439,8 +473,9 @@
         showQueries(restored.length ? restored : ['Toa Keris Cam']);
         const initialSearches = [...entriesElement.children].map(element => element._searchEntry.initialSearch);
         // The rest of the index downloads only after the page's own queries finish.
-        indexReady.then(() => {
-            pluginCountElement.textContent = ` Currently ${searcher.manifest.plugins.length.toLocaleString()} active.`;
+        Promise.all([indexReady, activePluginsReady]).then(() => {
+            const active = searcher.manifest.plugins.filter(([plugin]) => isPluginActive(plugin)).length;
+            pluginCountElement.textContent = ` Currently ${active.toLocaleString()} active.`;
             if (!prefetchStarted) showIndexProgress(0, 'paused', 'Index 0%, paused for search');
             return Promise.allSettled(initialSearches).then(startPrefetch);
         }).catch(error => {

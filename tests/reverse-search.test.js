@@ -193,6 +193,35 @@ test('searches report partial results and pause the index download', async t => 
     assert.ok(reports.every((report, index) => !index || report.done >= reports[index - 1].done));
 });
 
+test('searches leave out plugins the isPluginActive filter rejects', async t => {
+    const temporaryDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'reverse-index-'));
+    t.after(() => fs.rmSync(temporaryDirectory, { recursive: true, force: true }));
+
+    const dataDirectory = path.join(temporaryDirectory, 'data');
+    fs.mkdirSync(dataDirectory);
+    for (const name of ['enabled-plugin', 'disabled-plugin']) {
+        fs.writeFileSync(path.join(dataDirectory, `${name}.json`), JSON.stringify({
+            files: [{ filePath: 'src/A.java', content: 'needle one\nneedle two\n' }]
+        }));
+    }
+    const indexDirectory = path.join(temporaryDirectory, 'index');
+    buildIndex(dataDirectory, indexDirectory, 1);
+
+    const searcher = new BrowserReverseSearcher('https://pages.example/index/', fileFetch(indexDirectory));
+    await searcher.load();
+
+    const everything = await searcher.search('needle');
+    assert.equal(everything.lineCount, 4);
+    assert.deepEqual(everything.plugins.map(entry => entry.plugin).sort(), ['disabled-plugin', 'enabled-plugin']);
+
+    for (const options of [{}, { isRegex: true }]) {
+        const found = await searcher.search('needle', { ...options, isPluginActive: plugin => plugin === 'enabled-plugin' });
+        assert.equal(found.lineCount, 2);
+        assert.deepEqual(found.results.map(result => result.plugin), ['enabled-plugin', 'enabled-plugin']);
+        assert.deepEqual(found.plugins.map(entry => entry.plugin), ['enabled-plugin']);
+    }
+});
+
 test('required regex literals are conservative', () => {
     assert.deepEqual(requiredRegexLiterals('client.getLocalPlayer'), ['client', 'getLocalPlayer']);
     assert.deepEqual(requiredRegexLiterals('ItemID\\.ABYSSAL_WHIP'), ['ItemID.ABYSSAL_WHIP']);
